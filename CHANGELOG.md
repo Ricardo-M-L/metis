@@ -26,6 +26,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   METIS session root and shown in the tool trace; nested worktrees and other
   ambiguous failures remain blocked with an actionable explanation.
 
+## [0.4.75] - 2026-09-25
+
+CLI-only release. Desktop packages and the shared Desktop updater version remain
+on v0.4.74.
+
+### Changed
+
+- Replace the CLI welcome owl with a compact, blue-to-violet Braille mark based
+  on the existing METIS app icon. Keep the welcome card in the transcript so it
+  scrolls naturally after the first turn.
+
 ## [0.4.59] - 2026-09-12
 
 Prepared as a full CLI and Desktop release. Publication requires the complete

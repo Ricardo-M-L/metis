@@ -32,9 +32,9 @@ func TestBuildChatSurfaceItems_ActiveChatKeepsWelcomeAsPrologue(t *testing.T) {
 	if !ok {
 		t.Fatalf("first active-chat item should be the welcome prologue; got %T", items[0])
 	}
-	rendered := welcome.Render(120)
+	rendered := stripANSI(welcome.Render(120))
 	if !strings.Contains(rendered, "metis") ||
-		!strings.Contains(rendered, metisOwlGlyphLines[0]) {
+		!strings.Contains(rendered, metisIconLines[1]) {
 		t.Errorf("active-chat prologue is missing the welcome identity: %q", rendered)
 	}
 	if strings.Contains(rendered, "Type a message to start") {

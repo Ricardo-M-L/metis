@@ -1,22 +1,9 @@
 package tui
 
-// render_welcome.go — fresh-session banner. Design notes (2026-05-08
-// user feedback, images #1 and #4):
-//
-//   * The icon was missing — claude-code anchors its banner with a
-//     pixel-block robot face. We add a 4-row ASCII robot whose shape
-//     stays legible across fonts (no glyph-collision class — the
-//     earlier METIS wordmark rendered as MCTIS in some terminals).
-//   * The session UUID didn't belong on the banner — it's noise the
-//     user can find via /session if they need it. Dropped.
-//   * The welcome card belongs to the transcript, not to fixed chrome.
-//     Claude Code renders LogoHeader as the first child of Messages, so
-//     the same card remains above the first user turn and later scrolls
-//     away naturally. Metis mirrors that lifecycle: the empty frame adds
-//     a start hint, while active chat reuses the card itself as item zero.
+// render_welcome.go — fresh-session banner. Its small brand mark remains the
+// first transcript item, so it scrolls away with the conversation.
 
 import (
-	"image/color"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,81 +13,39 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/version"
 )
 
-// metisOwlGlyphLines is the metis owl banner — an 18-char × 7-row
-// Braille (U+2800-U+28FF) bitmap derived from the user's reference
-// image (#29). Generated via tools/img2braille:
-//
-//	go run ./tools/img2braille \
-//	    -in owl.png -w 18 -h 7 -threshold 110 \
-//	    -crop 540,140,910,800 -quoted
-//
-// Each Braille char carries 8 dot positions (2×4) — virtual resolution
-// at this banner size is 36×28 pixels. Compact 2.6:1 aspect ratio
-// (2026-05-16 user pick after iterating 24×14 → 18×10 → 30×7 →
-// settling on this size as "稍宽,特征最清晰"): the silhouette stays
-// legible, the wing spread is recognizable, and the banner only eats
-// 7 rows so the first chat turn lands above the fold on a standard
-// terminal. Hermes-agent's caduceus is 15-row-tall for comparison —
-// metis goes half as tall to keep the welcome card from dominating
-// first impressions the way hermes's does.
-var metisOwlGlyphLines = []string{
-	"⠀⠀⢳⣦⣤⣖⡋⠩⡽⠯⡏⢙⣓⣤⣤⣞⠀⠀",
-	"⠀⠀⢈⡍⣁⢙⡛⠷⡖⢠⠾⢛⡛⣈⣩⡁⠀⠀",
-	"⠀⠀⠈⣇⠁⣠⣅⠀⣈⣈⡀⣨⣥⠘⢹⠃⠀⠀",
-	"⣤⢤⣤⣬⡓⠲⠖⠊⠘⡏⠙⠒⠷⢚⣧⣤⡤⣤",
-	"⠿⡷⢜⠓⠭⠹⠏⢻⣦⣴⣟⠻⢫⠭⠲⡫⢼⡿",
-	"⠀⠈⡱⢫⠟⠞⢀⠩⠛⠟⠌⡀⠰⠙⠝⢯⡁⠀",
-	"⠀⠀⠀⠤⠐⠀⣈⢅⢈⡃⣀⣅⠀⠔⠐⠤⠀⠀",
+// Terminal icon derived from the blue M, orbit, and star in the existing
+// metis-desktop/build/appicon.png. The white app-tile background is omitted;
+// the mark is sampled onto a 20x16 dot grid and encoded as 10x4 Braille cells.
+var metisIconLines = []string{
+	"  ⣀   ⠴⠆  ",
+	"  ⣿⣷⣄⣠⣴⣿⠐⣦",
+	"⢠⠖⣿⡟⠿⠿⢻⣿⠖⠁",
+	"⠻⠶⠿⠷⠖⠛⠙⠿  ",
 }
 
-// Eye-row index — the row that holds the owl's eye ring. The
-// renderer paints this row in cyan (#00D5E5) to echo the "glowing
-// iris" detail in image #29. In the 18×7 layout the eye ring sits
-// at row 2 (forehead → eye band → cheek), right above the wing-
-// spread midline at row 3.
-const owlEyeRow = 2
+var metisIconPalette = []string{
+	"#08A9F7", "#0797F8", "#0786F9", "#0872FA", "#0B5EFA",
+	"#1751FA", "#2B48FA", "#433FFA", "#5937F9", "#6830F7",
+}
 
-// owlRowColor returns the foreground color for row i of the owl
-// banner — colors picked by anatomical part, not a linear silver
-// gradient, so the banner reads as a real owl rather than a
-// monochrome silhouette.
-//
-// Palette borrows from both Athena's mythological iconography
-// (owl, olive branch, golden helmet) and image #29's metallic
-// silver-with-cyan-accent aesthetic. Mapping for the 18×7 layout:
-//
-//	0  ear tufts + crown   #F2D27A  warm amber-gold (raptor highlights)
-//	1  brow / forehead     #E0E8F0  ice silver
-//	2  eye band            #00D5E5  cyan iris (Athena's "lit" gaze)
-//	3  wing-spread bar     #B8C4DC  silver-blue (midline outline)
-//	4  wing feathers       #8090B8  steel-blue
-//	5  wing tips           #5C6F8E  dim steel
-//	6  talons + olive      #88A056  olive green (Athena's olive branch)
-//
-// Saturated colors are reserved for the visual "anchor" rows
-// (ear tufts, eyes, olive branch) — the surrounding silver/
-// steel-blue stays close to neutral so the highlights pop without
-// the whole banner reading as a clown wash. Bumped saturation on
-// the amber/cyan/olive versus prior passes to defeat the "all
-// looks white" perception users got when half the rows used pale
-// tints that 256-color terminals quantized to bright_white.
-func owlRowColor(i int) color.Color {
-	switch i {
-	case 0:
-		return lipgloss.Color("#F2D27A") // amber-gold ear tufts + crown
-	case 1:
-		return lipgloss.Color("#E0E8F0") // ice-silver brow
-	case owlEyeRow:
-		return lipgloss.Color("#00D5E5") // cyan iris
-	case 3:
-		return lipgloss.Color("#B8C4DC") // silver-blue wing-spread bar
-	case 4:
-		return lipgloss.Color("#8090B8") // steel-blue wing feathers
-	case 5:
-		return lipgloss.Color("#5C6F8E") // dim steel wing tips
-	default:
-		return lipgloss.Color("#88A056") // olive-green talons + branch
+func renderMetisIcon() string {
+	styles := make([]lipgloss.Style, len(metisIconPalette))
+	for i, hex := range metisIconPalette {
+		styles[i] = lipgloss.NewStyle().Foreground(lipgloss.Color(hex)).Bold(true)
 	}
+	var rows []string
+	for _, raw := range metisIconLines {
+		var row strings.Builder
+		for col, dot := range []rune(raw) {
+			if dot == ' ' {
+				row.WriteRune(dot)
+			} else {
+				row.WriteString(styles[col].Render(string(dot)))
+			}
+		}
+		rows = append(rows, row.String())
+	}
+	return strings.Join(rows, "\n")
 }
 
 // renderWelcomeBanner paints the fresh-session card plus its one-time start
@@ -118,29 +63,13 @@ func (m *Model) renderWelcomeBannerCard() string {
 	labelStyle := lipgloss.NewStyle().Foreground(textMuted)
 	valueStyle := lipgloss.NewStyle().Foreground(textPrimary)
 
-	// Owl glyph painted in per-row color tiers — matches the silver-
-	// with-cyan-accent aesthetic of image #29. Hermes uses the same
-	// trick on its caduceus banner (per-row Rich [#hex] markup):
-	// dividing the silhouette into bands gives a "lit from above"
-	// feel that's much more visually rich than a single-color paint
-	// at the same character cost. Band mapping lives in owlRowColor
-	// next to the glyph data so the palette + layout stay in sync.
-	rowStyles := make([]lipgloss.Style, len(metisOwlGlyphLines))
-	for i := range rowStyles {
-		rowStyles[i] = lipgloss.NewStyle().Foreground(owlRowColor(i)).Bold(true)
-	}
-
-	owlRows := make([]string, len(metisOwlGlyphLines))
-	for i, raw := range metisOwlGlyphLines {
-		owlRows[i] = rowStyles[i].Render(raw)
-	}
-	icon := strings.Join(owlRows, "\n")
+	icon := renderMetisIcon()
 
 	// Title row carries the version inline (claude-code parity: the
 	// banner is the discoverable surface for "what version am I on?",
 	// no need to also stash it in the bottom status bar).
 	titleRow := lipgloss.JoinHorizontal(lipgloss.Bottom,
-		titleStyle.Render("✻ metis"),
+		titleStyle.Render("metis"),
 		labelStyle.Render(" v"+version.Short()),
 	)
 

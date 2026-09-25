@@ -90,7 +90,7 @@ func TestWelcomeToActiveKeepsSameCardAndDropsOnlyHint(t *testing.T) {
 	if !strings.Contains(active, "你好") {
 		t.Fatal("active frame should render the first user prompt below the welcome card")
 	}
-	if count := strings.Count(active, "✻ metis"); count != 1 {
+	if count := strings.Count(active, "metis v"); count != 1 {
 		t.Fatalf("active frame contains %d Metis identities, want the welcome card only", count)
 	}
 }
@@ -232,7 +232,7 @@ func assertSingleActiveFrameAfterLastClear(t *testing.T, suffix, responseMarker 
 		t.Fatalf("active transition did not contain ED2; output=%q", suffix)
 	}
 	finalFrame := suffix[lastClear:]
-	for _, marker := range []string{"✻ metis", "renderer-user-marker", responseMarker} {
+	for _, marker := range []string{"metis v", "renderer-user-marker", responseMarker} {
 		if count := strings.Count(finalFrame, marker); count != 1 {
 			t.Fatalf("final frame contains %q %d times, want exactly 1; output=%q",
 				marker, count, finalFrame)
@@ -439,7 +439,7 @@ func TestRequestingToProviderEOFDoesNotScrollFullscreen(t *testing.T) {
 		t.Fatalf("provider EOF transition did not re-anchor with ED2; output=%q", suffix)
 	}
 	finalFrame := suffix[lastClear:]
-	if count := strings.Count(finalFrame, "✻ metis"); count != 1 {
+	if count := strings.Count(finalFrame, "metis v"); count != 1 {
 		t.Fatalf("final EOF frame contains %d headers, want exactly 1; output=%q", count, finalFrame)
 	}
 	if count := strings.Count(finalFrame, "API Error: EOF"); count != 1 {
