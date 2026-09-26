@@ -9,7 +9,8 @@ let sessions = [];
 let workspaces = [];
 let activeWorkspaceId = '';
 let currentSessionId = null;
-let desktopPreferences = { busyEnter: 'queue', sidebarView: 'grouped', sidebarSort: 'recent', sessionOrder: [], defaultPreset: 'standard', language: 'zh-CN', rootTurnParallelism: 8 };
+let desktopPreferences = { busyEnter: 'queue', sidebarView: 'grouped', sidebarSort: 'recent', sessionOrder: [], defaultPreset: 'standard', language: 'zh-CN', presentationMode: 'standard', rootTurnParallelism: 8 };
+const desktopPreferenceKeysEditedDuringInitialLoad = new Set();
 let lastStatusSnapshot = null;
 let statusRequestGeneration = 0;
 let subAgentDetailState = { agentId: '', trigger: null, data: null, loading: false, error: '', requestGeneration: 0 };
@@ -71,9 +72,17 @@ async function initDesktopPreferences() {
   try {
     const res = await fetch('/api/preferences');
     const data = await res.json();
-    if (res.ok) desktopPreferences = Object.assign({}, desktopPreferences, data);
-	applyLanguage(desktopPreferences.language);
+    if (res.ok) {
+      const merged = Object.assign({}, desktopPreferences);
+      for (const [key, value] of Object.entries(data)) {
+        if (!desktopPreferenceKeysEditedDuringInitialLoad.has(key)) merged[key] = value;
+      }
+      desktopPreferences = merged;
+    }
   } catch (_) { /* server defaults remain authoritative on next save */ }
+	desktopPreferenceKeysEditedDuringInitialLoad.clear();
+	applyLanguage(desktopPreferences.language);
+	if (typeof applyActivityPresentationMode === 'function') applyActivityPresentationMode(desktopPreferences.presentationMode);
 }
 
 const DESKTOP_I18N = {
@@ -110,6 +119,7 @@ function applyLanguage(value) {
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el => { const text = dict[el.dataset.i18nPlaceholder]; if (text) el.placeholder = text; });
   document.querySelectorAll('[data-i18n-label]').forEach(el => { const text = dict[el.dataset.i18nLabel]; if (text) el.setAttribute('aria-label', text); });
   document.querySelectorAll('[data-i18n-title]').forEach(el => { const text = dict[el.dataset.i18nTitle]; if (text) el.title = text; });
+  if (typeof refreshActivityGroupLanguage === 'function') refreshActivityGroupLanguage();
   applyLayout();
   if (typeof syncApprovalChip === 'function') syncApprovalChip(approvalMode);
   if (lastStatusSnapshot) renderStatusSnapshot(lastStatusSnapshot);
@@ -128,6 +138,7 @@ async function saveDesktopPreference(key, value) {
 
 async function saveDesktopPreferencesPatch(patch) {
   const previous = Object.assign({}, desktopPreferences, { sessionOrder: (desktopPreferences.sessionOrder || []).slice() });
+  Object.keys(patch).forEach(key => desktopPreferenceKeysEditedDuringInitialLoad.add(key));
   Object.assign(desktopPreferences, patch);
   try {
     const res = await fetch('/api/preferences', {
@@ -137,10 +148,16 @@ async function saveDesktopPreferencesPatch(patch) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'preferences: ' + res.status);
-    desktopPreferences = Object.assign({}, desktopPreferences, data);
+    // The API returns the entire preference document. An older response must
+    // not roll back another setting changed while this request was in flight.
+    Object.keys(patch).forEach(key => {
+      if (Object.prototype.hasOwnProperty.call(data, key)) desktopPreferences[key] = data[key];
+    });
     return data;
   } catch (e) {
-	desktopPreferences = previous;
+	Object.keys(patch).forEach(key => {
+      if (desktopPreferences[key] === patch[key]) desktopPreferences[key] = previous[key];
+    });
     showToast('Preference save failed: ' + e.message);
     return false;
   }

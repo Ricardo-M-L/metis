@@ -158,6 +158,37 @@ func TestCheckpointHistory_ProviderMayReuseIDAfterCompletedPair(t *testing.T) {
 	checkpointLoaded(t, store, id, history)
 }
 
+func TestCheckpointHistory_ReusedIDWithinBatchPersistsOccurrencePairing(t *testing.T) {
+	store, id := checkpointStore(t)
+	history := []llm.Message{
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+			{Type: "tool_use", ToolUseID: "duplicate", TraceCallID: "trace-first", ToolName: "Write", ToolInput: map[string]any{}},
+			{Type: "tool_use", ToolUseID: "duplicate", TraceCallID: "trace-second", ToolName: "ExitPlanMode", ToolInput: map[string]any{}},
+		}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{
+			{Type: "tool_result", ToolUseID: "duplicate", TraceCallID: "trace-second", ToolResult: "ExitPlanMode ok"},
+			{Type: "tool_result", ToolUseID: "duplicate", TraceCallID: "trace-first", ToolResult: "Write skipped"},
+		}},
+	}
+	cursor := HistoryCursor{}
+	if err := checkpointHistory(t, store, id, history, &cursor); err != nil {
+		t.Fatal(err)
+	}
+	checkpointLoaded(t, store, id, history)
+	if got := checkpointBody(t, store, id); bytes.Count(got, []byte(`"trace_call_id"`)) != 4 {
+		t.Fatalf("ledger must retain every occurrence key: %s", got)
+	}
+	// A mismatched key must not be accepted merely because the provider ID
+	// matches another pending call.
+	broken := []llm.Message{
+		history[0],
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "tool_result", ToolUseID: "duplicate", TraceCallID: "wrong-key"}}},
+	}
+	if err := validateCheckpointToolPairs(broken); err == nil {
+		t.Fatal("mismatched occurrence key was accepted")
+	}
+}
+
 func TestCheckpointHistory_PartialAppendFailureKeepsRetryableVisiblePrefix(t *testing.T) {
 	store, id := checkpointStore(t)
 	history := append([]llm.Message{historyText(llm.RoleUser, "prompt")}, checkpointPair("read-1")...)

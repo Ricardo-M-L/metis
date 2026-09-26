@@ -60,11 +60,15 @@ const (
 // Only attachments uploaded inline are supported here; URL-based image
 // references would need a separate Source field.
 type ContentBlock struct {
-	Type      string         `json:"type"`
-	Text      string         `json:"text,omitempty"`
-	ToolUseID string         `json:"tool_use_id,omitempty"`
-	ToolName  string         `json:"name,omitempty"`
-	ToolInput map[string]any `json:"input,omitempty"`
+	Type      string `json:"type"`
+	Text      string `json:"text,omitempty"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	// TraceCallID is Metis-owned occurrence identity for one tool_use and its
+	// matching tool_result. Providers may reuse ToolUseID; adapters must keep
+	// this field out of provider wire payloads while session JSON retains it.
+	TraceCallID string         `json:"trace_call_id,omitempty"`
+	ToolName    string         `json:"name,omitempty"`
+	ToolInput   map[string]any `json:"input,omitempty"`
 	// ToolInputMalformed is an in-memory parse-failure marker. Providers and
 	// the stream consumer set it when function arguments are not valid JSON.
 	// It is deliberately not persisted or sent back over provider wires: raw

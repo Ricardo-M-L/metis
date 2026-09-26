@@ -16,12 +16,13 @@ import (
 // random loopback port keeps the same behavior (localStorage is origin/port
 // scoped and therefore cannot provide that guarantee).
 type desktopPreferences struct {
-	BusyEnter     string   `json:"busyEnter"`     // queue | send
-	SidebarView   string   `json:"sidebarView"`   // grouped | flat
-	SidebarSort   string   `json:"sidebarSort"`   // recent | name | manual
-	SessionOrder  []string `json:"sessionOrder"`  // stable ids, manual mode
-	DefaultPreset string   `json:"defaultPreset"` // standard | agent profile name
-	Language      string   `json:"language"`      // auto | en | zh-CN
+	BusyEnter        string   `json:"busyEnter"`        // queue | send
+	SidebarView      string   `json:"sidebarView"`      // grouped | flat
+	SidebarSort      string   `json:"sidebarSort"`      // recent | name | manual
+	SessionOrder     []string `json:"sessionOrder"`     // stable ids, manual mode
+	DefaultPreset    string   `json:"defaultPreset"`    // standard | agent profile name
+	Language         string   `json:"language"`         // auto | en | zh-CN
+	PresentationMode string   `json:"presentationMode"` // compact | standard | detailed | verbose
 	// RootTurnParallelism limits simultaneously-running top-level turns in
 	// different workspaces. A workspace itself remains exclusive so agents do
 	// not concurrently edit one checkout.
@@ -38,7 +39,7 @@ const (
 )
 
 func defaultDesktopPreferences() desktopPreferences {
-	return desktopPreferences{BusyEnter: "queue", SidebarView: "grouped", SidebarSort: "recent", DefaultPreset: "standard", Language: "zh-CN", RootTurnParallelism: DefaultDesktopRootTurnParallelism}
+	return desktopPreferences{BusyEnter: "queue", SidebarView: "grouped", SidebarSort: "recent", DefaultPreset: "standard", Language: "zh-CN", PresentationMode: "standard", RootTurnParallelism: DefaultDesktopRootTurnParallelism}
 }
 
 var desktopPresetName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
@@ -66,6 +67,9 @@ func loadDesktopPreferences() (desktopPreferences, error) {
 	if prefs.Language == "" {
 		prefs.Language = "zh-CN"
 	}
+	if prefs.PresentationMode == "" {
+		prefs.PresentationMode = "standard"
+	}
 	// Files written before Desktop exposed controlled foreground concurrency
 	// omit this field. Migrate them in memory rather than treating a safe old
 	// preference file as corrupt.
@@ -92,6 +96,9 @@ func validDesktopPreferences(p desktopPreferences) bool {
 		return false
 	}
 	if p.Language != "auto" && p.Language != "en" && p.Language != "zh-CN" {
+		return false
+	}
+	if p.PresentationMode != "compact" && p.PresentationMode != "standard" && p.PresentationMode != "detailed" && p.PresentationMode != "verbose" {
 		return false
 	}
 	if p.RootTurnParallelism < 1 || p.RootTurnParallelism > MaxDesktopRootTurnParallelism {
@@ -181,13 +188,14 @@ func (s *Server) handlePreferences(w http.ResponseWriter, r *http.Request) {
 			SessionOrder        *[]string `json:"sessionOrder"`
 			DefaultPreset       *string   `json:"defaultPreset"`
 			Language            *string   `json:"language"`
+			PresentationMode    *string   `json:"presentationMode"`
 			RootTurnParallelism *int      `json:"rootTurnParallelism"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid body")
 			return
 		}
-		if body.BusyEnter == nil && body.SidebarView == nil && body.SidebarSort == nil && body.SessionOrder == nil && body.DefaultPreset == nil && body.Language == nil && body.RootTurnParallelism == nil {
+		if body.BusyEnter == nil && body.SidebarView == nil && body.SidebarSort == nil && body.SessionOrder == nil && body.DefaultPreset == nil && body.Language == nil && body.PresentationMode == nil && body.RootTurnParallelism == nil {
 			writeError(w, http.StatusBadRequest, "no changes")
 			return
 		}
@@ -208,6 +216,9 @@ func (s *Server) handlePreferences(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.Language != nil {
 			prefs.Language = *body.Language
+		}
+		if body.PresentationMode != nil {
+			prefs.PresentationMode = *body.PresentationMode
 		}
 		if body.RootTurnParallelism != nil {
 			prefs.RootTurnParallelism = *body.RootTurnParallelism

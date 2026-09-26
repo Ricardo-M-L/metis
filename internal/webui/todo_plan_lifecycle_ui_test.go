@@ -49,7 +49,7 @@ function element() {
 const elements = Object.fromEntries(['todoPlanDock', 'todoPlanPopover', 'todoPlanTrigger', 'todoPlanStepLabel', 'todoPlanCounts', 'todoPlanList', 'sendBtn'].map(id => [id, element()]));
 const c = {
   currentSessionId: 'A', runningSessionId: null, turnRunning: false, stopRequestPending: false,
-  backgroundContinuationGeneration: 0, backgroundContinuationGenerations: new Map(), pendingForegroundRequest: null,
+  backgroundContinuationGeneration: 0, backgroundContinuationGenerations: new Map(), pendingForegroundRequest: null, resumeSessionGeneration: 0,
   queuedTurns: [], queuedSessionId: null, drainingQueuedTurns: false, runningTurnNeedsHistorySync: false, runningTurnIncompleteReason: '', streamedTextThisTurn: false,
   document: { getElementById: id => elements[id] || null },
   escHtml: String, escAttr: String, syncTurnControls() {}, renderSessions() {},

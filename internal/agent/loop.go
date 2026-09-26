@@ -1960,6 +1960,14 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		// provider_state, thinking, and redacted_thinking remain essential for
 		// stateful continuation and must be retained even though they still trigger
 		// the user-facing-text rescue below.
+		// Allocate a durable occurrence key before the assistant message enters
+		// canonical history. Dispatch, event streaming, and the matching result
+		// must use this exact key even if the provider repeats ToolUseID.
+		for i := range assistant {
+			if assistant[i].Type == "tool_use" && assistant[i].TraceCallID == "" {
+				assistant[i].TraceCallID = NewTraceInvocationID()
+			}
+		}
 		retainAssistant := len(assistant) > 0
 		if retainAssistant {
 			l.mu.Lock()
@@ -2392,7 +2400,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				const reason = "skipped: EnterPlanMode was denied or did not activate plan mode; sibling execution was refused"
 				skipped := make([]llm.ContentBlock, len(otherTools))
 				for i, toolUse := range otherTools {
-					traceCallID := NewTraceInvocationID()
+					traceCallID := toolUse.TraceCallID
 					emit(ctx, out, Event{
 						Kind: EventToolStart, ToolUseID: toolUse.ToolUseID,
 						ToolName: toolUse.ToolName, ToolInput: redactedToolInput(toolUse.ToolInput),
@@ -2400,7 +2408,8 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					})
 					skipped[i] = llm.ContentBlock{
 						Type: "tool_result", ToolUseID: toolUse.ToolUseID,
-						ToolResult: reason, IsError: true,
+						TraceCallID: traceCallID,
+						ToolResult:  reason, IsError: true,
 					}
 					emit(ctx, out, Event{
 						Kind: EventToolResult, ToolUseID: toolUse.ToolUseID, ToolName: toolUse.ToolName,
@@ -2495,7 +2504,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				const reason = "skipped: ExitPlanMode is an approval boundary; sibling tool calls from the pre-approval batch were not executed and must be reissued after the approval result"
 				results := make([]llm.ContentBlock, len(approvalBoundarySiblings))
 				for i, toolUse := range approvalBoundarySiblings {
-					traceCallID := NewTraceInvocationID()
+					traceCallID := toolUse.TraceCallID
 					emit(ctx, out, Event{
 						Kind: EventToolStart, ToolUseID: toolUse.ToolUseID,
 						ToolName: toolUse.ToolName, ToolInput: redactedToolInput(toolUse.ToolInput),
@@ -2503,7 +2512,8 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					})
 					results[i] = llm.ContentBlock{
 						Type: "tool_result", ToolUseID: toolUse.ToolUseID,
-						ToolResult: reason, IsError: true,
+						TraceCallID: traceCallID,
+						ToolResult:  reason, IsError: true,
 					}
 					emit(ctx, out, Event{
 						Kind: EventToolResult, ToolUseID: toolUse.ToolUseID, ToolName: toolUse.ToolName,
@@ -2541,7 +2551,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					results := make([]llm.ContentBlock, len(writeTools))
 					for i, toolUse := range writeTools {
 						const reason = "denied: plan mode has no permission gate; refusing to execute a potentially mutating tool"
-						traceCallID := NewTraceInvocationID()
+						traceCallID := toolUse.TraceCallID
 						emit(ctx, out, Event{
 							Kind: EventToolStart, ToolUseID: toolUse.ToolUseID,
 							ToolName: toolUse.ToolName, ToolInput: redactedToolInput(toolUse.ToolInput),
@@ -2549,7 +2559,8 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 						})
 						results[i] = llm.ContentBlock{
 							Type: "tool_result", ToolUseID: toolUse.ToolUseID,
-							ToolResult: reason, IsError: true,
+							TraceCallID: traceCallID,
+							ToolResult:  reason, IsError: true,
 						}
 						emit(ctx, out, Event{
 							Kind: EventToolResult, ToolUseID: toolUse.ToolUseID, ToolName: toolUse.ToolName,
@@ -3725,9 +3736,17 @@ func mergeEffectiveToolUses(all, batch []llm.ContentBlock) {
 	used := make([]bool, len(all))
 	for _, toolUse := range batch {
 		slot := -1
-		if toolUse.ToolUseID != "" {
+		if toolUse.TraceCallID != "" {
 			for i, candidate := range all {
-				if !used[i] && candidate.ToolUseID == toolUse.ToolUseID {
+				if !used[i] && candidate.TraceCallID == toolUse.TraceCallID {
+					slot = i
+					break
+				}
+			}
+		}
+		if slot < 0 && toolUse.ToolUseID != "" {
+			for i, candidate := range all {
+				if !used[i] && candidate.ToolUseID == toolUse.ToolUseID && (toolUse.TraceCallID == "" || candidate.TraceCallID == "") {
 					slot = i
 					break
 				}
@@ -3735,7 +3754,7 @@ func mergeEffectiveToolUses(all, batch []llm.ContentBlock) {
 		}
 		if slot < 0 {
 			for i, candidate := range all {
-				if !used[i] && candidate.ToolName == toolUse.ToolName {
+				if !used[i] && candidate.ToolName == toolUse.ToolName && (toolUse.TraceCallID == "" || candidate.TraceCallID == "") {
 					slot = i
 					break
 				}
@@ -3743,6 +3762,9 @@ func mergeEffectiveToolUses(all, batch []llm.ContentBlock) {
 		}
 		if slot < 0 {
 			continue
+		}
+		if toolUse.TraceCallID == "" {
+			toolUse.TraceCallID = all[slot].TraceCallID
 		}
 		all[slot] = toolUse
 		used[slot] = true
@@ -3758,9 +3780,17 @@ func mergeEffectiveToolUses(all, batch []llm.ContentBlock) {
 func mergeBatchResults(original, batch, results, slots []llm.ContentBlock, filled []bool) {
 	for batchIdx, toolUse := range batch {
 		slot := -1
-		if toolUse.ToolUseID != "" {
+		if toolUse.TraceCallID != "" {
 			for i, candidate := range original {
-				if !filled[i] && candidate.ToolUseID == toolUse.ToolUseID {
+				if !filled[i] && candidate.TraceCallID == toolUse.TraceCallID {
+					slot = i
+					break
+				}
+			}
+		}
+		if slot < 0 && toolUse.ToolUseID != "" {
+			for i, candidate := range original {
+				if !filled[i] && candidate.ToolUseID == toolUse.ToolUseID && (toolUse.TraceCallID == "" || candidate.TraceCallID == "") {
 					slot = i
 					break
 				}
@@ -3768,7 +3798,7 @@ func mergeBatchResults(original, batch, results, slots []llm.ContentBlock, fille
 		}
 		if slot < 0 {
 			for i, candidate := range original {
-				if !filled[i] && candidate.ToolName == toolUse.ToolName {
+				if !filled[i] && candidate.ToolName == toolUse.ToolName && (toolUse.TraceCallID == "" || candidate.TraceCallID == "") {
 					slot = i
 					break
 				}
@@ -3792,15 +3822,17 @@ func mergeBatchResults(original, batch, results, slots []llm.ContentBlock, fille
 		}
 		if result.Type == "" {
 			result = llm.ContentBlock{
-				Type:       "tool_result",
-				ToolUseID:  original[slot].ToolUseID,
-				ToolResult: "tool execution completed without a result block",
-				IsError:    true,
+				Type:        "tool_result",
+				ToolUseID:   original[slot].ToolUseID,
+				TraceCallID: original[slot].TraceCallID,
+				ToolResult:  "tool execution completed without a result block",
+				IsError:     true,
 			}
 		}
 		if result.ToolUseID == "" {
 			result.ToolUseID = original[slot].ToolUseID
 		}
+		result.TraceCallID = original[slot].TraceCallID
 		slots[slot] = result
 		filled[slot] = true
 	}
@@ -3818,10 +3850,11 @@ func orderedBatchResults(original, slots []llm.ContentBlock, filled []bool) []ll
 			continue
 		}
 		ordered[i] = llm.ContentBlock{
-			Type:       "tool_result",
-			ToolUseID:  toolUse.ToolUseID,
-			ToolResult: "tool was not dispatched while processing its assistant batch",
-			IsError:    true,
+			Type:        "tool_result",
+			ToolUseID:   toolUse.ToolUseID,
+			TraceCallID: toolUse.TraceCallID,
+			ToolResult:  "tool was not dispatched while processing its assistant batch",
+			IsError:     true,
 		}
 	}
 	return ordered

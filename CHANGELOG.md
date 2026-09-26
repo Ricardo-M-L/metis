@@ -7,6 +7,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.77] - 2026-09-26
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Changed
+
+- Desktop conversations now group command, search, read, and edit activity by
+  turn, with elapsed time and expandable detail. Failed tools remain visible;
+  presentation density can be changed in Settings and applies to both live
+  output and saved sessions.
+- Artifact cards stay in conversation order outside collapsible activity
+  groups, while tool rows show concise labels and retain their full detail.
+
+### Fixed
+
+- Persist an occurrence-specific tool trace identity so live events and saved
+  history pair the right call and result even when a provider reuses an ID.
+  Orphan repair and checkpoint traversal preserve that identity.
+- Keep an in-progress response attached to its originating conversation when
+  the user changes sessions, and prevent delayed preferences from overriding a
+  newly selected presentation mode.
+
 ## [0.4.76] - 2026-09-26
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

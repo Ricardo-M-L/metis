@@ -150,7 +150,18 @@ func (s *Store) CheckpointHistory(id string, history []llm.Message, cursor *Hist
 }
 
 func validateCheckpointToolPairs(history []llm.Message) error {
-	pending := make(map[string]struct{})
+	// Provider ToolUseID is not an occurrence key: some compatible gateways
+	// reuse it within one assistant batch. Prefer Metis's durable trace key
+	// when present, and consume legacy unkeyed pairs in message order.
+	type pendingCall struct {
+		id      string
+		traceID string
+		matched bool
+	}
+	var calls []pendingCall
+	byID := make(map[string][]int)
+	byTrace := make(map[string]int)
+	seenTrace := make(map[string]bool)
 	for _, message := range history {
 		for _, block := range message.Content {
 			switch block.Type {
@@ -158,20 +169,54 @@ func validateCheckpointToolPairs(history []llm.Message) error {
 				if block.ToolUseID == "" {
 					return fmt.Errorf("tool_use is missing its id")
 				}
-				if _, exists := pending[block.ToolUseID]; exists {
-					return fmt.Errorf("duplicate pending tool_use %q", block.ToolUseID)
+				if block.TraceCallID != "" {
+					if seenTrace[block.TraceCallID] {
+						return fmt.Errorf("duplicate trace_call_id %q", block.TraceCallID)
+					}
+					seenTrace[block.TraceCallID] = true
+					byTrace[block.TraceCallID] = len(calls)
 				}
-				pending[block.ToolUseID] = struct{}{}
+				byID[block.ToolUseID] = append(byID[block.ToolUseID], len(calls))
+				calls = append(calls, pendingCall{id: block.ToolUseID, traceID: block.TraceCallID})
 			case "tool_result":
-				if _, exists := pending[block.ToolUseID]; !exists {
+				idx := -1
+				if block.TraceCallID != "" {
+					if exact, ok := byTrace[block.TraceCallID]; ok && !calls[exact].matched {
+						idx = exact
+					} else {
+						// Mixed-version histories may have an unkeyed use followed
+						// by a keyed result. Do not consume another keyed use.
+						for _, candidate := range byID[block.ToolUseID] {
+							if !calls[candidate].matched && calls[candidate].traceID == "" {
+								idx = candidate
+								break
+							}
+						}
+					}
+				} else {
+					for _, candidate := range byID[block.ToolUseID] {
+						if !calls[candidate].matched {
+							idx = candidate
+							break
+						}
+					}
+				}
+				if idx < 0 || calls[idx].id != block.ToolUseID {
 					return fmt.Errorf("tool_result %q has no pending tool_use", block.ToolUseID)
 				}
-				delete(pending, block.ToolUseID)
+				calls[idx].matched = true
+				delete(byTrace, calls[idx].traceID)
 			}
 		}
 	}
-	if len(pending) != 0 {
-		return fmt.Errorf("history contains %d unfinished tool call(s)", len(pending))
+	unfinished := 0
+	for _, call := range calls {
+		if !call.matched {
+			unfinished++
+		}
+	}
+	if unfinished != 0 {
+		return fmt.Errorf("history contains %d unfinished tool call(s)", unfinished)
 	}
 	return nil
 }

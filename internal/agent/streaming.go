@@ -130,10 +130,11 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			block := blocks[tool.blockIndex]
 			if snapshot, err := json.Marshal(redactedToolInput(block.ToolInput)); err == nil {
 				emit(ctx, out, Event{
-					Kind:      EventToolArgsDelta,
-					ToolUseID: block.ToolUseID,
-					ToolName:  block.ToolName,
-					TextDelta: string(snapshot),
+					Kind:        EventToolArgsDelta,
+					ToolUseID:   block.ToolUseID,
+					ToolName:    block.ToolName,
+					TraceCallID: block.TraceCallID,
+					TextDelta:   string(snapshot),
 				})
 			}
 		}
@@ -257,9 +258,10 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			// assistant message must retain the model's content-block order.
 			blockIndex := len(blocks)
 			blocks = append(blocks, llm.ContentBlock{
-				Type:      "tool_use",
-				ToolUseID: ev.ToolUseID,
-				ToolName:  ev.ToolName,
+				Type:        "tool_use",
+				ToolUseID:   ev.ToolUseID,
+				ToolName:    ev.ToolName,
+				TraceCallID: NewTraceInvocationID(),
 				// Tool inputs are objects by protocol. Start with a non-nil empty
 				// object so a name-only / output-truncated call never enters live
 				// history as null even when no argument delta arrives at all.

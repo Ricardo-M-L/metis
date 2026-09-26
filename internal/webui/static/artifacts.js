@@ -249,11 +249,26 @@ function renderArtifactPresentation(toolRow, presentation) {
   if (!item || !toolRow || !toolRow.parentElement) return false;
   const saved = upsertArtifact(item) || item;
   const area = document.getElementById('chatArea');
+  const group = toolRow.closest('.activity-group');
+  // An Artifact is a visible result in the conversation, not a tool detail.
+  // Only close its own active process section: concurrent results from an old
+  // group may arrive after a newer group has already started.
+  if (group && group.parentElement === area &&
+      typeof activityGroupEl !== 'undefined' && activityGroupEl === group &&
+      typeof finishActivityGroup === 'function') finishActivityGroup();
   const selector = '.artifact-chat-card[data-artifact-id="' + CSS.escape(saved.id) + '"]';
   const existing = area && area.querySelector(selector);
   const card = createArtifactCard(saved, 'chat');
   if (existing) existing.replaceWith(card);
-  else toolRow.insertAdjacentElement('afterend', card);
+  else if (group && group.parentElement === area) {
+    // Multiple Artifact results from one group keep their arrival order.
+    let anchor = group;
+    while (anchor.nextElementSibling?.classList.contains('artifact-chat-card')) anchor = anchor.nextElementSibling;
+    anchor.insertAdjacentElement('afterend', card);
+  } else toolRow.insertAdjacentElement('afterend', card);
+  // Also repair a card that was already nested in a folded process section.
+  const nestedGroup = card.closest('.activity-group');
+  if (nestedGroup && nestedGroup.parentElement === area) nestedGroup.insertAdjacentElement('afterend', card);
   updateEmptyLayout();
   autoScroll();
   return true;
@@ -264,7 +279,13 @@ function syncArtifactChatCards(items) {
   if (!area) return;
   (items || []).forEach(item => {
     const selector = '.artifact-chat-card[data-artifact-id="' + CSS.escape(item.id) + '"]';
-    if (area.querySelector(selector)) return;
+    const existing = area.querySelector(selector);
+    if (existing) {
+      const nestedGroup = existing.closest('.activity-group');
+      if (nestedGroup && nestedGroup.parentElement === area) nestedGroup.insertAdjacentElement('afterend', existing);
+      return;
+    }
+    if (typeof finishActivityGroup === 'function') finishActivityGroup();
     const card = createArtifactCard(item, 'chat');
     if (turnStatusEl && turnStatusEl.parentElement === area) area.insertBefore(card, turnStatusEl);
     else area.appendChild(card);

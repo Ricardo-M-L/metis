@@ -98,9 +98,14 @@ function connectEvents() {
   onLive('loop_done', d => {
     runningTurnIncompleteReason = d.incomplete ? (d.stopReason || 'incomplete') : '';
     if (runningTurnIncompleteReason) showToast('Turn incomplete: ' + runningTurnIncompleteReason);
-    finishUserTurn();
+    const state = ['stopped', 'cancelled', 'interrupted'].includes(String(d.stopReason || '').toLowerCase())
+      ? 'stopped' : (d.incomplete ? 'error' : 'completed');
+    finishUserTurn(state, d.stopReason || '');
   });
-  onLive('agent_error', d => showToast('Agent error: ' + (d.message || 'request failed')));
+  onLive('agent_error', d => {
+    showToast('Agent error: ' + (d.message || 'request failed'));
+    finishUserTurn('error', d.message || 'request failed');
+  });
   eventSource.addEventListener('error', () => {
     showReconnectBanner();
   });
@@ -208,6 +213,431 @@ function sameSession(d) {
 let thinkingEl = null;
 let thinkingText = '';
 let thinkStartMs = 0;
+let activityGroupEl = null;
+let activityGroupNumber = 0;
+let activityTurnEl = null;
+let activityTurnNumber = 0;
+let activityCurrentTurnId = '';
+let renderingActivityHistory = false;
+let activityHistoryTurn = 0;
+let activityHistoryLastTurn = 0;
+let activityHistoryGeneration = 0;
+const activityGroupStats = new WeakMap();
+const activityGroupScrollPending = new WeakSet();
+const activityGroupFollowPending = new WeakSet();
+const activityGroupFollow = new WeakMap();
+const activityGroupsByTurn = new Map();
+
+// Presentation only changes disclosure, never the transcript or tool data.
+// Keeping one policy for live SSE, saved history and an in-place setting
+// change prevents each renderer from quietly adopting different defaults.
+const ACTIVITY_PRESENTATION_POLICIES = Object.freeze({
+  compact: Object.freeze({ mode: 'compact', groupLive: true, groupHistory: true, foldCompleted: true, liveDetail: false, completedThoughtPreview: false }),
+  standard: Object.freeze({ mode: 'standard', groupLive: true, groupHistory: true, foldCompleted: true, liveDetail: true, completedThoughtPreview: true }),
+  detailed: Object.freeze({ mode: 'detailed', groupLive: false, groupHistory: true, foldCompleted: true, liveDetail: true, completedThoughtPreview: true }),
+  verbose: Object.freeze({ mode: 'verbose', groupLive: false, groupHistory: false, foldCompleted: false, liveDetail: false, completedThoughtPreview: true }),
+});
+
+function activityPresentationPolicy(value) {
+  const selected = value || (typeof desktopPreferences !== 'undefined' ? desktopPreferences.presentationMode : 'standard');
+  return ACTIVITY_PRESENTATION_POLICIES[selected] || ACTIVITY_PRESENTATION_POLICIES.standard;
+}
+
+function applyActivityPresentationGroup(group, policy = activityPresentationPolicy()) {
+  if (!group) return;
+  const turn = group._activityTurn;
+  const running = turn ? turn.dataset.state === 'running' : group.dataset.running === 'true';
+  const flat = !(running ? policy.groupLive : policy.groupHistory);
+  group.dataset.presentationFlat = String(flat);
+  const summary = group.querySelector('.activity-group-summary');
+  if (summary) {
+    summary.setAttribute('aria-hidden', String(flat));
+    summary.tabIndex = flat ? -1 : 0;
+  }
+  if (group.dataset.userTouched !== 'true') {
+    // A failed tool or a stopped turn must reveal its evidence by default.
+    const showEvidence = group.dataset.hasError === 'true' ||
+      (turn && (turn.dataset.state === 'error' || turn.dataset.state === 'stopped'));
+    setActivityGroupOpen(group, !!showEvidence);
+  }
+  if (flat) scheduleActivityGroupFollow(group);
+}
+
+function applyActivityPresentationTurn(turn, policy = activityPresentationPolicy()) {
+  if (!turn) return;
+  const groups = activityTurnGroups(turn);
+  const state = turn.dataset.state;
+  const hasFailure = groups.some(group => group.dataset.hasError === 'true');
+  const hasAnswer = activityTurnHasFinalAnswer(turn, groups);
+  turn.dataset.hasFinalAnswer = String(hasAnswer);
+  const showEvidence = state === 'running' || state === 'error' || state === 'stopped' || hasFailure || !hasAnswer;
+  const manualOpen = turn.dataset.userTouched === 'true' && turn.dataset.userOpen !== undefined
+    ? turn.dataset.userOpen === 'true' : null;
+  const open = showEvidence || !policy.foldCompleted ||
+    (manualOpen === null ? false : manualOpen);
+  setActivityTurnOpen(turn, open);
+  const button = turn.querySelector('.activity-turn-toggle');
+  if (button) button.disabled = showEvidence || !policy.foldCompleted;
+}
+
+function applyActivityPresentationMode(value) {
+  const policy = activityPresentationPolicy(value);
+  if (typeof desktopPreferences !== 'undefined') desktopPreferences.presentationMode = policy.mode;
+  if (document.documentElement) document.documentElement.dataset.presentationMode = policy.mode;
+  // This full pass happens only when the preference loads or the user changes
+  // it. SSE append and delta paths update their own current group in O(1).
+  document.querySelectorAll('.activity-turn').forEach(turn => applyActivityPresentationTurn(turn, policy));
+  document.querySelectorAll('.activity-group').forEach(group => {
+    applyActivityPresentationGroup(group, policy);
+    updateActivityGroupSummary(group);
+  });
+}
+
+// Keep process events in the conversation, but show one readable account of
+// the work until the user chooses to inspect its individual steps. The same
+// container is built by live SSE events and saved-session replay.
+function activityToolKind(name) {
+  const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (['bash', 'pwsh', 'exec', 'execcommand', 'shell', 'runcommand'].includes(key)) return 'command';
+  if (['grep', 'glob', 'search', 'websearch', 'filesearch'].includes(key)) return 'search';
+  if (['read', 'webfetch', 'list', 'ls'].includes(key)) return 'read';
+  if (['edit', 'write', 'applypatch', 'multiedit'].includes(key)) return 'edit';
+  if (['agent', 'task', 'spawnagent'].includes(key)) return 'agent';
+  return 'other';
+}
+
+function setActivityGroupOpen(group, open) {
+  if (!group) return;
+  group.classList.toggle('open', open);
+  group.querySelectorAll('.activity-group-summary').forEach(button => {
+    button.setAttribute('aria-expanded', String(open));
+  });
+  if (open) scheduleActivityGroupFollow(group);
+  scheduleActivityGroupScroll(group);
+}
+
+function toggleActivityGroup(button) {
+  const group = button && button.closest('.activity-group');
+  if (!group) return;
+  const open = !group.classList.contains('open');
+  group.dataset.userTouched = 'true';
+  // Opening process details while work runs is an explicit wish to keep the
+  // enclosing turn visible when the final answer later arrives.
+  const turn = group._activityTurn;
+  if (turn && open) {
+    turn.dataset.userTouched = 'true';
+    turn.dataset.userOpen = 'true';
+  }
+  setActivityGroupOpen(group, open);
+}
+
+function activityDurationLabel(ms) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return uiText(`Took ${seconds}s`, `用时 ${seconds} 秒`);
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return uiText(`Took ${minutes}m ${remainder}s`, `用时 ${minutes} 分 ${remainder} 秒`);
+}
+
+function activityTurnStateLabel(state) {
+  return ({
+    running: uiText('Running', '进行中'),
+    completed: uiText('Completed', '已完成'),
+    stopped: uiText('Stopped', '已停止'),
+    error: uiText('Failed', '失败'),
+  })[state] || '';
+}
+
+function activityTurnKey() {
+  if (renderingActivityHistory) return 'history-' + activityHistoryTurn;
+  if (!activityCurrentTurnId) activityCurrentTurnId = 'live-' + (++activityTurnNumber);
+  return activityCurrentTurnId;
+}
+
+// A turn header is independent of its process groups. Artifact cards and
+// assistant answers can therefore stay in their original transcript order.
+function setActivityTurnOpen(turn, open) {
+  if (!turn) return;
+  turn.classList.toggle('open', open);
+  const button = turn.querySelector('.activity-turn-toggle');
+  if (button) button.setAttribute('aria-expanded', String(open));
+  activityTurnGroups(turn).forEach(group => {
+    if (open) group.removeAttribute('data-turn-collapsed');
+    else group.dataset.turnCollapsed = 'true';
+    if (open) scheduleActivityGroupFollow(group);
+  });
+}
+
+function toggleActivityTurn(button) {
+  const turn = button && button.closest('.activity-turn');
+  if (turn) {
+    if (turn.dataset.state === 'running' || turn.dataset.state === 'error' || turn.dataset.state === 'stopped' ||
+        !activityPresentationPolicy().foldCompleted) return;
+    turn.dataset.userTouched = 'true';
+    const open = !turn.classList.contains('open');
+    turn.dataset.userOpen = String(open);
+    setActivityTurnOpen(turn, open);
+  }
+}
+
+function updateActivityTurnLabel(turn) {
+  if (!turn) return;
+  const duration = turn.querySelector('.activity-turn-duration');
+  const state = turn.querySelector('.activity-turn-state');
+  const startedAt = Number(turn.dataset.startedAt);
+  if (duration) duration.textContent = turn.dataset.durationMs
+    ? activityDurationLabel(Number(turn.dataset.durationMs))
+    : turn.dataset.state === 'running' && startedAt > 0 && Date.now() - startedAt >= 1000
+      ? activityDurationLabel(Date.now() - startedAt)
+      : turn.dataset.state === 'running' ? uiText('Working', '执行中') : uiText('Activity', '执行过程');
+  if (state) state.textContent = activityTurnStateLabel(turn.dataset.state);
+}
+
+function ensureActivityTurn() {
+  const area = document.getElementById('chatArea');
+  const key = activityTurnKey();
+  if (activityTurnEl && activityTurnEl.parentElement === area && activityTurnEl.dataset.turnId === key) return activityTurnEl;
+  const turn = document.createElement('section');
+  const id = 'activity-turn-' + (++activityTurnNumber);
+  turn.className = 'activity-turn open';
+  turn.dataset.turnId = key;
+  turn.dataset.state = renderingActivityHistory ? 'finished' : 'running';
+  if (renderingActivityHistory && activityHistoryTurn > 0) turn.dataset.historyTurn = String(activityHistoryTurn);
+  if (!renderingActivityHistory) turn.dataset.startedAt = String(turnStartMs || Date.now());
+  turn.innerHTML = `<button class="activity-turn-toggle" type="button" aria-expanded="true" aria-controls="" onclick="toggleActivityTurn(this)">
+      <span class="activity-turn-duration"></span>
+      <span class="activity-turn-state"></span>
+      <span class="activity-turn-chevron" aria-hidden="true"></span>
+    </button>`;
+  area.appendChild(turn);
+  activityTurnEl = turn;
+  updateActivityTurnLabel(turn);
+  applyActivityPresentationTurn(turn);
+  return turn;
+}
+
+function activityTurnGroups(turn) {
+  if (!turn) return [];
+  const groups = activityGroupsByTurn.get(turn.dataset.turnId) || [];
+  return groups.filter(group => group.isConnected);
+}
+
+function activityTurnHasFinalAnswer(turn, groups) {
+  const last = groups.length ? groups[groups.length - 1] : turn;
+  for (let next = last.nextElementSibling; next; next = next.nextElementSibling) {
+    if (next.classList.contains('activity-turn')) break;
+    // A new user message closes the answer boundary even when that next turn
+    // has no tool activity (and therefore no following activity-turn node).
+    // A steer remains inside the current turn and may precede its answer.
+    if (next.classList.contains('message-user') && next.dataset.activitySteer !== 'true') break;
+    if (!next.classList.contains('message-assistant')) continue;
+    const answer = next.querySelector('.message-content');
+    if (answer && String(answer.textContent || answer.innerHTML || '').trim()) return true;
+  }
+  return false;
+}
+
+function settleActivityTurnDisclosure(turn) {
+  if (!turn) return;
+  applyActivityPresentationTurn(turn);
+  activityTurnGroups(turn).forEach(group => applyActivityPresentationGroup(group));
+}
+
+function finishActivityTurn(state = 'completed', reason = '') {
+  const turn = activityTurnEl;
+  if (!turn || !turn.isConnected) return;
+  // SSE loop_done can arrive before the POST resolves. A later generic
+  // completion must not overwrite the more specific stop/failure outcome.
+  const oldState = turn.dataset.state;
+  const wasSettled = turn.dataset.settled === 'true';
+  const hadAnswer = turn.dataset.hasFinalAnswer === 'true';
+  if (oldState !== 'error' && oldState !== 'stopped') {
+    turn.dataset.state = state;
+  }
+  if (turn.dataset.state !== 'running') settleUnfinishedActivityTools(turn, turn.dataset.state, reason);
+  if (reason) turn.dataset.reason = String(reason);
+  if (!turn.dataset.durationMs) {
+    const startedAt = Number(turn.dataset.startedAt);
+    if (startedAt > 0) turn.dataset.durationMs = String(Math.max(0, Date.now() - startedAt));
+  }
+  updateActivityTurnLabel(turn);
+  // An SSE terminal event and the POST result can both finish one turn.
+  // Preserve a disclosure the user reopened after the first completion.
+  const hasAnswer = activityTurnHasFinalAnswer(turn, activityTurnGroups(turn));
+  if (!wasSettled || oldState !== turn.dataset.state ||
+      (!hadAnswer && hasAnswer && turn.dataset.userTouched !== 'true')) {
+    settleActivityTurnDisclosure(turn);
+    turn.dataset.settled = 'true';
+  }
+}
+
+function activityGroupNearBottom(items) {
+  return items.scrollHeight - items.scrollTop - items.clientHeight <= 56;
+}
+
+function scheduleActivityGroupFollow(group) {
+  if (!group || activityGroupFollowPending.has(group) || typeof requestAnimationFrame !== 'function') return;
+  activityGroupFollowPending.add(group);
+  requestAnimationFrame(() => {
+    activityGroupFollowPending.delete(group);
+    if (!group.isConnected || (!group.classList.contains('open') && group.dataset.presentationFlat !== 'true') || group.dataset.turnCollapsed === 'true' ||
+        activityGroupFollow.get(group) === false) return;
+    const items = group.querySelector('.activity-group-items');
+    if (!items) return;
+    items.scrollTop = items.scrollHeight;
+    scheduleActivityGroupScroll(group);
+  });
+}
+
+function scheduleActivityGroupScroll(group) {
+  if (!group || activityGroupScrollPending.has(group) || typeof requestAnimationFrame !== 'function') return;
+  activityGroupScrollPending.add(group);
+  requestAnimationFrame(() => {
+    activityGroupScrollPending.delete(group);
+    if (!group.isConnected) return;
+    const items = group.querySelector('.activity-group-items');
+    if (!items) return;
+    const scrollable = items.scrollHeight > items.clientHeight + 2;
+    if (scrollable && items.scrollTop > 2) items.dataset.scrollUp = '';
+    else items.removeAttribute('data-scroll-up');
+    if (scrollable && items.scrollTop + items.clientHeight < items.scrollHeight - 2) items.dataset.scrollDown = '';
+    else items.removeAttribute('data-scroll-down');
+  });
+}
+
+function ensureActivityGroup() {
+  const area = document.getElementById('chatArea');
+  const turn = ensureActivityTurn();
+  if (activityGroupEl && activityGroupEl.parentElement === area && activityGroupEl.dataset.turnId === turn.dataset.turnId) return activityGroupEl;
+  const group = document.createElement('section');
+  const id = 'activity-group-' + (++activityGroupNumber);
+  group.className = 'activity-group';
+  group.id = id;
+  group.dataset.turnId = turn.dataset.turnId;
+  group.dataset.running = renderingActivityHistory ? 'false' : 'true';
+  group.dataset.hasError = 'false';
+  group._activityTurn = turn;
+  activityGroupStats.set(group, { kinds: new Map(), errors: 0, runningRows: [], currentRunning: null });
+  if (renderingActivityHistory && activityHistoryTurn > 0) group.dataset.historyTurn = String(activityHistoryTurn);
+  if (!turn.classList.contains('open')) group.dataset.turnCollapsed = 'true';
+  const bodyId = id + '-body';
+  group.innerHTML = `<button class="activity-group-summary" type="button" aria-expanded="${renderingActivityHistory ? 'false' : 'true'}" aria-controls="${bodyId}" onclick="toggleActivityGroup(this)"></button>
+    <div class="activity-group-body" id="${bodyId}"><div class="activity-group-items"></div></div>`;
+  area.appendChild(group);
+  if (!activityGroupsByTurn.has(group.dataset.turnId)) activityGroupsByTurn.set(group.dataset.turnId, []);
+  activityGroupsByTurn.get(group.dataset.turnId).push(group);
+  const turnButton = turn.querySelector('.activity-turn-toggle');
+  if (turnButton) turnButton.setAttribute('aria-controls', [turnButton.getAttribute('aria-controls'), id].filter(Boolean).join(' '));
+  activityGroupFollow.set(group, !renderingActivityHistory);
+  group.querySelector('.activity-group-items').addEventListener('scroll', () => {
+    const items = group.querySelector('.activity-group-items');
+    activityGroupFollow.set(group, activityGroupNearBottom(items));
+    scheduleActivityGroupScroll(group);
+  }, { passive: true });
+  activityGroupEl = group;
+  applyActivityPresentationGroup(group);
+  return group;
+}
+
+function updateActivityGroupSummary(group) {
+  if (!group) return;
+  const stats = activityGroupStats.get(group);
+  if (!stats) return;
+  const labels = {
+    command: uiText('Ran commands', '执行了命令'),
+    search: uiText('Searched code', '已搜索代码'),
+    read: uiText('Read files', '已读取文件'),
+    edit: uiText('Edited files', '修改了文件'),
+    agent: uiText('Delegated work', '分派了任务'),
+    other: uiText('Used tools', '调用了工具'),
+  };
+  const summary = [...stats.kinds]
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 3)
+    .map(([kind]) => labels[kind]);
+  if (!summary.length) summary.push(uiText('Analyzed the task', '分析了任务'));
+  const failure = stats.errors ? uiText(`${stats.errors} failed`, `${stats.errors} 项失败`) : '';
+  let label = summary.join(uiText(', ', '，'));
+  if (group.dataset.running === 'true' || (group._activityTurn && group._activityTurn.dataset.state === 'running')) {
+    const current = stats.currentRunning;
+    if (current) {
+      const title = current.querySelector('.tc-title');
+      const detail = current.querySelector('.tc-summary');
+      label = (title ? title.textContent : uiText('Using a tool', '调用工具')) +
+        (activityPresentationPolicy().liveDetail && detail && detail.textContent && detail.textContent !== '—'
+          ? ' · ' + detail.textContent.slice(0, 120) : '');
+    }
+  }
+  const button = group.querySelector('.activity-group-summary');
+  button.textContent = label;
+  if (failure) button.setAttribute('aria-label', label + ' · ' + failure);
+  else button.removeAttribute('aria-label');
+  group.dataset.hasError = stats.errors ? 'true' : 'false';
+  if (stats.errors && group.dataset.userTouched !== 'true') setActivityGroupOpen(group, true);
+}
+
+function appendActivityRow(row) {
+  const group = ensureActivityGroup();
+  group.querySelector('.activity-group-items').appendChild(row);
+  if (row.classList.contains('call-row')) {
+    const stats = activityGroupStats.get(group);
+    const kind = activityToolKind(row.dataset.tool);
+    stats.kinds.set(kind, (stats.kinds.get(kind) || 0) + 1);
+    if (row.dataset.state === 'error') stats.errors++;
+    if (row.dataset.state === 'running') {
+      stats.runningRows.push(row);
+      stats.currentRunning = row;
+    }
+  }
+  updateActivityGroupSummary(group);
+  scheduleActivityGroupFollow(group);
+  scheduleActivityGroupScroll(group);
+}
+
+function finishActivityGroup() {
+  const group = activityGroupEl;
+  activityGroupEl = null;
+  if (!group || !group.isConnected) return;
+  group.dataset.running = 'false';
+  updateActivityGroupSummary(group);
+  applyActivityPresentationGroup(group);
+  scheduleActivityGroupScroll(group);
+}
+
+function refreshActivityGroupLanguage() {
+  document.querySelectorAll('.activity-turn').forEach(updateActivityTurnLabel);
+  document.querySelectorAll('.activity-group').forEach(group => {
+    group.querySelectorAll('.think-row').forEach(row => {
+      const title = row.querySelector('.think-title');
+      if (title) title.textContent = uiText('Think', '思考');
+      if (row.classList.contains('redacted')) {
+        const summary = row.querySelector('.think-summary');
+        if (summary) summary.textContent = uiText('Reasoning redacted by provider', '推理内容已由提供方隐藏');
+      }
+    });
+    group.querySelectorAll('.call-row').forEach(row => {
+      const title = row.querySelector('.tc-title');
+      if (title) title.textContent = toolVariantOf(row.dataset.tool).title;
+      const inspect = row.querySelector('.tc-inspect');
+      if (inspect) inspect.textContent = uiText('Inspect', '查看详情');
+      const labels = row.querySelectorAll('.tc-io-label');
+      if (labels[0]) labels[0].textContent = uiText('IN', '输入');
+      if (labels[1]) labels[1].textContent = uiText('OUT', '输出');
+      updateToolRowAccessibleLabel(row);
+    });
+    updateActivityGroupSummary(group);
+  });
+  if (selectedToolId) renderDetailPanel();
+}
+
+function viewedHistoryTurnIsRunning() {
+  const sessionId = String(currentSessionId || '');
+  if (!sessionId) return false;
+  if (turnRunning && String(runningSessionId || '') === sessionId) return true;
+  if (pendingForegroundRequest && String(pendingForegroundRequest.sessionId || '') === sessionId) return true;
+  if (typeof foregroundRequests !== 'undefined' && foregroundRequests.has(sessionId)) return true;
+  return typeof trackedRunningSessions === 'function' && trackedRunningSessions().has(sessionId);
+}
 
 const THINK_ORBIT_ICON = '<svg class="think-orbit-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.1" aria-hidden="true"><ellipse cx="8" cy="8" rx="6.2" ry="2.55"/><ellipse cx="8" cy="8" rx="6.2" ry="2.55" transform="rotate(60 8 8)"/><ellipse cx="8" cy="8" rx="6.2" ry="2.55" transform="rotate(120 8 8)"/><circle cx="8" cy="8" r="1.1" fill="currentColor" stroke="none"/></svg>';
 const THINK_LOCK_ICON = '<svg class="think-lock-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/><path d="M5.5 7V5.3a2.5 2.5 0 0 1 5 0V7"/></svg>';
@@ -243,7 +673,7 @@ function appendThinkingRow(text, options = {}) {
           <span class="think-icon-idle">${redacted ? THINK_LOCK_ICON : THINK_ORBIT_ICON}</span>
           ${redacted ? '' : '<svg class="think-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6.5 5 3 3-3 3"/></svg>'}
         </span>
-        <span class="think-title">Think</span>
+        <span class="think-title">${uiText('Think', '思考')}</span>
         <span class="think-summary"></span>
         <span class="think-time"></span>
       </${headTag}>
@@ -254,8 +684,9 @@ function appendThinkingRow(text, options = {}) {
   const summary = row.querySelector('.think-summary');
   if (body) body.textContent = String(text || '');
   if (summary) summary.textContent = redacted
-    ? REDACTED_THINKING_PLACEHOLDER
+    ? uiText(REDACTED_THINKING_PLACEHOLDER, '推理内容已由提供方隐藏')
     : thinkPreview(text, running);
+  appendActivityRow(row);
   return row;
 }
 
@@ -273,6 +704,7 @@ function handleThinkingDelta(d) {
   // DSH parity: while streaming, the collapsed row previews the LATEST line.
   const summary = thinkingEl.querySelector('.think-summary');
   if (summary) summary.textContent = thinkPreview(thinkingText, true);
+  scheduleActivityGroupFollow(thinkingEl.closest('.activity-group'));
   autoScroll();
 }
 
@@ -290,6 +722,7 @@ function toggleThinkRow(head) {
   if (!row.querySelector('.think-body')) return;
   const open = row.classList.toggle('open');
   head.setAttribute('aria-expanded', String(open));
+  scheduleActivityGroupFollow(row.closest('.activity-group'));
 }
 
 function thinkRowKeydown(event, head) {
@@ -569,6 +1002,7 @@ function handleAskUser(d) {
   if (!ask) return;
   if (!visibleInteraction(ask)) { renderSessions(); return; }
   if (interactionCard('ask', ask.askId)) { syncPendingAsk(); return; }
+  finishActivityGroup();
   const area = document.getElementById('chatArea');
   const optsHtml = (ask.options || []).map(o =>
     `<button class="ask-option" onclick="answerAskOption(this)">${escHtml(o)}</button>`).join('');
@@ -640,6 +1074,7 @@ function beginTurnStatus() {
   clearInterval(turnStatusTimer);
   turnStatusTimer = setInterval(() => {
     const ms = Date.now() - turnStartMs;
+    if (activityTurnEl && activityTurnEl.dataset.state === 'running') updateActivityTurnLabel(activityTurnEl);
     if (ms >= 15000 && turnStatusEl) {
       const clock = turnStatusEl.querySelector('.ts-clock');
       if (clock) clock.textContent = ' ' + fmtMs(ms);
@@ -701,6 +1136,7 @@ function upsertCompactionRow(title, detail, state) {
   const nextState = state || 'running';
   const needsNew = !compactionStatusEl || !compactionStatusEl.isConnected || compactionStatusEl.dataset.state !== 'running';
   if (needsNew) {
+    finishActivityGroup();
     const row = document.createElement('div');
     row.className = 'context-row compaction-row open';
     row.setAttribute('role', 'status');
@@ -754,6 +1190,7 @@ function handleCompactionEnd(d) {
 
 // Context injection / compaction disclosure rows (DSH ContextInjectionRow).
 function handleContextEvent(d, compacted) {
+  finishActivityGroup();
   const area = document.getElementById('chatArea');
   const text = d.info || '';
   const before = Number(d.previousContextTokens) || 0;
@@ -986,6 +1423,9 @@ function detachRunningTurnView() {
   streamingText = '';
   endTurnStatus();
   finishThinking();
+  finishActivityGroup();
+  activityTurnEl = null;
+  activityCurrentTurnId = '';
   pendingAsk = null;
   toolDetails = {};
   selectedToolId = null;
@@ -1036,6 +1476,7 @@ async function stopTurn() {
 }
 
 function startStreamingMessage() {
+  finishActivityGroup();
   streaming = true;
   streamMsgIdx = messages.length;
   const area = document.getElementById('chatArea');
@@ -1081,7 +1522,11 @@ function endStreamingMessage() {
 // continue through tool execution and another model request. Keep the
 // TurnStatus alive until loop_done (or the authoritative POST completion).
 function finishUserTurn() {
+  const state = arguments.length ? arguments[0] : (runningTurnIncompleteReason ? 'error' : 'completed');
+  const reason = arguments.length > 1 ? arguments[1] : '';
   endStreamingMessage();
+  finishActivityGroup();
+  finishActivityTurn(state, reason);
   endTurnStatus();
   showTurnStatsLine();
 }
@@ -1095,6 +1540,8 @@ function beginUserTurn() {
   // the previous assistant bubble. Close it first - idempotent when the
   // turn already ended normally.
   finishUserTurn();
+  activityTurnEl = null;
+  activityCurrentTurnId = 'live-' + (++activityTurnNumber);
   beginTurnStatus();
 }
 
@@ -1109,6 +1556,9 @@ function resetTurnState() {
   compactionStatusEl = null;
   endTurnStatus();
   finishThinking();
+  finishActivityGroup();
+  activityTurnEl = null;
+  activityCurrentTurnId = '';
   if (streamingEl) {
     const caret = streamingEl.querySelector('.stream-cursor');
     if (caret) caret.remove();
@@ -1128,7 +1578,7 @@ function resetTurnState() {
 }
 
 // Details column state: structured inspection of the selected tool row.
-let toolDetails = {};     // id -> {name, input, output, elapsed, error}
+let toolDetails = {};     // rendered row key -> {name, input, output, elapsed, error}
 let selectedToolId = null;
 let detailTab = 'summary';
 
@@ -1137,8 +1587,8 @@ function openToolDetail(id) {
   selectedToolId = id;
   detailTab = 'summary';
   document.querySelector('.app').classList.remove('details-closed');
-  document.querySelectorAll('.tool-event.selected').forEach(c => c.classList.remove('selected'));
-  const card = document.querySelector('.tool-event[data-id="' + escAttr(id) + '"]');
+  document.querySelectorAll('.call-row.selected').forEach(c => c.classList.remove('selected'));
+  const card = document.querySelector('.call-row[data-row-key="' + escAttr(id) + '"]');
   if (card) card.classList.add('selected');
   document.getElementById('detailsPlaceholder').style.display = 'none';
   document.getElementById('detailsTabs').style.display = 'flex';
@@ -1147,7 +1597,7 @@ function openToolDetail(id) {
 
 function closeToolDetail() {
   selectedToolId = null;
-  document.querySelectorAll('.tool-event.selected').forEach(c => c.classList.remove('selected'));
+  document.querySelectorAll('.call-row.selected').forEach(c => c.classList.remove('selected'));
   document.getElementById('detailsPlaceholder').style.display = '';
   document.getElementById('detailsTabs').style.display = 'none';
   document.getElementById('detailsBody').innerHTML = '';
@@ -1166,12 +1616,14 @@ function renderDetailPanel() {
   const d = toolDetails[selectedToolId];
   if (!d) return;
   if (detailTab === 'summary') {
+    const row = document.querySelector('.call-row[data-row-key="' + escAttr(selectedToolId) + '"]');
+    const state = row?.dataset.state || d.state || (d.error ? 'error' : 'incomplete');
     const lines = [
-      ['Tool', d.name],
-      ['Status', d.error ? 'Failed' : 'Done'],
-      ['Duration', d.elapsed ? fmtMs(d.elapsed) : '-'],
-      ['Input', d.input ? '(see Input tab)' : '(none)'],
-      ['Output', d.output ? '(see Output tab)' : '(none)'],
+      [uiText('Tool', '工具'), d.name],
+      [uiText('Status', '状态'), toolRowStateLabel(state)],
+      [uiText('Duration', '用时'), d.elapsed ? fmtMs(d.elapsed) : '-'],
+      [uiText('Input', '输入'), d.input ? uiText('(see Input tab)', '（见输入页）') : uiText('(none)', '（无）')],
+      [uiText('Output', '输出'), d.output ? uiText('(see Output tab)', '（见输出页）') : uiText('(none)', '（无）')],
     ];
     body.innerHTML = '<div class="insp-kv">' + lines.map(([k, v]) =>
       '<span class="k">' + escHtml(k) + '</span><span class="v">' + escHtml(v) + '</span>').join('') + '</div>';
@@ -1179,28 +1631,28 @@ function renderDetailPanel() {
     const t = document.querySelectorAll('.detail-tab')[0];
     if (t) t.classList.add('active');
   } else if (detailTab === 'input') {
-    body.innerHTML = '<div class="details-pre">' + escHtml(d.input || '(no input)') + '</div>';
+    body.innerHTML = '<div class="details-pre">' + escHtml(d.input || uiText('(no input)', '（无输入）')) + '</div>';
   } else {
-    body.innerHTML = '<div class="details-pre">' + escHtml(d.output || '(no output)') + '</div>';
+    body.innerHTML = '<div class="details-pre">' + escHtml(d.output || uiText('(no output)', '（无输出）')) + '</div>';
   }
 }
 
 // DSH ToolRow parity: per-tool variant title/icon and the summary
 // derivation (first preferred string arg, first line only).
 const TOOL_VARIANTS = {
-  bash:      { title: 'Bash',   keys: ['description', 'command'] },
-  pwsh:      { title: 'Pwsh',   keys: ['description', 'command'] },
-  read:      { title: 'Read',   keys: ['path', 'file_path', 'url'] },
-  web_fetch: { title: 'Read',   keys: ['path', 'file_path', 'url'] },
-  web_search:{ title: 'Search', keys: ['query', 'pattern', 'url'] },
-  grep:      { title: 'Grep',   keys: ['query', 'pattern', 'url'] },
-  glob:      { title: 'Glob',   keys: ['pattern', 'path'] },
-  write:     { title: 'Write',  keys: ['path', 'file_path'] },
-  edit:      { title: 'Edit',   keys: ['path', 'file_path'] },
-  run_code:  { title: 'Code',   keys: ['description'] },
-  todo_write:{ title: '\u66F4\u65B0\u4EFB\u52A1\u6E05\u5355', keys: [] },
-  todowrite: { title: '\u66F4\u65B0\u4EFB\u52A1\u6E05\u5355', keys: [] },
+  bash:      { title: 'Run command', titleZh: '运行命令', keys: ['description', 'command'] },
+  pwsh:      { title: 'Run command', titleZh: '运行命令', keys: ['description', 'command'] },
+  read:      { title: 'Read', titleZh: '读取', keys: ['path', 'file_path', 'url'] },
+  web_fetch: { title: 'Read', titleZh: '读取', keys: ['path', 'file_path', 'url'] },
+  web_search:{ title: 'Search', titleZh: '搜索', keys: ['query', 'pattern', 'url'] },
+  grep:      { title: 'Search in files', titleZh: '搜索文件内容', keys: ['query', 'pattern', 'url'] },
+  glob:      { title: 'Find files', titleZh: '查找文件', keys: ['pattern', 'path'] },
+  write:     { title: 'Write', titleZh: '写入', keys: ['path', 'file_path'] },
+  edit:      { title: 'Edit', titleZh: '编辑', keys: ['path', 'file_path'] },
+  run_code:  { title: 'Run code', titleZh: '运行代码', keys: ['description'] },
+  todo_write:{ title: 'Update tasks', titleZh: '更新任务清单', keys: [] },
 };
+let toolRowSequence = 0;
 const TOOL_ICONS = {
   search: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>',
   read:   '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.5 1.8h4.9A1.5 1.5 0 0 1 14 6.3v5.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/></svg>',
@@ -1210,16 +1662,86 @@ const TOOL_ICONS = {
   sparkle:'<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.6l1 2.9a2.6 2.6 0 0 0 1.5 1.5l2.9 1-2.9 1a2.6 2.6 0 0 0-1.5 1.5l-1 2.9-1-2.9a2.6 2.6 0 0 0-1.5-1.5l-2.9-1 2.9-1a2.6 2.6 0 0 0 1.5-1.5z"/></svg>',
 };
 function iconKeyOf(name) {
-  if (name === 'bash' || name === 'pwsh') return 'bash';
-  if (name === 'read' || name === 'web_fetch') return 'read';
-  if (name === 'web_search' || name === 'grep' || name === 'glob') return 'search';
-  if (name === 'write' || name === 'edit') return 'write';
-  if (name === 'run_code') return 'code';
+  const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (key === 'bash' || key === 'pwsh') return 'bash';
+  if (key === 'read' || key === 'webfetch') return 'read';
+  if (key === 'websearch' || key === 'grep' || key === 'glob') return 'search';
+  if (key === 'write' || key === 'edit') return 'write';
+  if (key === 'runcode') return 'code';
   return 'sparkle';
 }
+function toolVariantConfig(name) {
+  const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
+  return Object.entries(TOOL_VARIANTS).find(([variant]) => variant.replace(/[^a-z]/g, '') === key)?.[1];
+}
 function toolVariantOf(name) {
-  const v = TOOL_VARIANTS[name];
-  return { title: v ? v.title : 'Tool call', keys: v ? v.keys : [], icon: TOOL_ICONS[iconKeyOf(name)] };
+  const v = toolVariantConfig(name);
+  return { title: v ? uiText(v.title, v.titleZh) : uiText('Tool call', '工具调用'), keys: v ? v.keys : [], icon: TOOL_ICONS[iconKeyOf(name)] };
+}
+function toolRowStateLabel(state) {
+  if (state === 'running') return uiText('Running', '运行中');
+  if (state === 'stopped') return uiText('Interrupted', '已中断');
+  if (state === 'error') return uiText('Failed', '失败');
+  if (state === 'incomplete') return uiText('No result recorded', '未记录工具结果');
+  return uiText('Completed', '已完成');
+}
+
+function updateToolRowAccessibleLabel(row) {
+  const control = row && row.querySelector('.tc-disclosure');
+  if (!control) return;
+  const title = row.querySelector('.tc-title')?.textContent || toolVariantOf(row.dataset.tool).title;
+  const summary = row.querySelector('.tc-summary')?.textContent || '';
+  control.setAttribute('aria-label', [title, summary, toolRowStateLabel(row.dataset.state)].filter(Boolean).join(' · '));
+}
+
+function setToolRowVisualState(row, state) {
+  if (!row) return;
+  row.setAttribute('data-state', state);
+  const id = row.dataset.rowKey;
+  if (id && toolDetails[id]) toolDetails[id].state = state;
+  const leading = row.querySelector('.tc-leading');
+  if (leading) {
+    const icon = leading.innerHTML.replace(/<span class="tc-state-dot"[^>]*><\/span>/g, '');
+    const marker = state === 'error' || state === 'stopped'
+      ? `<span class="tc-state-dot" data-state="${state === 'error' ? 'error' : 'warning'}" aria-hidden="true"></span>` : '';
+    leading.innerHTML = icon + marker;
+  }
+  updateToolRowAccessibleLabel(row);
+  if (id && selectedToolId === id) renderDetailPanel();
+}
+
+function settleUnfinishedActivityTools(turn, turnState, reason = '') {
+  if (!turn || turnState === 'running') return;
+  const toolState = turnState === 'error' ? 'error' : turnState === 'stopped' ? 'stopped' : 'incomplete';
+  activityTurnGroups(turn).forEach(group => {
+    const stats = activityGroupStats.get(group);
+    group.querySelectorAll('.call-row').forEach(row => {
+      const priorState = row.dataset.state;
+      if (priorState !== 'running' && priorState !== 'incomplete') return;
+      if (priorState === 'incomplete' && toolState === 'incomplete') return;
+      setToolRowVisualState(row, toolState);
+      const output = row.querySelector('.tc-io-text[data-out]');
+      const message = reason || (toolState === 'error'
+        ? uiText('Tool failed without a result', '工具失败且未返回结果')
+        : toolState === 'stopped'
+          ? uiText('Interrupted before a tool result', '工具在返回结果前中断')
+          : uiText('Tool result unavailable', '未收到工具结果'));
+      if (output && (priorState === 'incomplete' || !output.textContent || output.textContent === '…')) output.textContent = message;
+      if (toolState === 'error' && output) output.setAttribute('data-error', 'true');
+      const id = row.dataset.rowKey;
+      if (id && toolDetails[id]) {
+        toolDetails[id].output = output?.textContent || message;
+        toolDetails[id].error = toolState === 'error';
+        toolDetails[id].stopped = toolState === 'stopped';
+      }
+      if (stats && toolState === 'error') stats.errors++;
+    });
+    if (stats) {
+      stats.runningRows.length = 0;
+      stats.currentRunning = null;
+      updateActivityGroupSummary(group);
+    }
+  });
 }
 function firstLine(s) {
   const t = String(s || '');
@@ -1238,7 +1760,7 @@ function toolSummaryText(name, input) {
   }
   let args;
   try { args = JSON.parse(input); } catch (e) { args = undefined; }
-  const v = TOOL_VARIANTS[name];
+  const v = toolVariantConfig(name);
   if (args === undefined) return firstLine(input);
   if (typeof args !== 'object' || args === null || Array.isArray(args)) return firstLine(input);
   let val = '';
@@ -1373,23 +1895,62 @@ function renderFileEditCard(chip, name, input) {
 
 // Provider-streamed partial tool args (tool_input_delta): route each
 // chunk to the in-flight row so the args JSON builds up live.
+function toolRowsInCurrentTurn() {
+  const groups = activityGroupsByTurn.get(activityTurnKey()) || [];
+  return groups.filter(group => group.isConnected)
+    .flatMap(group => [...group.querySelectorAll('.call-row')]);
+}
+
+function pendingToolRows(id, name = '') {
+  return toolRowsInCurrentTurn().filter(row =>
+    (id ? row.dataset.id === id : name ? row.dataset.tool === name : row.dataset.id === '') &&
+    (row.dataset.state === 'running' || row.dataset.state === 'incomplete'));
+}
+
+function sameToolInput(left, right) {
+  if (left === right) return true;
+  const ordered = value => {
+    if (Array.isArray(value)) return value.map(ordered);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.keys(value).sort().map(key => [key, ordered(value[key])]));
+    }
+    return value;
+  };
+  try { return JSON.stringify(ordered(JSON.parse(left))) === JSON.stringify(ordered(JSON.parse(right))); }
+  catch (e) { return false; }
+}
+
 function handleToolArgsDelta(d) {
   const id = d.id || '';
-  let card = id ? document.querySelector('.call-row[data-id="' + escAttr(id) + '"]') : null;
+  if (!id) return; // A preview with no provider ID cannot safely join its later start.
+  const traced = d.traceCallId ? toolRowsInCurrentTurn().find(row =>
+    row.dataset.traceCallId === d.traceCallId) : null;
+  if (traced && (traced.dataset.provisional !== 'true' ||
+      traced.dataset.id !== id || traced.dataset.tool !== d.tool)) return;
+  const preview = () => d.traceCallId
+    ? toolRowsInCurrentTurn().find(row => row.dataset.traceCallId === d.traceCallId &&
+      row.dataset.id === id && row.dataset.tool === d.tool &&
+      row.dataset.state === 'running' && row.dataset.provisional === 'true')
+    : pendingToolRows(id).filter(row => row.dataset.state === 'running' &&
+      row.dataset.provisional === 'true' && !row.dataset.traceCallId && row.dataset.tool === d.tool).at(-1);
+  let card = preview();
   if (!card && d.tool) {
     // Args deltas stream BEFORE the provider's final tool_use_stop, so the
-    // in-flight row does not exist yet: create it and let the args build up.
-    handleToolStart({ tool: d.tool, id: id, input: '' });
-    card = id ? document.querySelector('.call-row[data-id="' + escAttr(id) + '"]') : null;
+    // in-flight row does not exist yet. Preserve the occurrence key through
+    // the provisional preview and its authoritative tool_start.
+    handleToolStart({ tool: d.tool, id: id, traceCallId: d.traceCallId || '', input: '', provisional: true });
+    card = preview();
   }
   if (!card || card.getAttribute('data-state') !== 'running') return;
   const next = (card.getAttribute('data-args') || '') + (d.delta || '');
   card.setAttribute('data-args', next);
-  if (toolDetails[id]) toolDetails[id].input = next;
+  const key = card.dataset.rowKey;
+  if (toolDetails[key]) toolDetails[key].input = next;
   const name = card.getAttribute('data-tool') || 'tool';
   const summary = card.querySelector('.tc-summary');
   const text = toolSummaryText(name, next);
   if (summary && text) summary.textContent = text;
+  updateToolRowAccessibleLabel(card);
   const box = card.querySelector('.tc-io-text[data-in]');
   if (box) {
     try { box.textContent = JSON.stringify(JSON.parse(next), null, 2); }
@@ -1402,17 +1963,38 @@ function handleToolStart(d) {
   const name = d.tool || 'tool';
   const id = d.id || '';
   const input = d.input || '';
-  const existing = id ? document.querySelector('.call-row[data-id="' + escAttr(id) + '"]') : null;
+  // A replayed SSE start may arrive after the same call was reconstructed
+  // from a persisted transcript. Durable trace identity is authoritative.
+  const traced = d.traceCallId ? toolRowsInCurrentTurn().find(row =>
+    row.dataset.traceCallId === d.traceCallId) : null;
+  if (!renderingActivityHistory && traced && traced.dataset.provisional !== 'true') return;
+  const previews = !d.provisional && id ? pendingToolRows(id).filter(row =>
+    row.dataset.state === 'running' && row.dataset.provisional === 'true' &&
+    row.dataset.tool === name && !row.dataset.traceCallId) : [];
+  const provisional = !d.provisional
+    ? (traced && traced.dataset.provisional === 'true' && traced.dataset.tool === name
+      ? traced : (!traced && previews.length === 1 ? previews[0] : null)) : null;
+  const oldHistoryMatches = !renderingActivityHistory && !d.provisional && d.traceCallId && !provisional
+    ? toolRowsInCurrentTurn().filter(row => row.dataset.historyRendered === 'true' &&
+      row.dataset.state === 'running' && !row.dataset.traceCallId &&
+      row.dataset.id === id && row.dataset.tool === name &&
+      sameToolInput(row.getAttribute('data-args') || '', input)) : [];
+  const existing = provisional || (oldHistoryMatches.length === 1 ? oldHistoryMatches[0] : null);
   if (existing) {
     // The row was created early by tool_args_delta; adopt the provider's
     // authoritative full args instead of appending a duplicate row.
     const full = input || existing.getAttribute('data-args') || '';
     existing.setAttribute('data-args', full);
-    if (!toolDetails[id]) toolDetails[id] = { name: name, input: full, output: '', elapsed: 0, error: false };
-    toolDetails[id].input = full;
+    existing.dataset.provisional = 'false';
+    if (d.traceCallId) existing.dataset.traceCallId = d.traceCallId;
+    const key = existing.dataset.rowKey;
+    if (!toolDetails[key]) toolDetails[key] = { name: name, input: full, output: '', elapsed: 0, error: false, state: 'running' };
+    toolDetails[key].input = full;
     const summary = existing.querySelector('.tc-summary');
     const text = toolSummaryText(name, full);
     if (summary && text) summary.textContent = text;
+    updateToolRowAccessibleLabel(existing);
+    updateActivityGroupSummary(existing.closest('.activity-group'));
     const box = existing.querySelector('.tc-io-text[data-in]');
     if (box) {
       try { box.textContent = JSON.stringify(JSON.parse(full), null, 2); }
@@ -1423,66 +2005,121 @@ function handleToolStart(d) {
   // A new tool call is a provider event boundary: settle reasoning before
   // inserting the tool so the visible timeline keeps source order.
   finishThinking();
-  toolDetails[id] = { name: name, input: input, output: '', elapsed: 0, error: false };
   const v = toolVariantOf(name);
   const summary = toolSummaryText(name, input);
   const pretty = (() => {
     try { return JSON.stringify(JSON.parse(input), null, 2); }
     catch (e) { return input; }
   })();
+  const rowKey = 'tool-row-' + (++toolRowSequence);
+  const bodyId = rowKey + '-body';
+  toolDetails[rowKey] = { name: name, input: input, output: '', elapsed: 0, error: false, state: 'running' };
   area.insertAdjacentHTML('beforeend', `
-    <div class="call-row" data-tool="${escAttr(name)}" data-id="${escAttr(id)}" data-variant="${escAttr(iconKeyOf(name))}" data-state="running" data-args="${escAttr(input)}">
-      <div class="tc-row" role="button" tabindex="0" onclick="toggleToolInline('${escOnclick(id)}')">
-        <span class="tc-leading">
-          <span class="tc-icon-idle">${v.icon}</span>
-          <svg class="tc-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 6.5 8 9.5l3-3"/></svg>
-        </span>
-        <span class="tc-title">${escHtml(v.title)}</span>
-        <span class="tc-sep" aria-hidden="true"></span>
-        <span class="tc-summary">${escHtml(summary) || '\u2014'}</span>
-        <span class="tc-time"></span>
-        <button class="tc-inspect" onclick="event.stopPropagation();openToolDetail('${escOnclick(id)}')">Inspect</button>
+    <div class="call-row" data-tool="${escAttr(name)}" data-id="${escAttr(id)}" data-row-key="${rowKey}" data-trace-call-id="${escAttr(d.traceCallId || '')}" data-history-rendered="${renderingActivityHistory ? 'true' : 'false'}" data-provisional="${d.provisional ? 'true' : 'false'}" data-variant="${escAttr(iconKeyOf(name))}" data-state="running" data-args="${escAttr(input)}">
+      <div class="tc-row">
+        <button class="tc-disclosure" type="button" aria-expanded="false" aria-controls="${bodyId}" onclick="toggleToolInline('${rowKey}')">
+          <span class="tc-leading">
+            <span class="tc-icon-idle">${v.icon}</span>
+            <svg class="tc-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 6.5 8 9.5l3-3"/></svg>
+          </span>
+          <span class="tc-title">${escHtml(v.title)}</span>
+          <span class="tc-sep" aria-hidden="true"></span>
+          <span class="tc-summary">${escHtml(summary) || '\u2014'}</span>
+          <span class="tc-time"></span>
+        </button>
+        <button class="tc-inspect" type="button" onclick="openToolDetail('${rowKey}')">${uiText('Inspect', '查看详情')}</button>
       </div>
-      <div class="tc-body">
+      <div class="tc-body" id="${bodyId}">
         <div class="tc-io">
-          <div class="tc-io-sec"><span class="tc-io-label">IN</span><span class="tc-io-text" data-in>${escHtml(pretty || '\u2014')}</span></div>
+          <div class="tc-io-sec"><span class="tc-io-label">${uiText('IN', '输入')}</span><span class="tc-io-text" data-in>${escHtml(pretty || '\u2014')}</span></div>
           <div class="tc-io-div"></div>
-          <div class="tc-io-sec"><span class="tc-io-label">OUT</span><span class="tc-io-text" data-out>\u2026</span></div>
+          <div class="tc-io-sec"><span class="tc-io-label">${uiText('OUT', '输出')}</span><span class="tc-io-text" data-out>\u2026</span></div>
         </div>
       </div>
     </div>`);
+  const row = area.lastElementChild;
+  appendActivityRow(row);
+  updateToolRowAccessibleLabel(row);
   autoScroll();
 }
 
 function toggleToolInline(id) {
-  const card = document.querySelector('.call-row[data-id="' + escAttr(id) + '"]');
-  if (card) card.classList.toggle('open');
+  const card = document.querySelector('.call-row[data-row-key="' + escAttr(id) + '"]');
+  if (card) {
+    const open = card.classList.toggle('open');
+    card.querySelector('.tc-disclosure')?.setAttribute('aria-expanded', String(open));
+    scheduleActivityGroupFollow(card.closest('.activity-group'));
+  }
+}
+
+function showUnattributedToolResult(d) {
+  // Older event producers can omit the occurrence ID. Two pending calls with
+  // the same provider ID are then impossible to distinguish, so keep their
+  // states honest and show the result separately instead of guessing.
+  const row = document.createElement('div');
+  row.className = 'tool-unattributed-result';
+  row.setAttribute('role', 'status');
+  row.textContent = [uiText('Tool result attribution unknown', '工具结果归属不明'),
+    d.tool || '', firstLine(d.output || '')].filter(Boolean).join(' · ');
+  appendActivityRow(row);
 }
 
 function handleToolResult(d) {
-  const name = d.tool || '';
   const id = d.id || '';
-  // Prefer the exact tool_use_id; the old name+last-of-type selector
-  // failed whenever another element was appended between start and
-  // result, leaving the chip stuck on "Running".
+  if (d.traceCallId && toolRowsInCurrentTurn().some(row =>
+    row.dataset.traceCallId === d.traceCallId &&
+    (row.dataset.state === 'ok' || row.dataset.state === 'error'))) return;
+  const pending = id ? pendingToolRows(id) : pendingToolRows('', '');
+  const candidates = d.tool && !d.traceCallId
+    ? pending.filter(row => row.dataset.tool === d.tool) : pending;
   let chip = null;
-  if (id) chip = document.querySelector('.call-row[data-id="' + escAttr(id) + '"]');
-  if (!chip && name) {
-    const chips = document.querySelectorAll('.call-row[data-tool="' + escAttr(name) + '"]:not([data-state="ok"]):not([data-state="error"])');
-    chip = chips.length ? chips[chips.length - 1] : null;
+  if (d.traceCallId) {
+    chip = pending.find(row => row.dataset.traceCallId === d.traceCallId) || null;
+    if (!chip) {
+      // Permission denials and malformed arguments can produce a result
+      // without tool_start. They can still complete one preview row safely.
+      const previews = pending.filter(row => row.dataset.state === 'running' &&
+        row.dataset.provisional === 'true' && !row.dataset.traceCallId &&
+        (!d.tool || row.dataset.tool === d.tool));
+      if (previews.length > 1) {
+        showUnattributedToolResult(d);
+        return;
+      }
+      if (previews.length === 1) {
+        chip = previews[0];
+        chip.dataset.traceCallId = d.traceCallId;
+        chip.dataset.provisional = 'false';
+      }
+    }
+  } else if (candidates.length > 1 && (!renderingActivityHistory || !id)) {
+    showUnattributedToolResult(d);
+    return;
+  } else {
+    // Saved ContentBlocks lack traceCallId. They are replayed in transcript
+    // order, so consume the oldest unmatched start; live singletons are exact.
+    chip = candidates[0] || null;
   }
+  if (!chip) {
+    // A tool_result without a start is still a real tool event. Give it one
+    // inspectable row with the known name and outcome instead of dropping it.
+    handleToolStart({ tool: d.tool || 'tool', id: id, traceCallId: d.traceCallId || '', input: '' });
+    chip = toolRowsInCurrentTurn().at(-1) || null;
+    if (!chip) {
+      showUnattributedToolResult(d);
+      return;
+    }
+  }
+  const name = d.tool || chip.dataset.tool || '';
+  const rowKey = chip.dataset.rowKey;
   if (chip) {
     const ok = !d.isError;
-    chip.setAttribute('data-state', ok ? 'ok' : 'error');
+    const wasError = chip.dataset.state === 'error';
+    setToolRowVisualState(chip, ok ? 'ok' : 'error');
     if (ok && isTodoWriteTool(name)) {
       applyTodoSnapshot(name, chip.getAttribute('data-args') || '');
     }
     if (ok && isPlanningTool(name) && typeof pollStatus === 'function') {
       queueMicrotask(() => pollStatus());
-    }
-    const leading = chip.querySelector('.tc-leading');
-    if (!ok && leading) {
-      leading.innerHTML = '<span class="tc-state-dot" data-state="error" aria-hidden="true"></span>';
     }
     const t = chip.querySelector('.tc-time');
     if (t) t.textContent = d.elapsedMs ? fmtMs(d.elapsedMs) : '';
@@ -1491,6 +2128,7 @@ function handleToolResult(d) {
       summary.classList.add('err');
       summary.textContent = firstLine(d.output) || summary.textContent;
     }
+    updateToolRowAccessibleLabel(chip);
     const out = chip.querySelector('.tc-io-text[data-out]');
     if (out) {
       out.textContent = d.output || '(no output)';
@@ -1500,22 +2138,37 @@ function handleToolResult(d) {
     // search card (summary banner + per-file groups + line rows) instead
     // of the raw text dump. Details panel keeps the raw output.
     if (ok && name === 'Grep' && d.output) {
-      renderSearchCard(chip, d.output, id);
+      renderSearchCard(chip, d.output, rowKey);
     }
     if (ok && (String(name).toLowerCase() === 'edit' || String(name).toLowerCase() === 'write')) {
       renderFileEditCard(chip, name, chip.getAttribute('data-args') || '');
     }
+    updateToolRowAccessibleLabel(chip);
     // Rich results use structured presentation metadata persisted beside the
     // tool result. Never infer an Artifact from model-authored output text.
     if (ok && d.presentation && typeof renderArtifactPresentation === 'function') {
       renderArtifactPresentation(chip, d.presentation);
     }
-    if (toolDetails[id]) {
-      toolDetails[id].output = d.output || '';
-      toolDetails[id].elapsed = d.elapsedMs || 0;
-      toolDetails[id].error = !!d.isError;
+    if (toolDetails[rowKey]) {
+      toolDetails[rowKey].output = d.output || '';
+      toolDetails[rowKey].elapsed = d.elapsedMs || 0;
+      toolDetails[rowKey].error = !!d.isError;
     }
-    if (selectedToolId === id) renderDetailPanel();
+    const activityGroup = chip.closest('.activity-group');
+    const stats = activityGroupStats.get(activityGroup);
+    if (stats) {
+      if (!ok && !wasError) stats.errors++;
+      if (ok && wasError) stats.errors = Math.max(0, stats.errors - 1);
+      if (stats.currentRunning === chip) {
+        while (stats.runningRows.length && stats.runningRows[stats.runningRows.length - 1].dataset.state !== 'running') {
+          stats.runningRows.pop();
+        }
+        stats.currentRunning = stats.runningRows[stats.runningRows.length - 1] || null;
+      }
+      updateActivityGroupSummary(activityGroup);
+      scheduleActivityGroupFollow(activityGroup);
+    }
+    if (selectedToolId === rowKey) renderDetailPanel();
   }
 }
 
@@ -1623,6 +2276,7 @@ function handlePermissionRequest(d) {
   if (!interaction) return;
   if (!visibleInteraction(interaction)) { renderSessions(); return; }
   if (interactionCard('permission', interaction.permId)) return;
+  finishActivityGroup();
   d = interaction;
   const area = document.getElementById('chatArea');
   const id = d.permId || '';
@@ -1757,6 +2411,9 @@ function newChat() {
   queuedTurnPendingItem = null;
   renderQueuedTurns();
   resetTurnState();
+  if (typeof activityGroupsByTurn !== 'undefined') activityGroupsByTurn.clear();
+  if (typeof activityHistoryLastTurn !== 'undefined') activityHistoryLastTurn = 0;
+  if (typeof activityHistoryGeneration !== 'undefined') activityHistoryGeneration++;
   syncTrackedRunningState();
   messages = [];
   followOutput = true;
@@ -2004,7 +2661,7 @@ async function submitBusyInput(item, behavior) {
       });
       const data = await res.json();
       if (res.ok) {
-        if (currentSessionId === targetSessionId) addMessage('user', item.text);
+        if (currentSessionId === targetSessionId) addMessage('user', item.text, true, -1, 0, true);
         showToast('Sent to the current turn');
         await loadSessions();
         return;
@@ -2180,7 +2837,7 @@ async function steerQueuedTurn(event, index) {
     const liveIndex = ownedQueue.indexOf(item);
     if (liveIndex >= 0) ownedQueue.splice(liveIndex, 1);
     if (queuedTurns === ownedQueue && !queuedTurns.length) queuedSessionId = null;
-    if (currentSessionId === targetSessionId) addMessage('user', item.text);
+    if (currentSessionId === targetSessionId) addMessage('user', item.text, true, -1, 0, true);
     showToast(uiText('Sent to the current turn', '已发送给当前任务'));
     await loadSessions();
   } catch (error) {
@@ -2291,6 +2948,7 @@ async function runTurnItem(item) {
   const text = item.text || '';
   const images = item.images || [];
   const turnSessionId = currentSessionId;
+  const viewGenerationAtSubmit = resumeSessionGeneration;
   const continuationGenerationAtSubmit = turnSessionId ? (backgroundContinuationGenerations.get(turnSessionId) || 0) : backgroundContinuationGeneration;
   const continuationUnchanged = () => continuationGenerationAtSubmit === (turnSessionId ? (backgroundContinuationGenerations.get(turnSessionId) || 0) : backgroundContinuationGeneration);
   const foregroundRequest = { sessionId: turnSessionId, needsHistorySync: false, controller: typeof AbortController === 'function' ? new AbortController() : null };
@@ -2298,6 +2956,12 @@ async function runTurnItem(item) {
   pendingForegroundRequest = foregroundRequest;
   let resolvedTurnSessionId = turnSessionId;
   let turnSucceeded = false;
+  let turnOutcome = 'completed';
+  const viewingTurn = () => resolvedTurnSessionId
+    ? currentSessionId === resolvedTurnSessionId
+    : turnSessionId
+      ? currentSessionId === turnSessionId
+      : currentSessionId === null && resumeSessionGeneration === viewGenerationAtSubmit;
 
   // Hide welcome
   const welcome = document.getElementById('welcomeScreen');
@@ -2319,15 +2983,14 @@ async function runTurnItem(item) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `turn: ${res.status}`);
-    if (currentSessionId === turnSessionId && continuationUnchanged() && runningTurnIncompleteReason) throw new Error('Turn incomplete: ' + runningTurnIncompleteReason);
+    if (viewingTurn() && continuationUnchanged() && runningTurnIncompleteReason) throw new Error('Turn incomplete: ' + runningTurnIncompleteReason);
     resolvedTurnSessionId = data.sessionId || turnSessionId;
     foregroundRequest.sessionId = resolvedTurnSessionId;
     if (!runningSessionId && resolvedTurnSessionId) runningSessionId = resolvedTurnSessionId;
-    if (currentSessionId === turnSessionId) {
+    if (currentSessionId === turnSessionId && (turnSessionId || resumeSessionGeneration === viewGenerationAtSubmit)) {
       currentSessionId = resolvedTurnSessionId;
       if (!turnSessionId && window.metisNavigation) window.metisNavigation.recordSession(resolvedTurnSessionId, { replace: true });
     }
-    const viewingTurn = () => currentSessionId === resolvedTurnSessionId;
     if (viewingTurn() && typeof loadSessionFiles === 'function') void loadSessionFiles(resolvedTurnSessionId);
     if (viewingTurn() && typeof loadArtifactsForSession === 'function') {
       await loadArtifactsForSession(resolvedTurnSessionId, { rebuildCards: true, silent: true });
@@ -2344,32 +3007,34 @@ async function runTurnItem(item) {
     if (viewingTurn() && continuationUnchanged() && !historySynced && !streamedTextThisTurn && data.text) {
       addMessage('assistant', data.text);
     }
-    if (viewingTurn() && data.stopped) showToast('Turn stopped');
+    if (data.stopped) {
+      turnOutcome = 'stopped';
+      if (viewingTurn()) showToast('Turn stopped');
+    }
     await loadSessions();
     turnSucceeded = true;
   } catch (e) {
-    const viewingTurn = !resolvedTurnSessionId || currentSessionId === resolvedTurnSessionId || currentSessionId === turnSessionId;
-    if (e && e.name === 'AbortError') { if (viewingTurn) showToast('Turn stopped'); }
-    else if (viewingTurn) showError(e.message || 'The request failed.');
+    turnOutcome = e && e.name === 'AbortError' ? 'stopped' : 'error';
+    if (e && e.name === 'AbortError') { if (viewingTurn()) showToast('Turn stopped'); }
+    else if (viewingTurn()) showError(e.message || 'The request failed.');
     else showToast('Background turn failed: ' + (e.message || 'request failed'));
   } finally {
     // A background completion can start a newer turn before this older POST
     // response reaches the browser. Its SSE lifecycle now owns the controls.
-    const viewingTurn = !resolvedTurnSessionId || currentSessionId === resolvedTurnSessionId || currentSessionId === turnSessionId;
     if (typeof finishForegroundRequest === 'function') finishForegroundRequest(foregroundRequest);
     if (pendingForegroundRequest === foregroundRequest) pendingForegroundRequest = null;
     if (continuationUnchanged()) {
-      if (viewingTurn) finishUserTurn();
+      if (viewingTurn()) finishUserTurn(turnOutcome);
       if (typeof parallelTurnsEnabled === 'function' && parallelTurnsEnabled()) syncTrackedRunningState();
       else setTurnRunning(false);
-      if (viewingTurn) runningTurnNeedsHistorySync = false;
+      if (viewingTurn()) runningTurnNeedsHistorySync = false;
     }
     updateSendBtn();
     loadSessionStatsbar();
-    if (viewingTurn && turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
+    if (viewingTurn() && turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
       if (!queuedSessionId || currentSessionId === queuedSessionId) setTimeout(drainQueuedTurns, 0);
       else showToast('Queued messages are waiting in the completed session');
-    } else if (viewingTurn && !turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
+    } else if (viewingTurn() && !turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
       showToast('Queued messages paused after an incomplete or failed turn');
     }
   }
@@ -2438,17 +3103,19 @@ function messageActionsMarkup(role, date = new Date()) {
   return `<div class="msg-actions">${copy}${ratings}${branch}${feedback}${time}</div>`;
 }
 
-function addMessage(role, content, remember = true, idx = -1, historyTurn = 0) {
+function addMessage(role, content, remember = true, idx = -1, historyTurn = 0, activitySteer = false) {
+  finishActivityGroup();
   const now = remember ? new Date() : null;
   if (remember) messages.push({ role, content, time: now });
   const index = idx >= 0 ? idx : (remember ? messages.length - 1 : -1);
   const area = document.getElementById('chatArea');
   const idxAttr = index >= 0 ? ` data-idx="${index}"` : '';
   const turnAttr = historyTurn > 0 ? ` data-history-turn="${historyTurn}"` : '';
+  const steerAttr = role === 'user' && activitySteer ? ' data-activity-steer="true"' : '';
 
   if (role === 'user') {
     area.insertAdjacentHTML('beforeend', `
-      <div class="message message-user"${idxAttr}${turnAttr}>
+      <div class="message message-user"${idxAttr}${turnAttr}${steerAttr}>
         <div class="message-bubble">${escHtml(content)}</div>
         ${messageActionsMarkup('user', now)}
       </div>`);
@@ -2574,7 +3241,18 @@ function renderHistoryMessages(history) {
   // Avoid forcing a layout/scroll for every reconstructed history block. The
   // selected transcript is pinned once, after the complete history exists.
   followOutput = false;
+  // Row keys are render-local identities. A history refresh replaces every
+  // row, so any open inspector must release its old row and content first.
+  closeToolDetail();
+  toolDetails = {};
   area.innerHTML = '';
+  activityGroupsByTurn.clear();
+  activityHistoryGeneration++;
+  activityGroupEl = null;
+  activityTurnEl = null;
+  activityCurrentTurnId = '';
+  renderingActivityHistory = true;
+  activityHistoryTurn = 0;
   let i = 0;
   let historyTurn = 0;
   (history || []).forEach(m => {
@@ -2587,13 +3265,15 @@ function renderHistoryMessages(history) {
       const text = String(b.text || '');
       return text.trim() && !text.startsWith('[user steer mid-turn] ') && visibleTranscriptText(text).trim();
     })) historyTurn++;
+    activityHistoryTurn = historyTurn;
     blocks.forEach(b => {
       if (!b || typeof b !== 'object') return;
       if (b.type === 'text' && (b.text || '').trim()) {
         const rawShown = role === 'user' && String(b.text).startsWith('[user steer mid-turn] ')
           ? String(b.text).slice('[user steer mid-turn] '.length) : b.text;
         const shown = visibleTranscriptText(rawShown);
-        if (shown.trim()) addMessage(role, shown, false, i++, historyTurn);
+        if (shown.trim()) addMessage(role, shown, false, i++, historyTurn,
+          role === 'user' && String(b.text).startsWith('[user steer mid-turn] '));
       } else if (role === 'assistant' && b.type === 'thinking' && (b.text || '').trim()) {
         try {
           appendThinkingRow(b.text);
@@ -2603,19 +3283,24 @@ function renderHistoryMessages(history) {
         // history UI intentionally renders only the safe placeholder.
         try { appendThinkingRow('', { redacted: true }); }
         catch (e) { /* skip malformed block */ }
-      } else if (b.type === 'tool_use' && b.tool_use_id) {
+      } else if (b.type === 'tool_use') {
         let input = '';
         try { input = JSON.stringify(b.input || {}); } catch (e) { input = ''; }
-        try { handleToolStart({ tool: b.name || 'tool', id: b.tool_use_id, input: input }); }
+        try { handleToolStart({ tool: b.name || 'tool', id: b.tool_use_id,
+          traceCallId: b.trace_call_id || '', input: input }); }
         catch (e) { /* malformed history entry: skip the row */ }
-      } else if (b.type === 'tool_result' && b.tool_use_id) {
+      } else if (b.type === 'tool_result') {
         const out = typeof b.content === 'string' ? b.content
           : (b.content != null ? JSON.stringify(b.content) : '');
-        const det = toolDetails[b.tool_use_id] || {};
+        const pending = pendingToolRows(b.tool_use_id || '');
+        const matched = b.trace_call_id
+          ? pending.find(row => row.dataset.traceCallId === b.trace_call_id) : pending[0];
+        const det = matched ? toolDetails[matched.dataset.rowKey] || {} : {};
         try {
           handleToolResult({
             tool: det.name || 'tool',
             id: b.tool_use_id,
+            traceCallId: b.trace_call_id || '',
             output: out,
             isError: !!b.is_error,
             elapsedMs: 0,
@@ -2626,18 +3311,59 @@ function renderHistoryMessages(history) {
       }
     });
   });
+  finishActivityGroup();
+  activityHistoryLastTurn = historyTurn;
+  const lastTurnKey = 'history-' + historyTurn;
+  const viewedTurnRunning = viewedHistoryTurnIsRunning();
+  const historyTurns = Array.from(document.querySelectorAll('.activity-turn'));
+  historyTurns.forEach(turn => {
+    if (viewedTurnRunning && turn.dataset.turnId === lastTurnKey) return;
+    activityTurnEl = turn;
+    finishActivityTurn('finished');
+  });
+  if (viewedTurnRunning) {
+    activityCurrentTurnId = lastTurnKey;
+    activityTurnEl = historyTurns.find(turn => turn.dataset.turnId === lastTurnKey) || null;
+    if (activityTurnEl) {
+      activityTurnEl.dataset.state = 'running';
+      if (turnStartMs > 0) activityTurnEl.dataset.startedAt = String(turnStartMs);
+      updateActivityTurnLabel(activityTurnEl);
+      applyActivityPresentationTurn(activityTurnEl);
+      activityTurnGroups(activityTurnEl).forEach(group => {
+        applyActivityPresentationGroup(group);
+        updateActivityGroupSummary(group);
+      });
+    }
+  } else activityTurnEl = null;
+  renderingActivityHistory = false;
+  activityHistoryTurn = 0;
   updateEmptyLayout();
   resumeAutoScroll();
-  void restoreHistoryMessageMetadata(currentSessionId);
+  void restoreHistoryMessageMetadata(currentSessionId, activityHistoryGeneration);
 }
 
-async function restoreHistoryMessageMetadata(sessionId) {
+function restoreHistoryTurnState(turn, state, reason = '') {
+  if (!turn || !state) return;
+  const previous = activityTurnEl;
+  activityTurnEl = turn;
+  finishActivityTurn(state, reason);
+  activityTurnEl = previous;
+}
+
+async function restoreHistoryMessageMetadata(sessionId, generation = activityHistoryGeneration) {
   if (!sessionId) return;
   try {
-    const res = await fetch('/api/trace?sessionId=' + encodeURIComponent(sessionId) + '&limit=1');
-    if (!res.ok) return;
-    const data = await res.json();
-    if (currentSessionId !== sessionId) return;
+    const readJSON = async url => {
+      const res = await fetch(url);
+      return res.ok ? await res.json() : null;
+    };
+    const [traceResult, sessionResult] = await Promise.allSettled([
+      readJSON('/api/trace?sessionId=' + encodeURIComponent(sessionId) + '&limit=1'),
+      readJSON('/api/sessions/' + encodeURIComponent(sessionId)),
+    ]);
+    if (currentSessionId !== sessionId || generation !== activityHistoryGeneration) return;
+    const data = traceResult.status === 'fulfilled' ? (traceResult.value || {}) : {};
+    const sessionData = sessionResult.status === 'fulfilled' ? (sessionResult.value || {}) : {};
     (data.turnMetrics || []).forEach(metric => {
       const turn = Number(metric.turn) || 0;
       if (turn <= 0) return;
@@ -2647,6 +3373,15 @@ async function restoreHistoryMessageMetadata(sessionId) {
       if (userActions && !Number.isNaN(startedAt.getTime())) {
         userActions.querySelector('.msg-time')?.remove();
         userActions.insertAdjacentHTML('beforeend', `<span class="msg-time">${escHtml(messageActionTime(startedAt))}</span>`);
+      }
+
+      // The trace owns the saved turn duration. Show it once on the turn
+      // header even if Artifact cards or interim answers split the process
+      // into several independently expandable groups.
+      const activityTurn = document.querySelector(`.activity-turn[data-history-turn="${turn}"]`);
+      if (activityTurn && Number.isFinite(Number(metric.durationMs)) && Number(metric.durationMs) >= 0) {
+        activityTurn.dataset.durationMs = String(Number(metric.durationMs));
+        updateActivityTurnLabel(activityTurn);
       }
 
       const assistantRows = document.querySelectorAll(`.message-assistant[data-history-turn="${turn}"] .msg-actions`);
@@ -2664,6 +3399,23 @@ async function restoreHistoryMessageMetadata(sessionId) {
         assistantActions.classList.add('with-metrics');
       }
     });
+    // The trace wire view has a root terminal kind but no stopReason. A root
+    // error is conclusive; loop_done alone cannot distinguish a stop from a
+    // normal completion. The session header is authoritative for only its
+    // latest turn, so older turns stay in a neutral historical state.
+    (data.events || []).forEach(event => {
+      if (event.kind !== 'error' || Number(event.depth || 0) !== 0 || event.parentID) return;
+      const turn = Number(event.turn) || 0;
+      if (turn <= 0) return;
+      restoreHistoryTurnState(document.querySelector(`.activity-turn[data-history-turn="${turn}"]`), 'error', event.text || '');
+    });
+    const lastTurn = activityHistoryLastTurn;
+    const lastActivityTurn = lastTurn > 0
+      ? document.querySelector(`.activity-turn[data-history-turn="${lastTurn}"]`) : null;
+    const sessionStatus = String(sessionData.session && sessionData.session.status || '').toLowerCase();
+    const lastState = ({ completed: 'completed', stopped: 'stopped', failed: 'error' })[sessionStatus] ||
+      (sessionStatus === 'running' && viewedHistoryTurnIsRunning() ? 'running' : '');
+    if (lastActivityTurn && lastState) restoreHistoryTurnState(lastActivityTurn, lastState, sessionStatus);
   } catch (_) {}
 }
 
@@ -4161,6 +4913,7 @@ const THEME_DESCS_ZH = {
 
 function renderGeneralTab() {
 	const parts = [];
+	parts.push(renderPresentationModePreference());
 	parts.push(renderDesktopParallelismPreference());
 	parts.push(renderBusyEnterPreference());
   const perm = settingByKey('permission.mode');
@@ -4174,6 +4927,57 @@ function renderGeneralTab() {
   const loop = settingByKey('loop_detection.disabled');
   if (loop) parts.push(renderBoolSetting(loop));
   return parts.join('');
+}
+
+function renderPresentationModePreference() {
+  const value = activityPresentationPolicy().mode;
+  const choices = document.documentElement.lang === 'zh-CN' ? [
+    { value: 'compact', title: '简洁', desc: '收起工作步骤，不预览已结束的思考。' },
+    { value: 'standard', title: '标准', desc: '收起工作步骤，显示运行详情和思考摘要。' },
+    { value: 'detailed', title: '详细', desc: '运行时逐步展示，完成后整理为可展开的过程。' },
+    { value: 'verbose', title: '完全展开', desc: '始终逐步展示全部工作过程。' },
+  ] : [
+    { value: 'compact', title: 'Compact', desc: 'Fold work steps and hide finished reasoning previews.' },
+    { value: 'standard', title: 'Standard', desc: 'Fold work steps with live details and reasoning previews.' },
+    { value: 'detailed', title: 'Detailed', desc: 'Show live steps, then group them when the turn ends.' },
+    { value: 'verbose', title: 'Verbose', desc: 'Keep every work step visible.' },
+  ];
+  return `<div class="settings-section">
+    <div class="settings-section-title">${uiText('Work step display', '工作步骤展示')}</div>
+    <div class="settings-section-desc">${uiText('Choose how much of the agent\'s process appears in conversations. Tool details and artifacts are always retained.', '选择对话中展示多少代理工作过程。工具详情和 Artifacts 始终保留。')}</div>
+    <div class="radio-cards">${choices.map(c => `<button type="button" aria-pressed="${value === c.value}" class="radio-card desktop-pref${value === c.value ? ' selected' : ''}" onclick="choosePresentationMode('${c.value}')">
+      <div class="radio-card-title">${c.title}</div><div class="radio-card-desc">${c.desc}</div>
+    </button>`).join('')}</div>
+  </div>`;
+}
+
+let presentationModeSaveActive = false;
+let pendingPresentationMode = '';
+let savedPresentationMode = '';
+
+async function choosePresentationMode(value) {
+  if (!ACTIVITY_PRESENTATION_POLICIES[value]) return;
+  if (!savedPresentationMode) savedPresentationMode = activityPresentationPolicy().mode;
+  pendingPresentationMode = value;
+  applyActivityPresentationMode(value);
+  renderSettingsTab();
+  if (presentationModeSaveActive) return;
+  presentationModeSaveActive = true;
+  try {
+    // Serialize writes of the same preference. The last click is the last
+    // persisted value even when earlier HTTP responses arrive much later.
+    while (pendingPresentationMode) {
+      const next = pendingPresentationMode;
+      pendingPresentationMode = '';
+      const saved = await saveDesktopPreference('presentationMode', next);
+      if (saved) savedPresentationMode = next;
+      else if (!pendingPresentationMode) applyActivityPresentationMode(savedPresentationMode);
+      if (pendingPresentationMode) applyActivityPresentationMode(pendingPresentationMode);
+      renderSettingsTab();
+    }
+  } finally {
+    presentationModeSaveActive = false;
+  }
 }
 
 function renderDesktopParallelismPreference() {

@@ -54,8 +54,9 @@ func RepairOrphanedToolUses(messages []llm.Message) []llm.Message {
 	// occurrences; a downstream result consumes the oldest occurrence,
 	// preserving message order even when a provider reuses an id.
 	type pending struct {
-		id      string
-		matched bool
+		id          string
+		traceCallID string
+		matched     bool
 	}
 	var open []pending
 	pendingByID := make(map[string][]int)
@@ -66,12 +67,48 @@ func RepairOrphanedToolUses(messages []llm.Message) []llm.Message {
 			case "tool_use":
 				if b.ToolUseID != "" {
 					idx := len(open)
-					open = append(open, pending{id: b.ToolUseID})
+					open = append(open, pending{id: b.ToolUseID, traceCallID: b.TraceCallID})
 					pendingByID[b.ToolUseID] = append(pendingByID[b.ToolUseID], idx)
 				}
 			case "tool_result":
 				queue := pendingByID[b.ToolUseID]
 				if b.ToolUseID == "" || len(queue) == 0 {
+					continue
+				}
+				// New histories can pair a result to the exact occurrence even
+				// when provider IDs repeat and results were delivered out of order.
+				if b.TraceCallID != "" {
+					matched := false
+					for _, idx := range queue {
+						if !open[idx].matched && open[idx].traceCallID == b.TraceCallID {
+							open[idx].matched = true
+							matched = true
+							break
+						}
+					}
+					if matched {
+						continue
+					}
+					// A result from a newer version may follow a legacy tool_use
+					// without a trace key. Only that unkeyed occurrence may use
+					// the old FIFO fallback; never consume a different trace key.
+					for _, idx := range queue {
+						if !open[idx].matched && open[idx].traceCallID == "" {
+							open[idx].matched = true
+							matched = true
+							break
+						}
+					}
+					if matched {
+						continue
+					}
+					continue
+				}
+				for len(queue) > 0 && open[queue[0]].matched {
+					queue = queue[1:]
+				}
+				if len(queue) == 0 {
+					delete(pendingByID, b.ToolUseID)
 					continue
 				}
 				open[queue[0]].matched = true
@@ -85,24 +122,25 @@ func RepairOrphanedToolUses(messages []llm.Message) []llm.Message {
 	}
 
 	// Preserve occurrence order, including repeated provider ids.
-	var orphans []string
+	var orphans []pending
 	for _, p := range open {
 		if p.matched {
 			continue
 		}
-		orphans = append(orphans, p.id)
+		orphans = append(orphans, p)
 	}
 	if len(orphans) == 0 {
 		return messages
 	}
 
 	stub := make([]llm.ContentBlock, 0, len(orphans))
-	for _, id := range orphans {
+	for _, orphan := range orphans {
 		stub = append(stub, llm.ContentBlock{
-			Type:       "tool_result",
-			ToolUseID:  id,
-			ToolResult: orphanRepairMessage,
-			IsError:    true,
+			Type:        "tool_result",
+			ToolUseID:   orphan.id,
+			TraceCallID: orphan.traceCallID,
+			ToolResult:  orphanRepairMessage,
+			IsError:     true,
 		})
 	}
 	return append(messages, llm.Message{

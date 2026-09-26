@@ -55,6 +55,7 @@ function context() {
   fetch:async(url,options)=>{sent.push({url,body:JSON.parse(options.body)});return ok({});},
  };
  vm.createContext(c);
+ vm.runInContext('let activityGroupEl = null;' + extract('chat.js','function finishActivityGroup()','const THINK_ORBIT_ICON'),c);
  vm.runInContext(extract('chat.js','let pendingAsk = null;','let turnStartMs = 0;'),c);
  vm.runInContext(extract('chat.js','function handlePermissionRequest(d)','function isChatNearBottom('),c);
  vm.runInContext(extract('sessions.js','function sessionState(s)','function sessionStatusIcon('),c);

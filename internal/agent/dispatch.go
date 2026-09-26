@@ -265,12 +265,26 @@ func emitToolDispatchDenial(ctx context.Context, out chan<- Event, blk llm.Conte
 // metis-original: useful for rate-limited APIs (WebFetch, an MCP server
 // pinned to one connection) that don't need full exclusivity but
 // shouldn't run in parallel with each other.
-func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, out chan<- Event, tc HookContext) ([]llm.ContentBlock, error) {
-	results := make([]llm.ContentBlock, len(toolUses))
+func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, out chan<- Event, tc HookContext) (results []llm.ContentBlock, err error) {
+	results = make([]llm.ContentBlock, len(toolUses))
+	for i := range toolUses {
+		if toolUses[i].TraceCallID == "" {
+			toolUses[i].TraceCallID = NewTraceInvocationID()
+		}
+	}
+	// Every return path (including preflight denials and malformed calls)
+	// carries the same occurrence key as its tool_use and emitted events.
+	defer func() {
+		for i := range results {
+			if i < len(toolUses) && results[i].Type == "tool_result" {
+				results[i].TraceCallID = toolUses[i].TraceCallID
+			}
+		}
+	}()
 	releaseBatch, batchAllowed, batchReason := l.Gate.TryAcquireToolDispatchLease()
 	if !batchAllowed {
 		for i, blk := range toolUses {
-			results[i] = emitToolDispatchDenial(ctx, out, blk, batchReason, "", "", NewTraceInvocationID())
+			results[i] = emitToolDispatchDenial(ctx, out, blk, batchReason, "", "", blk.TraceCallID)
 		}
 		return results, nil
 	}
@@ -342,7 +356,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	// before launching any goroutine.
 	asks := make([]*job, 0)
 	for i, b := range toolUses {
-		traceCallID := NewTraceInvocationID()
+		traceCallID := b.TraceCallID
 		dispatchEpoch, allowed, reason := l.beginToolDispatchAdmission()
 		if !allowed {
 			results[i] = emitToolDispatchDenial(ctx, out, b, reason, "", "", traceCallID)

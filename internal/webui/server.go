@@ -832,6 +832,14 @@ func (s *Server) writeHubEvent(w http.ResponseWriter, he hubEvent) {
 	for k, v := range he.extra {
 		payload[k] = v
 	}
+	// Provider tool_use_id values may repeat. Expose the agent's per-call
+	// identity so live clients can pair a result with its exact start row.
+	switch he.ev.Kind {
+	case agent.EventToolArgsDelta, agent.EventToolStart, agent.EventToolResult:
+		if he.ev.TraceCallID != "" {
+			payload["traceCallId"] = he.ev.TraceCallID
+		}
+	}
 	switch he.ev.Kind {
 	case agent.EventTokens:
 		payload["inputTokens"] = he.ev.InputTokens
