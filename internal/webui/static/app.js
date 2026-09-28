@@ -13,7 +13,7 @@ let desktopPreferences = { busyEnter: 'queue', sidebarView: 'grouped', sidebarSo
 const desktopPreferenceKeysEditedDuringInitialLoad = new Set();
 let lastStatusSnapshot = null;
 let statusRequestGeneration = 0;
-let subAgentDetailState = { agentId: '', trigger: null, data: null, loading: false, error: '', requestGeneration: 0 };
+let subAgentDetailState = { agentId: '', ownerSessionId: '', trigger: null, data: null, loading: false, error: '', requestGeneration: 0 };
 let subAgentDetailStream = null;
 let subAgentDetailStreamGeneration = 0;
 
@@ -93,7 +93,9 @@ const DESKTOP_I18N = {
     chat: 'Chat', trajectory: 'Trajectory', welcome: 'From idea to done', preview: 'METIS Desktop', sessionLog: 'Session log',
     composerPlaceholder: 'Describe what you want to build', jumpLatest: 'Jump to latest', details: 'Details', detailsPlaceholder: 'Select a tool row to inspect details',
     backToApp: 'Back to app', searchSettings: 'Search settings…', personal: 'Personal', general: 'General', appearance: 'Appearance',
-    modelProviders: 'Model Providers', agentPresets: 'Agent Presets', plugins: 'Plugins', computerUse: 'Computer Use', smartRouting: 'Smart Routing', configuration: 'Configuration'
+    modelProviders: 'Model Providers', agentPresets: 'Agent Presets', plugins: 'Plugins', computerUse: 'Computer Use', smartRouting: 'Smart Routing', configuration: 'Configuration',
+    artifacts: 'Artifacts', files: 'Files', addWorkspace: 'Add workspace', sessionViewOptions: 'Session view options', showArchivedSessions: 'Show archived sessions',
+    layout: 'Layout', groupByWorkspace: 'Grouped by workspace', flatList: 'Flat list', sort: 'Sort', mostRecent: 'Most recent', name: 'Name', manualOrder: 'Manual order', pageNavigation: 'Page navigation'
   },
   'zh-CN': {
     newSession: '新会话', workspaces: '工作区', searchSessions: '搜索会话…', settings: '设置', checkUpdates: '检查更新',
@@ -102,7 +104,9 @@ const DESKTOP_I18N = {
     chat: '对话', trajectory: '轨迹', welcome: '从想法，到完成', preview: 'METIS Desktop', sessionLog: '会话日志',
     composerPlaceholder: '描述你想要构建的内容', jumpLatest: '回到最新', details: '详情', detailsPlaceholder: '点击消息流中的工具行查看详情',
     backToApp: '返回应用', searchSettings: '搜索设置…', personal: '个人', general: '通用', appearance: '外观',
-    modelProviders: '模型提供商', agentPresets: '代理预设', plugins: '插件', computerUse: '电脑操作', smartRouting: '智能路由', configuration: '配置'
+    modelProviders: '模型提供商', agentPresets: '代理预设', plugins: '插件', computerUse: '电脑操作', smartRouting: '智能路由', configuration: '配置',
+    artifacts: '产物', files: '文件', addWorkspace: '添加工作区', sessionViewOptions: '会话列表选项', showArchivedSessions: '显示已归档会话',
+    layout: '布局', groupByWorkspace: '按工作区分组', flatList: '平铺列表', sort: '排序', mostRecent: '最近更新', name: '名称', manualOrder: '手动排序', pageNavigation: '页面导航'
   }
 };
 
@@ -125,6 +129,8 @@ function applyLanguage(value) {
   if (lastStatusSnapshot) renderStatusSnapshot(lastStatusSnapshot);
   if (typeof subAgentDetailState !== 'undefined' && subAgentDetailState.agentId) renderSubAgentDetails();
   if (typeof renderSessions === 'function') renderSessions();
+  if (typeof refreshMessageActionTimesLanguage === 'function') refreshMessageActionTimesLanguage();
+  if (typeof window !== 'undefined' && window.metisNavigation && typeof window.metisNavigation.refresh === 'function') window.metisNavigation.refresh();
 }
 
 function presetDisplayName(id) {
@@ -400,11 +406,16 @@ function showToast(msg) {
 // the conversation it belongs to and only exposed non-interactive names.
 async function pollStatus(shouldApply = () => true) {
   const generation = ++statusRequestGeneration;
+  const selectedSessionId = String(currentSessionId || '');
+  const viewGeneration = typeof resumeSessionGeneration === 'number' ? resumeSessionGeneration : 0;
   try {
-    const res = await fetch('/api/status');
+    const url = selectedSessionId ? '/api/status?sessionId=' + encodeURIComponent(selectedSessionId) : '/api/status';
+    const res = await fetch(url);
     if (!res.ok) return;
     const d = await res.json();
-    if (generation !== statusRequestGeneration || !shouldApply()) return;
+    if (generation !== statusRequestGeneration || !shouldApply() ||
+        selectedSessionId !== String(currentSessionId || '') ||
+        viewGeneration !== (typeof resumeSessionGeneration === 'number' ? resumeSessionGeneration : 0)) return;
     d.requestGeneration = generation;
     lastStatusSnapshot = d;
     renderStatusSnapshot(d);
@@ -417,16 +428,24 @@ function renderStatusSnapshot(d) {
     const chip = document.getElementById('statusChip');
     if (!chip) return;
     const dict = DESKTOP_I18N[document.documentElement.lang] || DESKTOP_I18N['zh-CN'];
-    const n = d.subAgents || 0, m = d.backgroundTasks || 0;
-    if (n === 0 && m === 0) {
+    const selectedSessionId = String(currentSessionId || '');
+    const roster = statusRosterForSelectedSession(d);
+    const n = roster ? Number(roster.subAgents) || 0 : 0;
+    const m = roster ? Number(roster.backgroundTasks) || 0 : 0;
+    const visibleAgents = statusSubAgentsForSelectedSession(d);
+    if (subAgentDetailState.agentId && subAgentDetailState.ownerSessionId !== selectedSessionId) {
+      closeSubAgentDetails(false);
+    }
+    if (!roster || (n === 0 && m === 0 && visibleAgents.length === 0 && (!Array.isArray(roster.jobs) || roster.jobs.length === 0))) {
       chip.style.display = 'none';
       closeStatusPopover();
     } else {
       chip.style.display = '';
-      chip.innerHTML = `<svg class="agent-status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.4" cy="5.2" r="2.1"/><circle cx="11.3" cy="6.4" r="1.65"/><path d="M1.9 13c.35-2.25 1.6-3.45 3.5-3.45S8.55 10.75 8.9 13M9.2 12.8c.23-1.55 1.08-2.38 2.45-2.38 1.32 0 2.1.76 2.38 2.18"/></svg><span>${n} ${escHtml(dict.subAgents)}</span><span class="agent-status-divider" aria-hidden="true"></span><span>${m} ${escHtml(dict.backgroundTasks)}</span>`;
+      const listedAgents = Math.max(n, visibleAgents.length);
+      chip.innerHTML = `<svg class="agent-status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.4" cy="5.2" r="2.1"/><circle cx="11.3" cy="6.4" r="1.65"/><path d="M1.9 13c.35-2.25 1.6-3.45 3.5-3.45S8.55 10.75 8.9 13M9.2 12.8c.23-1.55 1.08-2.38 2.45-2.38 1.32 0 2.1.76 2.38 2.18"/></svg><span>${listedAgents} ${escHtml(dict.subAgents)}</span><span class="agent-status-divider" aria-hidden="true"></span><span>${m} ${escHtml(dict.backgroundTasks)}</span>`;
       const title = subAgentText('View sub-agent activity', '查看子代理活动');
       chip.title = title;
-      chip.setAttribute('aria-label', title + ': ' + n + ' ' + dict.subAgents + ', ' + m + ' ' + dict.backgroundTasks);
+      chip.setAttribute('aria-label', title + ': ' + listedAgents + ' ' + dict.subAgents + ', ' + m + ' ' + dict.backgroundTasks);
     }
     const pop = document.getElementById('statusPopover');
     if (pop && pop.style.display !== 'none') renderStatusPopover();
@@ -545,12 +564,29 @@ function subAgentStatusLabel(status) {
   return labels[status] || subAgentText('Unknown', '未知');
 }
 
+function statusRosterForSelectedSession(snapshot) {
+  const selectedSessionId = String(currentSessionId || '');
+  const roster = snapshot && snapshot.viewRoster;
+  if (!selectedSessionId || !roster || String(roster.sessionId || '') !== selectedSessionId) return null;
+  return roster;
+}
+
+function statusSubAgentsForSelectedSession(snapshot) {
+  const roster = statusRosterForSelectedSession(snapshot);
+  if (!roster) return [];
+  const selectedSessionId = String(currentSessionId || '');
+  return (Array.isArray(roster.agents) ? roster.agents : []).filter(agent =>
+    String(agent.sessionId || '') === selectedSessionId);
+}
+
 function renderStatusPopover() {
   const pop = document.getElementById('statusPopover');
   if (!pop) return;
   const d = lastStatusSnapshot || {};
-  const agents = Array.isArray(d.agents) ? d.agents : [];
-  const jobs = Array.isArray(d.jobs) ? d.jobs : [];
+  const roster = statusRosterForSelectedSession(d);
+  const agents = statusSubAgentsForSelectedSession(d);
+  const jobs = roster && Array.isArray(roster.jobs) ? roster.jobs.filter(job =>
+    !job.sessionId || String(job.sessionId) === String(currentSessionId || '')) : [];
   const rows = [];
   if (agents.length) {
     rows.push('<div class="status-popover-label">' + escHtml(subAgentText('Sub-agents', '子代理')) + '</div>');
@@ -558,10 +594,10 @@ function renderStatusPopover() {
       const agentID = String(a.agentId || '');
       const canOpen = !!agentID;
       rows.push('<button type="button" class="status-popover-row status-agent-row"' +
-        (canOpen ? ' data-subagent-id="' + escAttr(agentID) + '"' : ' disabled') +
+        (canOpen ? ' data-subagent-id="' + escAttr(agentID) + '" data-subagent-session-id="' + escAttr(currentSessionId) + '"' : ' disabled') +
         (canOpen ? ' title="' + escAttr(subAgentText('Open sub-agent details', '查看子代理详情')) + '"' : '') + '>' +
         '<span class="status-dot ' + subAgentStatusClass(a.status || '') + '"></span>' +
-        '<span class="status-agent-name"><strong>' + escHtml(a.name || a.agentId || 'agent') + '</strong><small>' + escHtml(subAgentText('Open live output', '打开实时输出')) + '</small></span>' +
+        '<span class="status-agent-name"><strong>' + escHtml(a.name || a.agentId || 'agent') + '</strong><small>' + escHtml(a.status === 'running' ? subAgentText('Open live output', '打开实时输出') : subAgentText('Open output', '查看输出')) + '</small></span>' +
         '<span class="status-agent-state">' + escHtml(subAgentStatusLabel(a.status || '')) + '</span>' +
       '</button>');
     });
@@ -571,7 +607,7 @@ function renderStatusPopover() {
     jobs.forEach(j => rows.push('<div class="status-popover-row"><span class="status-dot ' + subAgentStatusClass(j.status || '') + '"></span><span>' + escHtml(j.description || j.id || 'task') + '</span><small>' + escHtml(subAgentStatusLabel(j.status || '')) + '</small></div>'));
   }
   pop.innerHTML = rows.join('') || '<div class="status-popover-empty">' + escHtml(subAgentText('No active agents or tasks', '没有正在运行的子代理或后台任务')) + '</div>';
-  pop.querySelectorAll('[data-subagent-id]').forEach(row => row.addEventListener('click', () => openSubAgentDetails(row.dataset.subagentId, row)));
+  pop.querySelectorAll('[data-subagent-id]').forEach(row => row.addEventListener('click', () => openSubAgentDetails(row.dataset.subagentId, row, row.dataset.subagentSessionId)));
 }
 
 document.addEventListener('click', e => {
@@ -595,17 +631,26 @@ function initSubAgentDetails() {
   });
 }
 
-function openSubAgentDetails(agentID, trigger) {
+// The transcript supplies its parent session explicitly. The header roster
+// instead derives it from the currently selected session's status snapshot.
+// The server repeats this check against the child's persisted parent before
+// returning output; an agent ID alone is never an ownership credential.
+function openSubAgentDetails(agentID, trigger, ownerSessionID) {
   agentID = String(agentID || '').trim();
-  if (!agentID) return;
-  const sameAgent = subAgentDetailState.agentId === agentID;
+  const selectedSessionID = String(currentSessionId || '');
+  const explicitOwner = String(ownerSessionID || '');
+  const rosterOwnsAgent = statusSubAgentsForSelectedSession(lastStatusSnapshot || {}).some(agent => String(agent.agentId || '') === agentID);
+  const owner = explicitOwner || (rosterOwnsAgent ? selectedSessionID : '');
+  if (!agentID || !selectedSessionID || owner !== selectedSessionID) return false;
+  const overlay = document.getElementById('subAgentDetailOverlay');
+  if (!overlay) return false;
+  const sameAgent = subAgentDetailState.agentId === agentID && subAgentDetailState.ownerSessionId === owner;
   subAgentDetailState.agentId = agentID;
+  subAgentDetailState.ownerSessionId = owner;
   subAgentDetailState.trigger = trigger || document.getElementById('statusChip');
   subAgentDetailState.error = '';
   subAgentDetailState.loading = false;
   if (!sameAgent) subAgentDetailState.data = null;
-  const overlay = document.getElementById('subAgentDetailOverlay');
-  if (!overlay) return;
   overlay.hidden = false;
   document.body.classList.add('subagent-detail-open');
   closeStatusPopover();
@@ -613,20 +658,22 @@ function openSubAgentDetails(agentID, trigger) {
   const dialog = overlay.querySelector('.subagent-detail-dialog');
   requestAnimationFrame(() => dialog && dialog.focus());
   startSubAgentDetailStream(agentID);
+  return true;
 }
 
-function closeSubAgentDetails() {
+function closeSubAgentDetails(restoreFocus = true) {
   const overlay = document.getElementById('subAgentDetailOverlay');
   if (overlay) overlay.hidden = true;
   document.body.classList.remove('subagent-detail-open');
   const trigger = subAgentDetailState.trigger;
   subAgentDetailState.agentId = '';
+  subAgentDetailState.ownerSessionId = '';
   subAgentDetailState.trigger = null;
   subAgentDetailState.loading = false;
   subAgentDetailState.error = '';
   subAgentDetailState.requestGeneration++;
   stopSubAgentDetailStream();
-  if (trigger && typeof trigger.focus === 'function') trigger.focus();
+  if (restoreFocus && trigger && typeof trigger.focus === 'function') trigger.focus();
 }
 
 function stopSubAgentDetailStream() {
@@ -639,6 +686,7 @@ function stopSubAgentDetailStream() {
 
 function subAgentStreamIsCurrent(agentID, generation, source) {
   return subAgentDetailState.agentId === agentID &&
+    subAgentDetailState.ownerSessionId === String(currentSessionId || '') &&
     subAgentDetailStreamGeneration === generation &&
     subAgentDetailStream === source;
 }
@@ -650,7 +698,8 @@ function subAgentStreamPayload(event) {
 function applySubAgentStreamSnapshot(agentID, generation, source, payload) {
   if (!subAgentStreamIsCurrent(agentID, generation, source) || !payload || !payload.agent) return;
   const next = payload.agent;
-  if (next.agentId && String(next.agentId) !== agentID) return;
+  if (String(next.agentId || '') !== agentID) return;
+  if (String(next.sessionId || '') !== subAgentDetailState.ownerSessionId) return;
   subAgentDetailState.data = next;
   subAgentDetailState.loading = false;
   subAgentDetailState.error = '';
@@ -659,6 +708,8 @@ function applySubAgentStreamSnapshot(agentID, generation, source, payload) {
 
 function applySubAgentStreamDelta(agentID, generation, source, payload) {
   if (!subAgentStreamIsCurrent(agentID, generation, source) || !payload) return;
+  if (String(payload.agentId || '') !== agentID) return;
+  if (String(payload.sessionId || '') !== subAgentDetailState.ownerSessionId) return;
   const current = subAgentDetailState.data || { agentId: agentID, output: '' };
   const next = Object.assign({}, current, payload);
   delete next.delta;
@@ -674,6 +725,8 @@ function applySubAgentStreamDelta(agentID, generation, source, payload) {
 // assistant message just because both runs happen at the same time.
 function startSubAgentDetailStream(agentID) {
   stopSubAgentDetailStream();
+  const ownerSessionID = subAgentDetailState.ownerSessionId;
+  if (!ownerSessionID || ownerSessionID !== String(currentSessionId || '')) return;
   if (!window || !window.EventSource) {
     refreshSubAgentDetails();
     return;
@@ -681,7 +734,7 @@ function startSubAgentDetailStream(agentID) {
   const generation = ++subAgentDetailStreamGeneration;
   subAgentDetailState.loading = !subAgentDetailState.data;
   renderSubAgentDetails();
-  const source = new window.EventSource('/api/subagents/' + encodeURIComponent(agentID) + '/events');
+  const source = new window.EventSource('/api/subagents/' + encodeURIComponent(agentID) + '/events?sessionId=' + encodeURIComponent(ownerSessionID));
   subAgentDetailStream = source;
   source.addEventListener('snapshot', event => {
     applySubAgentStreamSnapshot(agentID, generation, source, subAgentStreamPayload(event));
@@ -713,22 +766,24 @@ function startSubAgentDetailStream(agentID) {
 
 async function refreshSubAgentDetails() {
   const agentID = subAgentDetailState.agentId;
-  if (!agentID || subAgentDetailState.loading && subAgentDetailState.requestGeneration > 0) return;
+  const ownerSessionID = subAgentDetailState.ownerSessionId;
+  if (!agentID || !ownerSessionID || ownerSessionID !== String(currentSessionId || '') || subAgentDetailState.loading && subAgentDetailState.requestGeneration > 0) return;
   const generation = ++subAgentDetailState.requestGeneration;
   subAgentDetailState.loading = true;
   renderSubAgentDetails();
   try {
-    const response = await fetch('/api/subagents/' + encodeURIComponent(agentID), { cache: 'no-store' });
+    const response = await fetch('/api/subagents/' + encodeURIComponent(agentID) + '?sessionId=' + encodeURIComponent(ownerSessionID), { cache: 'no-store' });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.error || subAgentText('Unable to load sub-agent details.', '无法读取子代理详情。'));
-    if (subAgentDetailState.agentId !== agentID || subAgentDetailState.requestGeneration !== generation) return;
+    if (subAgentDetailState.agentId !== agentID || subAgentDetailState.ownerSessionId !== ownerSessionID || subAgentDetailState.requestGeneration !== generation || String(currentSessionId || '') !== ownerSessionID) return;
+    if (payload.agent && (String(payload.agent.agentId || '') !== agentID || String(payload.agent.sessionId || '') !== ownerSessionID)) throw new Error(subAgentText('This sub-agent belongs to another session.', '这个子代理属于其他会话。'));
     subAgentDetailState.data = payload.agent || null;
     subAgentDetailState.error = '';
   } catch (error) {
-    if (subAgentDetailState.agentId !== agentID || subAgentDetailState.requestGeneration !== generation) return;
+    if (subAgentDetailState.agentId !== agentID || subAgentDetailState.ownerSessionId !== ownerSessionID || subAgentDetailState.requestGeneration !== generation || String(currentSessionId || '') !== ownerSessionID) return;
     subAgentDetailState.error = error && error.message || subAgentText('Unable to load sub-agent details.', '无法读取子代理详情。');
   } finally {
-    if (subAgentDetailState.agentId === agentID && subAgentDetailState.requestGeneration === generation) {
+    if (subAgentDetailState.agentId === agentID && subAgentDetailState.ownerSessionId === ownerSessionID && subAgentDetailState.requestGeneration === generation && String(currentSessionId || '') === ownerSessionID) {
       subAgentDetailState.loading = false;
       renderSubAgentDetails();
     }
@@ -750,6 +805,10 @@ function renderSubAgentDetails() {
   const body = document.getElementById('subAgentDetailBody');
   if (!overlay || overlay.hidden || !title || !subtitle || !body) return;
   const state = subAgentDetailState;
+  if (state.ownerSessionId !== String(currentSessionId || '')) {
+    closeSubAgentDetails(false);
+    return;
+  }
   body.setAttribute('aria-busy', state.loading ? 'true' : 'false');
   if (state.loading && !state.data) {
     title.textContent = subAgentText('Sub-agent details', '子代理详情');

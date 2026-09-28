@@ -7,6 +7,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.78] - 2026-09-28
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Changed
+
+- Refine Desktop conversation spacing, composer controls, sidebar, and activity
+  groups. Completed turns show a compact activity summary while expanded turns
+  retain individual tool results and errors.
+- Show sub-agent work as a distinct stage in the conversation. Its detail view
+  follows live output and remains available when a saved session is reopened.
+
+### Fixed
+
+- Persist sub-agent lifecycle and final status independently of the parent
+  turn, and keep child events attached to the correct session and trace.
+- Bind newly created CLI sessions to their sub-agent transcript before the
+  first tool invocation.
+
 ## [0.4.77] - 2026-09-26
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
@@ -1668,7 +1688,9 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.48...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.78...HEAD
+[0.4.78]: https://github.com/Ricardo-M-L/metis/compare/v0.4.77...v0.4.78
+[0.4.77]: https://github.com/Ricardo-M-L/metis/compare/v0.4.76...v0.4.77
 [0.4.48]: https://github.com/Ricardo-M-L/metis/compare/v0.4.47...v0.4.48
 [0.4.47]: https://github.com/Ricardo-M-L/metis/compare/v0.4.46...v0.4.47
 [0.4.46]: https://github.com/Ricardo-M-L/metis/compare/v0.4.45...v0.4.46

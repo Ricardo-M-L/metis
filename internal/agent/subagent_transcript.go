@@ -23,8 +23,10 @@ package agent
 // users get familiar geography.
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +36,33 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
+
+// LoadSubAgentHeader reads only the immutable first JSONL record. Desktop
+// uses it to check parent-session ownership without scanning a growing child
+// transcript on every live detail request.
+func LoadSubAgentHeader(sessionDir, agentID string) (pubsess.Header, error) {
+	if sessionDir == "" || agentID == "" {
+		return pubsess.Header{}, fmt.Errorf("subagent transcript: sessionDir + agentID both required")
+	}
+	path := filepath.Join(sessionDir, SubAgentTranscriptDirname, agentID+".jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		return pubsess.Header{}, err
+	}
+	defer f.Close()
+	line, err := bufio.NewReader(io.LimitReader(f, 64<<10)).ReadBytes('\n')
+	if err != nil {
+		return pubsess.Header{}, fmt.Errorf("read subagent header: %w", err)
+	}
+	var entry subagentEntry
+	if err := json.Unmarshal(line, &entry); err != nil {
+		return pubsess.Header{}, fmt.Errorf("decode subagent header: %w", err)
+	}
+	if entry.Type != "header" || entry.Header == nil || entry.Header.ID != agentID {
+		return pubsess.Header{}, fmt.Errorf("invalid subagent header for %q", agentID)
+	}
+	return *entry.Header, nil
+}
 
 // SubAgentTranscriptDirname is the subdirectory under the main session
 // directory where sub-agent JSONLs live. Exported so the slash command
@@ -46,15 +75,30 @@ const SubAgentTranscriptDirname = "subagents"
 type SubAgentSnapshot struct {
 	Header   pubsess.Header
 	Messages []llm.Message
+	Terminal *SubAgentTerminal
+}
+
+// SubAgentTerminal records the last known lifecycle state independently of
+// the parent turn. A background child can finish after its parent tool_result
+// has already been saved, so that result cannot be the source of final status.
+type SubAgentTerminal struct {
+	Status     string    `json:"status"`
+	Background bool      `json:"background"`
+	EndedAt    time.Time `json:"endedAt"`
+	Output     string    `json:"output,omitempty"`
+	Result     string    `json:"result,omitempty"`
+	StopHint   string    `json:"stopHint,omitempty"`
+	ExitError  string    `json:"exitError,omitempty"`
 }
 
 // subagentEntry mirrors the JSONL line shape used for the main
 // internal/session.Entry. Kept private here so the file format
 // stays opaque to callers — they only see SubAgentSnapshot.
 type subagentEntry struct {
-	Type    string          `json:"type"` // "header" | "message"
-	Header  *pubsess.Header `json:"header,omitempty"`
-	Message *llm.Message    `json:"message,omitempty"`
+	Type     string            `json:"type"` // "header" | "message" | "terminal"
+	Header   *pubsess.Header   `json:"header,omitempty"`
+	Message  *llm.Message      `json:"message,omitempty"`
+	Terminal *SubAgentTerminal `json:"terminal,omitempty"`
 }
 
 // SubAgentTranscript is the per-sub-agent writer. Owns an open file
@@ -103,6 +147,16 @@ func (t *SubAgentTranscript) AppendMessage(m llm.Message) error {
 		return nil
 	}
 	return t.writeEntry(subagentEntry{Type: "message", Message: &m})
+}
+
+// AppendTerminal is called after the child has finished and its private
+// resources have been joined. It makes the status and final output available
+// to Desktop after a process restart or roster eviction.
+func (t *SubAgentTranscript) AppendTerminal(terminal SubAgentTerminal) error {
+	if t == nil || t.f == nil {
+		return nil
+	}
+	return t.writeEntry(subagentEntry{Type: "terminal", Terminal: &terminal})
 }
 
 // Close flushes and closes the underlying file. Safe to call on nil.
@@ -184,6 +238,12 @@ func LoadSubAgentSnapshot(sessionDir, agentID string) (*SubAgentSnapshot, error)
 				return nil, fmt.Errorf("subagent transcript line %d: message entry with nil message", i+1)
 			}
 			snap.Messages = append(snap.Messages, *e.Message)
+		case "terminal":
+			if e.Terminal == nil {
+				return nil, fmt.Errorf("subagent transcript line %d: terminal entry with nil terminal", i+1)
+			}
+			terminal := *e.Terminal
+			snap.Terminal = &terminal
 		default:
 			return nil, fmt.Errorf("subagent transcript line %d: unknown entry type %q", i+1, e.Type)
 		}

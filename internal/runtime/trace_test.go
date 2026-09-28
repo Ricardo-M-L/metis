@@ -137,6 +137,33 @@ func TestChildLoopDoneDoesNotCloseTopLevelTurn(t *testing.T) {
 	}
 }
 
+func TestSubAgentLifecycleKeepsOriginalTraceAfterSessionSwitch(t *testing.T) {
+	store, err := session.NewTraceStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	adapter := NewTraceAdapter(store)
+	adapter.SetSession("owner")
+	const invocationID = "child-invocation"
+	adapter.OnEvent(agent.Event{Kind: agent.EventToolStart, ToolName: "Agent", ToolUseID: "parent-tool", TraceInvocationID: invocationID})
+	adapter.OnEvent(agent.Event{Kind: agent.EventTraceInvocationStart, TraceInvocationID: invocationID})
+	adapter.OnEvent(agent.Event{Kind: agent.EventSubAgentStart, SubAgentParentID: "parent-tool", SubAgentID: "child", TraceInvocationID: invocationID})
+	adapter.OnEvent(agent.Event{Kind: agent.EventToolResult, ToolName: "Agent", ToolUseID: "parent-tool", TraceInvocationID: invocationID})
+	adapter.SetSession("other")
+	adapter.OnEvent(agent.Event{Kind: agent.EventSubAgentEnd, SubAgentParentID: "parent-tool", SubAgentID: "child", TraceInvocationID: invocationID})
+	adapter.OnEvent(agent.Event{Kind: agent.EventTraceInvocationEnd, TraceInvocationID: invocationID})
+
+	owner := store.Events("owner")
+	if len(owner) != 4 || owner[1].Kind != "subagent_start" || owner[3].Kind != "subagent_end" || owner[3].TraceInvocationID != invocationID {
+		t.Fatalf("child lifecycle lost its owner: %+v", owner)
+	}
+	if other := store.Events("other"); len(other) != 0 {
+		t.Fatalf("child lifecycle polluted selected session: %+v", other)
+	}
+}
+
 func TestTopLevelErrorClosesTurnBeforeNextUserMessage(t *testing.T) {
 	dir := t.TempDir()
 	store, err := session.NewTraceStore(dir)

@@ -25,6 +25,11 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 
+AGENT_FIXTURE_MARKER = "[agent-fixture]"
+AGENT_CHILD_PROMPT = "CHILD_FIXTURE_TASK_1"
+AGENT_CALL_PREFIX = "call_fixture_agent_"
+
+
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -60,6 +65,25 @@ def last_user_input(body: dict) -> str:
                 return content
             return "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
     return "fixture request"
+
+
+def agent_fixture_phase(body: dict, user_input: str) -> str:
+    """Select the opt-in, three-request Agent exchange from Responses input."""
+    items = body.get("input", body.get("messages", []))
+    if not isinstance(items, list):
+        items = []
+    last_user = max((index for index, item in enumerate(items)
+                     if isinstance(item, dict) and item.get("role") == "user"), default=-1)
+    last_result = max((index for index, item in enumerate(items)
+                       if isinstance(item, dict) and item.get("type") == "function_call_output"
+                       and str(item.get("call_id", "")).startswith(AGENT_CALL_PREFIX)), default=-1)
+    if last_result > last_user:
+        return "parent_final"
+    if AGENT_CHILD_PROMPT in user_input:
+        return "child_stream"
+    if AGENT_FIXTURE_MARKER in user_input:
+        return "parent_call"
+    return "echo"
 
 
 def handler_for(fixture: Fixture):
@@ -117,17 +141,33 @@ def handler_for(fixture: Fixture):
                 return
             user_input = last_user_input(body)
             memory_extraction = user_input.startswith("Extract any DURABLE facts from this user-assistant exchange")
+            phase = "memory_extraction" if memory_extraction else agent_fixture_phase(body, user_input)
             with fixture.lock:
                 number = len(fixture.calls) + 1
-                entry = {"number": number, "kind": "memory_extraction" if memory_extraction else "agent_turn", "input": user_input, "model": body.get("model"), "started": time.time(), "state": "streaming"}
+                entry = {"number": number, "kind": "memory_extraction" if memory_extraction else "agent_turn", "phase": phase, "input": user_input, "model": body.get("model"), "started": time.time(), "state": "streaming"}
                 fixture.calls.append(entry)
             fixture.record({"event": "started", **entry})
-            gate_match = None if memory_extraction else re.search(r"\[gate:([A-Za-z0-9_-]+)\]", user_input)
-            delay_match = None if memory_extraction else re.search(r"\[slow:(\d+)\]", user_input)
-            text = "[]" if memory_extraction else f"FIXTURE_REPLY_{number}: {user_input[-500:]}"
+            gate_match = re.search(r"\[gate:([A-Za-z0-9_-]+)\]", user_input) if phase in ("echo", "child_stream") else None
+            delay_match = re.search(r"\[slow:(\d+)\]", user_input) if phase in ("echo", "child_stream") else None
+            if phase == "memory_extraction":
+                text = "[]"
+            elif phase == "child_stream":
+                text = f"CHILD_FIXTURE_STREAM_{number}: Inspecting the isolated workspace. Child task complete."
+            elif phase == "parent_final":
+                text = f"FIXTURE_AGENT_FINAL_{number}: The sub-agent completed its task."
+            else:
+                text = f"FIXTURE_REPLY_{number}: {user_input[-500:]}"
             response_id = f"resp_fixture_{number}"
             message_id = f"msg_fixture_{number}"
-            output = [{"type": "message", "id": message_id, "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}]
+            if phase == "parent_call":
+                child_controls = " ".join(re.findall(r"\[(?:gate:[A-Za-z0-9_-]+|slow:\d+)\]", user_input))
+                child_prompt = AGENT_CHILD_PROMPT + (" " + child_controls if child_controls else "")
+                output = [{"type": "function_call", "id": f"fc_fixture_agent_{number}",
+                           "call_id": f"{AGENT_CALL_PREFIX}{number}", "name": "Agent",
+                           "arguments": json.dumps({"prompt": child_prompt, "name": "probe", "isolation": "none"}),
+                           "status": "completed"}]
+            else:
+                output = [{"type": "message", "id": message_id, "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}]
             envelope = {"id": response_id, "object": "response", "status": "completed", "model": body.get("model"), "output": output, "usage": {"input_tokens": 128, "output_tokens": 16, "total_tokens": 144, "input_tokens_details": {"cached_tokens": 64}}}
             if not body.get("stream"):
                 self.send_json(envelope)
@@ -151,8 +191,23 @@ def handler_for(fixture: Fixture):
                     self.wfile.flush()
 
                 emit("response.created", response={**envelope, "status": "in_progress", "output": []})
+                if phase == "parent_call":
+                    emit("response.output_item.added", output_index=0, item={"type": "function_call", "id": output[0]["id"],
+                         "call_id": output[0]["call_id"], "name": "Agent", "status": "in_progress"})
+                    emit("response.output_item.done", output_index=0, item=output[0])
+                    emit("response.completed", response=envelope)
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    entry["state"] = "completed"
+                    entry["completed"] = time.time()
+                    fixture.record({"event": "completed", **entry})
+                    return
                 emit("response.output_item.added", output_index=0, item={"type": "message", "id": message_id, "role": "assistant", "status": "in_progress", "content": []})
-                emit("response.output_text.delta", output_index=0, item_id=message_id, content_index=0, delta=f"FIXTURE_REPLY_{number}: ")
+                first_delta = (text[:len(text) // 2] if phase == "child_stream" else
+                               f"FIXTURE_REPLY_{number}: " if phase == "echo" else text)
+                emit("response.output_text.delta", output_index=0, item_id=message_id, content_index=0, delta=first_delta)
+                if phase == "child_stream":
+                    fixture.stopped.wait(0.3)
                 deadline = time.monotonic() + (min(int(delay_match.group(1)), 120) if delay_match else 0)
                 wait_gate = fixture.gate(gate_match.group(1)) if gate_match else None
                 while not fixture.stopped.is_set() and (time.monotonic() < deadline or (wait_gate and not wait_gate.is_set())):
@@ -161,7 +216,9 @@ def handler_for(fixture: Fixture):
                     fixture.stopped.wait(0.15)
                 if fixture.stopped.is_set():
                     return
-                emit("response.output_text.delta", output_index=0, item_id=message_id, content_index=0, delta=user_input[-500:])
+                remainder = text[len(first_delta):]
+                if remainder:
+                    emit("response.output_text.delta", output_index=0, item_id=message_id, content_index=0, delta=remainder)
                 emit("response.output_text.done", output_index=0, item_id=message_id, content_index=0, text=text)
                 emit("response.output_item.done", output_index=0, item=output[0])
                 emit("response.completed", response=envelope)
@@ -220,6 +277,8 @@ skill_dir = "{home}/skills"
 max_iterations = 5
 [permission]
 mode = "default"
+[[permission.allow]]
+tool = "Agent"
 '''
     (home / "config.toml").write_text(config)
     (home / "config.toml").chmod(0o600)

@@ -241,8 +241,15 @@ func TestBackgroundTraceInvocationEndsOnlyAfterChildRunExitsOnError(t *testing.T
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		var ends int
+		var terminalBeforeEnd bool
 		for _, ev := range capture.snapshot() {
+			if ev.Kind == agent.EventSubAgentEnd && ev.TraceInvocationID == "background-error-internal" {
+				terminalBeforeEnd = true
+			}
 			if ev.Kind == agent.EventTraceInvocationEnd && ev.TraceInvocationID == "background-error-internal" {
+				if !terminalBeforeEnd {
+					t.Fatal("background child terminal was emitted after trace origin ended")
+				}
 				ends++
 			}
 		}

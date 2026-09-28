@@ -16,6 +16,29 @@ func TestAutomationsBrowserBehavior(t *testing.T) {
 		t.Fatal(err)
 	}
 	tests := []struct{ name, body string }{
+		{"empty-state controls follow task inventory", `
+server = async () => response({automations:[],scheduler:{enabled:false,available:true}});
+c.showAutomationsPage(); await new Promise(setImmediate);
+assert.equal(get('#automationHeaderCreate').hidden,true,'empty state owns the only create action');
+assert.equal(get('.automations-toolbar').hidden,true,'search and filters have no tasks to manage');
+assert.equal((get('#automationList').innerHTML.match(/data-automation-action="create"/g)||[]).length,1);
+assert.match(get('#automationScheduler').innerHTML,/automation-scheduler is-paused/);
+server = async () => response({automations:[job()],scheduler:{enabled:true,available:true}});
+await c.loadAutomations();
+assert.equal(get('#automationHeaderCreate').hidden,false,'header create returns when tasks exist');
+assert.equal(get('.automations-toolbar').hidden,false);
+assert.doesNotMatch(get('#automationList').innerHTML,/data-automation-action="create"/);
+state.query='no-match'; c.renderAutomations();
+assert.equal(get('.automations-toolbar').hidden,false,'filtered empties keep the search controls');
+assert.match(get('#automationList').innerHTML,/清除筛选/);
+state.query=''; server = async () => response({automations:[],scheduler:{enabled:false,available:true}});
+await c.loadAutomations();
+assert.equal(get('#automationHeaderCreate').hidden,true,'deleting the final task restores the first-task view');
+assert.equal(get('.automations-toolbar').hidden,true);
+c.document.documentElement.lang='en'; c.showAutomationsPage(); await new Promise(setImmediate);
+assert.match(get('#automationList').innerHTML,/Create your first task/);
+assert.equal(get('#automationHeaderCreate').hidden,true);
+`},
 		{"server state and safe rendering", `
 server = async () => response({automations:[job({name:'<img onerror=bad()>',prompt:'<script>bad()</script>'})],scheduler:{enabled:false,available:true},workspace:'/workspace',model:'local-model'});
 c.showAutomationsPage(); await new Promise(setImmediate);

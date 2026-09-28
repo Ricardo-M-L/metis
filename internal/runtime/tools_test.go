@@ -122,6 +122,40 @@ func TestBuildToolRegistry_AgentToolHasModelAndSystem(t *testing.T) {
 	}
 }
 
+func TestAgentPersistenceSurvivesSessionIDAssignedAfterRegistryBuild(t *testing.T) {
+	previous := CurrentSessionID()
+	SetCurrentSessionID("")
+	t.Cleanup(func() { SetCurrentSessionID(previous) })
+	dir := t.TempDir()
+	cfg := &config.Config{}
+	cfg.Session.Dir = dir
+	provider := environmentRecoveryProvider{}
+	reg := BuildToolRegistry(ToolRegistryOptions{
+		Cfg: cfg, Gate: permission.New(permission.ModeBypass), Provider: provider,
+		Model: "environment-test", System: "sys", Roster: agent.NewRoster(2),
+		ChannelRegistry: channels.NewRegistry(),
+	})
+	// Desktop allocates a fresh session after building the initial registry.
+	builtin.RebindProviderTools(reg, provider, "environment-test", "sys", "parent-session")
+	raw, ok := reg.Get("Agent")
+	if !ok {
+		t.Fatal("Agent tool missing")
+	}
+	result, err := raw.Execute(context.Background(), map[string]any{"prompt": "inspect", "name": "probe"})
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("Agent.Execute = %+v, %v", result, err)
+	}
+	meta, ok := result.Presentation["subagent"].(map[string]any)
+	if !ok || meta["sessionId"] != "parent-session" {
+		t.Fatalf("wrong parent metadata: %#v", result.Presentation)
+	}
+	agentID, _ := meta["agentId"].(string)
+	header, err := agent.LoadSubAgentHeader(dir, agentID)
+	if err != nil || header.SubAgentOf != "parent-session" {
+		t.Fatalf("child transcript ownership = %+v, %v", header, err)
+	}
+}
+
 func TestBuildToolRegistryWiresEnvironmentRecoveryIntoAgent(t *testing.T) {
 	memory := &recordingEnvironmentMemory{}
 	reg := BuildToolRegistry(ToolRegistryOptions{

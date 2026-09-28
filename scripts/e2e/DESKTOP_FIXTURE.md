@@ -41,6 +41,23 @@ calls; it does not synthesize application session state. `POST /fixture/stop`
 terminates the fixture's owned CLI process and local model service. The default
 maximum lifetime is 30 minutes; Ctrl-C also performs cleanup.
 
+Send `[agent-fixture]` in an isolated chat to exercise a deterministic real
+parent → `Agent` → child → parent Responses API exchange. The first model
+response contains a finalized `Agent` function call with name `probe`,
+`isolation: none`, and prompt `CHILD_FIXTURE_TASK_1`. The child returns two
+streamed text deltas; the parent's next model request, after its
+`function_call_output`, receives a final answer. The fixture-local config
+allows only the `Agent` tool without a permission prompt for this probe.
+Add `[gate:subagent]` to the same prompt to pause the child's stream after its
+first delta; release it through `/fixture/release` with `{"gate":"subagent"}`.
+The child also accepts `[slow:3]` to make the live detail easier to inspect.
+Other prompts retain the normal echo behavior. The evidence file records the
+phase names (`parent_call`, `child_stream`, `parent_final`) and submitted test
+input; it does not capture request headers, configured provider credentials,
+system prompts, or tool output. To check this
+contract without starting METIS, run
+`python3 -m unittest discover -s scripts/e2e -p 'test_desktop_fixture.py'`.
+
 ## Native Desktop without Apple signing
 
 Build the frontend and native wrapper using the repository's installed Wails CLI:

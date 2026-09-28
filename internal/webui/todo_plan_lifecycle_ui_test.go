@@ -61,6 +61,7 @@ vm.createContext(c);
 vm.runInContext(extract('let todoPlanItems =', 'let pendingAsk ='), c);
 vm.runInContext(extract('function setTurnRunning(', '// Detach transient DOM state'), c);
 vm.runInContext(extract('function handleBackgroundContinuation(d)', 'async function loadEffort'), c);
+vm.runInContext(extract('function closeMismatchedSubAgentDetails()', 'function newChat()'), c);
 vm.runInContext(extract('async function runTurnItem(', 'const MESSAGE_ACTION_ICONS'), c);
 const dock = elements.todoPlanDock;
 const running = () => dock.classList.contains('is-running');

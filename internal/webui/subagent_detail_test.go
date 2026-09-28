@@ -29,12 +29,18 @@ func TestSubAgentDetailServesLiveAndRetainedOutput(t *testing.T) {
 	if err := roster.Register(teammate); err != nil {
 		t.Fatal(err)
 	}
+	transcript, err := agent.NewSubAgentTranscript(store.Dir, teammate.AgentID,
+		agent.NewSubAgentHeader(teammate.AgentID, "fixture-model", "session-a", teammate.Name, t.TempDir(), "default"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transcript.Close()
 	server := NewServer("127.0.0.1:0", nil, store, RuntimeBindings{Roster: roster})
 
 	read := func(method string) (int, http.Header, map[string]any) {
 		t.Helper()
 		rr := httptest.NewRecorder()
-		server.handler().ServeHTTP(rr, httptest.NewRequest(method, "/api/subagents/agt-transport", nil))
+		server.handler().ServeHTTP(rr, httptest.NewRequest(method, "/api/subagents/agt-transport?sessionId=session-a", nil))
 		body := map[string]any{}
 		if rr.Body.Len() > 0 {
 			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
@@ -61,6 +67,9 @@ func TestSubAgentDetailServesLiveAndRetainedOutput(t *testing.T) {
 	if got := view["background"]; got != true {
 		t.Fatalf("background = %#v", got)
 	}
+	if got := view["sessionId"]; got != "session-a" {
+		t.Fatalf("session ownership = %#v", got)
+	}
 
 	// The roster keeps completed entries briefly specifically so the Desktop
 	// can still open an agent whose work finished while its status menu was up.
@@ -86,6 +95,20 @@ func TestSubAgentDetailServesLiveAndRetainedOutput(t *testing.T) {
 	if code != http.StatusMethodNotAllowed || headers.Get("Allow") != http.MethodGet {
 		t.Fatalf("POST detail = %d Allow=%q, want 405 GET", code, headers.Get("Allow"))
 	}
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{"/api/subagents/agt-transport", http.StatusBadRequest},
+		{"/api/subagents/agt-transport?sessionId=session-b", http.StatusNotFound},
+		{"/api/subagents/agt-transport/events?sessionId=session-b", http.StatusNotFound},
+	} {
+		rr := httptest.NewRecorder()
+		server.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if rr.Code != tc.want {
+			t.Fatalf("GET %s = %d, want %d", tc.path, rr.Code, tc.want)
+		}
+	}
 }
 
 func TestSubAgentDetailOutputBoundPreservesHeadAndTail(t *testing.T) {
@@ -102,6 +125,53 @@ func TestSubAgentDetailOutputBoundPreservesHeadAndTail(t *testing.T) {
 	}
 }
 
+func TestSubAgentDetailReopensFromTranscriptAfterRestart(t *testing.T) {
+	_, store := testServer(t)
+	agentID := "agt-persisted"
+	transcript, err := agent.NewSubAgentTranscript(store.Dir, agentID,
+		agent.NewSubAgentHeader(agentID, "fixture-model", "session-a", "auditor", t.TempDir(), "default"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := time.Now()
+	if err := transcript.AppendTerminal(agent.SubAgentTerminal{
+		Status: "completed", Background: true, EndedAt: ended,
+		Output: "checked files", Result: "audit complete", StopHint: "end_turn",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := transcript.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// No roster or worker snapshot exists in this new Server instance.
+	restarted := NewServer("127.0.0.1:0", nil, store)
+	for _, tc := range []struct {
+		session string
+		want    int
+	}{
+		{"session-a", http.StatusOK},
+		{"session-b", http.StatusNotFound},
+	} {
+		rr := httptest.NewRecorder()
+		path := "/api/subagents/" + agentID + "?sessionId=" + tc.session
+		restarted.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != tc.want {
+			t.Fatalf("GET %s = %d, want %d: %s", path, rr.Code, tc.want, rr.Body.String())
+		}
+		if tc.want == http.StatusOK {
+			var body struct {
+				Agent subAgentDetailView `json:"agent"`
+			}
+			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Agent.SessionID != "session-a" || body.Agent.Status != "completed" || body.Agent.Result != "audit complete" || !body.Agent.Background {
+				t.Fatalf("restart detail = %+v", body.Agent)
+			}
+		}
+	}
+}
+
 func TestSubAgentDetailStreamEmitsSnapshotDeltaAndTerminal(t *testing.T) {
 	_, store := testServer(t)
 	roster := agent.NewRoster(2)
@@ -115,13 +185,19 @@ func TestSubAgentDetailStreamEmitsSnapshotDeltaAndTerminal(t *testing.T) {
 	if err := roster.Register(teammate); err != nil {
 		t.Fatal(err)
 	}
+	transcript, err := agent.NewSubAgentTranscript(store.Dir, teammate.AgentID,
+		agent.NewSubAgentHeader(teammate.AgentID, "fixture-model", "session-a", teammate.Name, t.TempDir(), "default"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transcript.Close()
 	server := NewServer("127.0.0.1:0", nil, store, RuntimeBindings{Roster: roster})
 	httpServer := httptest.NewServer(server.handler())
 	defer httpServer.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpServer.URL+"/api/subagents/agt-transport/events", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpServer.URL+"/api/subagents/agt-transport/events?sessionId=session-a", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,6 +237,66 @@ func TestSubAgentDetailStreamEmitsSnapshotDeltaAndTerminal(t *testing.T) {
 	}
 	if got := view["result"]; got != "initial live text" {
 		t.Fatalf("terminal result = %#v", got)
+	}
+}
+
+func TestSubAgentDetailStreamRefreshesTruncatedTail(t *testing.T) {
+	_, store := testServer(t)
+	roster := agent.NewRoster(2)
+	teammate := &agent.Teammate{
+		Name: "transport", AgentID: "agt-long-output",
+		Started: time.Now().Add(-time.Second),
+	}
+	teammate.AppendText(strings.Repeat("x", subAgentDetailOutputLimit+100))
+	if err := roster.Register(teammate); err != nil {
+		t.Fatal(err)
+	}
+	transcript, err := agent.NewSubAgentTranscript(store.Dir, teammate.AgentID,
+		agent.NewSubAgentHeader(teammate.AgentID, "fixture-model", "session-a", teammate.Name, t.TempDir(), "default"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transcript.Close()
+	server := NewServer("127.0.0.1:0", nil, store, RuntimeBindings{Roster: roster})
+	httpServer := httptest.NewServer(server.handler())
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		httpServer.URL+"/api/subagents/agt-long-output/events?sessionId=session-a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	event, payload := nextSubAgentSSE(t, reader)
+	initial, _ := payload["agent"].(map[string]any)
+	if event != "snapshot" || initial["outputTruncated"] != true {
+		t.Fatalf("initial SSE = %q %#v, want truncated snapshot", event, initial)
+	}
+
+	teammate.AppendText("-new-tail-1")
+	event, payload = nextSubAgentSSE(t, reader)
+	updated, _ := payload["agent"].(map[string]any)
+	output, _ := updated["output"].(string)
+	if event != "snapshot" || updated["outputTruncated"] != true || !strings.HasSuffix(output, "-new-tail-1") {
+		t.Fatalf("first updated preview = %q truncated=%v tail=%q", event, updated["outputTruncated"], output[max(0, len(output)-32):])
+	}
+	if len([]rune(output)) > subAgentDetailOutputLimit {
+		t.Fatalf("preview exceeds bound: %d runes", len([]rune(output)))
+	}
+
+	teammate.AppendText("-new-tail-2")
+	event, payload = nextSubAgentSSE(t, reader)
+	updated, _ = payload["agent"].(map[string]any)
+	output, _ = updated["output"].(string)
+	if event != "snapshot" || !strings.HasSuffix(output, "-new-tail-2") {
+		t.Fatalf("second updated preview = %q tail=%q", event, output[max(0, len(output)-32):])
 	}
 }
 
@@ -248,7 +384,7 @@ func TestDesktopSubAgentPanelLivesInHeaderAndLoadsOutput(t *testing.T) {
 			t.Fatalf("sub-agent live stream wiring missing %q", want)
 		}
 	}
-	start := strings.Index(js, "function closeStatusPopover()")
+	start := strings.Index(js, "function renderStatusSnapshot(d)")
 	endOffset := -1
 	if start >= 0 {
 		endOffset = strings.Index(js[start:], "// ============================================================\n// Layout")
@@ -282,26 +418,70 @@ class Element {
 const byId = new Map();
 for (const id of ['statusPopover','statusChip','subAgentDetailOverlay','subAgentDetailTitle','subAgentDetailDescription','subAgentDetailBody']) byId.set(id,new Element());
 const overlay = byId.get('subAgentDetailOverlay'); overlay.dialog = new Element();
+const requested = [];
 const c = {
   console, Promise, Map, Set, encodeURIComponent, requestAnimationFrame: fn => fn(),
-  subAgentDetailState:{agentId:'',trigger:null,data:null,loading:false,error:'',requestGeneration:0},
+  currentSessionId:'session-a', lastStatusSnapshot:null,
+  DESKTOP_I18N:{'zh-CN':{subAgents:'子代理',backgroundTasks:'后台任务'},en:{subAgents:'sub-agents',backgroundTasks:'background tasks'}},
+  subAgentDetailState:{agentId:'',ownerSessionId:'',trigger:null,data:null,loading:false,error:'',requestGeneration:0},
   subAgentDetailStream:null, subAgentDetailStreamGeneration:0,
   document:{documentElement:{lang:'zh-CN'}, body:new Element(), getElementById:id=>byId.get(id)||null, createElement:()=>new Element(), addEventListener(){}},
-  uiText:(en,zh)=>zh, escHtml:v=>String(v),
-  fetch:async url=>({ok:true,json:async()=>({agent:{name:'transport',agentId:'agt-transport',status:'running',background:true,elapsedMs:2400,output:'正在读取 transport.go'}})}),
+  uiText:(en,zh)=>zh, escHtml:v=>String(v), escAttr:v=>String(v),
+  fetch:async url=>{requested.push(url);return {ok:true,json:async()=>({agent:{name:'transport',agentId:'agt-transport',sessionId:'session-a',status:'completed',background:true,elapsedMs:2400,output:'正在读取 transport.go'}})};},
 };
-c.window=c; vm.createContext(c); vm.runInContext(source,c);
+c.window=c; vm.createContext(c); vm.runInContext(source.replace('} catch (_) { /* status is best-effort */ }', '} catch (error) { throw error; }'),c);
 (async()=>{
-  c.openSubAgentDetails('agt-transport', byId.get('statusChip'));
+  const status = {activeSessionId:'session-a',subAgents:0,backgroundTasks:0,agents:[],jobs:[],
+    viewRoster:{sessionId:'session-a',subAgents:0,backgroundTasks:0,
+      agents:[{agentId:'agt-transport',sessionId:'session-a',name:'transport',status:'completed'}],jobs:[]}};
+  c.lastStatusSnapshot=status;
+  c.renderStatusSnapshot(status);
+  assert.equal(byId.get('statusChip').style.display,'','completed sub-agent remains discoverable');
+  c.renderStatusPopover();
+  assert.match(byId.get('statusPopover').innerHTML,/data-subagent-session-id="session-a"/);
+  assert.match(byId.get('statusPopover').innerHTML,/查看输出/);
+  c.openSubAgentDetails('agt-transport', byId.get('statusChip'), 'session-a');
   await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(requested.at(-1),'/api/subagents/agt-transport?sessionId=session-a');
   assert.equal(overlay.hidden,false);
   assert.equal(byId.get('subAgentDetailTitle').textContent,'transport');
-  assert.match(byId.get('subAgentDetailDescription').textContent,/运行中/);
+  assert.match(byId.get('subAgentDetailDescription').textContent,/已完成/);
   assert.match(byId.get('subAgentDetailBody').children.at(-1).children.at(-1).textContent,/transport.go/);
+  c.closeSubAgentDetails();
+  const before = requested.length;
+  c.currentSessionId='session-b';
+  c.openSubAgentDetails('agt-transport', byId.get('statusChip'), 'session-a');
+  assert.equal(requested.length,before,'cross-session direct entry must not fetch');
+  assert.equal(overlay.hidden,true,'cross-session direct entry must not open');
+  c.renderStatusSnapshot(status);
+  assert.equal(byId.get('statusChip').style.display,'none','other session must not show this roster');
+  c.renderStatusPopover();
+  assert.doesNotMatch(byId.get('statusPopover').innerHTML,/agt-transport/,'other session must not list this agent');
+  const streams=[];
+  c.EventSource=class {
+    constructor(url){ this.url=url; this.listeners={}; this.closed=false; streams.push(this); }
+    addEventListener(name,fn){ this.listeners[name]=fn; }
+    close(){ this.closed=true; }
+    emit(name,payload){ this.listeners[name]({data:JSON.stringify(payload)}); }
+  };
+  c.currentSessionId='session-a';
+  c.openSubAgentDetails('agt-transport', byId.get('statusChip'), 'session-a');
+  assert.equal(streams.at(-1).url,'/api/subagents/agt-transport/events?sessionId=session-a');
+  const stream=streams.at(-1);
+  stream.emit('snapshot',{agent:{agentId:'agt-transport',sessionId:'session-b',status:'running',output:'wrong session output'}});
+  assert.equal(c.subAgentDetailState.data,null,'foreign snapshot must not enter dialog');
+  stream.emit('snapshot',{agent:{agentId:'agt-transport',sessionId:'session-a',status:'running',output:'owned output'}});
+  assert.equal(c.subAgentDetailState.data.output,'owned output');
+  stream.emit('delta',{agentId:'agt-transport',sessionId:'session-b',delta:' foreign delta'});
+  assert.equal(c.subAgentDetailState.data.output,'owned output','foreign delta must not append');
+  c.currentSessionId='session-b';
+  c.renderStatusSnapshot(status);
+  assert.equal(overlay.hidden,true,'session switch closes previous child dialog');
+  assert.equal(stream.closed,true,'session switch closes child output stream');
 })().catch(error=>{console.error(error);process.exitCode=1;});
 `
 	cmd := exec.Command(node, "-e", harness)
-	cmd.Stdin = bytes.NewBufferString(js[start:end])
+	cmd.Stdin = bytes.NewBufferString(strings.ReplaceAll(js[start:end], "setInterval(pollStatus, 3000);\npollStatus();", ""))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("sub-agent Desktop interaction: %v\n%s", err, out)
 	}

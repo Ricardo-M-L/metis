@@ -111,8 +111,10 @@ function fmtMs(ms) {
 
 function fmtRunDur(ms) {
   const sec = Math.floor(ms / 1000);
-  if (sec < 60) return sec + '\u79D2';
-  return Math.floor(sec / 60) + '\u5206' + String(sec % 60).padStart(2, '0') + '\u79D2';
+  const chinese = document.documentElement.lang === 'zh-CN';
+  if (sec < 60) return sec + (chinese ? '\u79D2' : 's');
+  return Math.floor(sec / 60) + (chinese ? '\u5206' : 'm') +
+    String(sec % 60).padStart(2, '0') + (chinese ? '\u79D2' : 's');
 }
 
 function fmtTokens(n) {

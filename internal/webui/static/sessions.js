@@ -733,7 +733,7 @@ function openSessionDeleteDialog(id, title, trigger) {
     closeSessionDeleteDialog(false);
   }
   const record = sessions.find(s => s.id === id);
-  title = title || record && record.title || uiText('Untitled session', '\u672a\u547d\u540d\u4f1a\u8bdd');
+  title = title && title !== 'Untitled' ? title : sessionDisplayTitle(record);
   if (openMenuBtn) {
     const menu = openMenuBtn.parentElement.querySelector('.session-menu');
     if (menu) menu.style.display = 'none';
@@ -965,10 +965,18 @@ function sessionMatches(s) {
 
 function relativeTime(ts) {
   const diff = Date.now() - new Date(ts).getTime();
-  if (diff < 60000) return '\u521A\u521A';
-  if (diff < 3600000) return Math.floor(diff / 60000) + '\u5206\u949F';
-  if (diff < 86400000) return Math.floor(diff / 3600000) + '\u5C0F\u65F6';
-  return Math.floor(diff / 86400000) + '\u5929';
+  if (!Number.isFinite(diff)) return '';
+  if (diff < 60000) return uiText('just now', '\u521A\u521A');
+  if (diff < 3600000) {
+    const n = Math.floor(diff / 60000);
+    return n + uiText(n === 1 ? ' min' : ' mins', '\u5206\u949F');
+  }
+  if (diff < 86400000) {
+    const n = Math.floor(diff / 3600000);
+    return n + uiText(n === 1 ? ' hr' : ' hrs', '\u5C0F\u65F6');
+  }
+  const n = Math.floor(diff / 86400000);
+  return n + uiText(n === 1 ? ' day' : ' days', '\u5929');
 }
 
 let sessionsExpanded = false;
@@ -1051,18 +1059,18 @@ function sessionState(s) {
 }
 
 function sessionStatusIcon(state) {
-  // The shared open-corner channel gives the sidebar a METIS visual language;
-  // familiar inner glyphs keep every state readable at the 18px list scale.
+  // Each state has a recognizable line icon; the completed state is a round
+  // check, not a square mark that can be mistaken for a checkbox.
   const icons = {
     idle: '<path class="session-glyph-fill" d="M10.25 3.15a4.95 4.95 0 1 0 2.62 8.96A4.58 4.58 0 0 1 10.25 3.15Z"/>',
     loading: '<g class="session-working-glyph"><path d="M8 3.05a4.95 4.95 0 1 1-4.1 2.18"/><path d="M3.05 6.25v-2.1h2.1"/></g>',
     running: '<g class="session-working-glyph"><path d="M8 3.05a4.95 4.95 0 1 1-4.1 2.18"/><path d="M3.05 6.25v-2.1h2.1"/></g>',
-    delegating: '<g class="session-working-glyph"><path d="M8 3.05a4.95 4.95 0 1 1-4.1 2.18"/><path d="M3.05 6.25v-2.1h2.1"/></g>',
+    delegating: '<circle cx="8" cy="3.8" r="1.2"/><circle cx="4.4" cy="11" r="1.2"/><circle cx="11.6" cy="11" r="1.2"/><path d="M7.4 5 5 9.8M8.6 5l2.4 4.8M5.7 11h4.6"/>',
     waiting: '<path d="M3.1 4.2h9.8v6.05H8.1l-2.55 1.85v-1.85H3.1z"/><path class="session-glyph-fill" d="M5.65 7.2a.7.7 0 1 0 0 .01m2.35-.01a.7.7 0 1 0 0 .01m2.35-.01a.7.7 0 1 0 0 .01"/>',
     approval: '<path d="M5.05 8.2V5.1a.82.82 0 0 1 1.64 0v1.82V3.8a.82.82 0 0 1 1.64 0v3.12V4.45a.82.82 0 0 1 1.64 0v3.08l.78-.48a1 1 0 0 1 1.37.3.93.93 0 0 1-.22 1.26l-1.72 1.47a3.7 3.7 0 0 1-2.42.9H7.6a2.55 2.55 0 0 1-2.55-2.78Z"/><path class="session-glyph-fill" d="M12.45 3.08a.7.7 0 1 0 0 .01"/>',
-    done: '<path d="m4.1 8.25 2.35 2.3 5.45-5.15"/>',
-    stopped: '<path d="M5.45 4.35v7.3M10.55 4.35v7.3"/>',
-    interrupted: '<path d="M5.45 4.35v7.3M10.55 4.35v7.3"/>',
+    done: '<circle cx="8" cy="8" r="5.6"/><path d="m5.3 8.05 1.9 1.85 3.55-3.8"/>',
+    stopped: '<circle cx="8" cy="8" r="5.6"/><path d="M6.45 5.7v4.6M9.55 5.7v4.6"/>',
+    interrupted: '<path d="M3.1 5.95a5.3 5.3 0 0 0 7.2 6.55M12.9 10.05a5.3 5.3 0 0 0-7.2-6.55"/><path d="m5.55 6 4.9 4"/>',
     failed: '<path d="m8 2.85 5.15 5.15L8 13.15 2.85 8Z"/><path d="M8 5.6v3M8 10.55v.1"/>',
     plan: '<path d="m10.9 5.1-1.4 4.4-4.4 1.4 1.4-4.4z"/><path d="M5.05 10.95 3.8 12.2M10.95 5.05 12.2 3.8"/>',
     archived: '<path d="M3.35 5.3h9.3v7.05h-9.3z"/><path d="M2.8 3.65h10.4v1.7H2.8zM6.25 8.4h3.5"/>',
@@ -1070,14 +1078,19 @@ function sessionStatusIcon(state) {
   };
   const icon = icons[state.name] || icons.unknown;
   const tooltip = state.tooltip || state.label;
-  return `<span class="session-item-status ${state.name}" role="img" aria-label="${escAttr(tooltip)}" title="${escAttr(tooltip)}">
-    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path class="session-channel-frame" d="M5.25 1.5H3.8A2.3 2.3 0 0 0 1.5 3.8v1.45M10.75 1.5h1.45a2.3 2.3 0 0 1 2.3 2.3v1.45M1.5 10.75v1.45a2.3 2.3 0 0 0 2.3 2.3h1.45M14.5 10.75v1.45a2.3 2.3 0 0 1-2.3 2.3h-1.45"/>
-      <path class="session-channel-accent" d="M3.8 1.5h1.45M14.5 10.75v1.45a2.3 2.3 0 0 1-2.3 2.3h-1.45"/>
+  return `<span class="session-item-status ${state.name}" role="img" aria-label="${escAttr(tooltip)}">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <g class="session-status-glyph">${icon}</g>
     </svg>
     <span class="session-status-tooltip" aria-hidden="true">${escHtml(tooltip)}</span>
   </span>`;
+}
+
+function sessionDisplayTitle(s) {
+  const title = String(s && s.title || '').trim();
+  // The server uses this literal for a newly created session. Translate only
+  // the displayed placeholder so saved titles and search data stay intact.
+  return title && title !== 'Untitled' ? title : uiText('Untitled session', '\u672a\u547d\u540d\u4f1a\u8bdd');
 }
 
 function sessionItemKeydown(e, id) {
@@ -1090,13 +1103,14 @@ function sessionItemKeydown(e, id) {
 function renderSessionItem(s) {
   const time = relativeTime(s.updatedAt || s.createdAt);
   const state = sessionState(s);
-		const detail = `data-detail-title="${escAttr(s.title || 'Untitled')}" data-detail-path="${escAttr(s.workDir || '')}" data-detail-model="${escAttr(s.model || '')}" data-detail-meta="${escAttr([state.label, s.preset || 'standard', s.mode || '', s.effort || 'default effort', new Date(s.updatedAt || s.createdAt).toLocaleString()].filter(Boolean).join(' · '))}"`;
+  const title = sessionDisplayTitle(s);
+  const detail = `data-detail-title="${escAttr(title)}" data-detail-path="${escAttr(s.workDir || '')}" data-detail-model="${escAttr(s.model || '')}" data-detail-meta="${escAttr([state.label, s.preset || uiText('standard', '\u6807\u51c6'), s.mode || '', s.effort || uiText('default effort', '\u9ed8\u8ba4\u63a8\u7406\u5f3a\u5ea6'), new Date(s.updatedAt || s.createdAt).toLocaleString()].filter(Boolean).join(' · '))}"`;
   if (showArchivedSessions) {
-	return `<div class="session-item archived" ${detail} role="group" aria-label="${escAttr(s.title || 'Untitled')} — ${escAttr(state.label)}" tabindex="0">
+	return `<div class="session-item archived" ${detail} role="group" aria-label="${escAttr(title + ' — ' + state.label)}" tabindex="0">
       ${sessionStatusIcon(state)}
-      <span class="session-item-name">${escHtml(s.title)}</span>
+      <span class="session-item-name">${escHtml(title)}</span>
       <span class="session-item-time">${time}</span>
-    <button class="session-more" aria-label="Session actions for ${escAttr(s.title)}" aria-haspopup="menu" aria-expanded="false" onclick="event.stopPropagation();toggleSessionMenu(this)">&#8943;</button>
+    <button class="session-more" aria-label="${escAttr(uiText('Session actions for ', '\u4f1a\u8bdd\u64cd\u4f5c\uff1a') + title)}" aria-haspopup="menu" aria-expanded="false" onclick="event.stopPropagation();toggleSessionMenu(this)">&#8943;</button>
       <div class="session-menu" role="menu" aria-label="${uiText('Session actions', '会话操作')}" style="display:none" onkeydown="sessionMenuKeydown(event)">
         <button type="button" role="menuitem" class="session-menu-item" onclick="event.stopPropagation();restoreSession('${escOnclick(s.id)}')">&#8634; ${uiText('Restore session', '\u6062\u590d\u4f1a\u8bdd')}</button>
         <div class="session-menu-sep" role="separator"></div>
@@ -1104,11 +1118,11 @@ function renderSessionItem(s) {
       </div>
     </div>`;
   }
-  return `<div class="session-item${s.id === currentSessionId ? ' active' : ''}" role="button" tabindex="0" aria-label="Open session ${escAttr(s.title)} — ${escAttr(state.label)}" ${detail} data-state="${state.name}" onclick="resumeSession('${escOnclick(s.id)}')" onkeydown="sessionItemKeydown(event,'${escOnclick(s.id)}')">
+  return `<div class="session-item${s.id === currentSessionId ? ' active' : ''}" role="button" tabindex="0" aria-label="${escAttr(uiText('Open session ', '\u6253\u5f00\u4f1a\u8bdd ') + title + ' — ' + state.label)}" ${detail} data-state="${state.name}" onclick="resumeSession('${escOnclick(s.id)}')" onkeydown="sessionItemKeydown(event,'${escOnclick(s.id)}')">
     ${sessionStatusIcon(state)}
-    <span class="session-item-name">${escHtml(s.title)}</span>
+    <span class="session-item-name">${escHtml(title)}</span>
     <span class="session-item-time">${time}</span>
-    <button class="session-more" aria-label="Session actions for ${escAttr(s.title)}" aria-haspopup="menu" aria-expanded="false" onclick="event.stopPropagation();toggleSessionMenu(this)">&#8943;</button>
+    <button class="session-more" aria-label="${escAttr(uiText('Session actions for ', '\u4f1a\u8bdd\u64cd\u4f5c\uff1a') + title)}" aria-haspopup="menu" aria-expanded="false" onclick="event.stopPropagation();toggleSessionMenu(this)">&#8943;</button>
     <div class="session-menu" role="menu" aria-label="${uiText('Session actions', '会话操作')}" style="display:none" onkeydown="sessionMenuKeydown(event)">
       <button type="button" role="menuitem" class="session-menu-item" onclick="event.stopPropagation();renameSession('${escOnclick(s.id)}', this)">&#9998;&#65039; ${uiText('Rename', '重命名')}</button>
       <button type="button" role="menuitem" class="session-menu-item" onclick="event.stopPropagation();branchSessionFromSidebar('${escOnclick(s.id)}', this)">&#9850; ${uiText('Branch session', '分叉会话')}</button>
@@ -1125,7 +1139,7 @@ function renderSessions() {
   const list = document.getElementById('sessionList');
   if (!sessions.length && (desktopPreferences.sidebarView !== 'grouped' || !workspaces.length)) {
     list.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:13px;">' +
-      (showArchivedSessions ? 'No archived sessions' : 'No sessions yet') + '</div>';
+      (showArchivedSessions ? uiText('No archived sessions', '\u6ca1\u6709\u5df2\u5f52\u6863\u7684\u4f1a\u8bdd') : uiText('No sessions yet', '\u8fd8\u6ca1\u6709\u4f1a\u8bdd')) + '</div>';
     return;
   }
   const visibleWorkspaceIDs = workspaces.length ? new Set(workspaces.map(w => w.id)) : null;
@@ -1136,7 +1150,7 @@ function renderSessions() {
     return sessionMatches(s);
   }));
   if (!sorted.length && (desktopPreferences.sidebarView !== 'grouped' || sessionFilter)) {
-    list.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:13px;">No matching sessions</div>';
+    list.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:13px;">' + uiText('No matching sessions', '\u6ca1\u6709\u5339\u914d\u7684\u4f1a\u8bdd') + '</div>';
     return;
   }
 
@@ -1172,10 +1186,10 @@ function renderSessions() {
     visible.forEach(s => { html += renderSessionItem(s); });
   }
   if (hiddenCount > 0 || sessionsExpanded && (grouped ? hasCollapsibleGroup : sorted.length > COLLAPSE)) {
-    html += `<button type="button" class="session-expand" onclick="toggleSessionsExpand()">${sessionsExpanded ? '\u6536\u8D77' : '\u5C55\u5F00\u5176\u4F59 ' + hiddenCount + ' \u4E2A\u4F1A\u8BDD'}</button>`;
+    html += `<button type="button" class="session-expand" onclick="toggleSessionsExpand()">${sessionsExpanded ? uiText('Show less', '\u6536\u8d77') : uiText('Show ', '\u5c55\u5f00\u5176\u4f59 ') + hiddenCount + uiText(' more sessions', ' \u4e2a\u4f1a\u8bdd')}</button>`;
   }
 	if (sessionsNextCursor) {
-	  html += `<button type="button" class="session-load-more" onclick="loadMoreSessions()">Load more (${Math.max(0, sessionsTotal - sessions.length)} remaining)</button>`;
+	  html += `<button type="button" class="session-load-more" onclick="loadMoreSessions()">${uiText('Load more', '\u52a0\u8f7d\u66f4\u591a')} (${Math.max(0, sessionsTotal - sessions.length)} ${uiText('remaining', '\u5269\u4f59')})</button>`;
 	}
   list.innerHTML = html;
 }
@@ -1201,7 +1215,7 @@ function showSessionDetail(item) {
 	  sessionDetailCard.className = 'session-detail-card';
 	  document.body.appendChild(sessionDetailCard);
 	}
-	sessionDetailCard.innerHTML = `<strong>${escHtml(item.dataset.detailTitle)}</strong><span>${escHtml(item.dataset.detailPath || 'No workspace path')}</span><span>${escHtml(item.dataset.detailModel || 'No model')}</span><small>${escHtml(item.dataset.detailMeta || '')}</small>`;
+	sessionDetailCard.innerHTML = `<strong>${escHtml(item.dataset.detailTitle)}</strong><span>${escHtml(item.dataset.detailPath || uiText('No workspace path', '\u65e0\u5de5\u4f5c\u533a\u8def\u5f84'))}</span><span>${escHtml(item.dataset.detailModel || uiText('No model', '\u672a\u9009\u62e9\u6a21\u578b'))}</span><small>${escHtml(item.dataset.detailMeta || '')}</small>`;
 	const rect = item.getBoundingClientRect();
 	const left = Math.min(window.innerWidth - 330, rect.right + 8);
 	sessionDetailCard.style.left = Math.max(8, left) + 'px';
@@ -1260,6 +1274,12 @@ async function resumeSession(id) {
     }
     if (id !== currentSessionId && typeof detachRunningTurnView === 'function') detachRunningTurnView();
     currentSessionId = id;
+    if (typeof subAgentDetailState !== 'undefined' && subAgentDetailState.agentId &&
+        subAgentDetailState.ownerSessionId !== String(currentSessionId || '') &&
+        typeof closeSubAgentDetails === 'function') closeSubAgentDetails(false);
+    // Reconcile the status chip against the newly selected session now. The
+    // later status poll can wait behind optional history/artifact requests.
+    if (lastStatusSnapshot && typeof renderStatusSnapshot === 'function') renderStatusSnapshot(lastStatusSnapshot);
     if (typeof restoreSessionQueue === 'function') restoreSessionQueue(id);
     if (typeof syncTrackedRunningState === 'function') syncTrackedRunningState();
     pendingSessionId = null;

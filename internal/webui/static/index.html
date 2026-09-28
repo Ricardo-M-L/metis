@@ -47,25 +47,25 @@
         </button>
         <input type="text" class="sb-search-input" id="sessionSearchInput" placeholder="&#25628;&#32034;&#20250;&#35805;..." data-i18n-placeholder="searchSessions" oninput="onSessionSearch(this.value)">
       </div>
-      <button class="sb-workspace-add" id="workspaceAddBtn" title="Add workspace" aria-label="Add workspace" onclick="addWorkspace()">
+      <button class="sb-workspace-add" id="workspaceAddBtn" title="添加工作区" aria-label="添加工作区" data-i18n-title="addWorkspace" data-i18n-label="addWorkspace" onclick="addWorkspace()">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.5 1.8h4.9A1.5 1.5 0 0 1 14 6.3v5.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/><path d="M8 7v4M6 9h4"/></svg>
       </button>
-      <button class="sb-view-toggle" id="sessionViewBtn" title="Session view options" aria-label="Session view options" aria-expanded="false" onclick="toggleSessionViewMenu(event)">
+      <button class="sb-view-toggle" id="sessionViewBtn" title="会话列表选项" aria-label="会话列表选项" data-i18n-title="sessionViewOptions" data-i18n-label="sessionViewOptions" aria-expanded="false" onclick="toggleSessionViewMenu(event)">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><path d="M3 4h10M5 8h6M7 12h2"/><circle cx="4" cy="4" r="1" fill="currentColor"/><circle cx="12" cy="8" r="1" fill="currentColor"/><circle cx="6" cy="12" r="1" fill="currentColor"/></svg>
       </button>
-      <button class="sb-archive-toggle" id="archivedSessionsBtn" title="Show archived sessions" aria-label="Show archived sessions" onclick="toggleArchivedSessions()">
+      <button class="sb-archive-toggle" id="archivedSessionsBtn" title="显示已归档会话" aria-label="显示已归档会话" data-i18n-title="showArchivedSessions" data-i18n-label="showArchivedSessions" onclick="toggleArchivedSessions()">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4h11v9h-11zM2 2h12v2H2z"/><path d="M6 7h4"/></svg>
       </button>
     </div>
     <div class="sidebar-view-menu" id="sessionViewMenu" role="menu" style="display:none">
-      <div class="sidebar-menu-label">Layout</div>
-      <button type="button" role="menuitemradio" data-pref="sidebarView" data-value="grouped" onclick="setSessionPreference('sidebarView','grouped')">Grouped by workspace</button>
-      <button type="button" role="menuitemradio" data-pref="sidebarView" data-value="flat" onclick="setSessionPreference('sidebarView','flat')">Flat list</button>
+      <div class="sidebar-menu-label" data-i18n="layout">布局</div>
+      <button type="button" role="menuitemradio" data-pref="sidebarView" data-value="grouped" data-i18n="groupByWorkspace" onclick="setSessionPreference('sidebarView','grouped')">按工作区分组</button>
+      <button type="button" role="menuitemradio" data-pref="sidebarView" data-value="flat" data-i18n="flatList" onclick="setSessionPreference('sidebarView','flat')">平铺列表</button>
       <div class="sidebar-menu-sep"></div>
-      <div class="sidebar-menu-label">Sort</div>
-      <button type="button" role="menuitemradio" data-pref="sidebarSort" data-value="recent" onclick="setSessionPreference('sidebarSort','recent')">Most recent</button>
-      <button type="button" role="menuitemradio" data-pref="sidebarSort" data-value="name" onclick="setSessionPreference('sidebarSort','name')">Name</button>
-      <button type="button" role="menuitemradio" data-pref="sidebarSort" data-value="manual" onclick="setSessionPreference('sidebarSort','manual')">Manual order</button>
+      <div class="sidebar-menu-label" data-i18n="sort">排序</div>
+      <button type="button" role="menuitemradio" data-pref="sidebarSort" data-value="recent" data-i18n="mostRecent" onclick="setSessionPreference('sidebarSort','recent')">最近更新</button>
+      <button type="button" role="menuitemradio" data-pref="sidebarSort" data-value="name" data-i18n="name" onclick="setSessionPreference('sidebarSort','name')">名称</button>
+      <button type="button" role="menuitemradio" data-pref="sidebarSort" data-value="manual" data-i18n="manualOrder" onclick="setSessionPreference('sidebarSort','manual')">手动排序</button>
     </div>
     <div class="session-list" id="sessionList">
       <!-- Populated by JS -->
@@ -83,7 +83,7 @@
 
   <!-- Main Content -->
   <main class="main" data-page="session">
-    <header class="navigation-header" id="navigationHeader" aria-label="Page navigation">
+    <header class="navigation-header" id="navigationHeader" aria-label="页面导航" data-i18n-label="pageNavigation">
       <button class="navigation-button" id="navigationBack" type="button" title="后退（Alt+←）" aria-label="后退" disabled onclick="metisNavigation.back()">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
       </button>
@@ -96,9 +96,9 @@
       <button class="view-tab active" id="tabChat" data-i18n="chat" onclick="switchView('chat')">&#23545;&#35805;</button>
       <button class="view-tab" id="tabTrace" data-i18n="trajectory" onclick="switchView('trace')">&#36712;&#36857;</button>
       <button class="view-tab artifact-tab" id="tabArtifacts" type="button" aria-controls="artifactsPanel" onclick="openArtifactsPanel()">
-        <span>Artifacts</span><span class="artifact-tab-count" id="artifactTabCount" hidden>0</span>
+        <span data-i18n="artifacts">产物</span><span class="artifact-tab-count" id="artifactTabCount" hidden>0</span>
       </button>
-      <button class="view-tab" type="button" aria-controls="sessionFilePanel" onclick="openSessionFiles()">文件 <span id="sessionFileCount">0</span></button>
+      <button class="view-tab" type="button" aria-controls="sessionFilePanel" onclick="openSessionFiles()"><span data-i18n="files">文件</span> <span id="sessionFileCount">0</span></button>
       <div class="agent-status-anchor" id="agentStatusAnchor">
         <button class="agent-status-trigger" id="statusChip" type="button" style="display:none" aria-label="Agent status details" aria-controls="statusPopover" aria-expanded="false" onclick="toggleStatusPopover(event)"></button>
         <div class="status-popover" id="statusPopover" style="display:none" aria-label="Agent and background task details"></div>
@@ -246,42 +246,42 @@
   <div class="settings-panel">
     <div class="settings-sidebar">
       <button type="button" class="settings-back" onclick="closeSettings()">
-        <span>&#8592;</span>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9.5 3.5-4.5 4.5 4.5 4.5M5 8h8"/></svg>
         <span data-i18n="backToApp">Back to app</span>
       </button>
-      <input type="search" class="settings-search" name="settings-search" autocomplete="off" placeholder="Search settings…" data-i18n-placeholder="searchSettings" aria-label="Search settings" oninput="filterSettings(this.value)">
+      <input type="search" class="settings-search" name="settings-search" autocomplete="off" placeholder="Search settings…" data-i18n-placeholder="searchSettings" aria-label="Search settings" data-i18n-label="searchSettings" oninput="filterSettings(this.value)">
 
       <div class="settings-group-label" data-i18n="personal">Personal</div>
       <button type="button" class="settings-item active" data-settings-tab="general" onclick="showSettingsTab('general', this)">
-        <span class="settings-item-icon">&#9881;&#65039;</span>
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2.2"/><path d="M8 2v1.8M8 12.2V14M2 8h1.8M12.2 8H14M3.8 3.8l1.3 1.3M10.9 10.9l1.3 1.3M12.2 3.8l-1.3 1.3M5.1 10.9l-1.3 1.3"/></svg></span>
         <span data-i18n="general">General</span>
       </button>
       <button type="button" class="settings-item" id="settingsAppearanceBtn" data-settings-tab="appearance" onclick="showSettingsTab('appearance', this)">
-        <span class="settings-item-icon">&#127912;</span>
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 2.5v11M8 2.5a5.5 5.5 0 0 1 0 11"/></svg></span>
         <span data-i18n="appearance">Appearance</span>
       </button>
       <button type="button" class="settings-item" id="settingsProvidersBtn" data-settings-tab="providers" onclick="showSettingsTab('providers', this)">
-        <span class="settings-item-icon">&#128268;</span>
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="8" cy="4" rx="5.5" ry="2"/><path d="M2.5 4v8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2V4M2.5 8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2"/></svg></span>
         <span data-i18n="modelProviders">Model Providers</span>
       </button>
       <button type="button" class="settings-item" id="settingsPresetsBtn" data-settings-tab="presets" onclick="showSettingsTab('presets', this)">
-        <span class="settings-item-icon">&#129504;</span>
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 9.4 6.6 13.8 8l-4.4 1.4L8 13.8 6.6 9.4 2.2 8l4.4-1.4L8 2.2Z"/></svg></span>
         <span data-i18n="agentPresets">Agent Presets</span>
       </button>
       <button type="button" class="settings-item" id="settingsPluginsBtn" data-settings-tab="plugins" onclick="showSettingsTab('plugins', this)">
-        <span class="settings-item-icon">&#129513;</span>
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.3h3V4.8a1.7 1.7 0 1 1 3.4 0v1.5h4.6v2.4H12a1.7 1.7 0 1 0 0 3.4h1.5v1.4h-11V9h1.4a1.4 1.4 0 1 0 0-2.7H2.5Z"/></svg></span>
         <span data-i18n="plugins">Plugins</span>
       </button>
       <button type="button" class="settings-item" id="settingsComputerUseBtn" data-settings-tab="computer-use" onclick="showSettingsTab('computer-use', this)">
-        <span class="settings-item-icon" aria-hidden="true">&#128421;</span>
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="8.5" rx="1.5"/><path d="M8 11v2.5M5.5 13.5h5"/></svg></span>
         <span data-i18n="computerUse">电脑操作</span>
       </button>
       <button type="button" class="settings-item" id="settingsRoutingBtn" data-settings-tab="routing" onclick="showSettingsTab('routing', this)">
-        <span class="settings-item-icon">&#8644;</span>
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h8.8M9 2l2.3 2L9 6M13.5 12H4.7M7 10l-2.3 2L7 14"/></svg></span>
         <span data-i18n="smartRouting">Smart Routing</span>
       </button>
       <button type="button" class="settings-item" id="settingsConfigBtn" data-settings-tab="config" onclick="showSettingsTab('config', this)">
-        <span class="settings-item-icon">&#128295;</span>
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 2.5h8a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5H4A1.5 1.5 0 0 1 2.5 12V4A1.5 1.5 0 0 1 4 2.5Z"/><path d="M5.5 6h5M5.5 9h5"/></svg></span>
         <span data-i18n="configuration">Configuration</span>
       </button>
     </div>

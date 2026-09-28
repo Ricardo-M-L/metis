@@ -178,14 +178,11 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	reg.Register(builtin.NewRalph(opts.Gate, opts.Provider, reg, opts.Model, opts.System))
 	// G.4 (2026-05-12) — wire on-disk transcript persistence so
 	// sub-agents can be resumed via `/agents resume <id>` or the
-	// `resume_from` schema field. CurrentSessionID() is set by
-	// setupRuntime before this builder runs in the chat REPL path;
-	// `metis tools` listing leaves it empty, which falls back to the
-	// in-memory-only path (resume_from will refuse with a clear error).
+	// `resume_from` schema field. Desktop workers and fresh CLI sessions
+	// allocate their ID after this registry is built. Keep the directory now;
+	// startup rebinds Agent's parent ID before its first invocation.
 	if opts.Cfg != nil && opts.Cfg.Session.Dir != "" {
-		if parentID := CurrentSessionID(); parentID != "" {
-			agentTool = agentTool.WithSessionPersistence(opts.Cfg.Session.Dir, parentID)
-		}
+		agentTool = agentTool.WithSessionPersistence(opts.Cfg.Session.Dir, CurrentSessionID())
 	}
 	// Q1 (2026-05-15) — wire the per-invocation profile resolver so
 	// the schema field `subagent_type` actually does something. The

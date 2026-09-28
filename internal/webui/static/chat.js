@@ -77,6 +77,8 @@ function connectEvents() {
   onLive('tool_start', handleToolStart);
   onLive('tool_result', handleToolResult);
   onLive('tool_args_delta', handleToolArgsDelta);
+  onLive('subagent_start', d => handleSubagentLifecycle(d, 'running'));
+  onLive('subagent_end', d => handleSubagentLifecycle(d, d.status || 'completed'));
   onLive('thinking_delta', handleThinkingDelta);
   onLive('tokens', handleTokensEvent);
   onLive('context_warn', d => handleContextEvent(d));
@@ -306,6 +308,10 @@ function activityToolKind(name) {
   return 'other';
 }
 
+function isSubagentTool(name) {
+  return String(name || '').toLowerCase() === 'agent';
+}
+
 function setActivityGroupOpen(group, open) {
   if (!group) return;
   group.classList.toggle('open', open);
@@ -406,6 +412,7 @@ function ensureActivityTurn() {
   if (!renderingActivityHistory) turn.dataset.startedAt = String(turnStartMs || Date.now());
   turn.innerHTML = `<button class="activity-turn-toggle" type="button" aria-expanded="true" aria-controls="" onclick="toggleActivityTurn(this)">
       <span class="activity-turn-duration"></span>
+      <span class="activity-turn-summary" hidden></span>
       <span class="activity-turn-state"></span>
       <span class="activity-turn-chevron" aria-hidden="true"></span>
     </button>`;
@@ -539,18 +546,46 @@ function ensureActivityGroup() {
   return group;
 }
 
-function updateActivityGroupSummary(group) {
-  if (!group) return;
-  const stats = activityGroupStats.get(group);
-  if (!stats) return;
-  const labels = {
+function activityKindLabels() {
+  return {
     command: uiText('Ran commands', '执行了命令'),
     search: uiText('Searched code', '已搜索代码'),
     read: uiText('Read files', '已读取文件'),
     edit: uiText('Edited files', '修改了文件'),
     agent: uiText('Delegated work', '分派了任务'),
+    subagent: uiText('Sub-agent work', '子代理任务'),
     other: uiText('Used tools', '调用了工具'),
   };
+}
+
+function updateActivityTurnSummary(turn) {
+  const summary = turn && turn.querySelector('.activity-turn-summary');
+  if (!summary) return;
+  const groups = activityTurnGroups(turn);
+  const kinds = new Map();
+  let errors = 0;
+  groups.forEach(group => {
+    const stats = activityGroupStats.get(group);
+    if (!stats) return;
+    stats.kinds.forEach((count, kind) => kinds.set(kind, (kinds.get(kind) || 0) + count));
+    errors += stats.errors;
+  });
+  const labels = activityKindLabels();
+  const parts = [...kinds]
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 3)
+    .map(([kind]) => labels[kind]);
+  if (groups.length && !parts.length) parts.push(uiText('Analyzed the task', '分析了任务'));
+  if (errors) parts.push(uiText(`${errors} failed`, `${errors} 项失败`));
+  summary.textContent = parts.join(uiText(', ', '，'));
+  summary.hidden = !parts.length;
+}
+
+function updateActivityGroupSummary(group) {
+  if (!group) return;
+  const stats = activityGroupStats.get(group);
+  if (!stats) return;
+  const labels = activityKindLabels();
   const summary = [...stats.kinds]
     .sort((left, right) => right[1] - left[1])
     .slice(0, 3)
@@ -574,14 +609,44 @@ function updateActivityGroupSummary(group) {
   else button.removeAttribute('aria-label');
   group.dataset.hasError = stats.errors ? 'true' : 'false';
   if (stats.errors && group.dataset.userTouched !== 'true') setActivityGroupOpen(group, true);
+  updateActivityTurnSummary(group._activityTurn);
+}
+
+function updateSubagentStage(group) {
+  const stage = group && group.querySelector('.subagent-stage');
+  if (!stage) return;
+  const rows = [...group.querySelectorAll('.call-row')].filter(row => isSubagentTool(row.dataset.tool));
+  const active = rows.some(row => row.dataset.state === 'running');
+  const detached = rows.some(row => row.dataset.subagentBackground === 'true' &&
+    row.dataset.subagentStatus === 'running' && row.dataset.state !== 'running');
+  const failures = rows.filter(row => ['failed', 'error', 'killed', 'stopped'].includes(row.dataset.subagentStatus) ||
+    (row.dataset.subagentBackground !== 'true' && ['error', 'stopped'].includes(row.dataset.state))).length;
+  const unknown = rows.some(row => row.dataset.state === 'incomplete' && !row.dataset.subagentStatus);
+  const title = active ? uiText('Coordinating sub-agents', '正在协调子代理')
+    : detached ? uiText('Background sub-agents started', '已启动后台子代理')
+    : failures || unknown ? uiText('Sub-agent work', '子代理任务')
+      : uiText('Coordinated sub-agents', '已协调子代理');
+  const count = uiText(`${rows.length} agent${rows.length === 1 ? '' : 's'}`, `${rows.length} 个`);
+  const failure = failures ? uiText(` · ${failures} failed`, ` · ${failures} 项失败`) : '';
+  const uncertain = unknown ? uiText(' · result unavailable', ' · 结果未记录') : '';
+  stage.textContent = `${title} · ${count}${failure}${uncertain}`;
+  stage.dataset.state = active ? 'running' : failures ? 'error' : detached || unknown ? 'incomplete' : 'completed';
 }
 
 function appendActivityRow(row) {
   const group = ensureActivityGroup();
-  group.querySelector('.activity-group-items').appendChild(row);
+  const items = group.querySelector('.activity-group-items');
+  if (row.classList.contains('call-row') && isSubagentTool(row.dataset.tool) && !group.querySelector('.subagent-stage')) {
+    const stage = document.createElement('div');
+    stage.className = 'subagent-stage';
+    stage.setAttribute('role', 'status');
+    stage.setAttribute('aria-live', 'polite');
+    items.appendChild(stage);
+  }
+  items.appendChild(row);
   if (row.classList.contains('call-row')) {
     const stats = activityGroupStats.get(group);
-    const kind = activityToolKind(row.dataset.tool);
+    const kind = isSubagentTool(row.dataset.tool) ? 'subagent' : activityToolKind(row.dataset.tool);
     stats.kinds.set(kind, (stats.kinds.get(kind) || 0) + 1);
     if (row.dataset.state === 'error') stats.errors++;
     if (row.dataset.state === 'running') {
@@ -589,6 +654,7 @@ function appendActivityRow(row) {
       stats.currentRunning = row;
     }
   }
+  if (isSubagentTool(row.dataset.tool)) updateSubagentStage(group);
   updateActivityGroupSummary(group);
   scheduleActivityGroupFollow(group);
   scheduleActivityGroupScroll(group);
@@ -605,6 +671,8 @@ function finishActivityGroup() {
 }
 
 function refreshActivityGroupLanguage() {
+  refreshTurnStatusLanguage();
+  refreshTurnMetricsLanguage();
   document.querySelectorAll('.activity-turn').forEach(updateActivityTurnLabel);
   document.querySelectorAll('.activity-group').forEach(group => {
     group.querySelectorAll('.think-row').forEach(row => {
@@ -618,14 +686,21 @@ function refreshActivityGroupLanguage() {
     group.querySelectorAll('.call-row').forEach(row => {
       const title = row.querySelector('.tc-title');
       if (title) title.textContent = toolVariantOf(row.dataset.tool).title;
+      const semantic = semanticToolSummary(row.dataset.tool, row.getAttribute('data-args') || '');
+      const summary = row.querySelector('.tc-summary');
+      if (semantic !== null && summary) summary.textContent = row.dataset.state === 'error'
+        ? semanticToolErrorSummary(row.dataset.tool) : semantic;
       const inspect = row.querySelector('.tc-inspect');
       if (inspect) inspect.textContent = uiText('Inspect', '查看详情');
+      const openAgent = row.querySelector('.tc-open-agent');
+      if (openAgent) openAgent.textContent = uiText('Open agent', '打开子代理');
       const labels = row.querySelectorAll('.tc-io-label');
       if (labels[0]) labels[0].textContent = uiText('IN', '输入');
       if (labels[1]) labels[1].textContent = uiText('OUT', '输出');
       updateToolRowAccessibleLabel(row);
     });
     updateActivityGroupSummary(group);
+    updateSubagentStage(group);
   });
   if (selectedToolId) renderDetailPanel();
 }
@@ -1060,8 +1135,26 @@ let turnStatusTimer = null;
 let compactionInFlight = false;
 let compactionStatusEl = null;
 
-// "Deep diving..." turn-level status (DSH TurnStatus parity): rides the
-// whole running turn and gains a clock after 15s.
+// The turn-level status follows the Desktop language setting, including
+// changes made while a turn is running.
+function turnStatusDuration(ms) {
+  if (document.documentElement.lang !== 'zh-CN') return fmtRunDur(ms);
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  return minutes ? `${minutes} 分 ${seconds % 60} 秒` : `${seconds} 秒`;
+}
+
+function refreshTurnStatusLanguage() {
+  if (!turnStatusEl) return;
+  const label = uiText('Deep diving...', '深入分析中…');
+  if (turnStatusEl.firstChild?.nodeValue !== label) setTurnStatusLabel(label);
+  const clock = turnStatusEl.querySelector('.ts-clock');
+  if (clock) {
+    const ms = Date.now() - turnStartMs;
+    clock.textContent = ms >= 15000 ? ' ' + turnStatusDuration(ms) : '';
+  }
+}
+
 function beginTurnStatus() {
   turnStartMs = Date.now();
   turnFirstTokenMs = 0;
@@ -1069,16 +1162,13 @@ function beginTurnStatus() {
   turnOutTokens = 0;
   const area = document.getElementById('chatArea');
   area.insertAdjacentHTML('beforeend',
-    '<div class="turn-status" role="status" aria-live="polite">Deep diving...<span class="ts-clock"></span></div>');
+    '<div class="turn-status" role="status" aria-live="polite">' +
+    uiText('Deep diving...', '深入分析中…') + '<span class="ts-clock"></span></div>');
   turnStatusEl = area.lastElementChild;
   clearInterval(turnStatusTimer);
   turnStatusTimer = setInterval(() => {
-    const ms = Date.now() - turnStartMs;
     if (activityTurnEl && activityTurnEl.dataset.state === 'running') updateActivityTurnLabel(activityTurnEl);
-    if (ms >= 15000 && turnStatusEl) {
-      const clock = turnStatusEl.querySelector('.ts-clock');
-      if (clock) clock.textContent = ' ' + fmtMs(ms);
-    }
+    refreshTurnStatusLanguage();
   }, 1000);
   autoScroll();
 }
@@ -1255,11 +1345,19 @@ function handleTextDelta(d) {
   finishThinking();
   if (turnStartMs && !turnFirstTokenMs) turnFirstTokenMs = Date.now();
   streamedTextThisTurn = true;
-  if (!streaming) startStreamingMessage();
+  if (!streaming) streaming = true;
   streamingText += d.delta || '';
+  const visibleText = visibleTranscriptText(streamingText, true);
+  // Internal envelopes and empty deltas can precede a tool call. Do not
+  // create an empty assistant row that would leave a large gap in the chat.
+  if (streamingEl && !visibleText.trim()) {
+    streamingEl.remove();
+    streamingEl = null;
+  }
+  if (!streamingEl && visibleText.trim()) startStreamingMessage();
   if (streamingEl) {
     const box = streamingEl.querySelector('.message-content');
-    box.innerHTML = formatContent(visibleTranscriptText(streamingText)) + '<span class="stream-cursor"></span>';
+    box.innerHTML = formatContent(visibleText);
   }
   autoScroll();
 }
@@ -1353,6 +1451,7 @@ async function prepareDraftSession() {
     if (generation !== resumeSessionGeneration) return false;
     if (currentSessionId && currentSessionId !== data.id) return false;
     currentSessionId = data.id;
+    closeMismatchedSubAgentDetails();
     if (!sessions.some(session => session.id === data.id)) sessions = [data, ...sessions];
     if (window.metisNavigation) window.metisNavigation.recordSession(data.id, { replace: true });
     renderSessions();
@@ -1413,10 +1512,6 @@ function detachRunningTurnView() {
   if (request) request.needsHistorySync = true;
   if (turnRunning && currentSessionId && currentSessionId === runningSessionId) {
     runningTurnNeedsHistorySync = true;
-  }
-  if (streamingEl) {
-    const caret = streamingEl.querySelector('.stream-cursor');
-    if (caret) caret.remove();
   }
   streaming = false;
   streamingEl = null;
@@ -1487,19 +1582,20 @@ function startStreamingMessage() {
     <div class="message message-assistant">
       <div class="message-avatar">M</div>
       <div class="message-body">
-        <div class="message-content"><span class="stream-cursor"></span></div>
+        <div class="message-content"></div>
       </div>
     </div>`);
   streamingEl = area.lastElementChild;
   autoScroll();
 }
 
-function endStreamingMessage() {
+function endStreamingMessage(refresh = true) {
   finishThinking();
+  // The stream is complete: a trailing literal "<" is now answer text, not
+  // an internal tag prefix that still needs to be buffered.
   const visibleText = visibleTranscriptText(streamingText);
+  if (!streamingEl && visibleText.trim()) startStreamingMessage();
   if (streamingEl) {
-    const caret = streamingEl.querySelector('.stream-cursor');
-    if (caret) caret.remove();
     const box = streamingEl.querySelector('.message-content');
     if (visibleText.trim()) {
       if (box) box.innerHTML = formatContent(visibleText);
@@ -1513,9 +1609,11 @@ function endStreamingMessage() {
   streamingEl = null;
   streamingText = '';
   updateSendBtn();
-  loadSessions();
-  loadSessionStatsbar();
-  if (currentView === 'trace') loadTrace();
+  if (refresh !== false) {
+    loadSessions();
+    loadSessionStatsbar();
+    if (currentView === 'trace') loadTrace();
+  }
 }
 
 // A provider turn_end closes one assistant response, but an agent turn can
@@ -1559,10 +1657,6 @@ function resetTurnState() {
   finishActivityGroup();
   activityTurnEl = null;
   activityCurrentTurnId = '';
-  if (streamingEl) {
-    const caret = streamingEl.querySelector('.stream-cursor');
-    if (caret) caret.remove();
-  }
   streaming = false;
   streamingEl = null;
   streamingText = '';
@@ -1651,6 +1745,12 @@ const TOOL_VARIANTS = {
   edit:      { title: 'Edit', titleZh: '编辑', keys: ['path', 'file_path'] },
   run_code:  { title: 'Run code', titleZh: '运行代码', keys: ['description'] },
   todo_write:{ title: 'Update tasks', titleZh: '更新任务清单', keys: [] },
+  agent:     { title: 'Start sub-agent', titleZh: '启动子代理', keys: [] },
+  subagentlist:   { title: 'View sub-agents', titleZh: '查看子代理', keys: [] },
+  subagentoutput: { title: 'Read sub-agent output', titleZh: '读取子代理输出', keys: [] },
+  subagentstop:   { title: 'Stop sub-agent', titleZh: '停止子代理', keys: [] },
+  messageteammate:{ title: 'Message sub-agent', titleZh: '给子代理发消息', keys: [] },
+  sendmessage:    { title: 'Send external message', titleZh: '发送外部消息', keys: [] },
 };
 let toolRowSequence = 0;
 const TOOL_ICONS = {
@@ -1660,6 +1760,7 @@ const TOOL_ICONS = {
   write:  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M11.7 2.3a1.6 1.6 0 0 1 2.3 2.3L6 12.6 2.5 13.5l.9-3.5z"/></svg>',
   code:   '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4 2.5 8 6 12M10 4l3.5 4L10 12"/></svg>',
   sparkle:'<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.6l1 2.9a2.6 2.6 0 0 0 1.5 1.5l2.9 1-2.9 1a2.6 2.6 0 0 0-1.5 1.5l-1 2.9-1-2.9a2.6 2.6 0 0 0-1.5-1.5l-2.9-1 2.9-1a2.6 2.6 0 0 0 1.5-1.5z"/></svg>',
+  agent:  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="4.5" r="2"/><path d="M4.5 12.5c.3-2 1.5-3 3.5-3s3.2 1 3.5 3M2.1 5.2 1 7l1.1 1.8M13.9 5.2 15 7l-1.1 1.8"/></svg>',
 };
 function iconKeyOf(name) {
   const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
@@ -1668,6 +1769,7 @@ function iconKeyOf(name) {
   if (key === 'websearch' || key === 'grep' || key === 'glob') return 'search';
   if (key === 'write' || key === 'edit') return 'write';
   if (key === 'runcode') return 'code';
+  if (['agent', 'subagentlist', 'subagentoutput', 'subagentstop', 'messageteammate'].includes(key)) return 'agent';
   return 'sparkle';
 }
 function toolVariantConfig(name) {
@@ -1707,6 +1809,7 @@ function setToolRowVisualState(row, state) {
     leading.innerHTML = icon + marker;
   }
   updateToolRowAccessibleLabel(row);
+  if (isSubagentTool(row.dataset.tool)) updateSubagentStage(row.closest('.activity-group'));
   if (id && selectedToolId === id) renderDetailPanel();
 }
 
@@ -1748,7 +1851,36 @@ function firstLine(s) {
   const i = t.indexOf('\n');
   return (i === -1 ? t : t.slice(0, i)).trim();
 }
+function boundedToolLabel(value) {
+  return firstLine(value).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 84);
+}
+function semanticToolSummary(name, input) {
+  const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (!['agent', 'subagentlist', 'subagentoutput', 'subagentstop', 'messageteammate', 'sendmessage'].includes(key)) return null;
+  let args = {};
+  try { args = JSON.parse(input); } catch (_) {}
+  if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
+  const field = (...keys) => {
+    for (const item of keys) if (typeof args[item] === 'string' && args[item].trim()) return boundedToolLabel(args[item]);
+    return '';
+  };
+  if (key === 'agent') return field('description', 'name', 'subagent_type') || uiText('Preparing a task', '准备任务');
+  if (key === 'subagentlist') return uiText('Current agents', '当前代理');
+  if (key === 'subagentoutput') return field('name', 'agent_id') || uiText('Agent output', '代理输出');
+  if (key === 'subagentstop') return field('name', 'agent_id') || uiText('Stop request', '停止请求');
+  if (key === 'messageteammate') return field('to') || uiText('Recipient not specified', '未指定接收者');
+  return uiText('External channel', '外部频道');
+}
+function semanticToolErrorSummary(name) {
+  const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (key === 'agent') return uiText('Start failed; inspect details', '启动失败，查看详情');
+  if (key === 'messageteammate') return uiText('Message failed; inspect details', '消息发送失败，查看详情');
+  if (key === 'sendmessage') return uiText('External delivery failed; inspect details', '外部发送失败，查看详情');
+  return uiText('Request failed; inspect details', '请求失败，查看详情');
+}
 function toolSummaryText(name, input) {
+  const semantic = semanticToolSummary(name, input);
+  if (semantic !== null) return semantic;
   if (isTodoWriteTool(name)) {
     const todos = normalizeTodoItems(input);
     if (todos) {
@@ -1901,6 +2033,65 @@ function toolRowsInCurrentTurn() {
     .flatMap(group => [...group.querySelectorAll('.call-row')]);
 }
 
+function attachSubagentIdentity(row, info, status) {
+  if (!row || !isSubagentTool(row.dataset.tool) || !info || typeof info !== 'object') return false;
+  const agentId = String(info.agentId || '');
+  const owner = String(info.sessionId || '');
+  const parentToolUseId = String(info.parentToolUseId || '');
+  if (!agentId || !owner || !parentToolUseId || row.dataset.id !== parentToolUseId ||
+      row.dataset.ownerSession !== owner) return false;
+  if (row.dataset.subagentId && row.dataset.subagentId !== agentId) return false;
+  row.dataset.subagentId = agentId;
+  row.dataset.subagentSessionId = owner;
+  row.dataset.subagentName = boundedToolLabel(info.name || '');
+  row.dataset.subagentBackground = String(!!info.background);
+  if (status) row.dataset.subagentStatus = String(status);
+  const open = row.querySelector('.tc-open-agent');
+  if (open) open.hidden = false;
+  updateSubagentStage(row.closest('.activity-group'));
+  return true;
+}
+
+function handleSubagentLifecycle(d, status) {
+  // This event is a child lifecycle fact, not an assistant message. It may
+  // identify the existing Agent call, but must never append child text here.
+  const owner = String(d.sessionId || d.session || '');
+  const agentId = String(d.agentId || '');
+  if (!owner || owner !== String(currentSessionId || runningSessionId || '') ||
+      !d.parentToolUseId || !agentId) return;
+  // Background children can end after the parent turn has completed. Search
+  // connected rows in the viewed session, including earlier turns and replayed
+  // history, rather than limiting lifecycle facts to the current turn.
+  const rows = [...document.querySelectorAll('.call-row')].filter(row =>
+    row.isConnected &&
+    isSubagentTool(row.dataset.tool) && row.dataset.id === String(d.parentToolUseId) &&
+    row.dataset.ownerSession === owner &&
+    (!row.dataset.subagentId || row.dataset.subagentId === agentId));
+  const traceCallId = String(d.traceCallId || '');
+  if (traceCallId) {
+    const traced = rows.filter(row => row.dataset.traceCallId === traceCallId);
+    if (traced.length === 1) {
+      attachSubagentIdentity(traced[0], { ...d, sessionId: owner }, status);
+      return;
+    }
+    if (traced.length > 1) return;
+  }
+  // A missing trace on an older saved row is safe only when its child ID is
+  // already known. A new traced child may reuse a provider ID from another
+  // turn, so only the current turn's unique unbound row is a safe fallback.
+  // Never use a row whose nonempty trace contradicts this lifecycle event.
+  const compatible = traceCallId ? rows.filter(row => !row.dataset.traceCallId) : rows;
+  const matching = compatible.filter(row => row.dataset.subagentId === agentId);
+  if (matching.length > 1) return;
+  const unbound = compatible.filter(row => !row.dataset.subagentId);
+  const fallback = traceCallId
+    ? unbound.filter(row => activityCurrentTurnId &&
+      row.closest('.activity-group')?.dataset.turnId === activityCurrentTurnId)
+    : unbound;
+  const row = matching.length === 1 ? matching[0] : fallback.length === 1 ? fallback[0] : null;
+  if (row) attachSubagentIdentity(row, { ...d, sessionId: owner }, status);
+}
+
 function pendingToolRows(id, name = '') {
   return toolRowsInCurrentTurn().filter(row =>
     (id ? row.dataset.id === id : name ? row.dataset.tool === name : row.dataset.id === '') &&
@@ -1987,6 +2178,7 @@ function handleToolStart(d) {
     existing.setAttribute('data-args', full);
     existing.dataset.provisional = 'false';
     if (d.traceCallId) existing.dataset.traceCallId = d.traceCallId;
+    if (d.session && !existing.dataset.ownerSession) existing.dataset.ownerSession = String(d.session);
     const key = existing.dataset.rowKey;
     if (!toolDetails[key]) toolDetails[key] = { name: name, input: full, output: '', elapsed: 0, error: false, state: 'running' };
     toolDetails[key].input = full;
@@ -2002,6 +2194,9 @@ function handleToolStart(d) {
     }
     return;
   }
+  // A tool call starts after this assistant text segment. Settle it now;
+  // turn_end arrives only after the tool has finished, which can take minutes.
+  if (!renderingActivityHistory && streaming) endStreamingMessage(false);
   // A new tool call is a provider event boundary: settle reasoning before
   // inserting the tool so the visible timeline keeps source order.
   finishThinking();
@@ -2015,7 +2210,7 @@ function handleToolStart(d) {
   const bodyId = rowKey + '-body';
   toolDetails[rowKey] = { name: name, input: input, output: '', elapsed: 0, error: false, state: 'running' };
   area.insertAdjacentHTML('beforeend', `
-    <div class="call-row" data-tool="${escAttr(name)}" data-id="${escAttr(id)}" data-row-key="${rowKey}" data-trace-call-id="${escAttr(d.traceCallId || '')}" data-history-rendered="${renderingActivityHistory ? 'true' : 'false'}" data-provisional="${d.provisional ? 'true' : 'false'}" data-variant="${escAttr(iconKeyOf(name))}" data-state="running" data-args="${escAttr(input)}">
+    <div class="call-row" data-tool="${escAttr(name)}" data-id="${escAttr(id)}" data-row-key="${rowKey}" data-owner-session="${escAttr(d.session || currentSessionId || '')}" data-trace-call-id="${escAttr(d.traceCallId || '')}" data-history-rendered="${renderingActivityHistory ? 'true' : 'false'}" data-provisional="${d.provisional ? 'true' : 'false'}" data-variant="${escAttr(iconKeyOf(name))}" data-state="running" data-args="${escAttr(input)}">
       <div class="tc-row">
         <button class="tc-disclosure" type="button" aria-expanded="false" aria-controls="${bodyId}" onclick="toggleToolInline('${rowKey}')">
           <span class="tc-leading">
@@ -2028,6 +2223,7 @@ function handleToolStart(d) {
           <span class="tc-time"></span>
         </button>
         <button class="tc-inspect" type="button" onclick="openToolDetail('${rowKey}')">${uiText('Inspect', '查看详情')}</button>
+        ${isSubagentTool(name) ? `<button class="tc-open-agent" type="button" hidden onclick="openSubagentFromTool('${rowKey}', this)">${uiText('Open agent', '打开子代理')}</button>` : ''}
       </div>
       <div class="tc-body" id="${bodyId}">
         <div class="tc-io">
@@ -2052,6 +2248,15 @@ function toggleToolInline(id) {
   }
 }
 
+function openSubagentFromTool(rowKey, trigger) {
+  const row = document.querySelector('.call-row[data-row-key="' + escAttr(rowKey) + '"]');
+  const agentId = row && row.dataset.subagentId;
+  const owner = row && row.dataset.subagentSessionId;
+  if (!agentId || !owner || owner !== String(currentSessionId || '') ||
+      typeof openSubAgentDetails !== 'function') return;
+  openSubAgentDetails(agentId, trigger, owner);
+}
+
 function showUnattributedToolResult(d) {
   // Older event producers can omit the occurrence ID. Two pending calls with
   // the same provider ID are then impossible to distinguish, so keep their
@@ -2060,7 +2265,7 @@ function showUnattributedToolResult(d) {
   row.className = 'tool-unattributed-result';
   row.setAttribute('role', 'status');
   row.textContent = [uiText('Tool result attribution unknown', '工具结果归属不明'),
-    d.tool || '', firstLine(d.output || '')].filter(Boolean).join(' · ');
+    d.tool || '', semanticToolSummary(d.tool, '') === null ? firstLine(d.output || '') : ''].filter(Boolean).join(' · ');
   appendActivityRow(row);
 }
 
@@ -2115,6 +2320,9 @@ function handleToolResult(d) {
     const ok = !d.isError;
     const wasError = chip.dataset.state === 'error';
     setToolRowVisualState(chip, ok ? 'ok' : 'error');
+    if (isSubagentTool(name) && d.presentation && d.presentation.subagent) {
+      attachSubagentIdentity(chip, d.presentation.subagent, d.presentation.subagent.status || (ok ? 'completed' : 'failed'));
+    }
     if (ok && isTodoWriteTool(name)) {
       applyTodoSnapshot(name, chip.getAttribute('data-args') || '');
     }
@@ -2124,9 +2332,10 @@ function handleToolResult(d) {
     const t = chip.querySelector('.tc-time');
     if (t) t.textContent = d.elapsedMs ? fmtMs(d.elapsedMs) : '';
     const summary = chip.querySelector('.tc-summary');
-    if (!ok && summary && d.output) {
+    if (!ok && summary) {
       summary.classList.add('err');
-      summary.textContent = firstLine(d.output) || summary.textContent;
+      summary.textContent = semanticToolSummary(name, '') === null
+        ? firstLine(d.output) || summary.textContent : semanticToolErrorSummary(name);
     }
     updateToolRowAccessibleLabel(chip);
     const out = chip.querySelector('.tc-io-text[data-out]');
@@ -2394,6 +2603,11 @@ function resumeAutoScroll() {
 
 
 // --- Chat ---
+function closeMismatchedSubAgentDetails() {
+  if (typeof subAgentDetailState !== 'undefined' && subAgentDetailState.agentId &&
+      subAgentDetailState.ownerSessionId !== String(currentSessionId || '') &&
+      typeof closeSubAgentDetails === 'function') closeSubAgentDetails(false);
+}
 function newChat() {
   if (turnRunning && !parallelTurnsEnabled()) {
     showToast('Stop the current turn before starting a new session');
@@ -2402,6 +2616,7 @@ function newChat() {
   saveSessionQueue();
   if (typeof invalidateSessionAsyncLoads === 'function') invalidateSessionAsyncLoads();
   currentSessionId = null;
+  closeMismatchedSubAgentDetails();
   if (typeof resetTraceForSession === 'function') resetTraceForSession();
   if (typeof resetSessionFiles === 'function') resetSessionFiles();
   if (typeof resetArtifactsForSession === 'function') resetArtifactsForSession();
@@ -2989,6 +3204,7 @@ async function runTurnItem(item) {
     if (!runningSessionId && resolvedTurnSessionId) runningSessionId = resolvedTurnSessionId;
     if (currentSessionId === turnSessionId && (turnSessionId || resumeSessionGeneration === viewGenerationAtSubmit)) {
       currentSessionId = resolvedTurnSessionId;
+      closeMismatchedSubAgentDetails();
       if (!turnSessionId && window.metisNavigation) window.metisNavigation.recordSession(resolvedTurnSessionId, { replace: true });
     }
     if (viewingTurn() && typeof loadSessionFiles === 'function') void loadSessionFiles(resolvedTurnSessionId);
@@ -3082,12 +3298,52 @@ function messageActionTime(date = new Date()) {
   return `${localDateTime} · ${messageUTCOffset(date)} · ${MESSAGE_TIME_ZONE}`;
 }
 
+function messageShortTime(date) {
+  const lang = resolvedLanguage(desktopPreferences.language);
+  const sameYear = date.getFullYear() === new Date().getFullYear();
+  return new Intl.DateTimeFormat(lang === 'en' ? 'en-US' : 'zh-CN', {
+    ...(sameYear ? {} : {year: 'numeric'}),
+    month: lang === 'en' ? 'short' : 'long', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  }).format(date);
+}
+
+function messageTimeMarkup(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
+  const full = messageActionTime(date);
+  return `<time class="msg-time" datetime="${escAttr(date.toISOString())}" title="${escAttr(full)}" aria-label="${escAttr(full)}">${escHtml(messageShortTime(date))}</time>`;
+}
+
+function refreshMessageActionTimesLanguage() {
+  document.querySelectorAll('.msg-time[datetime]').forEach(node => {
+    const date = new Date(node.getAttribute?.('datetime') || node.dateTime || '');
+    if (Number.isNaN(date.getTime())) return;
+    const full = messageActionTime(date);
+    node.textContent = messageShortTime(date);
+    node.title = full;
+    node.setAttribute?.('aria-label', full);
+  });
+}
+
 function turnMetricsMarkup(metric) {
   const durationMs = Number(metric && metric.durationMs) || 0;
   const ttftMs = Number(metric && metric.ttftMs) || 0;
   const tokPerSec = Math.round(Number(metric && metric.tokPerSec) || 0);
   if (durationMs <= 0 && ttftMs <= 0 && tokPerSec <= 0) return '';
-  return `<span class="msg-metrics"><span class="msg-sep">\u00B7</span><span>${uiText('Ran for ', '用时 ')}${fmtRunDur(durationMs)}</span>${ttftMs ? `<span class="msg-sep">\u00B7</span><span>${uiText('First token ', '首 token ')}${fmtMs(ttftMs)}</span>` : ''}${tokPerSec ? `<span class="msg-sep">\u00B7</span><span>${tokPerSec} tok/s</span>` : ''}</span>`;
+  return `<span class="msg-metrics" data-duration-ms="${durationMs}" data-ttft-ms="${ttftMs}" data-tok-per-sec="${tokPerSec}">${turnMetricsContentMarkup({durationMs, ttftMs, tokPerSec})}</span>`;
+}
+
+function turnMetricsContentMarkup(metric) {
+  const durationMs = Number(metric.durationMs) || 0;
+  const ttftMs = Number(metric.ttftMs) || 0;
+  const tokPerSec = Math.round(Number(metric.tokPerSec) || 0);
+  return `<span class="msg-sep">\u00B7</span><span>${uiText('Ran for ', '用时 ')}${fmtRunDur(durationMs)}</span>${ttftMs ? `<span class="msg-sep">\u00B7</span><span>${uiText('First token ', '首 token ')}${fmtMs(ttftMs)}</span>` : ''}${tokPerSec ? `<span class="msg-sep">\u00B7</span><span>${tokPerSec} tok/s</span>` : ''}`;
+}
+
+function refreshTurnMetricsLanguage() {
+  document.querySelectorAll('.msg-metrics').forEach(node => {
+    node.innerHTML = turnMetricsContentMarkup(node.dataset);
+  });
 }
 
 function messageActionsMarkup(role, date = new Date()) {
@@ -3097,9 +3353,7 @@ function messageActionsMarkup(role, date = new Date()) {
   const ratings = role === 'assistant'
     ? messageActionButton('up', uiText('Good reply', '回答很好'), "rateMessage(this,'up')") + messageActionButton('down', uiText('Bad reply', '回答不好'), "rateMessage(this,'down')")
     : '';
-  const time = date instanceof Date && !Number.isNaN(date.getTime())
-    ? `<span class="msg-time">${escHtml(messageActionTime(date))}</span>`
-    : '';
+  const time = messageTimeMarkup(date);
   return `<div class="msg-actions">${copy}${ratings}${branch}${feedback}${time}</div>`;
 }
 
@@ -3222,11 +3476,24 @@ function messageText(content) {
 // internal rescue prompt cannot expose it in Desktop (screenshot regression).
 const INTERNAL_TRANSCRIPT_SECTION_RE = /<(system-reminder|memory-context|auto-retrieve|peer_message|task-context|project-context|job_notification|sub_agent_idle|memory_consolidation_done|monitor_event|post_compact_context|metis-internal-review)(?:\s[^>]*)?>[\s\S]*?<\/\1\s*>/gi;
 const UNTERMINATED_INTERNAL_SECTION_RE = /<(?:system-reminder|memory-context|auto-retrieve|peer_message|task-context|project-context|job_notification|sub_agent_idle|memory_consolidation_done|monitor_event|post_compact_context|metis-internal-review)(?:\s[^>]*)?>[\s\S]*$/i;
+const INTERNAL_TRANSCRIPT_TAGS = ['system-reminder', 'memory-context', 'auto-retrieve', 'peer_message', 'task-context', 'project-context', 'job_notification', 'sub_agent_idle', 'memory_consolidation_done', 'monitor_event', 'post_compact_context', 'metis-internal-review'];
 
-function visibleTranscriptText(value) {
-  return String(value == null ? '' : value)
+function visibleTranscriptText(value, streaming = false) {
+  const visible = String(value == null ? '' : value)
     .replace(INTERNAL_TRANSCRIPT_SECTION_RE, '')
     .replace(UNTERMINATED_INTERNAL_SECTION_RE, '');
+  if (!streaming) return visible;
+  // An internal opening tag can arrive across several deltas. Hold a trailing
+  // prefix until it either proves to be ordinary text or becomes a full tag.
+  const start = visible.lastIndexOf('<');
+  if (start < 0) return visible;
+  const tail = visible.slice(start + 1);
+  if (tail.includes('>') || tail.includes('\n')) return visible;
+  const name = /^[a-z_-]*/i.exec(tail)?.[0].toLowerCase() || '';
+  const rest = tail.slice(name.length);
+  const possibleTag = INTERNAL_TRANSCRIPT_TAGS.some(tag => tag.startsWith(name) &&
+    (!rest || (tag === name && /^\s/.test(rest))));
+  return possibleTag ? visible.slice(0, start) : visible;
 }
 
 // Rebuild the full transcript from session history (DSH parity: reloading
@@ -3234,7 +3501,50 @@ function visibleTranscriptText(value) {
 // Shapes come from the JSONL: assistant messages carry {type:'tool_use',
 // tool_use_id, name, input} blocks; the following user message carries
 // {type:'tool_result', tool_use_id, content, is_error?} blocks.
+function refreshHistoricalSubagentStatuses(sessionId, generation) {
+  if (!sessionId || typeof fetch !== 'function') return;
+  const rows = [...document.querySelectorAll('.call-row[data-subagent-id]')].filter(row =>
+    row.dataset.historyRendered === 'true' && row.dataset.ownerSession === sessionId &&
+    row.dataset.subagentSessionId === sessionId && row.dataset.subagentStatus === 'running');
+  const byAgent = new Map();
+  rows.forEach(row => {
+    const id = String(row.dataset.subagentId || '');
+    if (!id) return;
+    if (!byAgent.has(id)) byAgent.set(id, []);
+    byAgent.get(id).push(row);
+  });
+  const entries = [...byAgent.entries()];
+  let next = 0;
+  const stillViewing = () => String(currentSessionId || '') === sessionId &&
+    activityHistoryGeneration === generation;
+  const drain = async () => {
+    while (next < entries.length && stillViewing()) {
+      const [agentId, matchingRows] = entries[next++];
+      try {
+        const response = await fetch('/api/subagents/' + encodeURIComponent(agentId) +
+          '?sessionId=' + encodeURIComponent(sessionId), { cache: 'no-store' });
+        if (!response.ok) continue;
+        const body = await response.json();
+        if (!stillViewing()) return;
+        const detail = body && body.agent;
+        if (!detail || String(detail.agentId || '') !== agentId ||
+            String(detail.sessionId || '') !== sessionId ||
+            !['completed', 'failed', 'killed'].includes(detail.status)) continue;
+        matchingRows.forEach(row => {
+          if (!row.isConnected || row.dataset.ownerSession !== sessionId ||
+              row.dataset.subagentSessionId !== sessionId ||
+              row.dataset.subagentId !== agentId || row.dataset.subagentStatus !== 'running') return;
+          row.dataset.subagentStatus = detail.status;
+          updateSubagentStage(row.closest('.activity-group'));
+        });
+      } catch (_) { /* Keep the persisted started state when detail is unavailable. */ }
+    }
+  };
+  for (let i = 0; i < Math.min(4, entries.length); i++) void drain();
+}
+
 function renderHistoryMessages(history) {
+  const historySessionId = String(currentSessionId || '');
   if (typeof loadSessionFiles === 'function') void loadSessionFiles(currentSessionId);
   queueMicrotask(() => restoreTodoPlanFromHistory(history));
   const area = document.getElementById('chatArea');
@@ -3287,7 +3597,7 @@ function renderHistoryMessages(history) {
         let input = '';
         try { input = JSON.stringify(b.input || {}); } catch (e) { input = ''; }
         try { handleToolStart({ tool: b.name || 'tool', id: b.tool_use_id,
-          traceCallId: b.trace_call_id || '', input: input }); }
+          session: historySessionId, traceCallId: b.trace_call_id || '', input: input }); }
         catch (e) { /* malformed history entry: skip the row */ }
       } else if (b.type === 'tool_result') {
         const out = typeof b.content === 'string' ? b.content
@@ -3296,6 +3606,20 @@ function renderHistoryMessages(history) {
         const matched = b.trace_call_id
           ? pending.find(row => row.dataset.traceCallId === b.trace_call_id) : pending[0];
         const det = matched ? toolDetails[matched.dataset.rowKey] || {} : {};
+        let presentation = b.presentation;
+        const subagent = presentation && presentation.subagent;
+        // Older Agent results were saved before the parent session ID reached
+        // the tool. The result still carries a dispatcher-owned marker, child
+        // ID, and exact parent tool call ID. Restore only that missing owner
+        // from the session whose transcript the server just loaded; an
+        // explicit different owner must remain non-clickable.
+        if (presentation && presentation['metis.agent_started'] === true &&
+            subagent && typeof subagent === 'object' && !subagent.sessionId &&
+            historySessionId && matched && matched.dataset.tool === 'Agent' &&
+            matched.dataset.ownerSession === historySessionId &&
+            String(subagent.parentToolUseId || '') === String(b.tool_use_id || '')) {
+          presentation = { ...presentation, subagent: { ...subagent, sessionId: historySessionId } };
+        }
         try {
           handleToolResult({
             tool: det.name || 'tool',
@@ -3305,7 +3629,7 @@ function renderHistoryMessages(history) {
             isError: !!b.is_error,
             elapsedMs: 0,
             display: b.display,
-            presentation: b.presentation
+            presentation
           });
         } catch (e) { /* skip */ }
       }
@@ -3339,6 +3663,7 @@ function renderHistoryMessages(history) {
   activityHistoryTurn = 0;
   updateEmptyLayout();
   resumeAutoScroll();
+  refreshHistoricalSubagentStatuses(historySessionId, activityHistoryGeneration);
   void restoreHistoryMessageMetadata(currentSessionId, activityHistoryGeneration);
 }
 
@@ -3372,7 +3697,7 @@ async function restoreHistoryMessageMetadata(sessionId, generation = activityHis
       const startedAt = new Date(metric.startedAt || '');
       if (userActions && !Number.isNaN(startedAt.getTime())) {
         userActions.querySelector('.msg-time')?.remove();
-        userActions.insertAdjacentHTML('beforeend', `<span class="msg-time">${escHtml(messageActionTime(startedAt))}</span>`);
+        userActions.insertAdjacentHTML('beforeend', messageTimeMarkup(startedAt));
       }
 
       // The trace owns the saved turn duration. Show it once on the turn
@@ -3391,7 +3716,7 @@ async function restoreHistoryMessageMetadata(sessionId, generation = activityHis
       assistantActions.querySelector('.msg-metrics')?.remove();
       const completedAt = new Date(metric.completedAt || '');
       if (!Number.isNaN(completedAt.getTime())) {
-        assistantActions.insertAdjacentHTML('beforeend', `<span class="msg-time">${escHtml(messageActionTime(completedAt))}</span>`);
+        assistantActions.insertAdjacentHTML('beforeend', messageTimeMarkup(completedAt));
       }
       const metrics = turnMetricsMarkup(metric);
       if (metrics) {
@@ -4944,7 +5269,7 @@ function renderPresentationModePreference() {
   ];
   return `<div class="settings-section">
     <div class="settings-section-title">${uiText('Work step display', '工作步骤展示')}</div>
-    <div class="settings-section-desc">${uiText('Choose how much of the agent\'s process appears in conversations. Tool details and artifacts are always retained.', '选择对话中展示多少代理工作过程。工具详情和 Artifacts 始终保留。')}</div>
+    <div class="settings-section-desc">${uiText('Choose how much of the agent\'s process appears in conversations. Tool details and artifacts are always retained.', '选择对话中展示多少代理工作过程。工具详情和产物始终保留。')}</div>
     <div class="radio-cards">${choices.map(c => `<button type="button" aria-pressed="${value === c.value}" class="radio-card desktop-pref${value === c.value ? ' selected' : ''}" onclick="choosePresentationMode('${c.value}')">
       <div class="radio-card-title">${c.title}</div><div class="radio-card-desc">${c.desc}</div>
     </button>`).join('')}</div>

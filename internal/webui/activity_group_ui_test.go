@@ -100,6 +100,7 @@ class Element {
       const expanded = this._html.match(/aria-expanded="(true|false)"/)?.[1] || 'true';
       const toggle = new Element('button'); toggle.className = 'activity-turn-toggle'; toggle.setAttribute('aria-expanded', expanded);
       const duration = new Element('span'); duration.className = 'activity-turn-duration'; toggle.appendChild(duration);
+      const summary = new Element('span'); summary.className = 'activity-turn-summary'; toggle.appendChild(summary);
       const state = new Element('span'); state.className = 'activity-turn-state'; toggle.appendChild(state);
       const chevron = new Element('span'); chevron.className = 'activity-turn-chevron'; toggle.appendChild(chevron);
       this.appendChild(toggle);
@@ -136,6 +137,14 @@ class Element {
       content.innerHTML = html.match(/class="message-content">([\s\S]*?)<\/div>/)?.[1] || '';
       node.appendChild(content);
       if (html.includes('stream-cursor')) { const cursor = new Element('span'); cursor.className = 'stream-cursor'; node.appendChild(cursor); }
+    } else if (node.classList.contains('turn-status')) {
+      node.textContent = html.match(/aria-live="polite">([^<]*)/)?.[1] || '';
+      node.firstChild = {
+        nodeType: 3,
+        get nodeValue() { return node.textContent; },
+        set nodeValue(value) { node.textContent = value; }
+      };
+      const clock = new Element('span'); clock.className = 'ts-clock'; node.appendChild(clock);
     }
     this.appendChild(node);
   }
@@ -167,6 +176,8 @@ area = new Element();
 root = new Element('html');
 const liveCallbacks = {};
 const frames = [];
+const intervals = new Map();
+let nextIntervalID = 0;
 function flushFrames() {
   for (let count = 0; frames.length; count++) {
     assert(count < 100, 'animation frames must settle');
@@ -176,6 +187,8 @@ function flushFrames() {
 const c = {
   Map, Set, Date, console, queueMicrotask: fn => fn(),
   requestAnimationFrame: fn => frames.push(fn),
+  setInterval: fn => { const id = ++nextIntervalID; intervals.set(id, fn); return id; },
+  clearInterval: id => intervals.delete(id),
   window: {EventSource: function() {}},
   EventSource: function() { this.addEventListener = () => {}; this.close = () => {}; },
   eventSource: null,
@@ -187,7 +200,12 @@ const c = {
     createElement: tag => new Element(tag), querySelector: selector => area.querySelector(selector),
     querySelectorAll: selector => area.querySelectorAll(selector)},
   uiText: (en, zh) => zh, escHtml: value => String(value), escAttr: value => String(value), escOnclick: value => String(value),
-  fmtMs: ms => ms + 'ms', formatContent: text => String(text),
+  fmtMs: ms => ms < 60000 ? (ms / 1000).toFixed(1) + 's'
+    : Math.floor(ms / 60000) + 'm' + Math.round((ms % 60000) / 1000) + 's',
+  fmtRunDur: ms => root.lang === 'zh-CN'
+    ? Math.floor(ms / 60000) + ' 分 ' + Math.floor(ms % 60000 / 1000) + ' 秒'
+    : Math.floor(ms / 60000) + 'm' + Math.floor(ms % 60000 / 1000) + 's',
+  formatContent: text => String(text),
   messageActionsMarkup: () => '', visibleTranscriptText: value => String(value),
   autoScroll() {}, updateEmptyLayout() {}, updateSendBtn() {}, loadSessions() {}, loadSessionStatsbar() {},
   resumeAutoScroll() {}, restoreTodoPlanFromHistory() {}, restoreHistoryMessageMetadata() {},
@@ -201,18 +219,23 @@ const c = {
   runningTurnIncompleteReason: '',
   toolDetails: {}, selectedToolId: null, messages: [], streaming: false,
   streamingEl: null, streamingText: '', streamMsgIdx: -1, turnStartMs: 0, turnFirstTokenMs: 0,
+  turnStatusEl: null, turnStatusTimer: null,
 };
 vm.createContext(c);
 vm.runInContext(extract('function sameSession(d)', 'let thinkingEl = null;'), c);
 vm.runInContext(extract('let thinkingEl = null;', 'const THINK_ORBIT_ICON'), c);
 vm.runInContext(extract('const THINK_ORBIT_ICON', 'let todoPlanItems ='), c);
 vm.runInContext(extract('function handleTextDelta(d)', 'const foregroundRequests ='), c);
+vm.runInContext(extract('function turnStatusDuration(ms)', '// Per-turn StatsLine'), c);
+vm.runInContext(extract('function setTurnStatusLabel(label)', 'function upsertCompactionRow('), c);
 vm.runInContext(extract('const foregroundRequests =', 'function syncTrackedRunningState('), c);
 vm.runInContext(extract('function startStreamingMessage()', '// A provider turn_end'), c);
 vm.runInContext(extract('const TOOL_VARIANTS =', 'const FILE_DIFF_MAX_LINES'), c);
 vm.runInContext(extract('function toolRowsInCurrentTurn()', '// Search card'), c);
 vm.runInContext(extract('function addMessage(', '// Attach the hover actions row'), c);
-vm.runInContext(extract('function renderHistoryMessages(history)', 'async function restoreHistoryMessageMetadata('), c);
+vm.runInContext(extract('function turnMetricsMarkup(metric)', 'function messageActionsMarkup('), c);
+vm.runInContext(extract('function refreshHistoricalSubagentStatuses(', 'async function restoreHistoryMessageMetadata('), c);
+vm.runInContext(extract('const INTERNAL_TRANSCRIPT_SECTION_RE =', '// Rebuild the full transcript'), c);
 vm.runInContext(extract('async function restoreHistoryMessageMetadata(', 'function showError('), c);
 vm.runInContext(extract('function finishUserTurn(', '// Reset every piece of in-flight turn state.'), c);
 vm.runInContext(extract('function connectEvents()', 'function handleBackgroundContinuation(d)'), c);
@@ -270,6 +293,9 @@ const liveTurn = turns()[0];
 assert.equal(liveTurn.dataset.state, 'completed');
 assert.equal(liveTurn.classList.contains('open'), false, 'successful turn with an answer folds by default');
 assert.equal(liveTurn.querySelectorAll('.activity-turn-duration').length, 1);
+assert.match(liveTurn.querySelector('.activity-turn-summary')?.textContent || '', /执行了命令/,
+  'folded turn retains a readable process summary beside the answer');
+assert.match(liveTurn.querySelector('.activity-turn-summary')?.textContent || '', /已读取文件/);
 assert.equal(groups().some(group => group.querySelector('.activity-group-duration')), false,
   'turn duration must never be repeated on an inner process group');
 assert.equal(area.lastElementChild.classList.contains('message-assistant'), true);
@@ -300,6 +326,7 @@ c.uiText = (en, zh) => en;
 c.refreshActivityGroupLanguage();
 assert.match(summary(firstGroup).textContent, /Ran commands/);
 assert.equal(liveTurn.querySelector('.activity-turn-duration').textContent.startsWith('Took '), true);
+assert.match(liveTurn.querySelector('.activity-turn-summary')?.textContent || '', /Ran commands/);
 c.uiText = (en, zh) => zh;
 c.refreshActivityGroupLanguage();
 assert.match(summary(firstGroup).textContent, /执行了命令/);
@@ -741,6 +768,126 @@ for (const mode of ['compact', 'standard', 'detailed']) {
     mode + ' later POST answer preserves deliberate process inspection');
   assert.equal(group.classList.contains('open'), true);
 }
+
+// Empty deltas and text hidden by internal transcript filtering must not
+// create a standalone assistant bubble or cursor before the next tool call.
+c.endStreamingMessage();
+c.renderHistoryMessages([]);
+c.handleTextDelta({delta:'<system-reminder>internal note'});
+assert.equal(area.querySelectorAll('.message-assistant').length, 0);
+c.handleTextDelta({delta:'</system-reminder>'});
+assert.equal(area.querySelectorAll('.message-assistant').length, 0);
+c.handleToolStart({tool:'Read', id:'after-hidden-text', input:'{"path":"README.md"}'});
+assert.equal(area.querySelectorAll('.message-assistant').length, 0,
+  'tool boundary must not retain an empty assistant bubble');
+assert.equal(area.querySelectorAll('.stream-cursor').length, 0);
+assert.equal(rows(groups()[0]).length, 1);
+c.handleToolResult({tool:'Read', id:'after-hidden-text', output:'read', elapsedMs:2});
+c.handleTextDelta({delta:'Visible answer'});
+assert.equal(area.querySelectorAll('.message-assistant').length, 1);
+assert.equal(area.querySelectorAll('.stream-cursor').length, 0,
+  'the turn status, not a blue caret, indicates that text is streaming');
+assert.equal(area.querySelectorAll('.message-assistant').at(-1).querySelector('.message-content').innerHTML, 'Visible answer');
+c.endStreamingMessage();
+
+// A visible partial answer also settles at the tool boundary. The later
+// answer gets its own block after the tool, preserving transcript order.
+c.renderHistoryMessages([]);
+c.handleTextDelta({delta:'Before tool'});
+let toolBoundarySessionReloads = 0;
+let toolBoundaryStatsReloads = 0;
+c.loadSessions = () => { toolBoundarySessionReloads++; };
+c.loadSessionStatsbar = () => { toolBoundaryStatsReloads++; };
+c.handleToolStart({tool:'Bash', id:'between-answers', input:'{}'});
+assert.equal(area.querySelectorAll('.message-assistant').length, 1);
+assert.equal(area.querySelectorAll('.stream-cursor').length, 0);
+assert.equal(area.querySelector('.message-assistant').querySelector('.message-content').innerHTML, 'Before tool');
+assert.equal(toolBoundarySessionReloads, 0, 'a tool boundary does not reload the session list');
+assert.equal(toolBoundaryStatsReloads, 0, 'a tool boundary does not reload the stats bar');
+c.handleToolResult({tool:'Bash', id:'between-answers', output:'ok', elapsedMs:2});
+c.handleTextDelta({delta:'After tool'});
+assert.equal(area.querySelectorAll('.message-assistant').length, 2);
+assert.equal(area.querySelectorAll('.message-assistant').at(-1).querySelector('.message-content').innerHTML, 'After tool');
+c.endStreamingMessage();
+c.loadSessions = () => {};
+c.loadSessionStatsbar = () => {};
+
+// Internal envelope names can arrive one token at a time. A partial opening
+// tag such as "<s" must stay buffered instead of flashing as assistant text.
+c.renderHistoryMessages([]);
+let hiddenChunkText = '';
+for (const piece of ['<', 's', 'ystem-reminder', '>', 'private instructions', '</', 'system-reminder', '>']) {
+  hiddenChunkText += piece;
+  c.handleTextDelta({delta:piece});
+  assert.equal(c.visibleTranscriptText(hiddenChunkText, true), '', 'hidden chunk ' + JSON.stringify(piece));
+  assert.equal(area.querySelectorAll('.message-assistant').length, 0,
+    'no partial internal tag or private body may appear in a chat bubble');
+}
+c.handleToolStart({tool:'Read', id:'after-split-envelope', input:'{}'});
+assert.equal(area.querySelectorAll('.message-assistant').length, 0,
+  'the split internal envelope leaves no blank bubble at the tool boundary');
+c.handleToolResult({tool:'Read', id:'after-split-envelope', output:'ok', elapsedMs:2});
+
+// Text on either side of a complete hidden section remains readable. During
+// a streamed opening and closing tag, the public prefix stays stable and the
+// private content never enters the message DOM.
+c.renderHistoryMessages([]);
+const beforeEnvelope = 'Visible before ';
+c.handleTextDelta({delta:beforeEnvelope});
+let mixedRaw = beforeEnvelope;
+for (const piece of ['<', 's', 'ystem-reminder', '>', 'private instructions', '</', 'system-reminder', '>']) {
+  mixedRaw += piece;
+  c.handleTextDelta({delta:piece});
+  assert.equal(c.visibleTranscriptText(mixedRaw, true), beforeEnvelope);
+  assert.equal(area.querySelector('.message-assistant').querySelector('.message-content').innerHTML,
+    beforeEnvelope, 'partial hidden markup must not leak or erase preceding public text');
+}
+c.handleTextDelta({delta:' Visible after'});
+assert.equal(area.querySelectorAll('.message-assistant').length, 1);
+assert.equal(area.querySelector('.message-assistant').querySelector('.message-content').innerHTML,
+  'Visible before  Visible after');
+c.endStreamingMessage();
+
+// Once a stream ends, a trailing partial tag prefix is literal answer text.
+// It must not disappear just because the stream filter buffered it mid-turn.
+c.renderHistoryMessages([]);
+c.handleTextDelta({delta:'a <'});
+assert.equal(area.querySelector('.message-assistant').querySelector('.message-content').innerHTML, 'a ');
+c.endStreamingMessage();
+assert.equal(area.querySelector('.message-assistant').querySelector('.message-content').innerHTML, 'a <');
+c.renderHistoryMessages([]);
+c.handleTextDelta({delta:'<'});
+assert.equal(area.querySelectorAll('.message-assistant').length, 0);
+c.endStreamingMessage();
+assert.equal(area.querySelector('.message-assistant').querySelector('.message-content').innerHTML, '<');
+
+// The live status follows the Desktop language setting without replacing its
+// node or resetting elapsed time, including a switch while the turn runs.
+c.renderHistoryMessages([]);
+const realDate = c.Date;
+c.Date = class FixedDate extends realDate { static now() { return 180000; } };
+root.lang = 'zh-CN';
+c.uiText = (en, zh) => zh;
+c.beginTurnStatus();
+const liveStatus = area.querySelector('.turn-status');
+assert.equal(liveStatus.textContent, '深入分析中…');
+c.turnStartMs = 6000;
+intervals.get(c.turnStatusTimer)();
+assert.equal(liveStatus.querySelector('.ts-clock').textContent, ' 2 分 54 秒');
+c.uiText = (en, zh) => en;
+root.lang = 'en';
+c.refreshActivityGroupLanguage();
+assert.equal(area.querySelector('.turn-status'), liveStatus);
+assert.equal(liveStatus.textContent, 'Deep diving...');
+assert.equal(liveStatus.querySelector('.ts-clock').textContent, ' 2m54s');
+c.uiText = (en, zh) => zh;
+root.lang = 'zh-CN';
+c.refreshActivityGroupLanguage();
+assert.equal(liveStatus.textContent, '深入分析中…');
+assert.equal(liveStatus.querySelector('.ts-clock').textContent, ' 2 分 54 秒');
+c.endTurnStatus();
+assert.equal(area.querySelector('.turn-status'), null);
+c.Date = realDate;
 })().catch(err => { console.error(err); process.exitCode = 1; });
 `
 	cmd := exec.Command(node, "-e", script)

@@ -59,6 +59,16 @@ func TraceInvocationEnded(ctx context.Context) {
 	notifyTraceInvocationLifecycle(ctx, EventTraceInvocationEnd)
 }
 
+// TraceSubAgentLifecycle records a child start/end alongside the ordinary
+// parent UI event. Agent publishes these events directly to the parent's
+// channel, so they do not pass through Loop.emit's trace hook.
+func TraceSubAgentLifecycle(ev Event) {
+	if ev.TraceInvocationID == "" || (ev.Kind != EventSubAgentStart && ev.Kind != EventSubAgentEnd) {
+		return
+	}
+	notifyTraceHook(ev)
+}
+
 func notifyTraceInvocationLifecycle(ctx context.Context, kind EventKind) {
 	id := TraceInvocationIDFromContext(ctx)
 	if id == "" {

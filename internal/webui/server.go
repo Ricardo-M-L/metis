@@ -832,6 +832,9 @@ func (s *Server) writeHubEvent(w http.ResponseWriter, he hubEvent) {
 	for k, v := range he.extra {
 		payload[k] = v
 	}
+	if he.ev.SubAgentParentID != "" {
+		payload["subAgentParentId"] = he.ev.SubAgentParentID
+	}
 	// Provider tool_use_id values may repeat. Expose the agent's per-call
 	// identity so live clients can pair a result with its exact start row.
 	switch he.ev.Kind {
@@ -874,6 +877,16 @@ func (s *Server) writeHubEvent(w http.ResponseWriter, he hubEvent) {
 			if len(he.ev.ToolResult.Presentation) > 0 {
 				payload["presentation"] = he.ev.ToolResult.Presentation
 			}
+		}
+	case agent.EventSubAgentStart, agent.EventSubAgentEnd:
+		payload["sessionId"] = he.session
+		payload["parentToolUseId"] = he.ev.SubAgentParentID
+		payload["agentId"] = he.ev.SubAgentID
+		payload["name"] = he.ev.SubAgentName
+		payload["background"] = he.ev.SubAgentBackground
+		payload["status"] = he.ev.SubAgentStatus
+		if he.ev.TraceCallID != "" {
+			payload["traceCallId"] = he.ev.TraceCallID
 		}
 	case agent.EventPermissionRequest:
 		payload["reason"] = he.ev.PermissionReason
@@ -3391,20 +3404,37 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	viewSessionID := r.URL.Query().Get("sessionId")
+	if viewSessionID != "" && (viewSessionID != strings.TrimSpace(viewSessionID) || len(viewSessionID) > 128 || strings.ContainsAny(viewSessionID, "/\\")) {
+		writeError(w, http.StatusBadRequest, "invalid viewed session id")
+		return
+	}
 	subAgents := 0
 	namedAgents := 0
 	agentDetails := make([]map[string]any, 0)
+	s.stateMu.RLock()
+	activeSessionID := s.activeSessionID
+	s.stateMu.RUnlock()
 	if s.roster != nil {
-		summary := s.roster.Summary()
-		subAgents = summary.Total
-		namedAgents = summary.Named
 		for _, teammate := range s.roster.List() {
 			if teammate == nil {
 				continue
 			}
 			snap := teammate.Snapshot()
+			// The legacy in-process roster has no session key. Only expose
+			// entries whose immutable transcript header proves ownership by
+			// the currently selected session.
+			if !s.subAgentBelongsToSession(activeSessionID, snap.AgentID) {
+				continue
+			}
+			if snap.Status == agent.StatusRunning {
+				subAgents++
+				if snap.IsNamed() {
+					namedAgents++
+				}
+			}
 			agentDetails = append(agentDetails, map[string]any{
-				"name": snap.Name, "agentId": snap.AgentID,
+				"name": snap.Name, "agentId": snap.AgentID, "sessionId": activeSessionID,
 				"status": snap.Status.String(), "background": snap.Background,
 				"startedAt": snap.Started,
 			})
@@ -3458,9 +3488,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.workerTurnsMu.Unlock()
 	sort.Strings(workerSessions)
-	s.stateMu.RLock()
-	activeSessionID := s.activeSessionID
-	s.stateMu.RUnlock()
 	if !turnRunning && len(workerSessions) > 0 {
 		turnRunning = true
 		runningSessionID = workerSessions[0]
@@ -3475,7 +3502,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		subAgents, namedAgents, backgroundTasks = status.SubAgents, status.NamedAgents, status.BackgroundTasks
 		agentDetails = make([]map[string]any, 0, len(status.Agents))
 		for _, item := range status.Agents {
-			agentDetails = append(agentDetails, map[string]any{"name": item.Name, "agentId": item.AgentID, "status": item.Status, "background": item.Background, "startedAt": item.StartedAt})
+			agentDetails = append(agentDetails, map[string]any{"name": item.Name, "agentId": item.AgentID, "sessionId": activeSessionID, "status": item.Status, "background": item.Background, "startedAt": item.StartedAt})
 		}
 		jobDetails = make([]map[string]any, 0, len(status.Jobs))
 		for _, item := range status.Jobs {
@@ -3487,7 +3514,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		planItems, _ = tasks.PlanningItems(activeSessionID)
 	}
 	executionStrategy := executionStrategyForStatus(len(planItems), subAgents, namedAgents)
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"subAgents": subAgents, "backgroundTasks": backgroundTasks, "workspace": workspace,
 		"agents": agentDetails, "jobs": jobDetails,
 		"toolCount": len(toolNames), "tools": toolNames,
@@ -3499,7 +3526,25 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"planItems":            planItems,
 		"executionStrategy":    executionStrategy,
 		"build":                s.buildVersion,
-	})
+	}
+	if viewSessionID != "" {
+		viewRoster := s.workerViewRoster(viewSessionID)
+		if viewSessionID == activeSessionID {
+			if _, hasWorkerSnapshot := s.workerSnapshot(viewSessionID); !hasWorkerSnapshot {
+				// Image turns and reduced embedders still run in the in-process
+				// Loop. Its roster has already passed the transcript ownership
+				// check above; preserve that selected session's status without
+				// borrowing an unrelated worker's snapshot.
+				viewRoster = map[string]any{
+					"sessionId": viewSessionID, "subAgents": subAgents,
+					"namedAgents": namedAgents, "backgroundTasks": backgroundTasks,
+					"agents": agentDetails, "jobs": jobDetails,
+				}
+			}
+		}
+		payload["viewRoster"] = viewRoster
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 // subAgentDetailOutputLimit keeps a single local UI detail request from
@@ -3515,10 +3560,15 @@ const subAgentDetailOutputLimit = 160_000
 // open; it does not repeatedly poll the detail endpoint.
 const subAgentDetailStreamInterval = 120 * time.Millisecond
 
+// A truncated preview is large, so coalesce frequent child deltas while still
+// refreshing its tail during a long-running stream.
+const subAgentDetailPreviewRefreshInterval = time.Second
+
 // subAgentDetailView is shared by the one-shot detail endpoint and its live
 // SSE companion. Keeping this view detached from Teammate means the browser
 // never holds a pointer to mutable roster state.
 type subAgentDetailView struct {
+	SessionID       string    `json:"sessionId"`
 	Name            string    `json:"name"`
 	AgentID         string    `json:"agentId"`
 	Status          string    `json:"status"`
@@ -3565,12 +3615,17 @@ func (s *Server) handleSubAgentDetail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid sub-agent id")
 		return
 	}
+	sessionID := r.URL.Query().Get("sessionId")
+	if sessionID == "" || sessionID != strings.TrimSpace(sessionID) || len(sessionID) > 128 || strings.ContainsAny(sessionID, "/\\") {
+		writeError(w, http.StatusBadRequest, "invalid parent session id")
+		return
+	}
 	if stream {
-		s.handleSubAgentEvents(w, r, agentID)
+		s.handleSubAgentEvents(w, r, sessionID, agentID)
 		return
 	}
 
-	view, ok := s.subAgentDetailView(agentID)
+	view, ok := s.subAgentDetailView(sessionID, agentID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "sub-agent not found")
 		return
@@ -3578,18 +3633,22 @@ func (s *Server) handleSubAgentDetail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"agent": view})
 }
 
-func (s *Server) subAgentDetailView(agentID string) (subAgentDetailView, bool) {
-	if view, ok := s.workerSubAgentDetail(agentID); ok {
+func (s *Server) subAgentDetailView(sessionID, agentID string) (subAgentDetailView, bool) {
+	if view, ok := s.workerSubAgentDetail(sessionID, agentID); ok {
 		return view, true
 	}
-	if s == nil || s.roster == nil {
+	if !s.subAgentBelongsToSession(sessionID, agentID) {
 		return subAgentDetailView{}, false
 	}
-	teammate, ok := s.roster.LookupByAgentID(agentID)
-	if !ok || teammate == nil {
-		return subAgentDetailView{}, false
+	if s.roster != nil {
+		if teammate, ok := s.roster.LookupByAgentID(agentID); ok && teammate != nil {
+			return subAgentDetailFromRoster(sessionID, teammate), true
+		}
 	}
+	return s.subAgentDetailFromTranscript(sessionID, agentID)
+}
 
+func subAgentDetailFromRoster(sessionID string, teammate *agent.Teammate) subAgentDetailView {
 	snap := teammate.Snapshot()
 	output, outputTruncated := trimSubAgentDetailOutput(snap.Output)
 	result, resultTruncated := trimSubAgentDetailOutput(snap.Result)
@@ -3605,6 +3664,7 @@ func (s *Server) subAgentDetailView(agentID string) (subAgentDetailView, bool) {
 		exitError = snap.ExitErr.Error()
 	}
 	return subAgentDetailView{
+		SessionID:       sessionID,
 		Name:            snap.Name,
 		AgentID:         snap.AgentID,
 		Status:          snap.Status.String(),
@@ -3618,7 +3678,42 @@ func (s *Server) subAgentDetailView(agentID string) (subAgentDetailView, bool) {
 		ResultTruncated: resultTruncated,
 		StopHint:        snap.StopHint,
 		ExitError:       exitError,
-	}, true
+	}
+}
+
+func (s *Server) subAgentBelongsToSession(sessionID, agentID string) bool {
+	if s == nil || s.store == nil || sessionID == "" || agentID == "" {
+		return false
+	}
+	header, err := agent.LoadSubAgentHeader(s.store.Dir, agentID)
+	return err == nil && header.SubAgentOf == sessionID
+}
+
+func (s *Server) subAgentDetailFromTranscript(sessionID, agentID string) (subAgentDetailView, bool) {
+	if s == nil || s.store == nil {
+		return subAgentDetailView{}, false
+	}
+	snap, err := agent.LoadSubAgentSnapshot(s.store.Dir, agentID)
+	if err != nil || snap.Header.SubAgentOf != sessionID {
+		return subAgentDetailView{}, false
+	}
+	view := subAgentDetailView{
+		SessionID: sessionID, Name: snap.Header.TeammateName, AgentID: agentID,
+		Status: "unknown", StartedAt: snap.Header.CreatedAt,
+	}
+	if terminal := snap.Terminal; terminal != nil {
+		view.Status = terminal.Status
+		view.Background = terminal.Background
+		view.EndedAt = terminal.EndedAt
+		view.Output, view.OutputTruncated = trimSubAgentDetailOutput(terminal.Output)
+		view.Result, view.ResultTruncated = trimSubAgentDetailOutput(terminal.Result)
+		view.StopHint = terminal.StopHint
+		view.ExitError = terminal.ExitError
+		if elapsed := terminal.EndedAt.Sub(snap.Header.CreatedAt); elapsed > 0 {
+			view.ElapsedMS = elapsed.Milliseconds()
+		}
+	}
+	return view, true
 }
 
 // handleSubAgentEvents emits a snapshot followed by output deltas over SSE.
@@ -3626,13 +3721,13 @@ func (s *Server) subAgentDetailView(agentID string) (subAgentDetailView, bool) {
 // SSE lane: that would splice a sub-agent's prose into the main agent reply.
 // This dedicated lane gives the detail dialog the same incremental feel while
 // preserving that separation.
-func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, agentID string) {
+func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, sessionID, agentID string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
 		return
 	}
-	current, ok := s.subAgentDetailView(agentID)
+	current, ok := s.subAgentDetailView(sessionID, agentID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "sub-agent not found")
 		return
@@ -3651,6 +3746,7 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, ag
 		return
 	}
 	flusher.Flush()
+	lastPreviewSent := time.Now()
 
 	ticker := time.NewTicker(subAgentDetailStreamInterval)
 	defer ticker.Stop()
@@ -3664,7 +3760,7 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, ag
 			fmt.Fprint(w, ": ping\n\n")
 			flusher.Flush()
 		case <-ticker.C:
-			next, found := s.subAgentDetailView(agentID)
+			next, found := s.subAgentDetailView(sessionID, agentID)
 			if !found {
 				// Finished teammates normally live in the roster's bounded
 				// retained set. If it has already rolled over, terminate the
@@ -3683,12 +3779,11 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, ag
 				continue
 			}
 
-			// Preserve a bounded browser document. Once the retained output
-			// itself becomes a head/tail preview, send that preview once and
-			// wait for the terminal snapshot instead of retransmitting 160 KiB
-			// for every later token.
-			if current.OutputTruncated && next.OutputTruncated {
-				current = next
+			// Keep the latest tail live without retransmitting a 160 KiB
+			// preview for every token. Keep current at the last sent preview
+			// so a change coalesced here is emitted on the next interval.
+			if current.OutputTruncated && next.OutputTruncated &&
+				time.Since(lastPreviewSent) < subAgentDetailPreviewRefreshInterval {
 				continue
 			}
 			if !current.OutputTruncated && !next.OutputTruncated && strings.HasPrefix(next.Output, current.Output) {
@@ -3704,6 +3799,9 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, ag
 					return
 				}
 				flusher.Flush()
+				if next.OutputTruncated {
+					lastPreviewSent = time.Now()
+				}
 			}
 			current = next
 		}
@@ -3712,6 +3810,7 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, ag
 
 func subAgentDeltaPayload(view subAgentDetailView, delta string) map[string]any {
 	return map[string]any{
+		"sessionId":       view.SessionID,
 		"agentId":         view.AgentID,
 		"name":            view.Name,
 		"status":          view.Status,

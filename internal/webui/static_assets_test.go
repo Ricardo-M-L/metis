@@ -1,8 +1,11 @@
 package webui
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -439,7 +442,9 @@ func TestTurnStatusMatchesWholeAgentTurnLifecycle(t *testing.T) {
 
 	chat := get("/chat.js")
 	for _, want := range []string{
-		`<div class="turn-status" role="status" aria-live="polite">Deep diving...<span class="ts-clock"></span></div>`,
+		`<div class="turn-status" role="status" aria-live="polite">`,
+		`uiText('Deep diving...', '深入分析中…')`,
+		`function refreshTurnStatusLanguage()`,
 		`onLive('turn_end', endStreamingMessage);`,
 		`onLive('loop_done', d => {`,
 		`runningTurnIncompleteReason = d.incomplete`,
@@ -455,7 +460,7 @@ func TestTurnStatusMatchesWholeAgentTurnLifecycle(t *testing.T) {
 		t.Fatal("chat.js still wraps TurnStatus in the retired grey pill")
 	}
 
-	streamEnd := strings.Index(chat, "function endStreamingMessage()")
+	streamEnd := strings.Index(chat, "function endStreamingMessage(refresh = true)")
 	turnEnd := strings.Index(chat, "function finishUserTurn()")
 	if streamEnd < 0 || turnEnd <= streamEnd {
 		t.Fatal("could not isolate assistant-message and whole-turn completion functions")
@@ -969,9 +974,11 @@ func TestRunningTurnCanBeViewedInBackgroundAndStoppedBySession(t *testing.T) {
 	}
 	chat = get("/chat.js")
 	for _, want := range []string{
-		"function visibleTranscriptText(value)",
+		"function visibleTranscriptText(value, streaming = false)",
 		"INTERNAL_TRANSCRIPT_SECTION_RE",
-		"formatContent(visibleTranscriptText(streamingText))",
+		"const visibleText = visibleTranscriptText(streamingText, true)",
+		"if (!streamingEl && visibleText.trim()) startStreamingMessage()",
+		"box.innerHTML = formatContent(visibleText)",
 		"Math.min(100, Math.round(used / limit * 100))",
 	} {
 		if !strings.Contains(chat, want) {
@@ -1033,6 +1040,118 @@ func TestChatAutoScrollYieldsWhenUserReadsEarlierOutput(t *testing.T) {
 		if !strings.Contains(style, want) {
 			t.Fatalf("style.css missing scroll-follow presentation %q", want)
 		}
+	}
+}
+
+// Render the real trace duration formatter in both Desktop languages. The
+// transcript's completed-turn metrics reuse this function, so an English
+// prefix must never be followed by Chinese time units.
+func TestRunDurationFollowsDesktopLanguage(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	source, err := staticFS.ReadFile("static/trace.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const script = `
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const source = require('node:fs').readFileSync(0, 'utf8');
+const start = source.indexOf('function fmtRunDur(ms)');
+const end = source.indexOf('\nfunction fmtTokens(', start);
+assert(start >= 0 && end > start, 'cannot isolate the real duration formatter');
+const context = { document: { documentElement: { lang: 'en' } } };
+vm.createContext(context);
+vm.runInContext(source.slice(start, end), context);
+assert.equal(context.fmtRunDur(20000), '20s');
+assert.equal(context.fmtRunDur(174000), '2m54s');
+context.document.documentElement.lang = 'zh-CN';
+assert.equal(context.fmtRunDur(20000), '20秒');
+assert.equal(context.fmtRunDur(174000), '2分54秒');
+context.document.documentElement.lang = 'en';
+assert.equal(context.fmtRunDur(174000), '2m54s', 'a live language switch reformats the same duration');
+`
+	cmd := exec.Command(node, "-e", script)
+	cmd.Stdin = bytes.NewReader(source)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run duration language rendering: %v\n%s", err, output)
+	}
+}
+
+// Completed message metrics retain their numeric source data so a language
+// change can update an existing bubble in place, without replaying history.
+func TestCompletedMessageMetricsFollowDesktopLanguage(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	chat, err := staticFS.ReadFile("static/chat.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace, err := staticFS.ReadFile("static/trace.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := staticFS.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := json.Marshal(map[string]string{"chat": string(chat), "trace": string(trace), "app": string(app)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const script = `
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const {chat, trace, app} = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+function extract(source, start, end) {
+  const a = source.indexOf(start), b = source.indexOf(end, a + start.length);
+  assert(a >= 0 && b > a, 'missing browser function boundary ' + start);
+  return source.slice(a, b);
+}
+const metricsNode = {dataset: {}, innerHTML: ''};
+assert.match(extract(app, 'function applyLanguage(value)', 'function presetDisplayName('),
+  /refreshActivityGroupLanguage\(\)/, 'Desktop language switch must trigger a transcript refresh');
+assert.match(extract(chat, 'function refreshActivityGroupLanguage()', 'function viewedHistoryTurnIsRunning()'),
+  /refreshTurnMetricsLanguage\(\)/, 'transcript refresh must update completed metrics');
+const root = {lang: 'zh-CN'};
+const context = {
+  document: {
+    documentElement: root,
+    querySelectorAll: selector => selector === '.msg-metrics' ? [metricsNode] : []
+  },
+  uiText: (en, zh) => root.lang === 'zh-CN' ? zh : en
+};
+vm.createContext(context);
+vm.runInContext(extract(trace, 'function fmtMs(ms)', 'function fmtTokens('), context);
+vm.runInContext(extract(chat, 'function turnMetricsMarkup(metric)', 'function messageActionsMarkup('), context);
+const markup = context.turnMetricsMarkup({durationMs:174000, ttftMs:1200, tokPerSec:42});
+assert.match(markup, /class="msg-metrics"/);
+for (const [attribute, key] of [['duration-ms','durationMs'], ['ttft-ms','ttftMs'], ['tok-per-sec','tokPerSec']]) {
+  metricsNode.dataset[key] = markup.match(new RegExp('data-' + attribute + '="([^"]+)"'))?.[1];
+  assert(metricsNode.dataset[key], 'missing durable metric ' + attribute);
+}
+metricsNode.innerHTML = markup.slice(markup.indexOf('>') + 1, markup.lastIndexOf('</span>'));
+assert.match(metricsNode.innerHTML, /用时 2分54秒/);
+assert.match(metricsNode.innerHTML, /首 token 1\.2s/);
+root.lang = 'en';
+context.refreshTurnMetricsLanguage();
+assert.match(metricsNode.innerHTML, /Ran for 2m54s/);
+assert.match(metricsNode.innerHTML, /First token 1\.2s/);
+assert.match(metricsNode.innerHTML, /42 tok\/s/);
+assert.doesNotMatch(metricsNode.innerHTML, /秒|分|用时|首 token/);
+root.lang = 'zh-CN';
+context.refreshTurnMetricsLanguage();
+assert.match(metricsNode.innerHTML, /用时 2分54秒/);
+assert.match(metricsNode.innerHTML, /首 token 1\.2s/);
+`
+	cmd := exec.Command(node, "-e", script)
+	cmd.Stdin = bytes.NewReader(input)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("completed metrics language rendering: %v\n%s", err, output)
 	}
 }
 

@@ -160,7 +160,10 @@
       else if (route.page === 'artifact') label = document.getElementById('artifactPreviewTitle')?.textContent || text('Artifact', '产物');
       else if (route.sessionId) {
         const session = typeof sessions !== 'undefined' && sessions.find(item => (item.id || item.ID) === route.sessionId);
-        label = session && (session.title || session.name || session.Title) || text('Conversation', '对话');
+        const rawTitle = session && (session.title || session.name || session.Title);
+        label = rawTitle && rawTitle !== 'Untitled' ? rawTitle
+          : session && typeof sessionDisplayTitle === 'function' ? sessionDisplayTitle(session)
+          : text('Conversation', '对话');
         if (route.view === 'trace') label += ' / ' + text('Trajectory', '轨迹');
         if (route.view === 'artifacts') label += ' / ' + text('Artifacts', '产物');
       }

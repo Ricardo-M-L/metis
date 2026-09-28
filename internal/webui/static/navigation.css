@@ -2,11 +2,11 @@
    conversation/composer and their ongoing stream state. */
 .navigation-header {
   display: flex;
-  flex: 0 0 44px;
+  flex: 0 0 36px;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
-  padding: 0 20px;
+  padding: 0 16px;
   border-bottom: 1px solid var(--border-faint);
   color: var(--fg-mid);
   background: var(--bg);
@@ -29,9 +29,9 @@
 .navigation-button:hover:not(:disabled) { color: var(--fg-strong); background: var(--surface-2); }
 .navigation-button:disabled { opacity: .3; cursor: default; }
 .navigation-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.navigation-title { margin-left: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.navigation-title { margin-left: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .navigation-header[aria-busy='true'] .navigation-title { opacity: .6; }
-.main[data-page='session'].empty > .navigation-header { position: absolute; top: 0; left: 0; right: 0; height: 44px; }
+.main[data-page='session'].empty > .navigation-header { position: absolute; top: 0; left: 0; right: 0; height: 36px; }
 .app-page[hidden] { display: none !important; }
 .main[data-page]:not([data-page='session']) { justify-content: flex-start; }
 .main[data-page]:not([data-page='session']) > :not(.navigation-header):not(.app-page) { display: none !important; }
@@ -54,7 +54,7 @@
   box-shadow: none;
   background: var(--bg);
 }
-.settings-page .settings-sidebar { background: var(--surface-1); }
+.settings-page .settings-sidebar { background: var(--bg-inset); }
 .settings-page .settings-content { min-width: 0; }
 .settings-page .settings-back { width: 100%; text-align: left; border: 0; background: transparent; }
 .main > .artifact-preview-overlay.app-page {
@@ -116,4 +116,210 @@
   .navigation-header { padding: 0 10px; }
   .settings-page .settings-panel { flex-direction: column; }
   .settings-page .settings-sidebar { width: 100%; min-width: 0; max-height: 190px; flex: 0 0 auto; border-right: 0; border-bottom: 1px solid var(--border-faint); }
+}
+
+/* A conversation's title and its four views share one row. The main column
+   itself is the query container, since sidebars/details can change its width
+   independently of the window. Narrow columns retain two compact rows. */
+.main[data-page='session'] {
+  container: session-main / inline-size;
+  --session-nav-width: clamp(190px, 30%, 290px);
+}
+.main[data-page='session']:not(.empty) > .navigation-header {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  left: 0;
+  box-sizing: border-box;
+  width: var(--session-nav-width);
+  height: 44px;
+  padding-left: 14px;
+  padding-right: 10px;
+  border-bottom: 1px solid var(--border-faint);
+  color: var(--fg-mid);
+}
+.main[data-page='session'] > .navigation-header .navigation-title {
+  min-width: 0;
+  margin-left: 5px;
+  color: var(--fg-strong);
+  font-size: 13px;
+  font-weight: 600;
+}
+.main[data-page='session'] > .view-tabs {
+  box-sizing: border-box;
+  flex: 0 0 44px;
+  height: 44px;
+  min-height: 44px;
+  gap: clamp(12px, 1.8vw, 24px);
+  padding: 0 16px 0 var(--session-nav-width);
+  align-items: center;
+  border-bottom: 1px solid var(--border-faint);
+}
+.main[data-page='session'] > .view-tabs .view-tab {
+  display: inline-flex;
+  align-items: center;
+  height: 100%;
+  flex: 0 0 auto;
+  padding: 0;
+  font-size: 12.5px;
+  line-height: 20px;
+  white-space: nowrap;
+}
+.main[data-page='session'] > .view-tabs .view-tab::after { bottom: 0; }
+.main[data-page='session'] > .view-tabs .view-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
+  border-radius: 3px;
+}
+@container session-main (max-width: 640px) {
+  .main[data-page='session']:not(.empty) > .navigation-header {
+    position: relative;
+    width: 100%;
+    height: 34px;
+    flex: 0 0 34px;
+    border-bottom: 0;
+  }
+  .main[data-page='session'] > .view-tabs {
+    flex-basis: 34px;
+    height: 34px;
+    min-height: 34px;
+    gap: clamp(10px, 3vw, 22px);
+    padding: 0 14px;
+  }
+}
+/* Empty sessions hide the tabs; keep the navigation independent of the
+   centered welcome/composer and allow its title the full available width. */
+.main[data-page='session'].empty > .navigation-header .navigation-title {
+  color: var(--fg-mid);
+}
+.sidebar-primary-actions .new-session-btn {
+  min-height: 34px;
+  height: 34px;
+  padding: 5px 10px;
+  border-color: transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--fg-strong);
+  font-size: 13px;
+  font-weight: 550;
+}
+.sidebar-primary-actions .new-session-btn:hover { background: var(--surface-2); border-color: var(--border-faint); }
+.sidebar-primary-actions .new-session-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.sidebar-primary-actions .sb-schedules { padding: 5px 10px; border-radius: 9px; }
+
+.settings-page .settings-sidebar {
+  box-sizing: border-box;
+  width: 218px;
+  min-width: 218px;
+  padding: 12px 10px;
+}
+.settings-page .settings-back {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  padding: 5px 10px;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  color: var(--fg-mid);
+}
+.settings-page .settings-back svg { width: 16px; height: 16px; flex: 0 0 16px; }
+.settings-page .settings-back:hover { background: var(--surface-2); color: var(--fg-strong); }
+.settings-page .settings-search { min-height: 34px; margin-bottom: 8px; border-radius: 9px; }
+.settings-page .settings-group-label { padding: 16px 10px 5px; }
+.settings-page .settings-item {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 10px;
+  margin: 1px 0;
+  gap: 10px;
+  border-radius: 8px;
+  text-align: left;
+}
+.settings-page .settings-item-icon {
+  display: grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  flex: 0 0 17px;
+  opacity: 1;
+}
+.settings-page .settings-item-icon svg { display: block; width: 16px; height: 16px; }
+.settings-page .settings-item.active {
+  background: var(--surface-2);
+  color: var(--fg-strong);
+  box-shadow: inset 2px 0 var(--accent);
+  font-weight: 600;
+}
+.settings-page .settings-item:focus-visible,
+.settings-page .settings-back:focus-visible,
+.settings-page .settings-search:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.settings-page .settings-content {
+  box-sizing: border-box;
+  min-width: 0;
+  padding: 30px clamp(18px, 4vw, 48px) 60px;
+  background: var(--bg);
+}
+.settings-page .settings-content > :not(h2) {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 860px;
+  margin-left: auto;
+  margin-right: auto;
+}
+/* The page-navigation title already names the category; retain h2 for screen readers. */
+.settings-page .settings-content > h2 {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+.settings-page .settings-content > .settings-section {
+  padding: 17px 0;
+  border-bottom: 1px solid var(--border-faint);
+}
+.settings-page .settings-content > .settings-section:first-of-type { padding-top: 0; }
+.settings-page .settings-content > .settings-section:last-child { border-bottom: 0; }
+.settings-page .settings-section-desc { max-width: 76ch; margin-bottom: 10px; }
+.settings-page .radio-cards { gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.settings-page .radio-card {
+  box-sizing: border-box;
+  min-width: 0;
+  padding: 11px 13px;
+  border: 1px solid var(--border-faint);
+  border-radius: 10px;
+  background: var(--surface);
+  text-align: left;
+}
+.settings-page .radio-card:hover { background: var(--surface-2); border-color: var(--border-mid); }
+.settings-page .radio-card.selected {
+  background: var(--surface-2);
+  border-color: var(--border-mid);
+  box-shadow: inset 3px 0 var(--accent);
+}
+.settings-page .radio-card:focus-visible,
+.settings-page .settings-number:focus-visible,
+.settings-page .settings-switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.settings-page .radio-card-title { margin-bottom: 2px; font-size: 13px; }
+.settings-page .radio-card-desc { font-size: 11.5px; line-height: 1.45; }
+.settings-page .settings-card { padding: 8px 14px; border-radius: 10px; }
+.settings-page .settings-card-row { padding: 9px 2px; }
+@media (max-width: 850px) {
+  .settings-page .radio-cards { grid-template-columns: 1fr; }
+}
+@media (max-width: 760px) {
+  .settings-page .settings-sidebar { width: 100%; min-width: 0; max-height: 190px; }
+  .settings-page .settings-content { padding: 22px 18px 44px; }
 }

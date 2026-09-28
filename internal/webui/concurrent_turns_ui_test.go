@@ -49,6 +49,7 @@ function context(){
  vm.runInContext(extract('async function runTurnItem(item)','const MESSAGE_ACTION_ICONS'),c);
  vm.runInContext(extract('async function sendMessage(busyBehavior)','function queuedTurnIcon('),c);
  vm.runInContext(extract('async function stopTurn()','function startStreamingMessage('),c);
+ vm.runInContext(extract('function closeMismatchedSubAgentDetails()','function newChat()'),c);
  vm.runInContext(extract('function newChat()','// The POST resolves'),c);
  vm.runInContext(extract('async function drainQueuedTurns()','async function syncViewedSessionHistory('),c);
  c.fetch=(url,options)=>{const pending=deferred();requests.push({url,body:JSON.parse(options?.body||'{}'),pending});return pending.promise;};

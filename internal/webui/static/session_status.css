@@ -1,7 +1,6 @@
-/* METIS Channel Marks: familiar state glyphs inside one compact visual language. */
+/* Quiet, readable status glyphs for the session list. */
 .session-item-status {
   --session-status-tone: var(--fg-dim);
-  --session-status-frame: rgba(156, 169, 187, 0.48);
   position: relative;
   display: inline-flex;
   width: 18px;
@@ -15,6 +14,7 @@
   border: 0;
   border-radius: 0;
   box-shadow: none;
+  animation: none;
   cursor: help;
   isolation: isolate;
 }
@@ -24,6 +24,13 @@
   content: none;
 }
 
+/* Override legacy colored-dot rules in style.css without changing the row. */
+.session-item-status:is(.idle, .loading, .running, .delegating, .waiting, .approval, .done, .stopped, .interrupted, .failed, .plan, .archived, .unknown) {
+  background: transparent;
+  box-shadow: none;
+  animation: none;
+}
+
 .session-item-status > svg {
   display: block;
   width: 16px;
@@ -31,22 +38,9 @@
   overflow: visible;
 }
 
-.session-channel-frame {
-  stroke: var(--session-status-frame);
-  opacity: 0.86;
-}
-
-.session-channel-accent,
 .session-status-glyph {
   stroke: currentColor;
-}
-
-.session-channel-accent {
-  stroke-width: 1.55;
-}
-
-.session-status-glyph {
-  stroke-width: 1.35;
+  stroke-width: 1.5;
 }
 
 .session-glyph-fill {
@@ -57,35 +51,35 @@
 .session-item-status.idle,
 .session-item-status.archived,
 .session-item-status.unknown {
-  --session-status-tone: #97a2b3;
+  --session-status-tone: var(--fg-dim);
 }
 
 .session-item-status.loading,
 .session-item-status.running,
 .session-item-status.delegating,
 .session-item-status.plan {
-  --session-status-tone: #5a9cff;
+  --session-status-tone: var(--accent);
 }
 
 .session-item-status.waiting {
-  --session-status-tone: #efb44d;
+  --session-status-tone: var(--warn);
 }
 
 .session-item-status.approval {
-  --session-status-tone: #f58b4d;
+  --session-status-tone: var(--warn);
 }
 
 .session-item-status.done {
-  --session-status-tone: #52cc88;
+  --session-status-tone: var(--ok);
 }
 
 .session-item-status.stopped,
 .session-item-status.interrupted {
-  --session-status-tone: #a485ec;
+  --session-status-tone: var(--fg-dim);
 }
 
 .session-item-status.failed {
-  --session-status-tone: #ee6e73;
+  --session-status-tone: var(--error);
 }
 
 .session-item-status.loading .session-working-glyph,
@@ -131,9 +125,9 @@
   transition: opacity 120ms ease, transform 120ms ease;
 }
 
-.session-item.active .session-channel-frame,
-.session-item:hover .session-channel-frame {
-  opacity: 1;
+.session-item.active .session-item-status,
+.session-item:hover .session-item-status {
+  filter: brightness(1.1);
 }
 
 @media (prefers-reduced-motion: reduce) {

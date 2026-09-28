@@ -2082,6 +2082,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// TodoRead persist into the right per-session file. Done last so a
 	// resume failure above doesn't leave a stale id in the singleton.
 	rtpkg.SetCurrentSessionID(rt.sessionID)
+	// Fresh-session IDs are allocated after the registry is built. Bind Agent's
+	// durable child transcripts and parent metadata before any tool invocation.
+	builtin.RebindProviderTools(reg, prov, model, system, rt.sessionID)
 	// Wire the same id into the LLM transport layer so dump-prompts
 	// (METIS_DUMP_PROMPTS=1) lands in dump-prompts/<sid>.jsonl
 	// instead of dump-prompts/default.jsonl.

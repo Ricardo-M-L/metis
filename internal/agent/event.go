@@ -627,6 +627,13 @@ type Event struct {
 	//
 	// Empty means "this event came from the main loop, not a sub-agent."
 	SubAgentParentID string
+	// SubAgentID/Name/Background/Status describe a child lifecycle event.
+	// They carry identifiers and state only: child text remains on its own
+	// detail stream and must never enter the parent's answer lane.
+	SubAgentID         string
+	SubAgentName       string
+	SubAgentBackground bool
+	SubAgentStatus     string
 
 	// TraceInvocationID is a process-unique internal execution identity. It
 	// MUST NOT be rendered as the public sub-agent parent: SubAgentParentID

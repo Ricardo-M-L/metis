@@ -28,6 +28,9 @@ const start = source.indexOf('async function runTurnItem(item)');
 const end = source.indexOf('const MESSAGE_ACTION_ICONS', start);
 assert(start >= 0 && end > start, 'runTurnItem must be extracted from the actual Desktop source');
 const turnSource = source.slice(start, end);
+const detailCloseStart = source.indexOf('function closeMismatchedSubAgentDetails()');
+const detailCloseEnd = source.indexOf('function newChat()', detailCloseStart);
+assert(detailCloseStart >= 0 && detailCloseEnd > detailCloseStart, 'session detail close helper must come from Desktop source');
 const deferred = () => {
   let resolve;
   const promise = new Promise(done => { resolve = done; });
@@ -59,6 +62,7 @@ function fixture() {
     },
   };
   vm.createContext(c);
+  vm.runInContext(source.slice(detailCloseStart, detailCloseEnd), c);
   vm.runInContext(turnSource, c);
   return { c, request, messages, errors, toasts, finishes, navigation };
 }

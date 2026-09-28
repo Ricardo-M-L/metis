@@ -69,6 +69,10 @@ type Event struct {
 	Info                     string            `json:"info,omitempty"`
 	Error                    string            `json:"error,omitempty"`
 	SubAgentParentID         string            `json:"subAgentParentId,omitempty"`
+	SubAgentID               string            `json:"subAgentId,omitempty"`
+	SubAgentName             string            `json:"subAgentName,omitempty"`
+	SubAgentBackground       bool              `json:"subAgentBackground,omitempty"`
+	SubAgentStatus           string            `json:"subAgentStatus,omitempty"`
 	TraceInvocationID        string            `json:"traceInvocationId,omitempty"`
 	TraceParentInvocationID  string            `json:"traceParentInvocationId,omitempty"`
 	TraceCallID              string            `json:"traceCallId,omitempty"`
@@ -84,7 +88,8 @@ func FromEvent(event agent.Event) Event {
 		AskUserQuestion: e.AskUserQuestion, AskUserOptions: e.AskUserOptions, AskUserAllowFreeform: e.AskUserAllowFreeform,
 		InputTokens: e.InputTokens, OutputTokens: e.OutputTokens, CacheCreationInputTokens: e.CacheCreationInputTokens,
 		CacheReadInputTokens: e.CacheReadInputTokens, PreviousContextTokens: e.PreviousContextTokens, ContextTokens: e.ContextTokens,
-		StopReason: e.StopReason, Info: e.Info, SubAgentParentID: e.SubAgentParentID, TraceInvocationID: e.TraceInvocationID,
+		StopReason: e.StopReason, Info: e.Info, SubAgentParentID: e.SubAgentParentID,
+		SubAgentID: e.SubAgentID, SubAgentName: e.SubAgentName, SubAgentBackground: e.SubAgentBackground, SubAgentStatus: e.SubAgentStatus, TraceInvocationID: e.TraceInvocationID,
 		TraceParentInvocationID: e.TraceParentInvocationID, TraceCallID: e.TraceCallID,
 	}
 	if e.Err != nil {
@@ -102,7 +107,8 @@ func (w Event) ToEvent() agent.Event {
 		AskUserQuestion: w.AskUserQuestion, AskUserOptions: w.AskUserOptions, AskUserAllowFreeform: w.AskUserAllowFreeform,
 		InputTokens: w.InputTokens, OutputTokens: w.OutputTokens, CacheCreationInputTokens: w.CacheCreationInputTokens,
 		CacheReadInputTokens: w.CacheReadInputTokens, PreviousContextTokens: w.PreviousContextTokens, ContextTokens: w.ContextTokens,
-		StopReason: w.StopReason, Info: w.Info, SubAgentParentID: w.SubAgentParentID, TraceInvocationID: w.TraceInvocationID,
+		StopReason: w.StopReason, Info: w.Info, SubAgentParentID: w.SubAgentParentID,
+		SubAgentID: w.SubAgentID, SubAgentName: w.SubAgentName, SubAgentBackground: w.SubAgentBackground, SubAgentStatus: w.SubAgentStatus, TraceInvocationID: w.TraceInvocationID,
 		TraceParentInvocationID: w.TraceParentInvocationID, TraceCallID: w.TraceCallID,
 	}
 	if w.Error != "" {

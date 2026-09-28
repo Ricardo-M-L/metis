@@ -39,6 +39,30 @@ func TestEventRoundTripDropsLocalAuthorizationState(t *testing.T) {
 	}
 }
 
+func TestSubAgentLifecycleEventSurvivesDesktopWorkerWire(t *testing.T) {
+	source := agent.Event{
+		Kind: agent.EventSubAgentStart, SubAgentParentID: "tool-a",
+		SubAgentID: "agt-a", SubAgentName: "auditor", SubAgentBackground: true,
+		SubAgentStatus: "running", TraceCallID: "call-a",
+	}
+	event := FromEvent(source)
+	var buffer bytes.Buffer
+	if err := NewEncoder(&buffer).Encode(Message{Version: Version, Type: TypeEvent, Event: &event}); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := NewDecoder(&buffer).Decode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decoded.Event.ToEvent()
+	if got.Kind != source.Kind || got.SubAgentParentID != source.SubAgentParentID ||
+		got.SubAgentID != source.SubAgentID || got.SubAgentName != source.SubAgentName ||
+		got.SubAgentBackground != source.SubAgentBackground || got.SubAgentStatus != source.SubAgentStatus ||
+		got.TraceCallID != source.TraceCallID {
+		t.Fatalf("lost sub-agent worker event fields: %+v", got)
+	}
+}
+
 func TestProtocolRejectsMalformedOrUnboundedMessages(t *testing.T) {
 	for _, data := range []string{
 		`{"version":2,"type":"reply","id":"x","decision":0}`,

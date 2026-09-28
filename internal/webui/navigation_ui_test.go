@@ -57,7 +57,7 @@ func TestNavigationHeaderStaysAboveEmptyConversation(t *testing.T) {
 		t.Fatal("navigation lacks an override for the centered empty conversation")
 	}
 	rule, _, _ = strings.Cut(rule, "}")
-	for _, declaration := range []string{"position: absolute", "top: 0", "left: 0", "right: 0", "height: 44px"} {
+	for _, declaration := range []string{"position: absolute", "top: 0", "left: 0", "right: 0", "height: 36px"} {
 		if !strings.Contains(rule, declaration) {
 			t.Fatalf("empty conversation navigation rule missing %q", declaration)
 		}

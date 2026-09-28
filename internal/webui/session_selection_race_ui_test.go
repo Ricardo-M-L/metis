@@ -59,6 +59,7 @@ function context() {
  vm.runInContext(extract('sessions.js','async function loadSessions(append)','async function loadMoreSessions('),c);
  vm.runInContext(extract('chat.js','async function runTurnItem(item)','const MESSAGE_ACTION_ICONS'),c);
  vm.runInContext(extract('chat.js','function sameSession(d)','let thinkingEl'),c);
+ vm.runInContext(extract('sessions.js','function relativeTime(ts)','let sessionsExpanded = false;'),c);
  vm.runInContext(extract('sessions.js','function sessionState(s)','function sessionItemKeydown('),c);
  return {c,errors,rendered,added};
 }
@@ -80,6 +81,34 @@ function context() {
   const selection=c.resumeSession('B'); await tick();
   assert.equal(c.currentSessionId,'B');
   assert(rendered.some(item=>item.sidebar==='B'),'sidebar still shows A while B transcript already rendered');
+  compaction.resolve(); await selection;
+ }
+ // A selected conversation must immediately dismiss another conversation's
+ // sub-agent detail, before a later status poll or streamed delta can render.
+ {
+  const {c}=context();let closed=0;
+  c.subAgentDetailState={agentId:'agt-A',ownerSessionId:'A'};
+  c.closeSubAgentDetails=restoreFocus=>{
+   assert.equal(restoreFocus,false);
+   closed++;
+   c.subAgentDetailState.agentId=null;
+  };
+  c.fetch=async()=>({ok:true,json:async()=>({messages:[]})});
+  await c.resumeSession('B');
+  assert.equal(closed,1,'switching sessions left the old agent detail visible');
+ }
+ // A's roster chip must disappear as soon as B is selected, even while
+ // optional history sidecars are still loading.
+ {
+  const {c}=context(), compaction=deferred();
+  c.lastStatusSnapshot={viewRoster:{sessionId:'A',agents:[{agentId:'agt-A'}]}};
+  c.statusChipVisible=true;
+  c.renderStatusSnapshot=snapshot=>{c.statusChipVisible=snapshot.viewRoster.sessionId===c.currentSessionId;};
+  c.fetch=async()=>({ok:true,json:async()=>({messages:[]})});
+  c.restoreCompactionHistory=()=>compaction.promise;
+  const selection=c.resumeSession('B'); await tick();
+  assert.equal(c.currentSessionId,'B');
+  assert.equal(c.statusChipVisible,false,'old session roster remained visible during B navigation');
   compaction.resolve(); await selection;
  }
  // A late activation cannot replace the user's latest successful selection.
@@ -139,19 +168,28 @@ function context() {
   assert.equal(c.sessionState({id:'B'}).name,'idle');
   const completedState=c.sessionState({id:'B',status:'completed'});
   assert.equal(completedState.tooltip,'Completed','status icon must use the current English interface language');
+  assert.equal(c.relativeTime(new Date(Date.now()-120000).toISOString()),'2 mins');
   c.uiText=(_en,zh)=>zh;
   assert.equal(c.sessionState({id:'B',status:'completed'}).tooltip,'已完成','status icon must use the current Chinese interface language');
+  assert.equal(c.relativeTime(new Date(Date.now()-120000).toISOString()),'2分钟');
   c.relativeTime=()=>'';c.escAttr=String;c.escHtml=String;c.escOnclick=String;
   vm.runInContext(extract('sessions.js','function renderSessionItem(s)','function renderSessions('),c);
   const completed=c.renderSessionItem({id:'C',title:'Example',status:'completed'});
-  assert.match(completed,/title="已完成"/,'status icon native tooltip must use the current Chinese interface language');
+  assert.match(completed,/role="img" aria-label="已完成"/,'status icon accessibility label must use the current Chinese interface language');
   assert.match(completed,/session-status-tooltip[^>]*>已完成/,'status icon hover tooltip must use the current Chinese interface language');
+  assert.match(completed,/<circle cx="8" cy="8" r="5\.6"\/>/,'completed state should use a round check icon');
+  assert.doesNotMatch(completed,/session-channel-frame/,'status icon should not resemble a framed checkbox');
   assert.doesNotMatch(completed,/Completed/,'Chinese tooltip must not contain the English label');
+  const untitledChinese=c.renderSessionItem({id:'D',title:'Untitled',status:'idle'});
+  assert.match(untitledChinese,/class="session-item-name">未命名会话</,'server placeholder should match the Chinese interface language');
+  assert.match(untitledChinese,/aria-label="打开会话 未命名会话 — 空闲"/);
+  assert.doesNotMatch(untitledChinese,/>Untitled</);
   c.uiText=en=>en;
   const completedEnglish=c.renderSessionItem({id:'C',title:'Example',status:'completed'});
-  assert.match(completedEnglish,/title="Completed"/,'status icon native tooltip must use the current English interface language');
+  assert.match(completedEnglish,/role="img" aria-label="Completed"/,'status icon accessibility label must use the current English interface language');
   assert.match(completedEnglish,/session-status-tooltip[^>]*>Completed/,'status icon hover tooltip must use the current English interface language');
   assert.doesNotMatch(completedEnglish,/已完成/,'English tooltip must not contain the Chinese label');
+  assert.match(c.renderSessionItem({id:'D',title:'Untitled',status:'idle'}),/class="session-item-name">Untitled session</);
   const saved={id:'B',title:'Beta',status:'stopped'};
   c.turnRunning=true;c.runningSessionId='B';
   const running=c.renderSessionItem(saved);

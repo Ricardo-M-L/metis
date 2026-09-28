@@ -21,6 +21,15 @@ func TestToolRowBrowserInteractions(t *testing.T) {
 	for _, scenario := range []string{
 		"keyboard_disclosure",
 		"inspect_and_language",
+		"subagent_semantic_rows",
+		"subagent_stage_lifecycle",
+		"subagent_background_lifecycle_across_turns",
+		"subagent_reused_provider_id_trace_binding",
+		"subagent_trace_miss_does_not_bind_old_row",
+		"subagent_known_child_without_trace_cross_turn",
+		"subagent_history_replay",
+		"subagent_history_terminal_refresh",
+		"subagent_history_terminal_race",
 		"stopped_tool",
 		"failed_tool_icon",
 		"completed_without_tool_result",
@@ -230,6 +239,16 @@ class Element {
       }
       header.appendChild(inspect);
     }
+    const agentTag = html.match(/<button class="tc-open-agent"([^>]*)>([^<]*)<\/button>/);
+    if (agentTag) {
+      const openAgent = new Element('button'); openAgent.className = 'tc-open-agent';
+      openAgent.textContent = agentTag[2]; openAgent.hidden = agentTag[1].includes('hidden');
+      for (const [, key, value] of agentTag[1].matchAll(/\b([\w-]+)="([^"]*)"/g)) {
+        openAgent.setAttribute(key, value);
+        if (key === 'onclick') openAgent.inline.click = value;
+      }
+      header.appendChild(openAgent);
+    }
     const body = new Element(); body.className = 'tc-body'; row.appendChild(body);
     for (const section of ['in', 'out']) {
       const sec = new Element(); sec.className = 'tc-io-sec'; body.appendChild(sec);
@@ -293,13 +312,15 @@ context = {
   fmtMs: ms => ms + 'ms',
   isTodoWriteTool: () => false, isPlanningTool: () => false,
   renderSearchCard() {}, renderFileEditCard() {},
-  autoScroll() {}, finishThinking() {}, endStreamingMessage() {}, endTurnStatus() {}, showTurnStatsLine() {}, beginTurnStatus() {},
+  autoScroll() {}, finishThinking() {}, endStreamingMessage() {}, endTurnStatus() {}, showTurnStatsLine() {}, beginTurnStatus() {}, refreshTurnStatusLanguage() {}, refreshTurnMetricsLanguage() {},
   updateEmptyLayout() {}, resumeAutoScroll() {}, restoreTodoPlanFromHistory() {}, loadSessionFiles() {},
   messageActionsMarkup: () => '', formatContent: value => String(value),
   showToast: message => toasts.push(String(message)),
-  turnStartMs: 0, toolDetails: {}, selectedToolId: null, detailTab: 'summary',
+  turnStartMs: 0, streaming: false, toolDetails: {}, selectedToolId: null, detailTab: 'summary',
   currentSessionId: 'A', turnRunning: false, runningSessionId: null, pendingForegroundRequest: null,
   messages: [], fetch: async () => ({ok:false}),
+  openedAgents: [],
+  openSubAgentDetails: (id, trigger, owner) => context.openedAgents.push({id, trigger, owner}),
 };
 vm.createContext(context);
 vm.runInContext(extract('let thinkingEl = null;', 'const THINK_ORBIT_ICON'), context);
@@ -310,7 +331,7 @@ vm.runInContext(extract('function finishUserTurn(', '// Called at the start of e
 vm.runInContext(extract('function beginUserTurn()', '// Reset every piece of in-flight turn state.'), context);
 vm.runInContext(extract('function addMessage(', '// Attach the hover actions row'), context);
 vm.runInContext(extract('const INTERNAL_TRANSCRIPT_SECTION_RE', '// Rebuild the full transcript'), context);
-vm.runInContext(extract('function renderHistoryMessages(history)', 'function restoreHistoryTurnState('), context);
+vm.runInContext(extract('function refreshHistoricalSubagentStatuses(', 'function restoreHistoryTurnState('), context);
 vm.runInContext(extract('function restoreHistoryTurnState(', 'function showError('), context);
 function flushFrames() {
   for (let i = 0; frames.length; i++) {
@@ -387,6 +408,266 @@ if (scenario === 'keyboard_disclosure') {
   assert.match(inspect.textContent, /Inspect|View details/, 'English UI translates Inspect');
   labels = row.querySelectorAll('.tc-io-label').map(label => label.textContent);
   assert.deepEqual(labels, ['IN', 'OUT'], 'English UI uses short tool input/output labels');
+} else if (scenario === 'subagent_semantic_rows') {
+  const add = (tool, id, input) => {
+    context.handleToolStart({tool, id, input:JSON.stringify(input)});
+    flushFrames();
+    return area.querySelectorAll('.call-row').at(-1);
+  };
+  const secret = 'DO_NOT_SHOW_PRIVATE_PROMPT_OR_MESSAGE_BODY';
+  const agent = add('Agent', 'agent-1', {description:'Inspect chart', prompt:secret, name:'reviewer'});
+  assert.match(visibleToolText(agent), /启动子代理.*Inspect chart/);
+  assert.doesNotMatch(agent.querySelector('.tc-summary').textContent, /DO_NOT_SHOW/);
+  const unnamed = add('Agent', 'agent-2', {prompt:secret});
+  assert.match(unnamed.querySelector('.tc-summary').textContent, /准备任务/);
+  const teammate = add('MessageTeammate', 'message-1', {to:'reviewer', body:secret});
+  assert.match(visibleToolText(teammate), /给子代理发消息.*reviewer/);
+  assert.doesNotMatch(teammate.querySelector('.tc-summary').textContent, /DO_NOT_SHOW/);
+  const external = add('SendMessage', 'external-1', {channel:'slack', text:secret});
+  assert.match(visibleToolText(external), /发送外部消息.*外部频道/);
+  assert.doesNotMatch(external.querySelector('.tc-summary').textContent, /DO_NOT_SHOW/);
+  context.handleToolResult({tool:'MessageTeammate', id:'message-1', isError:true, output:'private ' + secret});
+  assert.match(teammate.querySelector('.tc-summary').textContent, /消息发送失败/);
+  assert.doesNotMatch(teammate.querySelector('.tc-summary').textContent, /DO_NOT_SHOW/);
+  const list = add('SubAgentList', 'list-1', {});
+  assert.match(visibleToolText(list), /查看子代理.*当前代理/);
+  context.lang = 'en';
+  context.refreshActivityGroupLanguage();
+  assert.match(visibleToolText(agent), /Start sub-agent.*Inspect chart/);
+  assert.match(visibleToolText(teammate), /Message sub-agent.*Message failed/);
+  assert.match(visibleToolText(external), /Send external message.*External channel/);
+  assert.match(visibleToolText(list), /View sub-agents.*Current agents/);
+  assert.match(teammate.querySelector('.tc-summary').textContent, /Message failed/);
+} else if (scenario === 'subagent_stage_lifecycle') {
+  const input = JSON.stringify({description:'Review code', prompt:'private task body'});
+  context.handleToolStart({tool:'Agent', id:'parent-1', session:'A', input});
+  flushFrames();
+  const row = area.querySelector('.call-row');
+  const stage = area.querySelector('.subagent-stage');
+  assert(stage, 'Agent call inserts one compact stage into its process group');
+  assert.match(stage.textContent, /正在协调子代理.*1 个/);
+  const button = row.querySelector('.tc-open-agent');
+  assert(button.hidden, 'no link is shown before stable backend identity arrives');
+  context.handleSubagentLifecycle({session:'A', sessionId:'A', parentToolUseId:'parent-1',
+    agentId:'child-1', name:'reviewer', background:false}, 'running');
+  assert.equal(button.hidden, false, 'structured lifecycle reveals direct detail link');
+  button.dispatch('click');
+  assert.equal(context.openedAgents.length, 1);
+  assert.equal(context.openedAgents[0].id, 'child-1');
+  assert.equal(context.openedAgents[0].owner, 'A');
+  context.handleToolResult({tool:'Agent', id:'parent-1', output:'review complete', presentation:{subagent:{
+    sessionId:'A', parentToolUseId:'parent-1', agentId:'child-1', name:'reviewer', status:'completed'}}});
+  assert.match(stage.textContent, /已协调子代理.*1 个/);
+  assert.equal(area.querySelectorAll('.subagent-stage').length, 1, 'start and result share one stage');
+  context.handleToolStart({tool:'Agent', id:'parent-2', session:'A', input});
+  flushFrames();
+  assert.equal(area.querySelectorAll('.subagent-stage').length, 1, 'second Agent in same process section reuses heading');
+  assert.match(stage.textContent, /正在协调子代理.*2 个/);
+  const second = area.querySelectorAll('.call-row').at(-1);
+  context.handleSubagentLifecycle({session:'B', sessionId:'B', parentToolUseId:'parent-2', agentId:'foreign'}, 'running');
+  assert.equal(second.querySelector('.tc-open-agent').hidden, true, 'another session cannot bind a detail link');
+  context.handleToolResult({tool:'Agent', id:'parent-2', output:'failed', isError:true});
+  assert.match(stage.textContent, /1 项失败/);
+  context.finishActivityGroup();
+  const artifact = new Element(); artifact.className = 'artifact-chat-card'; area.appendChild(artifact);
+  context.handleToolStart({tool:'Agent', id:'parent-3', session:'A', input});
+  flushFrames();
+  const groups = area.querySelectorAll('.activity-group');
+  assert.equal(groups.length, 2, 'an Artifact splits process sections without changing the turn');
+  assert.equal(groups[0].dataset.turnId, groups[1].dataset.turnId);
+  assert.equal(artifact.parentElement, area, 'Artifact stays a peer in transcript order');
+  assert(groups[1].querySelector('.subagent-stage'), 'later Agent stays in the later process section');
+  context.lang = 'en';
+  context.refreshActivityGroupLanguage();
+  assert.match(stage.textContent, /Sub-agent work.*2 agents.*1 failed/);
+} else if (scenario === 'subagent_background_lifecycle_across_turns') {
+  context.handleToolStart({tool:'Agent', id:'background-parent', session:'A', traceCallId:'background-trace',
+    input:JSON.stringify({description:'Review later', run_in_background:true})});
+  flushFrames();
+  const oldRow = area.querySelector('.call-row');
+  const oldStage = area.querySelector('.subagent-stage');
+  context.handleSubagentLifecycle({sessionId:'A', parentToolUseId:'background-parent',
+    traceCallId:'background-trace', agentId:'background-child', background:true}, 'running');
+  context.handleToolResult({tool:'Agent', id:'background-parent', traceCallId:'background-trace',
+    output:'Agent started', presentation:{subagent:{sessionId:'A', parentToolUseId:'background-parent',
+      agentId:'background-child', background:true, status:'running'}}});
+  context.finishUserTurn('completed');
+  context.beginUserTurn();
+  assert.match(oldStage.textContent, /已启动后台子代理/, 'old turn remains visibly in progress');
+  context.handleSubagentLifecycle({sessionId:'A', parentToolUseId:'background-parent',
+    traceCallId:'background-trace', agentId:'background-child', background:true}, 'completed');
+  assert.equal(oldRow.dataset.subagentStatus, 'completed', 'terminal event updates the prior turn row');
+  assert.match(oldStage.textContent, /已协调子代理/, 'prior turn heading reflects terminal status');
+  context.currentSessionId = 'B';
+  context.handleSubagentLifecycle({sessionId:'A', parentToolUseId:'background-parent',
+    traceCallId:'background-trace', agentId:'background-child', background:true}, 'failed');
+  assert.equal(oldRow.dataset.subagentStatus, 'completed', 'offscreen lifecycle cannot mutate viewed transcript');
+} else if (scenario === 'subagent_reused_provider_id_trace_binding') {
+  const input = JSON.stringify({description:'Independent child', run_in_background:true});
+  context.handleToolStart({tool:'Agent', id:'reused-agent-id', session:'A', traceCallId:'agent-trace-1', input});
+  context.handleToolStart({tool:'Agent', id:'reused-agent-id', session:'A', traceCallId:'agent-trace-2', input});
+  flushFrames();
+  const [first, second] = area.querySelectorAll('.call-row');
+  context.handleSubagentLifecycle({sessionId:'A', parentToolUseId:'reused-agent-id',
+    traceCallId:'agent-trace-2', agentId:'child-2', background:true}, 'running');
+  assert.equal(first.dataset.subagentId, undefined, 'same provider ID must not bind the first row');
+  assert.equal(second.dataset.subagentId, 'child-2', 'trace identity binds the second invocation');
+  context.handleSubagentLifecycle({sessionId:'A', parentToolUseId:'reused-agent-id',
+    traceCallId:'agent-trace-1', agentId:'child-1', background:true}, 'running');
+  assert.equal(first.dataset.subagentId, 'child-1');
+  context.handleSubagentLifecycle({sessionId:'A', parentToolUseId:'reused-agent-id',
+    traceCallId:'unknown-trace', agentId:'unknown-child', background:true}, 'running');
+  assert.equal(first.dataset.subagentId, 'child-1', 'unknown trace never reassigns a known row');
+  assert.equal(second.dataset.subagentId, 'child-2');
+} else if (scenario === 'subagent_trace_miss_does_not_bind_old_row') {
+  const input = JSON.stringify({description:'Previous child'});
+  context.handleToolStart({tool:'Agent', id:'reused-parent', session:'A', input});
+  flushFrames();
+  const oldRow = area.querySelector('.call-row');
+  context.handleToolResult({tool:'Agent', id:'reused-parent', output:'old result'});
+  context.finishUserTurn('completed');
+  context.beginUserTurn();
+  context.handleSubagentLifecycle({sessionId:'A', parentToolUseId:'reused-parent',
+    traceCallId:'new-call-trace', agentId:'new-child', background:true}, 'running');
+  assert.equal(oldRow.dataset.subagentId, undefined,
+    'a new traced child must not attach to the only untraced Agent row from a previous turn');
+  context.handleToolStart({tool:'Agent', id:'reused-parent', session:'A', input});
+  flushFrames();
+  const currentRow = area.querySelectorAll('.call-row').at(-1);
+  context.handleSubagentLifecycle({sessionId:'A', parentToolUseId:'reused-parent',
+    traceCallId:'new-call-trace', agentId:'new-child', background:true}, 'running');
+  assert.equal(oldRow.dataset.subagentId, undefined, 'fallback never changes an old unbound row');
+  assert.equal(currentRow.dataset.subagentId, 'new-child',
+    'the unique untraced row in the current turn can receive its lifecycle identity');
+} else if (scenario === 'subagent_known_child_without_trace_cross_turn') {
+  context.handleToolStart({tool:'Agent', id:'known-parent', session:'A',
+    input:JSON.stringify({run_in_background:true})});
+  flushFrames();
+  const row = area.querySelector('.call-row');
+  context.handleSubagentLifecycle({sessionId:'A', parentToolUseId:'known-parent',
+    agentId:'known-child', background:true}, 'running');
+  context.handleToolResult({tool:'Agent', id:'known-parent', output:'Agent started'});
+  context.finishUserTurn('completed');
+  context.beginUserTurn();
+  context.handleSubagentLifecycle({sessionId:'A', parentToolUseId:'known-parent',
+    traceCallId:'late-trace', agentId:'known-child', background:true}, 'completed');
+  assert.equal(row.dataset.subagentStatus, 'completed',
+    'a known child can complete its untraced prior-turn row');
+} else if (scenario === 'subagent_history_replay') {
+  const presentation = {subagent:{sessionId:'A', parentToolUseId:'saved-parent', agentId:'saved-child',
+    name:'reviewer', background:false, status:'completed'}};
+  context.renderHistoryMessages([
+    {role:'user', content:[{type:'text', text:'Review this file'}]},
+    {role:'assistant', content:[{type:'tool_use', name:'Agent', tool_use_id:'saved-parent',
+      input:{description:'Review source', prompt:'private child task'}}]},
+    {role:'user', content:[{type:'tool_result', tool_use_id:'saved-parent',
+      content:'Child returned its findings', presentation}]},
+    {role:'assistant', content:[{type:'text', text:'My final answer'}]},
+  ]);
+  flushFrames();
+  const stage = area.querySelector('.subagent-stage');
+  assert(stage, 'saved tool blocks recreate the inline sub-agent stage');
+  assert.match(stage.textContent, /已协调子代理.*1 个/);
+  const row = area.querySelector('.call-row');
+  const open = row.querySelector('.tc-open-agent');
+  assert.equal(open.hidden, false, 'persisted structured identity restores direct detail link');
+  open.dispatch('click');
+  assert.equal(context.openedAgents.at(-1).id, 'saved-child');
+  assert.equal(area.querySelectorAll('.message-assistant').length, 1, 'child output does not become an extra parent answer');
+  context.handleSubagentLifecycle({session:'A', sessionId:'A', parentToolUseId:'saved-parent',
+    agentId:'saved-child', status:'completed', text:'PRIVATE_CHILD_STREAM'}, 'completed');
+  assert.doesNotMatch(visibleText(area), /PRIVATE_CHILD_STREAM/,
+    'child lifecycle updates status only; child text stays in the independent detail stream');
+  context.renderHistoryMessages([
+    {role:'user', content:[{type:'text', text:'Review after restart'}]},
+    {role:'assistant', content:[{type:'tool_use', name:'Agent', tool_use_id:'saved-parent-blank',
+      input:{description:'Review source', prompt:'private child task'}}]},
+    {role:'user', content:[{type:'tool_result', tool_use_id:'saved-parent-blank', content:'Child returned its findings',
+      presentation:{'metis.agent_started':true, subagent:{sessionId:'', parentToolUseId:'saved-parent-blank',
+        agentId:'saved-child-blank', name:'reviewer', background:false, status:'completed'}}}]},
+  ]);
+  const restored = area.querySelector('.tc-open-agent');
+  assert.equal(restored.hidden, false, 'empty owner in a structured saved result adopts the loaded session');
+  restored.dispatch('click');
+  assert.equal(context.openedAgents.at(-1).id, 'saved-child-blank');
+  assert.equal(context.openedAgents.at(-1).owner, 'A');
+  context.renderHistoryMessages([
+    {role:'user', content:[{type:'text', text:'Untrusted older data'}]},
+    {role:'assistant', content:[{type:'tool_use', name:'Agent', tool_use_id:'unmarked-parent', input:{prompt:'hidden'}}]},
+    {role:'user', content:[{type:'tool_result', tool_use_id:'unmarked-parent', content:'done', presentation:{subagent:{
+      sessionId:'', parentToolUseId:'unmarked-parent', agentId:'unmarked-child', status:'completed'}}}]},
+  ]);
+  assert.equal(area.querySelector('.tc-open-agent').hidden, true, 'unmarked empty owner stays non-clickable');
+  context.renderHistoryMessages([
+    {role:'user', content:[{type:'text', text:'No trusted identity'}]},
+    {role:'assistant', content:[{type:'tool_use', name:'Agent', tool_use_id:'foreign-parent', input:{prompt:'hidden'}}]},
+    {role:'user', content:[{type:'tool_result', tool_use_id:'foreign-parent', content:'done', presentation:{subagent:{
+      sessionId:'B', parentToolUseId:'foreign-parent', agentId:'foreign-child', status:'completed'}}}]},
+  ]);
+  assert.equal(area.querySelector('.tc-open-agent').hidden, true, 'foreign history identity stays non-clickable');
+} else if (scenario === 'subagent_history_terminal_refresh') {
+  const history = status => [
+    {role:'user', content:[{type:'text', text:'Run reviewer in background'}]},
+    {role:'assistant', content:[{type:'tool_use', name:'Agent', tool_use_id:'bg-parent',
+      input:{description:'Review source', run_in_background:true}}]},
+    {role:'user', content:[{type:'tool_result', tool_use_id:'bg-parent', content:'Agent started',
+      presentation:{'metis.agent_started':true, subagent:{sessionId:'A', parentToolUseId:'bg-parent',
+        agentId:'bg-child', name:'reviewer', background:true, status}}}]},
+  ];
+  const requested=[];
+  context.fetch=async url=>{
+    if (!url.startsWith('/api/subagents/')) return {ok:false};
+    requested.push(url);
+    return {ok:true,json:async()=>({agent:{sessionId:'A',agentId:'bg-child',status:'completed'}})};
+  };
+  context.renderHistoryMessages(history('running'));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(requested,['/api/subagents/bg-child?sessionId=A']);
+  assert.equal(area.querySelector('.call-row').dataset.subagentStatus,'completed');
+  assert.match(area.querySelector('.subagent-stage').textContent,/已协调子代理/);
+  requested.length=0;
+  context.renderHistoryMessages(history('completed'));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(requested.length,0,'terminal history does not need another detail request');
+  context.fetch=async url=>url.startsWith('/api/subagents/')
+    ? {ok:true,json:async()=>({agent:{sessionId:'B',agentId:'bg-child',status:'completed'}})}
+    : {ok:false};
+  context.renderHistoryMessages(history('running'));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(area.querySelector('.call-row').dataset.subagentStatus,'running','foreign owner cannot complete this child');
+  context.fetch=async () => ({ok:false});
+  context.renderHistoryMessages(history('running'));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(area.querySelector('.call-row').dataset.subagentStatus,'running','failed read keeps original running state');
+} else if (scenario === 'subagent_history_terminal_race') {
+  const history = owner => [
+    {role:'user', content:[{type:'text', text:'Run background reviewer'}]},
+    {role:'assistant', content:[{type:'tool_use', name:'Agent', tool_use_id:'bg-parent', input:{run_in_background:true}}]},
+    {role:'user', content:[{type:'tool_result', tool_use_id:'bg-parent', content:'Agent started',
+      presentation:{'metis.agent_started':true, subagent:{sessionId:owner, parentToolUseId:'bg-parent',
+        agentId:'bg-child', background:true, status:'running'}}}]},
+  ];
+  const pending=[];
+  context.fetch=url=>url.startsWith('/api/subagents/')
+    ? new Promise(resolve=>pending.push({url,resolve})) : Promise.resolve({ok:false});
+  context.renderHistoryMessages(history('A'));
+  assert.equal(pending.length,1);
+  const staleRow=area.querySelector('.call-row');
+  context.renderHistoryMessages(history('A'));
+  assert.equal(pending.length,2);
+  pending[0].resolve({ok:true,json:async()=>({agent:{sessionId:'A',agentId:'bg-child',status:'completed'}})});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(area.querySelector('.call-row').dataset.subagentStatus,'running','earlier render cannot update replacement row');
+  assert.equal(staleRow.dataset.subagentStatus,'running','detached earlier row also stays unchanged');
+  context.currentSessionId='B';
+  context.renderHistoryMessages(history('B'));
+  assert.equal(pending.length,3);
+  pending[1].resolve({ok:true,json:async()=>({agent:{sessionId:'A',agentId:'bg-child',status:'completed'}})});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(area.querySelector('.call-row').dataset.subagentStatus,'running','old session response cannot alter new transcript');
+  pending[2].resolve({ok:true,json:async()=>({agent:{sessionId:'B',agentId:'bg-child',status:'failed'}})});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(area.querySelector('.call-row').dataset.subagentStatus,'failed','current session terminal response can update');
 } else if (scenario === 'stopped_tool') {
   const row = newRow('stopped');
   assert.equal(row.getAttribute('data-state'), 'running');

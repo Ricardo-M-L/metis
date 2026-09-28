@@ -1152,6 +1152,8 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 
 	parentOut := agent.EventOutFromContext(ctx)
 	parentToolUseID := agent.ParentToolUseIDFromContext(ctx)
+	parentTraceCallID := tools.InvocationIDFromContext(ctx)
+	parentTraceInvocationID := agent.TraceInvocationIDFromContext(ctx)
 
 	// The runner finalizer is an idempotent join boundary. First stop the
 	// producer, then (after executeForeground/Background has joined sub.Run)
@@ -1194,6 +1196,18 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// Agent therefore has no start signal and its trace owner can be discarded
 	// as soon as the parent tool_result arrives.
 	agent.TraceInvocationStarted(ctx)
+	if teammate != nil {
+		publishSubAgentLifecycle(parentOut, agent.Event{
+			Kind:               agent.EventSubAgentStart,
+			SubAgentParentID:   parentToolUseID,
+			SubAgentID:         teammate.AgentID,
+			SubAgentName:       teammate.Name,
+			SubAgentBackground: teammate.Background,
+			SubAgentStatus:     agent.StatusRunning.String(),
+			TraceInvocationID:  parentTraceInvocationID,
+			TraceCallID:        parentTraceCallID,
+		})
+	}
 	if runInBackground {
 		result, err := a.executeBackground(
 			sub,
@@ -1201,6 +1215,8 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			finalize,
 			parentOut,
 			parentToolUseID,
+			parentTraceCallID,
+			parentTraceInvocationID,
 			teammate,
 			timeout,
 			transcript,
@@ -1212,12 +1228,31 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 				transcriptCleanupOwnedByExecute = false
 			},
 		)
-		return decorateAgentExecutionRecovery(result, recovery), err
+		return decorateAgentSubAgentResult(decorateAgentExecutionRecovery(result, recovery), a.parentSessionID, parentToolUseID, teammate), err
 	}
 	runnerCleanupOwnedByExecute = false
 	transcriptCleanupOwnedByExecute = false
-	result, err := a.executeForeground(sub, childCtx, finalize, parentOut, parentToolUseID, teammate, timeout, transcript, persistedOnDisk)
-	return decorateAgentExecutionRecovery(result, recovery), err
+	result, err := a.executeForeground(sub, childCtx, finalize, parentOut, parentToolUseID, parentTraceCallID, parentTraceInvocationID, teammate, timeout, transcript, persistedOnDisk)
+	return decorateAgentSubAgentResult(decorateAgentExecutionRecovery(result, recovery), a.parentSessionID, parentToolUseID, teammate), err
+}
+
+// decorateAgentSubAgentResult is presentation-only metadata. The dispatcher
+// persists it beside the parent tool_result, making a child clickable when an
+// old conversation is reopened without parsing human-facing output text.
+func decorateAgentSubAgentResult(result *tools.Result, sessionID, parentToolUseID string, teammate *agent.Teammate) *tools.Result {
+	if result == nil || teammate == nil {
+		return result
+	}
+	if result.Presentation == nil {
+		result.Presentation = make(map[string]any)
+	}
+	snap := teammate.Snapshot()
+	result.Presentation["subagent"] = map[string]any{
+		"sessionId": sessionID, "parentToolUseId": parentToolUseID,
+		"agentId": snap.AgentID, "name": snap.Name,
+		"background": snap.Background, "status": snap.Status.String(),
+	}
+	return result
 }
 
 // agentIsolationIssue is a classified execution-environment constraint. Only
@@ -1501,6 +1536,8 @@ func (a Agent) executeForeground(
 	finalize func(),
 	parentOut chan<- agent.Event,
 	parentToolUseID string,
+	parentTraceCallID string,
+	parentTraceInvocationID string,
 	teammate *agent.Teammate,
 	timeout time.Duration,
 	transcript *agent.SubAgentTranscript,
@@ -1519,6 +1556,8 @@ func (a Agent) executeForeground(
 		resultRet.Presentation[agent.AgentStartedPresentationKey] = true
 	}()
 	defer transcript.Close()
+	defer agent.TraceInvocationEnded(childCtx)
+	defer recordSubAgentTerminal(transcript, parentOut, parentToolUseID, teammate, parentTraceCallID, parentTraceInvocationID)
 	defer finalize()
 	// G.15 (2026-05-12) — panic recovery for the foreground path.
 	// The background path already handles this; the foreground was
@@ -1541,7 +1580,6 @@ func (a Agent) executeForeground(
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() {
-		defer agent.TraceInvocationEnded(childCtx)
 		defer close(events)
 		defer func() {
 			if r := recover(); r != nil {
@@ -1682,6 +1720,8 @@ func (a Agent) executeBackground(
 	finalize func(),
 	parentOut chan<- agent.Event,
 	parentToolUseID string,
+	parentTraceCallID string,
+	parentTraceInvocationID string,
 	teammate *agent.Teammate,
 	timeout time.Duration,
 	transcript *agent.SubAgentTranscript,
@@ -1693,7 +1733,7 @@ func (a Agent) executeBackground(
 		// No Roster wired — graceful fallback to foreground so callers
 		// that opt into run_in_background on a Roster-less embedding
 		// still get a useful result (just synchronously).
-		return a.executeForeground(sub, childCtx, finalize, parentOut, parentToolUseID, nil, timeout, transcript, persistedOnDisk)
+		return a.executeForeground(sub, childCtx, finalize, parentOut, parentToolUseID, parentTraceCallID, parentTraceInvocationID, nil, timeout, transcript, persistedOnDisk)
 	}
 
 	go func() {
@@ -1706,6 +1746,14 @@ func (a Agent) executeBackground(
 			}
 		}()
 		defer transcript.Close()
+		defer agent.TraceInvocationEnded(childCtx)
+		var terminalOnce sync.Once
+		publishTerminal := func() {
+			terminalOnce.Do(func() {
+				recordSubAgentTerminal(transcript, parentOut, parentToolUseID, teammate, parentTraceCallID, parentTraceInvocationID)
+			})
+		}
+		defer publishTerminal()
 		defer finalize()
 		// panic recovery — a background sub-agent that panics should
 		// land in StatusFailed with a captured error string, not crash
@@ -1714,6 +1762,7 @@ func (a Agent) executeBackground(
 			if r := recover(); r != nil {
 				finalize()
 				teammate.Finish(agent.StatusFailed, "", fmt.Errorf("panic: %v", r), "panic")
+				publishTerminal()
 				notifyParent(parentNotify, teammate, time.Since(startedAt))
 			}
 		}()
@@ -1721,7 +1770,6 @@ func (a Agent) executeBackground(
 		events := make(chan agent.Event, 64)
 		done := make(chan error, 1)
 		go func() {
-			defer agent.TraceInvocationEnded(childCtx)
 			defer close(events)
 			defer func() {
 				if r := recover(); r != nil {
@@ -1784,6 +1832,7 @@ func (a Agent) executeBackground(
 		default:
 			teammate.Finish(agent.StatusFailed, final, finalErr, stopReason)
 		}
+		publishTerminal()
 		notifyParent(parentNotify, teammate, time.Since(startedAt))
 	}()
 	// The detached runner now owns teammate cleanup. Handoff only after the
@@ -1870,6 +1919,50 @@ func forwardSubAgentEvent(parentOut chan<- agent.Event, parentToolUseID string, 
 			}
 		}()
 	}
+}
+
+// publishSubAgentLifecycle is best-effort because detached background agents
+// can outlive (and close) the parent's turn channel. The transcript terminal
+// and session-scoped detail endpoint remain authoritative after that point.
+func publishSubAgentLifecycle(parentOut chan<- agent.Event, ev agent.Event) {
+	agent.TraceSubAgentLifecycle(ev)
+	if parentOut == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	select {
+	case parentOut <- ev:
+	default:
+	}
+}
+
+func recordSubAgentTerminal(transcript *agent.SubAgentTranscript, parentOut chan<- agent.Event, parentToolUseID string, teammate *agent.Teammate, traceCallID, traceInvocationID string) {
+	if teammate == nil {
+		return
+	}
+	snap := teammate.Snapshot()
+	if snap.Status == agent.StatusRunning {
+		return
+	}
+	exitError := ""
+	if snap.ExitErr != nil {
+		exitError = snap.ExitErr.Error()
+	}
+	_ = transcript.AppendTerminal(agent.SubAgentTerminal{
+		Status: snap.Status.String(), Background: snap.Background,
+		EndedAt: snap.EndTime, Output: snap.Output, Result: snap.Result,
+		StopHint: snap.StopHint, ExitError: exitError,
+	})
+	publishSubAgentLifecycle(parentOut, agent.Event{
+		Kind:               agent.EventSubAgentEnd,
+		SubAgentParentID:   parentToolUseID,
+		SubAgentID:         snap.AgentID,
+		SubAgentName:       snap.Name,
+		SubAgentBackground: snap.Background,
+		SubAgentStatus:     snap.Status.String(),
+		TraceInvocationID:  traceInvocationID,
+		TraceCallID:        traceCallID,
+	})
 }
 
 // teammateSnapshotOutput is a tiny convenience for the background

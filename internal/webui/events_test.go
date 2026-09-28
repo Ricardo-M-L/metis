@@ -32,6 +32,32 @@ func TestEventHubPublishCarriesSession(t *testing.T) {
 	}
 }
 
+func TestSubAgentLifecycleSSEHasSessionAndParentCorrelation(t *testing.T) {
+	s := &Server{}
+	for _, kind := range []agent.EventKind{agent.EventSubAgentStart, agent.EventSubAgentEnd} {
+		recorder := httptest.NewRecorder()
+		s.writeHubEvent(recorder, hubEvent{session: "session-a", ev: agent.Event{
+			Kind: kind, SubAgentParentID: "parent-tool", SubAgentID: "agt-a",
+			SubAgentName: "auditor", SubAgentBackground: true,
+			SubAgentStatus: "running", TraceCallID: "call-a",
+		}})
+		var payload map[string]any
+		parts := strings.Split(recorder.Body.String(), "data: ")
+		if len(parts) != 2 || json.Unmarshal([]byte(strings.TrimSpace(parts[1])), &payload) != nil {
+			t.Fatalf("invalid SSE: %s", recorder.Body.String())
+		}
+		for key, want := range map[string]any{
+			"session": "session-a", "sessionId": "session-a",
+			"parentToolUseId": "parent-tool", "agentId": "agt-a", "name": "auditor",
+			"background": true, "status": "running", "traceCallId": "call-a",
+		} {
+			if payload[key] != want {
+				t.Fatalf("%s = %#v, want %#v; SSE=%s", key, payload[key], want, recorder.Body.String())
+			}
+		}
+	}
+}
+
 func TestEventHubStoresDetachedPresentationEvents(t *testing.T) {
 	h := newEventHub()
 	ch := h.subscribe()
