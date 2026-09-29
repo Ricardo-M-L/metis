@@ -166,7 +166,7 @@ printf '%s\n' '{"version":1,"type":"event","event":{"kind":0,"textDelta":"worker
 			Executable:          fixture,
 			MaxParallel:         DefaultDesktopRootTurnParallelism,
 			SubagentSlotDir:     slotDir,
-			MaxSubagentSlots:    8,
+			MaxTotalAgentSlots:  16,
 			MaxSubagentsPerRoot: 4,
 		},
 	})
@@ -266,14 +266,14 @@ printf '%s\n' '{"version":1,"type":"event","event":{"kind":0,"textDelta":"first 
 	}
 }
 
-func TestProcessIsolatedTurnRunnerResizesChildAgentBudget(t *testing.T) {
+func TestProcessIsolatedTurnRunnerResizesAgentLimits(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fixture uses a POSIX shell")
 	}
 	workdir := t.TempDir()
 	script := filepath.Join(workdir, "metis-fixture")
 	if err := os.WriteFile(script, []byte(`#!/bin/sh
-printf '{"version":1,"type":"event","event":{"kind":0,"textDelta":"%s"}}\n' "$METIS_DESKTOP_SUBAGENT_SLOTS"
+printf '{"version":1,"type":"event","event":{"kind":0,"textDelta":"%s/%s"}}\n' "$METIS_DESKTOP_SUBAGENT_SLOTS" "$METIS_DESKTOP_SUBAGENT_CAP"
 printf '%s\n' '{"version":1,"type":"event","event":{"kind":5}}'
 `), 0o700); err != nil {
 		t.Fatal(err)
@@ -281,23 +281,23 @@ printf '%s\n' '{"version":1,"type":"event","event":{"kind":5}}'
 	runner, err := newProcessIsolatedTurnRunner(IsolatedTurnOptions{
 		Executable:          script,
 		SubagentSlotDir:     t.TempDir(),
-		MaxSubagentSlots:    8,
+		MaxTotalAgentSlots:  16,
 		MaxSubagentsPerRoot: 4,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	resizer, ok := runner.(subagentSlotResizer)
+	resizer, ok := runner.(desktopAgentLimitResizer)
 	if !ok {
-		t.Fatal("process runner does not expose child budget resizer")
+		t.Fatal("process runner does not expose agent limit resizer")
 	}
-	resizer.SetMaxSubagentSlots(4)
+	resizer.SetDesktopAgentLimits(24, 8)
 	result, err := runner.Run(context.Background(), IsolatedTurnRequest{SessionID: "worker-fixture", WorkDir: workdir, Input: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Text != "4" {
-		t.Fatalf("resized child budget = %q, want 4", result.Text)
+	if result.Text != "24/8" {
+		t.Fatalf("resized agent limits = %q, want 24/8", result.Text)
 	}
 }
 

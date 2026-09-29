@@ -8,7 +8,51 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/desktopipc"
 )
+
+func TestProcessIsolatedTurnRunnerStopsChildWithoutStoppingParent(t *testing.T) {
+	runner := protocolTestRunner(t, "stop-subagent")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	controls := make(chan IsolatedSteerRequest, 1)
+	reply := make(chan bool, 1)
+	controls <- IsolatedSteerRequest{StopSubAgentID: "agt-queued", Reply: reply}
+	var status desktopipc.Status
+	result, err := runner.Run(ctx, IsolatedTurnRequest{SessionID: "owner", WorkDir: t.TempDir(), Steer: controls, OnStatus: func(value desktopipc.Status) { status = value }})
+	if err != nil || result.Stopped || result.Text != "parent continues" || result.Done == nil || ctx.Err() != nil {
+		t.Fatalf("result=%+v err=%v ctx=%v", result, err, ctx.Err())
+	}
+	if !<-reply || len(status.Agents) != 1 || status.Agents[0].Status != "killed" {
+		t.Fatalf("ack/status=%+v", status)
+	}
+}
+
+func TestSubAgentStopAcknowledgementCannotResolveAnotherControl(t *testing.T) {
+	for _, message := range []desktopipc.Message{
+		{ID: "stop-1", Type: desktopipc.TypeSteerResult, Accepted: true},
+		{ID: "stop-1", Type: desktopipc.TypeStopSubAgentResult, AgentID: "agt-other", Accepted: true},
+	} {
+		reply := make(chan bool, 1)
+		controls := &isolatedWorkerControls{pending: map[string]isolatedControlReply{
+			"stop-1": {reply: reply, messageType: desktopipc.TypeStopSubAgentResult, agentID: "agt-target"},
+		}}
+		if err := controls.acknowledge(message); err == nil {
+			t.Fatalf("accepted unrelated acknowledgement: %+v", message)
+		}
+		select {
+		case <-reply:
+			t.Fatal("unrelated acknowledgement resolved stop")
+		default:
+		}
+		if err := controls.acknowledge(desktopipc.Message{ID: "stop-1", Type: desktopipc.TypeStopSubAgentResult, AgentID: "agt-target", Accepted: true}); err != nil {
+			t.Fatal(err)
+		}
+		if !<-reply {
+			t.Fatal("matching acknowledgement did not accept stop")
+		}
+	}
+}
 
 func TestProcessIsolatedTurnRunnerSteerAcknowledgementsMatchRequests(t *testing.T) {
 	runner := protocolTestRunner(t, "steer-roundtrip")

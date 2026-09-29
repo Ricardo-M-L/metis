@@ -80,9 +80,11 @@ func TestSnapContextCancelGitWriteReleasesLockAndCanRetry(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { _, err := m.SnapContext(ctx, "Bash", "interrupted", "interrupted add"); done <- err }()
-	deadline := time.NewTimer(5 * time.Second)
+	// Starting git add can be delayed by other packages in a full-suite run;
+	// the marker, not elapsed startup time, is the barrier this test needs.
+	deadline := time.NewTimer(20 * time.Second)
 	defer deadline.Stop()
-	ticker := time.NewTicker(time.Millisecond)
+	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 waitForFilter:
 	for {

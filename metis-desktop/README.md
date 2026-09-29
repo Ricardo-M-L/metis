@@ -68,23 +68,41 @@ server and displays it in an embedded frame. The shell keeps a deliberately
 narrow native bridge for the system folder picker and explicit in-app updates;
 the browser-only build receives neither capability.
 
-## Foreground concurrency
+## Agent concurrency
 
-Desktop runs unattended sessions (`dontAsk`, `bypassPermissions`, or
-`fullAccess`) in isolated Metis worker processes. The default admits eight root
-turns from different workspaces concurrently. A single workspace has one writer
-lease, so two conversations cannot concurrently change the same checkout. Child
-agents share the remaining permits in a sixteen-agent total budget, with a
-maximum of four children from any one root session.
+Desktop text turns run in isolated Metis worker processes, including interactive
+permission modes: approval requests and replies travel through each worker's
+private channel. A single workspace has one foreground writer lease, so two
+conversations cannot concurrently change the same checkout. Image turns retain
+the serialized in-process runtime while sharing the Desktop execution budget.
 
-Open **Settings → General → Foreground workspace concurrency** to choose `1`
-through `12`. The choice persists in `METIS_HOME/desktop-preferences.json` and
-is used on the next native launch; when no isolated task is active it also takes
-effect for new turns immediately. `METIS_DESKTOP_MAX_PARALLEL_TURNS` remains an
-environment override for automation and development. The aggregate root-plus-
-child budget remains sixteen. Image turns and sessions that can ask for an
-approval use the existing interactive runtime and remain serialized so
-permission cards and the selected workspace cannot cross conversations.
+**Settings → General → Agent concurrency** exposes three independent limits:
+
+| Setting | Default | Range |
+| --- | --- | --- |
+| Concurrent foreground workspaces | 8 | 1–12 |
+| Running agents, roots and children combined | 16 | 1–64 |
+| Running children per root task, including descendants | 8 | 1–32 |
+
+Named and anonymous children use the same pool. Background spawns return an
+agent ID immediately even when capacity is full; queued agents start as permits
+become available and can be inspected or cancelled from the child-agent panel.
+There is a separate safety ceiling of 256 outstanding children per root. Roots
+waiting for child work release their execution permit, including during nested
+delegation. Admission rotates between roots and preserves eligible FIFO order
+within each root. Desktop-launched cron processes share this pool; independently
+launched CLI sessions retain their existing concurrency configuration.
+
+Settings persist in `METIS_HOME/desktop-preferences.json`. Changes apply to new
+work immediately when all tasks are idle; with active or queued work, or an
+active cron scheduler process, they take effect after restarting Desktop.
+`METIS_DESKTOP_MAX_PARALLEL_TURNS` remains a foreground-workspace environment
+override for automation and development. Each Desktop backend owns its own pool;
+it is not a machine-wide limit across separately launched applications.
+
+Stopping a root cancels its running and queued children. Kernel locks release
+execution permits after a worker crash; this does not restart abandoned jobs
+or provide durable queue recovery after the application exits.
 
 ## In-app updates
 

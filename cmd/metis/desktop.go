@@ -17,8 +17,6 @@ import (
 
 var launchNativeDesktop = desktop.LaunchApp
 
-const desktopTotalAgentSlots = 16
-
 // cmdDesktop implements `metis desktop`. The native Wails client is the
 // default; the old browser UI remains available behind --web for development
 // and backwards compatibility.
@@ -47,8 +45,10 @@ func cmdDesktop(ctx context.Context, args []string) error {
 
 	flags := &cliFlags{autoMemoryStartup: autoMemoryStartupDesktop}
 	prefs := webui.DesktopLaunchPreferences{
-		DefaultPreset:       "standard",
-		RootTurnParallelism: webui.DefaultDesktopRootTurnParallelism,
+		DefaultPreset:         "standard",
+		RootTurnParallelism:   webui.DefaultDesktopRootTurnParallelism,
+		TotalAgentParallelism: webui.DefaultDesktopTotalAgentParallelism,
+		SubagentParallelism:   webui.DefaultDesktopSubagentParallelism,
 	}
 	presetName := prefs.DefaultPreset
 	if loaded, prefErr := webui.LoadDesktopLaunchPreferences(); prefErr != nil {
@@ -85,11 +85,11 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	// Lock files are owned by this Desktop backend and inherited only by its
 	// isolated turn workers. OS advisory locks release on a worker crash; the
 	// directory itself is removed once the Desktop server exits.
-	subagentSlotDir, err := os.MkdirTemp("", "metis-desktop-agent-slots-")
+	agentSlotDir, err := os.MkdirTemp("", "metis-desktop-agent-slots-")
 	if err != nil {
 		return fmt.Errorf("desktop: create sub-agent scheduler storage: %w", err)
 	}
-	defer os.RemoveAll(subagentSlotDir)
+	defer os.RemoveAll(agentSlotDir)
 	bindings := webui.RuntimeBindings{
 		InitialSessionID:        rt.sessionID,
 		ProviderName:            rt.providerName,
@@ -133,16 +133,15 @@ func cmdDesktop(ctx context.Context, args []string) error {
 			Model:      rt.model,
 		},
 		// Every unattended foreground turn gets a private metis process. The
-		// scheduler reserves a fixed total budget for roots and child agents,
-		// while still serializing writes in one exact workspace.
+		// scheduler shares a configurable execution budget between root and
+		// child agents while serializing writes in each exact workspace.
 		IsolatedTurns: &webui.IsolatedTurnOptions{
 			Executable:                 executable,
 			MaxParallel:                turnParallelism,
 			MaxConfigurableParallelism: webui.MaxDesktopRootTurnParallelism,
-			MaxTotalAgentSlots:         desktopTotalAgentSlots,
-			SubagentSlotDir:            subagentSlotDir,
-			MaxSubagentSlots:           desktopChildAgentSlots(turnParallelism),
-			MaxSubagentsPerRoot:        4,
+			MaxTotalAgentSlots:         prefs.TotalAgentParallelism,
+			SubagentSlotDir:            agentSlotDir,
+			MaxSubagentsPerRoot:        prefs.SubagentParallelism,
 		},
 	}
 	// A regular `metis desktop --web` browser session has no frame token and
@@ -177,21 +176,6 @@ func desktopWorkerParallelism(getenv func(string) string, saved int) int {
 		return defaultParallelism
 	}
 	return n
-}
-
-// desktopChildAgentSlots keeps the aggregate root + child agent budget fixed
-// even when an advanced user raises or lowers the foreground worker setting.
-// The default is eight roots plus eight child permits. A per-root roster cap still
-// prevents one session from consuming the shared child pool.
-func desktopChildAgentSlots(rootSlots int) int {
-	if rootSlots < 1 {
-		rootSlots = 1
-	}
-	childSlots := desktopTotalAgentSlots - rootSlots
-	if childSlots < 1 {
-		return 1
-	}
-	return childSlots
 }
 
 type desktopOptions struct {

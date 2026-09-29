@@ -88,26 +88,29 @@ func TestProbeBoundedAndCanceled(t *testing.T) {
 		name, script, want  string
 		timeout, maxElapsed time.Duration
 	}{
-		// Sandbox startup can be delayed when the whole repository is under
-		// parallel test load. Keep these checks bounded without making a
-		// healthy probe fail before it gets a chance to start.
-		{"output", "#!/bin/sh\nhead -c 100000 /dev/zero\n", "output limit", 5 * time.Second, 8 * time.Second},
+		// Output validation uses Probe's own timeout so sandbox startup under
+		// parallel test load cannot consume a shorter test-only deadline.
+		{"output", "#!/bin/sh\nhead -c 100000 /dev/zero\n", "output limit", 0, 0},
 		{"timeout", "#!/bin/sh\nexec sleep 30\n", "canceled", 100 * time.Millisecond, 2 * time.Second},
-		{"trailing", "#!/bin/sh\nprintf '%s\\n' '{} {}'\n", "trailing", 5 * time.Second, 8 * time.Second},
+		{"trailing", "#!/bin/sh\nprintf '%s\\n' '{} {}'\n", "trailing", 0, 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			filename := filepath.Join(t.TempDir(), "helper")
 			if err := os.WriteFile(filename, []byte(test.script), 0700); err != nil {
 				t.Fatal(err)
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), test.timeout)
-			defer cancel()
+			ctx := context.Background()
+			if test.timeout != 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, test.timeout)
+				defer cancel()
+			}
 			start := time.Now()
 			_, err := Probe(ctx, filename)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("expected %s, got %v", test.want, err)
 			}
-			if time.Since(start) > test.maxElapsed {
+			if test.maxElapsed != 0 && time.Since(start) > test.maxElapsed {
 				t.Fatal("probe did not honor bounded execution")
 			}
 		})

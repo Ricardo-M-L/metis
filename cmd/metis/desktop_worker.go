@@ -23,18 +23,19 @@ type desktopWorkerPending struct {
 // and cleanup. Losing the parent connection cancels the run; it never grants
 // a permission or silently dismisses a live user's question.
 type desktopWorkerBridge struct {
-	ctx          context.Context
-	cancel       context.CancelCauseFunc
-	input        io.ReadCloser
-	encoder      *desktopipc.Encoder
-	mu           sync.Mutex
-	pending      map[string]desktopWorkerPending
-	err          error
-	closed       bool
-	done         chan struct{}
-	steerHandler func(string) bool
-	steers       chan desktopipc.Message
-	steerDone    chan struct{}
+	ctx                 context.Context
+	cancel              context.CancelCauseFunc
+	input               io.ReadCloser
+	encoder             *desktopipc.Encoder
+	mu                  sync.Mutex
+	pending             map[string]desktopWorkerPending
+	err                 error
+	closed              bool
+	done                chan struct{}
+	steerHandler        func(string) bool
+	stopSubAgentHandler func(string) bool
+	steers              chan desktopipc.Message
+	steerDone           chan struct{}
 }
 
 func newDesktopWorkerBridge(parent context.Context, input io.ReadCloser, output io.Writer) *desktopWorkerBridge {
@@ -53,6 +54,17 @@ func (b *desktopWorkerBridge) readReplies() {
 		if err != nil {
 			b.fail(fmt.Errorf("desktop worker reply stream: %w", err))
 			return
+		}
+		if message.Type == desktopipc.TypeStopSubAgent {
+			b.mu.Lock()
+			handler := b.stopSubAgentHandler
+			b.mu.Unlock()
+			accepted := handler != nil && handler(message.AgentID)
+			if err := b.encoder.Encode(desktopipc.Message{Version: desktopipc.Version, Type: desktopipc.TypeStopSubAgentResult, ID: message.ID, AgentID: message.AgentID, Accepted: accepted}); err != nil {
+				b.fail(err)
+				return
+			}
+			continue
 		}
 		if message.Type == desktopipc.TypeSteer {
 			select {
@@ -98,6 +110,26 @@ func (b *desktopWorkerBridge) readReplies() {
 func (b *desktopWorkerBridge) setSteerHandler(handler func(string) bool) {
 	b.mu.Lock()
 	b.steerHandler = handler
+	b.mu.Unlock()
+}
+
+// Only this worker's roster is reachable. Cancellation never calls the bridge's
+// parent cancel function, and RequestCancel safely latches queued identities.
+func (b *desktopWorkerBridge) setSubAgentRoster(roster *agent.Roster) {
+	b.mu.Lock()
+	b.stopSubAgentHandler = func(agentID string) bool {
+		if roster == nil {
+			return false
+		}
+		teammate, found := roster.LookupByAgentID(agentID)
+		if !found || teammate == nil {
+			return false
+		}
+		if teammate.Snapshot().Status.IsActive() {
+			teammate.RequestCancel()
+		}
+		return true
+	}
 	b.mu.Unlock()
 }
 

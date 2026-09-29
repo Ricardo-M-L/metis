@@ -24,8 +24,8 @@ func TestDesktopPresentationModeDefaultsAndMigratesOldPreferences(t *testing.T) 
 	if err := json.Unmarshal(rr.Body.Bytes(), &prefs); err != nil {
 		t.Fatal(err)
 	}
-	if prefs.PresentationMode != "standard" {
-		t.Fatalf("default presentation mode = %q, want standard", prefs.PresentationMode)
+	if prefs.PresentationMode != "standard" || prefs.TotalAgentParallelism != DefaultDesktopTotalAgentParallelism || prefs.SubagentParallelism != DefaultDesktopSubagentParallelism {
+		t.Fatalf("default preferences = %+v", prefs)
 	}
 
 	// An older Desktop file has no presentationMode but keeps its other choices.
@@ -41,7 +41,7 @@ func TestDesktopPresentationModeDefaultsAndMigratesOldPreferences(t *testing.T) 
 	if err := json.Unmarshal(rr.Body.Bytes(), &prefs); err != nil {
 		t.Fatal(err)
 	}
-	if prefs.PresentationMode != "standard" || prefs.Language != "en" || prefs.BusyEnter != "send" {
+	if prefs.PresentationMode != "standard" || prefs.Language != "en" || prefs.BusyEnter != "send" || prefs.TotalAgentParallelism != DefaultDesktopTotalAgentParallelism || prefs.SubagentParallelism != DefaultDesktopSubagentParallelism {
 		t.Fatalf("legacy migration changed preferences: %+v", prefs)
 	}
 }

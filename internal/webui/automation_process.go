@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -261,6 +262,13 @@ func (a *automationManager) startProcessLocked(args []string, runID string) (*au
 		if !strings.HasPrefix(entry, "METIS_DESKTOP_FRAME_TOKEN=") {
 			cmd.Env = append(cmd.Env, entry)
 		}
+	}
+	if a.options.DesktopSlotDir != "" {
+		cmd.Env = withIsolatedWorkerEnv(cmd.Env, map[string]string{
+			"METIS_DESKTOP_SUBAGENT_SLOT_DIR": a.options.DesktopSlotDir,
+			"METIS_DESKTOP_SUBAGENT_SLOTS":    strconv.Itoa(a.options.TotalAgentSlots),
+			"METIS_DESKTOP_SUBAGENT_CAP":      strconv.Itoa(a.options.SubagentsPerRoot),
+		})
 	}
 	output := &automationLogBuffer{limit: 64 << 10}
 	cmd.Stdout = output

@@ -7,6 +7,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.79] - 2026-09-29
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Added
+
+- Desktop shares sub-agent execution slots between named and anonymous agents.
+  Excess background work enters a bounded queue and starts automatically when
+  capacity becomes available; the default limits are 16 agents overall and
+  8 per root task. CLI concurrency settings remain independent.
+- Desktop shows queued sub-agents and lets users stop queued or running work.
+  The same limits apply across foreground turns, scheduled tasks, and nested
+  sub-agents, with controls in Settings.
+
+### Fixed
+
+- Release slots and settle queued work when a parent turn is cancelled, a
+  worker exits, or a nested sub-agent completes. Keep each child tied to its
+  owning session so status and output remain available across view changes.
+
 ## [0.4.78] - 2026-09-28
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

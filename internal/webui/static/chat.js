@@ -77,7 +77,7 @@ function connectEvents() {
   onLive('tool_start', handleToolStart);
   onLive('tool_result', handleToolResult);
   onLive('tool_args_delta', handleToolArgsDelta);
-  onLive('subagent_start', d => handleSubagentLifecycle(d, 'running'));
+  onLive('subagent_start', d => handleSubagentLifecycle(d, d.status || 'running'));
   onLive('subagent_end', d => handleSubagentLifecycle(d, d.status || 'completed'));
   onLive('thinking_delta', handleThinkingDelta);
   onLive('tokens', handleTokensEvent);
@@ -616,21 +616,29 @@ function updateSubagentStage(group) {
   const stage = group && group.querySelector('.subagent-stage');
   if (!stage) return;
   const rows = [...group.querySelectorAll('.call-row')].filter(row => isSubagentTool(row.dataset.tool));
-  const active = rows.some(row => row.dataset.state === 'running');
+  const queued = rows.filter(row => row.dataset.subagentStatus === 'queued').length;
+  const active = rows.some(row => row.dataset.state === 'running' &&
+    (!row.dataset.subagentStatus || row.dataset.subagentStatus === 'running'));
   const detached = rows.some(row => row.dataset.subagentBackground === 'true' &&
     row.dataset.subagentStatus === 'running' && row.dataset.state !== 'running');
-  const failures = rows.filter(row => ['failed', 'error', 'killed', 'stopped'].includes(row.dataset.subagentStatus) ||
-    (row.dataset.subagentBackground !== 'true' && ['error', 'stopped'].includes(row.dataset.state))).length;
+  const failures = rows.filter(row => ['failed', 'error'].includes(row.dataset.subagentStatus) ||
+    (!row.dataset.subagentStatus && row.dataset.subagentBackground !== 'true' && row.dataset.state === 'error')).length;
+  const stopped = rows.filter(row => ['killed', 'stopped'].includes(row.dataset.subagentStatus) ||
+    (!row.dataset.subagentStatus && row.dataset.subagentBackground !== 'true' && row.dataset.state === 'stopped')).length;
   const unknown = rows.some(row => row.dataset.state === 'incomplete' && !row.dataset.subagentStatus);
   const title = active ? uiText('Coordinating sub-agents', '正在协调子代理')
+    : queued && !detached ? uiText('Sub-agents queued', '子代理排队中')
     : detached ? uiText('Background sub-agents started', '已启动后台子代理')
     : failures || unknown ? uiText('Sub-agent work', '子代理任务')
+      : stopped ? uiText('Sub-agents stopped', '子代理已停止')
       : uiText('Coordinated sub-agents', '已协调子代理');
   const count = uiText(`${rows.length} agent${rows.length === 1 ? '' : 's'}`, `${rows.length} 个`);
   const failure = failures ? uiText(` · ${failures} failed`, ` · ${failures} 项失败`) : '';
+  const interrupted = stopped ? uiText(` · ${stopped} stopped`, ` · ${stopped} 个已停止`) : '';
   const uncertain = unknown ? uiText(' · result unavailable', ' · 结果未记录') : '';
-  stage.textContent = `${title} · ${count}${failure}${uncertain}`;
-  stage.dataset.state = active ? 'running' : failures ? 'error' : detached || unknown ? 'incomplete' : 'completed';
+  const waiting = queued && queued < rows.length ? uiText(` · ${queued} queued`, ` · ${queued} 个排队中`) : '';
+  stage.textContent = `${title} · ${count}${waiting}${failure}${interrupted}${uncertain}`;
+  stage.dataset.state = active ? 'running' : queued ? 'queued' : failures ? 'error' : detached || unknown ? 'incomplete' : stopped ? 'stopped' : 'completed';
 }
 
 function appendActivityRow(row) {
@@ -1714,7 +1722,7 @@ function renderDetailPanel() {
     const state = row?.dataset.state || d.state || (d.error ? 'error' : 'incomplete');
     const lines = [
       [uiText('Tool', '工具'), d.name],
-      [uiText('Status', '状态'), toolRowStateLabel(state)],
+      [uiText('Status', '状态'), subagentRowStatusLabel(row?.dataset.subagentStatus) || toolRowStateLabel(state)],
       [uiText('Duration', '用时'), d.elapsed ? fmtMs(d.elapsed) : '-'],
       [uiText('Input', '输入'), d.input ? uiText('(see Input tab)', '（见输入页）') : uiText('(none)', '（无）')],
       [uiText('Output', '输出'), d.output ? uiText('(see Output tab)', '（见输出页）') : uiText('(none)', '（无）')],
@@ -1788,12 +1796,33 @@ function toolRowStateLabel(state) {
   return uiText('Completed', '已完成');
 }
 
+function subagentRowStatusLabel(status) {
+  const labels = {
+    queued: uiText('Queued', '排队中'),
+    running: uiText('Running', '运行中'),
+    completed: uiText('Completed', '已完成'),
+    failed: uiText('Failed', '失败'),
+    killed: uiText('Stopped', '已停止'),
+  };
+  return labels[status] || '';
+}
+
 function updateToolRowAccessibleLabel(row) {
   const control = row && row.querySelector('.tc-disclosure');
   if (!control) return;
   const title = row.querySelector('.tc-title')?.textContent || toolVariantOf(row.dataset.tool).title;
   const summary = row.querySelector('.tc-summary')?.textContent || '';
-  control.setAttribute('aria-label', [title, summary, toolRowStateLabel(row.dataset.state)].filter(Boolean).join(' · '));
+  const childStatus = isSubagentTool(row.dataset.tool) ? subagentRowStatusLabel(row.dataset.subagentStatus) : '';
+  if (childStatus) {
+    let badge = row.querySelector('.tc-subagent-state');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'tc-subagent-state';
+      control.appendChild(badge);
+    }
+    badge.textContent = childStatus;
+  }
+  control.setAttribute('aria-label', [title, summary, childStatus || toolRowStateLabel(row.dataset.state)].filter(Boolean).join(' · '));
 }
 
 function setToolRowVisualState(row, state) {
@@ -2045,16 +2074,43 @@ function attachSubagentIdentity(row, info, status) {
   row.dataset.subagentSessionId = owner;
   row.dataset.subagentName = boundedToolLabel(info.name || '');
   row.dataset.subagentBackground = String(!!info.background);
-  if (status) row.dataset.subagentStatus = String(status);
+  updateSubagentRowStatus(row, status);
   const open = row.querySelector('.tc-open-agent');
   if (open) open.hidden = false;
+  updateToolRowAccessibleLabel(row);
   updateSubagentStage(row.closest('.activity-group'));
   return true;
+}
+
+function updateSubagentRowStatus(row, status) {
+  if (!row || !subagentRowStatusLabel(status)) return false;
+  const priorStatus = row.dataset.subagentStatus;
+  const lateActiveStatus = ['completed', 'failed', 'killed'].includes(priorStatus) && ['queued', 'running'].includes(status);
+  if (status === priorStatus || lateActiveStatus || (status === 'queued' && priorStatus && priorStatus !== 'queued')) return false;
+  row.dataset.subagentStatus = status;
+  updateToolRowAccessibleLabel(row);
+  updateSubagentStage(row.closest('.activity-group'));
+  if (selectedToolId === row.dataset.rowKey && detailTab === 'summary') renderDetailPanel();
+  return true;
+}
+
+function reconcileSubagentToolRows(roster) {
+  const owner = String(currentSessionId || '');
+  if (!owner || !roster || String(roster.sessionId || '') !== owner || !Array.isArray(roster.agents)) return;
+  const agents = new Map(roster.agents.filter(agent => String(agent.sessionId || '') === owner && agent.agentId)
+    .map(agent => [String(agent.agentId), agent]));
+  document.querySelectorAll('.call-row[data-subagent-id]').forEach(row => {
+    if (!row.isConnected || !isSubagentTool(row.dataset.tool) || row.dataset.ownerSession !== owner ||
+        row.dataset.subagentSessionId !== owner || ['completed', 'failed', 'killed'].includes(row.dataset.subagentStatus)) return;
+    const agent = agents.get(String(row.dataset.subagentId || ''));
+    if (agent) updateSubagentRowStatus(row, agent.status);
+  });
 }
 
 function handleSubagentLifecycle(d, status) {
   // This event is a child lifecycle fact, not an assistant message. It may
   // identify the existing Agent call, but must never append child text here.
+  status = d.status || status;
   const owner = String(d.sessionId || d.session || '');
   const agentId = String(d.agentId || '');
   if (!owner || owner !== String(currentSessionId || runningSessionId || '') ||
@@ -3505,7 +3561,7 @@ function refreshHistoricalSubagentStatuses(sessionId, generation) {
   if (!sessionId || typeof fetch !== 'function') return;
   const rows = [...document.querySelectorAll('.call-row[data-subagent-id]')].filter(row =>
     row.dataset.historyRendered === 'true' && row.dataset.ownerSession === sessionId &&
-    row.dataset.subagentSessionId === sessionId && row.dataset.subagentStatus === 'running');
+    row.dataset.subagentSessionId === sessionId && ['queued', 'running'].includes(row.dataset.subagentStatus));
   const byAgent = new Map();
   rows.forEach(row => {
     const id = String(row.dataset.subagentId || '');
@@ -3520,6 +3576,7 @@ function refreshHistoricalSubagentStatuses(sessionId, generation) {
   const drain = async () => {
     while (next < entries.length && stillViewing()) {
       const [agentId, matchingRows] = entries[next++];
+      const requestedStatuses = new Map(matchingRows.map(row => [row, row.dataset.subagentStatus]));
       try {
         const response = await fetch('/api/subagents/' + encodeURIComponent(agentId) +
           '?sessionId=' + encodeURIComponent(sessionId), { cache: 'no-store' });
@@ -3529,13 +3586,13 @@ function refreshHistoricalSubagentStatuses(sessionId, generation) {
         const detail = body && body.agent;
         if (!detail || String(detail.agentId || '') !== agentId ||
             String(detail.sessionId || '') !== sessionId ||
-            !['completed', 'failed', 'killed'].includes(detail.status)) continue;
+            !['queued', 'running', 'completed', 'failed', 'killed'].includes(detail.status)) continue;
         matchingRows.forEach(row => {
           if (!row.isConnected || row.dataset.ownerSession !== sessionId ||
               row.dataset.subagentSessionId !== sessionId ||
-              row.dataset.subagentId !== agentId || row.dataset.subagentStatus !== 'running') return;
-          row.dataset.subagentStatus = detail.status;
-          updateSubagentStage(row.closest('.activity-group'));
+              row.dataset.subagentId !== agentId || row.dataset.subagentStatus !== requestedStatuses.get(row) ||
+              !['queued', 'running'].includes(row.dataset.subagentStatus)) return;
+          updateSubagentRowStatus(row, detail.status);
         });
       } catch (_) { /* Keep the persisted started state when detail is unavailable. */ }
     }
@@ -3663,6 +3720,9 @@ function renderHistoryMessages(history) {
   activityHistoryTurn = 0;
   updateEmptyLayout();
   resumeAutoScroll();
+  if (typeof statusRosterForSelectedSession === 'function' && typeof lastStatusSnapshot !== 'undefined') {
+    reconcileSubagentToolRows(statusRosterForSelectedSession(lastStatusSnapshot));
+  }
   refreshHistoricalSubagentStatuses(historySessionId, activityHistoryGeneration);
   void restoreHistoryMessageMetadata(currentSessionId, activityHistoryGeneration);
 }
@@ -5306,27 +5366,40 @@ async function choosePresentationMode(value) {
 }
 
 function renderDesktopParallelismPreference() {
-  const value = Number(desktopPreferences.rootTurnParallelism) || 8;
+  const choices = [
+    { key: 'rootTurnParallelism', value: desktopPreferences.rootTurnParallelism, fallback: 8, max: 12,
+      label: uiText('Parallel workspaces', '并发工作区'),
+      desc: uiText('Maximum top-level turns in different workspaces. Each workspace still has one writer.', '不同工作区同时运行的顶层任务上限。同一工作区仍只允许一个写入任务。') },
+    { key: 'totalAgentParallelism', value: desktopPreferences.totalAgentParallelism, fallback: 16, max: 64,
+      label: uiText('Total running agents', '运行中代理总数'),
+      desc: uiText('One shared execution pool for top-level turns and child agents. Extra work waits for a free slot.', '顶层任务与子代理共用同一执行池；满额时其余任务等待空位。') },
+    { key: 'subagentParallelism', value: desktopPreferences.subagentParallelism, fallback: 8, max: 32,
+      label: uiText('Child agents per top-level turn', '每个顶层任务的子代理并发数'),
+      desc: uiText('Maximum child agents executing for one top-level turn; they also count toward the total.', '单个顶层任务同时执行的子代理上限；它们也计入代理总数。') },
+  ];
+  const rows = choices.map(choice => `<div class="settings-card-row"><div><div class="settings-card-label">${choice.label}</div><div class="settings-card-desc">${choice.desc} ${uiText(`Default ${choice.fallback}; choose 1–${choice.max}.`, `默认 ${choice.fallback}；可设 1–${choice.max}。`)}</div></div><input type="number" min="1" max="${choice.max}" step="1" class="settings-number" value="${escAttr(String(Number(choice.value) || choice.fallback))}" aria-label="${escAttr(choice.label)}" onchange="saveDesktopParallelism(this, '${choice.key}')"></div>`).join('');
   return `<div class="settings-section">
-    <div class="settings-section-title">${uiText('Foreground workspace concurrency', '前台工作区并发数')}</div>
-    <div class="settings-section-desc">${uiText('How many independent workspaces may run at once. The default is 8; the same workspace always runs one writer at a time. Choose 1–12. Changes apply to new tasks immediately when no task is running; otherwise restart Desktop after current tasks finish.', '允许多少个独立工作区同时运行。默认 8；同一工作区始终只有一个写入任务。可设 1–12。没有任务运行时，修改会立即用于新任务；否则请等待当前任务结束后重启 Desktop。')}</div>
-    <div class="settings-card"><div class="settings-card-row"><div><div class="settings-card-label">${uiText('Parallel conversations', '并发会话')}</div><div class="settings-card-desc">${uiText('High-performance mode shares a 16-agent root and child budget.', '高性能模式在根会话和子代理间共享 16 个代理槽位。')}</div></div><input type="number" min="1" max="12" step="1" class="settings-number" value="${escAttr(String(value))}" aria-label="${escAttr(uiText('Foreground workspace concurrency', '前台工作区并发数'))}" onchange="saveDesktopParallelism(this)"></div></div>
+    <div class="settings-section-title">${uiText('Agent concurrency', '代理并发设置')}</div>
+    <div class="settings-section-desc">${uiText('Changes apply immediately when all Desktop agent work is idle. If work is running or queued, the values are saved and apply after a Desktop restart.', '所有 Desktop 代理任务空闲时，修改会立即生效。如果仍有运行中或排队任务，设置会保存，并在重启 Desktop 后生效。')}</div>
+    <div class="settings-card">${rows}</div>
   </div>`;
 }
 
-async function saveDesktopParallelism(input) {
+async function saveDesktopParallelism(input, key) {
+  const maxByKey = { rootTurnParallelism: 12, totalAgentParallelism: 64, subagentParallelism: 32 };
+  const max = maxByKey[key];
   const value = Number(input && input.value);
-  if (!Number.isInteger(value) || value < 1 || value > 12) {
-    showToast(uiText('Concurrency must be an integer from 1 to 12.', '并发数必须是 1 到 12 的整数。'));
+  if (!max || !Number.isInteger(value) || value < 1 || value > max) {
+    showToast(uiText(`Concurrency must be an integer from 1 to ${max || 1}.`, `并发数必须是 1 到 ${max || 1} 的整数。`));
     renderSettingsTab();
     return;
   }
-  const result = await saveDesktopPreference('rootTurnParallelism', value);
-  if (!result) return;
+  const result = await saveDesktopPreference(key, value);
   renderSettingsTab();
+  if (!result) return;
   showToast(result.parallelismApplied === false
-    ? uiText('Concurrency saved. Restart Desktop after active tasks finish to apply it safely.', '并发数已保存。请等待当前任务结束后重启 Desktop 以安全生效。')
-    : uiText('Concurrency saved. New workspace tasks use it now.', '并发数已保存，新的工作区任务已使用该设置。'));
+    ? uiText('Concurrency saved. Restart Desktop after active and queued agent work finishes to apply it.', '并发数已保存。请在运行中和排队中的代理任务结束后重启 Desktop，使设置生效。')
+    : uiText('Concurrency saved. New agent work uses it now.', '并发数已保存，新的代理任务已使用该设置。'));
 }
 
 function renderBusyEnterPreference() {

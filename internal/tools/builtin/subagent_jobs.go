@@ -48,7 +48,7 @@ func NewSubAgentList(gate *permission.Gate, r *agent.Roster) SubAgentList {
 
 func (SubAgentList) Name() string { return "SubAgentList" }
 func (SubAgentList) Description() string {
-	return "List active and recently-finished sub-agents in the current session. Returns each one's agent_id, name, status (running/completed/failed/killed), started_at, and (for completed) the final result snippet. Pairs with Agent({run_in_background: true}) — use this to discover what's still in flight."
+	return "List active and recently-finished sub-agents in the current session. Returns each one's agent_id, name, status (queued/running/completed/failed/killed), started_at, and (for completed) the final result snippet. Desktop queued agents are waiting for execution capacity and can be cancelled with SubAgentStop. Pairs with Agent({run_in_background: true}) — use this to discover what's still in flight."
 }
 func (SubAgentList) InputSchema() map[string]any {
 	return map[string]any{
@@ -90,7 +90,7 @@ func (s SubAgentList) Execute(_ context.Context, _ map[string]any) (*tools.Resul
 		// Truncated result snippet for finished sub-agents so the
 		// model can decide whether to read full output without firing
 		// a second tool call.
-		if snap.Status != agent.StatusRunning && snap.Result != "" {
+		if !snap.Status.IsActive() && snap.Result != "" {
 			snip := snap.Result
 			if len(snip) > 120 {
 				snip = snip[:120] + "…"
@@ -168,7 +168,7 @@ func (s SubAgentOutput) Execute(_ context.Context, in map[string]any) (*tools.Re
 			b.WriteByte('\n')
 		}
 	}
-	if snap.Status != agent.StatusRunning {
+	if !snap.Status.IsActive() {
 		fmt.Fprintf(&b, "---end (elapsed=%s)---", snap.EndTime.Sub(snap.Started).Round(time.Second))
 		if snap.StopHint != "" {
 			fmt.Fprintf(&b, " %s", snap.StopHint)
@@ -179,7 +179,7 @@ func (s SubAgentOutput) Execute(_ context.Context, in map[string]any) (*tools.Re
 
 // ---------------------------------------------------------------------------
 
-// SubAgentStop — terminate a running sub-agent.
+// SubAgentStop — cancel a queued or running sub-agent.
 //
 // Records a cancellation request which cascades through ctx → sub-loop →
 // tools as soon as the child callback is installed. The sub-agent transitions
@@ -197,7 +197,7 @@ func NewSubAgentStop(gate *permission.Gate, r *agent.Roster) SubAgentStop {
 
 func (SubAgentStop) Name() string { return "SubAgentStop" }
 func (SubAgentStop) Description() string {
-	return "Terminate a running sub-agent. Pass `agent_id` (preferred) or `name`. The sub-agent's tools see context cancellation, partial output is preserved for one last SubAgentOutput read."
+	return "Cancel a queued or running sub-agent. Pass `agent_id` (preferred) or `name`. Cancellation interrupts execution-capacity waits and running tools; partial output is preserved for one last SubAgentOutput read."
 }
 func (SubAgentStop) InputSchema() map[string]any {
 	return map[string]any{
@@ -235,7 +235,7 @@ func (s SubAgentStop) Execute(_ context.Context, in map[string]any) (*tools.Resu
 		return &tools.Result{Output: err.Error(), IsError: true}, nil
 	}
 	snap := t.Snapshot()
-	if snap.Status != agent.StatusRunning {
+	if !snap.Status.IsActive() {
 		return &tools.Result{Output: fmt.Sprintf("sub-agent %s already %s", snap.AgentID, snap.Status)}, nil
 	}
 	// RequestCancel is deliberately safe even while Agent.Execute is still

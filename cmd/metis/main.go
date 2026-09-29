@@ -2516,6 +2516,7 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 		return err
 	}
 	if worker != nil {
+		worker.setSubAgentRoster(rt.subAgentRoster)
 		worker.setSteerHandler(func(input string) bool {
 			return rt.loop.SteerInjectWithAccepted(input, func() { rtpkg.RecordUserMessage(rt.sessionID, "[steer] "+input) })
 		})

@@ -122,10 +122,21 @@ func (l *Loop) waitForAwaitedJobNotifications(
 	ctx context.Context,
 	out chan<- Event,
 	pending map[string]struct{},
-) (bool, error) {
+) (completed bool, err error) {
 	if len(pending) == 0 {
 		return false, nil
 	}
+	resume := YieldDesktopExecution(ctx)
+	defer func() {
+		if err == nil && ctx.Err() == nil {
+			err = resume(ctx)
+			if err != nil && ctx.Err() != nil {
+				// Preserve a Loop-owned wall-clock deadline while rejoining the
+				// execution queue, just as the notification wait below does.
+				err = context.Cause(ctx)
+			}
+		}
+	}()
 	awaited := make(map[string]struct{}, len(pending))
 	for jobID := range pending {
 		awaited[jobID] = struct{}{}

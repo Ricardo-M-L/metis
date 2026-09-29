@@ -33,6 +33,29 @@ func TestIsolatedWorkerProtocolHelper(t *testing.T) {
 		}
 	}
 	switch scenario {
+	case "cancel-final-status":
+		_ = encoder.Encode(desktopipc.Message{Version: desktopipc.Version, Type: desktopipc.TypeStatus, Status: &desktopipc.Status{SubAgents: 2, Agents: []desktopipc.Subagent{{AgentID: "running", Status: "running"}, {AgentID: "queued", Status: "queued"}}}})
+		emit("", desktopipc.Event{Kind: agent.EventTextDelta, TextDelta: "ready"})
+		if _, err := decoder.Decode(); !errors.Is(err, io.EOF) {
+			os.Exit(61)
+		}
+		// Real child cleanup can emit progress before writing its durable terminal.
+		// Closing stdout here would trigger SIGPIPE and skip that persistence.
+		emit("", desktopipc.Event{Kind: agent.EventTextDelta, TextDelta: "cleanup"})
+		if err := os.WriteFile(filepath.Join(os.Getenv("METIS_TEST_WORKER_ROOT"), "terminal"), []byte("killed"), 0o600); err != nil {
+			os.Exit(62)
+		}
+		_ = encoder.Encode(desktopipc.Message{Version: desktopipc.Version, Type: desktopipc.TypeStatus, Status: &desktopipc.Status{Agents: []desktopipc.Subagent{{AgentID: "running", Status: "killed"}, {AgentID: "queued", Status: "killed"}}}})
+		emit("", desktopipc.Event{Kind: agent.EventLoopDone, StopReason: "stopped"})
+	case "stop-subagent":
+		request, err := decoder.Decode()
+		if err != nil || request.Type != desktopipc.TypeStopSubAgent || request.AgentID != "agt-queued" || request.Input != "" {
+			os.Exit(56)
+		}
+		_ = encoder.Encode(desktopipc.Message{Version: desktopipc.Version, Type: desktopipc.TypeStopSubAgentResult, ID: request.ID, AgentID: request.AgentID, Accepted: true})
+		_ = encoder.Encode(desktopipc.Message{Version: desktopipc.Version, Type: desktopipc.TypeStatus, Status: &desktopipc.Status{Agents: []desktopipc.Subagent{{AgentID: request.AgentID, Status: "killed"}}}})
+		emit("", desktopipc.Event{Kind: agent.EventTextDelta, TextDelta: "parent continues"})
+		emit("", desktopipc.Event{Kind: agent.EventLoopDone, StopReason: "end_turn"})
 	case "duplex":
 		emit("permission-a", desktopipc.Event{Kind: agent.EventPermissionRequest, PermissionTool: "Bash", ToolUseID: "tool-a"})
 		emit("permission-b", desktopipc.Event{Kind: agent.EventPermissionRequest, PermissionTool: "Write", ToolUseID: "tool-b"})

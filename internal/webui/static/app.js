@@ -9,11 +9,11 @@ let sessions = [];
 let workspaces = [];
 let activeWorkspaceId = '';
 let currentSessionId = null;
-let desktopPreferences = { busyEnter: 'queue', sidebarView: 'grouped', sidebarSort: 'recent', sessionOrder: [], defaultPreset: 'standard', language: 'zh-CN', presentationMode: 'standard', rootTurnParallelism: 8 };
+let desktopPreferences = { busyEnter: 'queue', sidebarView: 'grouped', sidebarSort: 'recent', sessionOrder: [], defaultPreset: 'standard', language: 'zh-CN', presentationMode: 'standard', rootTurnParallelism: 8, totalAgentParallelism: 16, subagentParallelism: 8 };
 const desktopPreferenceKeysEditedDuringInitialLoad = new Set();
 let lastStatusSnapshot = null;
 let statusRequestGeneration = 0;
-let subAgentDetailState = { agentId: '', ownerSessionId: '', trigger: null, data: null, loading: false, error: '', requestGeneration: 0 };
+let subAgentDetailState = { agentId: '', ownerSessionId: '', trigger: null, data: null, loading: false, error: '', requestGeneration: 0, stopping: false, stopGeneration: 0 };
 let subAgentDetailStream = null;
 let subAgentDetailStreamGeneration = 0;
 
@@ -433,6 +433,7 @@ function renderStatusSnapshot(d) {
     const n = roster ? Number(roster.subAgents) || 0 : 0;
     const m = roster ? Number(roster.backgroundTasks) || 0 : 0;
     const visibleAgents = statusSubAgentsForSelectedSession(d);
+    if (typeof reconcileSubagentToolRows === 'function') reconcileSubagentToolRows(roster);
     if (subAgentDetailState.agentId && subAgentDetailState.ownerSessionId !== selectedSessionId) {
       closeSubAgentDetails(false);
     }
@@ -551,11 +552,12 @@ function subAgentText(en, zh) {
 }
 
 function subAgentStatusClass(status) {
-  return ['running', 'completed', 'failed', 'killed'].includes(status) ? status : 'unknown';
+  return ['queued', 'running', 'completed', 'failed', 'killed'].includes(status) ? status : 'unknown';
 }
 
 function subAgentStatusLabel(status) {
   const labels = {
+    queued: subAgentText('Queued', '排队中'),
     running: subAgentText('Running', '运行中'),
     completed: subAgentText('Completed', '已完成'),
     failed: subAgentText('Failed', '失败'),
@@ -597,7 +599,7 @@ function renderStatusPopover() {
         (canOpen ? ' data-subagent-id="' + escAttr(agentID) + '" data-subagent-session-id="' + escAttr(currentSessionId) + '"' : ' disabled') +
         (canOpen ? ' title="' + escAttr(subAgentText('Open sub-agent details', '查看子代理详情')) + '"' : '') + '>' +
         '<span class="status-dot ' + subAgentStatusClass(a.status || '') + '"></span>' +
-        '<span class="status-agent-name"><strong>' + escHtml(a.name || a.agentId || 'agent') + '</strong><small>' + escHtml(a.status === 'running' ? subAgentText('Open live output', '打开实时输出') : subAgentText('Open output', '查看输出')) + '</small></span>' +
+        '<span class="status-agent-name"><strong>' + escHtml(a.name || a.agentId || 'agent') + '</strong><small>' + escHtml(a.status === 'queued' ? subAgentText('Waiting to start · Open details', '等待执行 · 查看详情') : a.status === 'running' ? subAgentText('Open live output', '打开实时输出') : subAgentText('Open output', '查看输出')) + '</small></span>' +
         '<span class="status-agent-state">' + escHtml(subAgentStatusLabel(a.status || '')) + '</span>' +
       '</button>');
     });
@@ -645,11 +647,14 @@ function openSubAgentDetails(agentID, trigger, ownerSessionID) {
   const overlay = document.getElementById('subAgentDetailOverlay');
   if (!overlay) return false;
   const sameAgent = subAgentDetailState.agentId === agentID && subAgentDetailState.ownerSessionId === owner;
+  stopSubAgentElapsedTimer();
   subAgentDetailState.agentId = agentID;
   subAgentDetailState.ownerSessionId = owner;
   subAgentDetailState.trigger = trigger || document.getElementById('statusChip');
   subAgentDetailState.error = '';
   subAgentDetailState.loading = false;
+  subAgentDetailState.stopping = false;
+  subAgentDetailState.stopGeneration = (subAgentDetailState.stopGeneration || 0) + 1;
   if (!sameAgent) subAgentDetailState.data = null;
   overlay.hidden = false;
   document.body.classList.add('subagent-detail-open');
@@ -662,6 +667,7 @@ function openSubAgentDetails(agentID, trigger, ownerSessionID) {
 }
 
 function closeSubAgentDetails(restoreFocus = true) {
+  stopSubAgentElapsedTimer();
   const overlay = document.getElementById('subAgentDetailOverlay');
   if (overlay) overlay.hidden = true;
   document.body.classList.remove('subagent-detail-open');
@@ -672,6 +678,8 @@ function closeSubAgentDetails(restoreFocus = true) {
   subAgentDetailState.loading = false;
   subAgentDetailState.error = '';
   subAgentDetailState.requestGeneration++;
+  subAgentDetailState.stopping = false;
+  subAgentDetailState.stopGeneration = (subAgentDetailState.stopGeneration || 0) + 1;
   stopSubAgentDetailStream();
   if (restoreFocus && trigger && typeof trigger.focus === 'function') trigger.focus();
 }
@@ -798,18 +806,92 @@ function subAgentElapsedLabel(milliseconds) {
   return minutes + subAgentText('m ', '分') + seconds + subAgentText('s', '秒');
 }
 
+function subAgentElapsedMilliseconds(agent) {
+  if (['queued', 'running'].includes(agent.status)) {
+    const started = Date.parse(agent.startedAt || '');
+    if (Number.isFinite(started) && started > 0) return Math.max(0, Date.now() - started);
+  }
+  return Math.max(0, Number(agent.elapsedMs) || 0);
+}
+
+function subAgentWasCancelled(agent) {
+  return agent.status === 'killed' && /^context cancel(?:ed|led)$/i.test(String(agent.exitError || '').trim());
+}
+
+function subAgentDetailStatusLabel(agent) {
+  return subAgentWasCancelled(agent) ? subAgentText('Cancelled', '已取消') : subAgentStatusLabel(agent.status);
+}
+
+function stopSubAgentElapsedTimer() {
+  if (subAgentDetailState.elapsedTimer != null) clearInterval(subAgentDetailState.elapsedTimer);
+  subAgentDetailState.elapsedTimer = null;
+}
+
+function updateSubAgentElapsedTime() {
+  const state = subAgentDetailState;
+  const overlay = document.getElementById('subAgentDetailOverlay');
+  if (!overlay || overlay.hidden || !state.agentId || !state.data ||
+      state.ownerSessionId !== String(currentSessionId || '') || !['queued', 'running'].includes(state.data.status)) {
+    stopSubAgentElapsedTimer();
+    return;
+  }
+  const elapsed = subAgentElapsedLabel(subAgentElapsedMilliseconds(state.data));
+  const subtitle = document.getElementById('subAgentDetailDescription');
+  const value = document.getElementById('subAgentDetailElapsed');
+  if (subtitle) subtitle.textContent = subAgentDetailStatusLabel(state.data) + ' · ' + elapsed;
+  if (value) value.textContent = elapsed;
+}
+
+async function stopSubAgent() {
+  const state = subAgentDetailState;
+  const agentID = state.agentId;
+  const owner = state.ownerSessionId;
+  if (!agentID || owner !== String(currentSessionId || '') || state.stopping ||
+      !state.data || !['queued', 'running'].includes(state.data.status)) return;
+  const generation = state.stopGeneration = (state.stopGeneration || 0) + 1;
+  const requestedData = state.data;
+  const stillCurrent = () => state.agentId === agentID && state.ownerSessionId === owner &&
+    state.stopGeneration === generation && String(currentSessionId || '') === owner;
+  state.stopping = true;
+  state.error = '';
+  renderSubAgentDetails();
+  try {
+    const response = await fetch('/api/subagents/' + encodeURIComponent(agentID) +
+      '/stop?sessionId=' + encodeURIComponent(owner), { method: 'POST' });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || subAgentText('Unable to stop this sub-agent.', '无法停止这个子代理。'));
+    if (!stillCurrent()) return;
+    if (state.data !== requestedData) return; // A newer live snapshot owns the displayed state.
+    if (payload.agent && String(payload.agent.agentId || '') === agentID &&
+        String(payload.agent.sessionId || '') === owner) state.data = payload.agent;
+    else await refreshSubAgentDetails();
+    if (typeof pollStatus === 'function') void pollStatus();
+  } catch (error) {
+    if (stillCurrent()) state.error = subAgentText('Unable to stop this sub-agent. Try again.', '无法停止这个子代理，请重试。');
+  } finally {
+    if (stillCurrent()) {
+      state.stopping = false;
+      renderSubAgentDetails();
+    }
+  }
+}
+
 function renderSubAgentDetails() {
   const overlay = document.getElementById('subAgentDetailOverlay');
   const title = document.getElementById('subAgentDetailTitle');
   const subtitle = document.getElementById('subAgentDetailDescription');
   const body = document.getElementById('subAgentDetailBody');
-  if (!overlay || overlay.hidden || !title || !subtitle || !body) return;
+  if (!overlay || overlay.hidden || !title || !subtitle || !body) {
+    stopSubAgentElapsedTimer();
+    return;
+  }
   const state = subAgentDetailState;
   if (state.ownerSessionId !== String(currentSessionId || '')) {
     closeSubAgentDetails(false);
     return;
   }
   body.setAttribute('aria-busy', state.loading ? 'true' : 'false');
+  if (!state.data) stopSubAgentElapsedTimer();
   if (state.loading && !state.data) {
     title.textContent = subAgentText('Sub-agent details', '子代理详情');
     subtitle.textContent = subAgentText('Loading live activity…', '正在读取实时活动…');
@@ -825,18 +907,32 @@ function renderSubAgentDetails() {
 
   const agent = state.data;
   const status = subAgentStatusClass(String(agent.status || ''));
-  const statusLabel = subAgentStatusLabel(status);
+  const cancelled = subAgentWasCancelled(agent);
+  const statusLabel = subAgentDetailStatusLabel(agent);
+  const elapsedLabel = subAgentElapsedLabel(subAgentElapsedMilliseconds(agent));
   title.textContent = agent.name || agent.agentId || subAgentText('Sub-agent', '子代理');
-  subtitle.textContent = statusLabel + ' · ' + subAgentElapsedLabel(agent.elapsedMs);
+  subtitle.textContent = statusLabel + ' · ' + elapsedLabel;
   const mode = agent.background ? subAgentText('Background', '后台执行') : subAgentText('Foreground', '前台执行');
   body.innerHTML = '<div class="subagent-detail-summary">' +
-    '<span class="status-dot ' + status + '"></span><strong>' + escHtml(statusLabel) + '</strong>' +
+    '<span class="status-dot ' + (cancelled ? 'unknown' : status) + '"></span><strong>' + escHtml(statusLabel) + '</strong>' +
     '<span class="subagent-detail-mode">' + escHtml(mode) + '</span>' +
     '</div><dl class="subagent-detail-meta">' +
       '<div><dt>' + escHtml(subAgentText('Agent ID', '代理 ID')) + '</dt><dd><code>' + escHtml(agent.agentId || '—') + '</code></dd></div>' +
-      '<div><dt>' + escHtml(subAgentText('Elapsed', '已运行')) + '</dt><dd>' + escHtml(subAgentElapsedLabel(agent.elapsedMs)) + '</dd></div>' +
-      (agent.stopHint ? '<div><dt>' + escHtml(subAgentText('Stop reason', '停止原因')) + '</dt><dd>' + escHtml(agent.stopHint) + '</dd></div>' : '') +
+      '<div><dt>' + escHtml(status === 'queued' ? subAgentText('Waiting', '已等待') : subAgentText('Elapsed', '用时')) + '</dt><dd id="subAgentDetailElapsed">' + escHtml(elapsedLabel) + '</dd></div>' +
+      (agent.stopHint ? '<div><dt>' + escHtml(subAgentText('Stop reason', '停止原因')) + '</dt><dd>' + escHtml(cancelled ? subAgentText('Cancelled by request', '已按请求取消') : agent.stopHint) + '</dd></div>' : '') +
     '</dl>';
+
+  if (['queued', 'running'].includes(status)) {
+    const stop = document.createElement('button');
+    stop.type = 'button';
+    stop.className = 'subagent-detail-stop';
+    stop.disabled = !!state.stopping;
+    stop.textContent = state.stopping
+      ? subAgentText('Stopping…', '正在停止…')
+      : status === 'queued' ? subAgentText('Cancel queued agent', '取消排队') : subAgentText('Stop sub-agent', '停止子代理');
+    stop.addEventListener('click', stopSubAgent);
+    body.appendChild(stop);
+  }
 
   const appendOutput = (heading, value, extraClass) => {
     const section = document.createElement('section');
@@ -853,7 +949,9 @@ function renderSubAgentDetails() {
   else {
     const waiting = document.createElement('div');
     waiting.className = 'subagent-detail-empty-output';
-    waiting.textContent = status === 'running'
+    waiting.textContent = status === 'queued'
+      ? subAgentText('Waiting for an execution slot. This sub-agent has not started yet; you can cancel it while it is queued.', '正在等待执行名额。这个子代理尚未开始执行，排队期间可以取消。')
+      : status === 'running'
       ? subAgentText('No text output yet. The sub-agent may still be inspecting files or using tools.', '暂时还没有文字输出。子代理可能仍在读取文件或调用工具。')
       : subAgentText('This sub-agent did not produce text output.', '这个子代理没有产生文字输出。');
     body.appendChild(waiting);
@@ -865,7 +963,12 @@ function renderSubAgentDetails() {
     body.appendChild(note);
   }
   if (agent.result && agent.result !== agent.output) appendOutput(subAgentText('Final result', '最终结果'), String(agent.result));
-  if (agent.exitError) {
+  if (cancelled) {
+    const note = document.createElement('p');
+    note.className = 'subagent-detail-note';
+    note.textContent = subAgentText('This sub-agent was cancelled.', '这个子代理已取消。');
+    body.appendChild(note);
+  } else if (agent.exitError) {
     const error = document.createElement('div');
     error.className = 'subagent-detail-error';
     error.setAttribute('role', 'alert');
@@ -877,6 +980,11 @@ function renderSubAgentDetails() {
     stale.className = 'subagent-detail-note';
     stale.textContent = state.error;
     body.appendChild(stale);
+  }
+  if (['queued', 'running'].includes(status)) {
+    if (state.elapsedTimer == null) state.elapsedTimer = setInterval(updateSubAgentElapsedTime, 1000);
+  } else {
+    stopSubAgentElapsedTimer();
   }
 }
 

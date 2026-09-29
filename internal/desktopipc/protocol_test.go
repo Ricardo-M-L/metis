@@ -100,3 +100,31 @@ func TestReplyExplicitlyEncodesAllow(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSubAgentStopProtocolRequiresTargetAndExplicitAcknowledgement(t *testing.T) {
+	for _, message := range []Message{
+		{Version: Version, Type: TypeStopSubAgent, ID: "request", AgentID: "agt-target"},
+		{Version: Version, Type: TypeStopSubAgentResult, ID: "request", AgentID: "agt-target", Accepted: true},
+		{Version: Version, Type: TypeStopSubAgentResult, ID: "request", AgentID: "agt-target", Accepted: false},
+	} {
+		var buffer bytes.Buffer
+		if err := NewEncoder(&buffer).Encode(message); err != nil {
+			t.Fatal(err)
+		}
+		got, err := NewDecoder(&buffer).Decode()
+		if err != nil || got.Type != message.Type || got.AgentID != message.AgentID || got.ID != message.ID || got.Accepted != message.Accepted {
+			t.Fatalf("roundtrip=%+v err=%v", got, err)
+		}
+	}
+	for _, data := range []string{
+		`{"version":1,"type":"stop_subagent","id":"x"}`,
+		`{"version":1,"type":"stop_subagent","id":"x","agentId":"../other"}`,
+		`{"version":1,"type":"stop_subagent","id":"x","agentId":"agt-a","input":"steer instead"}`,
+		`{"version":1,"type":"stop_subagent_result","id":"x","agentId":"agt-a"}`,
+		`{"version":1,"type":"stop_subagent_result","id":"x","agentId":"agt-a","accepted":null}`,
+	} {
+		if _, err := NewDecoder(strings.NewReader(data + "\n")).Decode(); err == nil {
+			t.Fatalf("accepted malformed control: %s", data)
+		}
+	}
+}

@@ -146,8 +146,14 @@ def handler_for(fixture: Fixture):
                 number = len(fixture.calls) + 1
                 entry = {"number": number, "kind": "memory_extraction" if memory_extraction else "agent_turn", "phase": phase, "input": user_input, "model": body.get("model"), "started": time.time(), "state": "streaming"}
                 fixture.calls.append(entry)
+            if phase == "parent_final":
+                entry["tool_results"] = [item.get("output", "") for item in body.get("input", [])
+                                         if isinstance(item, dict) and item.get("type") == "function_call_output"
+                                         and str(item.get("call_id", "")).startswith(AGENT_CALL_PREFIX)]
             fixture.record({"event": "started", **entry})
             gate_match = re.search(r"\[gate:([A-Za-z0-9_-]+)\]", user_input) if phase in ("echo", "child_stream") else None
+            if phase == "parent_final":
+                gate_match = re.search(r"\[parent-gate:([A-Za-z0-9_-]+)\]", user_input)
             delay_match = re.search(r"\[slow:(\d+)\]", user_input) if phase in ("echo", "child_stream") else None
             if phase == "memory_extraction":
                 text = "[]"
@@ -162,10 +168,12 @@ def handler_for(fixture: Fixture):
             if phase == "parent_call":
                 child_controls = " ".join(re.findall(r"\[(?:gate:[A-Za-z0-9_-]+|slow:\d+)\]", user_input))
                 child_prompt = AGENT_CHILD_PROMPT + (" " + child_controls if child_controls else "")
-                output = [{"type": "function_call", "id": f"fc_fixture_agent_{number}",
-                           "call_id": f"{AGENT_CALL_PREFIX}{number}", "name": "Agent",
-                           "arguments": json.dumps({"prompt": child_prompt, "name": "probe", "isolation": "none"}),
-                           "status": "completed"}]
+                batch = re.search(r"\[agent-batch:(\d+)\]", user_input)
+                count = min(32, max(1, int(batch.group(1)))) if batch else 1
+                output = [{"type": "function_call", "id": f"fc_fixture_agent_{number}_{index}",
+                           "call_id": f"{AGENT_CALL_PREFIX}{number}_{index}", "name": "Agent",
+                           "arguments": json.dumps({"prompt": child_prompt, "name": f"probe-{index + 1}", "isolation": "none", "subagent_type": "explore", "run_in_background": "[agent-background]" in user_input}),
+                           "status": "completed"} for index in range(count)]
             else:
                 output = [{"type": "message", "id": message_id, "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}]
             envelope = {"id": response_id, "object": "response", "status": "completed", "model": body.get("model"), "output": output, "usage": {"input_tokens": 128, "output_tokens": 16, "total_tokens": 144, "input_tokens_details": {"cached_tokens": 64}}}
@@ -192,9 +200,10 @@ def handler_for(fixture: Fixture):
 
                 emit("response.created", response={**envelope, "status": "in_progress", "output": []})
                 if phase == "parent_call":
-                    emit("response.output_item.added", output_index=0, item={"type": "function_call", "id": output[0]["id"],
-                         "call_id": output[0]["call_id"], "name": "Agent", "status": "in_progress"})
-                    emit("response.output_item.done", output_index=0, item=output[0])
+                    for index, item in enumerate(output):
+                        emit("response.output_item.added", output_index=index, item={"type": "function_call", "id": item["id"],
+                             "call_id": item["call_id"], "name": "Agent", "status": "in_progress"})
+                        emit("response.output_item.done", output_index=index, item=item)
                     emit("response.completed", response=envelope)
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()

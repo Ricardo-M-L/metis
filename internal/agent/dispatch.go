@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -813,9 +814,16 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	}
 
 	// Phase 1: classify ready jobs by concurrency tier and execute.
-	var safeJobs, queueJobs, exclJobs, bgJobs []*job
+	var safeJobs, queueJobs, exclJobs, bgJobs, coordinatingJobs []*job
 	for _, j := range jobs {
 		if j == nil || j.early != nil || !j.ready {
+			continue
+		}
+		// Desktop executes ordinary safe/queue work while the parent is still
+		// charged. Agent calls then yield that permit, before exclusive writes.
+		// Keeping the original jobs preserves hook rewrites and trace identity.
+		if desktopLeaseFromContext(ctx) != nil && j.t.Name() == "Agent" {
+			coordinatingJobs = append(coordinatingJobs, j)
 			continue
 		}
 		switch j.t.Concurrency(j.blk.ToolInput) {
@@ -889,6 +897,30 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 
 	wg.Wait()
 
+	var executionErr error
+	if len(coordinatingJobs) != 0 {
+		resume := YieldDesktopExecution(ctx)
+		for _, j := range coordinatingJobs {
+			if j.t.Concurrency(j.blk.ToolInput) == tools.ConcurrencyBackground {
+				results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc, j.dispatchEpoch, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
+				continue
+			}
+			wg.Add(1)
+			go func(j *job) {
+				defer wg.Done()
+				blk := l.runExecute(ctx, j.t, j.blk, out, tc, j.dispatchEpoch, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)
+				mu.Lock()
+				results[j.idx] = blk
+				mu.Unlock()
+			}(j)
+		}
+		wg.Wait()
+		// A cancelled parent does not rejoin the execution queue.
+		if ctx.Err() == nil {
+			executionErr = resume(ctx)
+		}
+	}
+
 	// Phase 2: serialize exclusive tools. Order preserved by insertion.
 	//
 	// Ctx-cancel short-circuit (2026-05-18): if the parent ctx already
@@ -899,7 +931,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 	// runs and returns its own ctx.Canceled — wasted work, plus the
 	// model sees N identical generic-cancel errors instead of one
 	// clear "batch interrupted" signal.
-	if err := ctx.Err(); err != nil {
+	if err := errors.Join(ctx.Err(), executionErr); err != nil {
 		for _, j := range exclJobs {
 			emit(ctx, out, Event{
 				Kind: EventToolResult, ToolUseID: j.blk.ToolUseID, ToolName: j.blk.ToolName,
@@ -929,7 +961,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 			results[i] = *j.early
 		}
 	}
-	return results, nil
+	return results, executionErr
 }
 
 // safeToolExecute runs a tool's Execute with panic recovery. Tools run

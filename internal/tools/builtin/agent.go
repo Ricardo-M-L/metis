@@ -358,16 +358,19 @@ func (a Agent) WithExecutionMemory(memory execution.Memory) Agent {
 
 func (Agent) Name() string { return "Agent" }
 
-// ShortDescription — see Bash.ShortDescription for the rationale.
-// Agents calling Agents (recursive fork) is rare and discouraged, so
-// the short form omits naming/isolation detail in favor of the
-// when-vs-when-NOT heuristic.
+// Keep the same capacity contract in both tool-description paths. Ordinary
+// toolSpecs truncates the first paragraph at 200 bytes, while child loops may
+// request ShortDescription directly. Neither path has a turn context.
+const agentDelegationSummary = "Delegate work to a fresh sub-agent. Desktop queues excess work; background calls return IDs and queued work runs automatically. CLI uses configured limits; foreground calls wait for results."
+
 func (Agent) ShortDescription() string {
-	return "Spawn a COLD sub-agent (fresh history, same tools) for self-contained work — code surveys, multi-file scouting, comparative analysis. Pass `subagent_type` to pick a profile (explore/plan/verify/...). For warm spawns that need this conversation's context, use Fork instead. Don't use for single-Grep lookups; spawn has setup overhead."
+	return agentDelegationSummary
 }
 
 func (Agent) Description() string {
-	return `Spawn a COLD sub-agent — a fresh agent loop with its own message history (no shared context with the parent), the same tool set, and a fresh permission gate cloned from yours. Returns a single final text answer. Use this for self-contained, isolated work. (For sub-tasks that need the parent's full conversation history — "based on everything we've discussed, draft X" — use Fork instead, which inherits the parent's context.)
+	return agentDelegationSummary + `
+
+Spawn a COLD sub-agent — a fresh agent loop with its own message history (no shared context with the parent), the same tool set, and a fresh permission gate cloned from yours. Use this for self-contained, isolated work. For sub-tasks that need the parent's full conversation history — "based on everything we've discussed, draft X" — use Fork instead, which inherits the parent's context.
 
 Use Agent for:
   - Deep codebase surveys: "find every place we instantiate a Logger and explain the constructor patterns" — the sub-agent can fan out 10+ Grep/Read calls without bloating your context.
@@ -381,8 +384,14 @@ THE SAME ASSISTANT TURN. metis's dispatcher launches foreground
 calls concurrently and starts run_in_background:true calls as
 background jobs that return immediately. Start with 2–4 concurrent
 agents; for larger plans, use waves and reduce the next wave after a
-provider 429/TPM error. The hard safety cap is 20 named + 40 anonymous,
-not a recommended launch size. Example shapes:
+provider 429/TPM error. Desktop shares configured execution capacity
+across root tasks and children; named and anonymous agents share the
+pool. Excess work is queued and starts automatically when capacity
+is available. Background calls return a stable agent_id and current
+status; use SubAgentList or SubAgentOutput to inspect it and
+SubAgentStop to cancel it. Foreground calls wait for admission and
+the final result. CLI admission follows the configured concurrency
+limits. Example shapes:
   - Surveying 5 libraries → 3 explore agents, then the remaining 2 as
     a second wave unless the provider has known headroom.
   - Implementing 4 independent file clusters → 4 general agents in
@@ -667,10 +676,10 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		if a.roster != nil {
 			if existing, ok := a.roster.LookupByAgentID(resumeFrom); ok {
 				snap := existing.Snapshot()
-				if snap.Status == agent.StatusRunning {
+				if snap.Status.IsActive() {
 					return &tools.Result{
 						Output: fmt.Sprintf(
-							"resume_from=%s refused: sub-agent is still RUNNING (name=%s, started=%s). "+
+							"resume_from=%s refused: sub-agent is still RUNNING or QUEUED (name=%s, started=%s). "+
 								"Stop it first with SubAgentStop({agent_id: %q}) and wait for it to finish, "+
 								"then re-issue the resume.",
 							resumeFrom, snap.Name, snap.Started.Format("15:04:05"), resumeFrom,
@@ -713,6 +722,9 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 				_ = worktreepkg.Cleanup(worktreeInfo)
 				worktreeCleanupOwnedByExecute = false
 			}
+			if teammate.Snapshot().Status == agent.StatusQueued {
+				teammate.Finish(agent.StatusFailed, "", errors.New("sub-agent setup did not complete"), "setup_failed")
+			}
 			a.roster.UnregisterTeammate(teammate)
 		}
 	}()
@@ -735,18 +747,9 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			AgentID:    agentID,
 			Background: runInBackground,
 		}
-		// Isolated Desktop workers share a small cross-process child-agent
-		// pool. Acquire before publishing into the local roster so a queued
-		// global permit never consumes this session's local capacity.
-		releaseDesktopSlot, err := agent.AcquireDesktopSubagentSlot(ctx)
-		if err != nil {
-			return &tools.Result{
-				Output:  fmt.Sprintf("sub-agent is waiting for Desktop capacity: %v", err),
-				IsError: true,
-			}, nil
-		}
-		if err := a.roster.Register(teammate); err != nil {
-			releaseDesktopSlot()
+		// Desktop publishes a queued identity immediately; its runner acquires
+		// execution capacity after setup. CLI retains fail-fast admission.
+		if err := agent.RegisterDesktopTeammate(ctx, a.roster, teammate, depth > 0); err != nil {
 			if errors.Is(err, agent.ErrCapacityExceeded) {
 				// Split pools: the error came from whichever pool
 				// matches this teammate's kind. Report THAT pool's
@@ -781,7 +784,6 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			}
 			return &tools.Result{Output: err.Error(), IsError: true}, nil
 		}
-		teammate.SetResourceRelease(releaseDesktopSlot)
 		rosterCleanupOwnedByExecute = true
 	}
 
@@ -1188,6 +1190,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// this child; Execute's guards close the transcript, unregister the roster
 	// entry, and join private resources synchronously.
 	if err := childCtx.Err(); err != nil {
+		finishSubAgentAdmissionFailure(teammate, err, timeout)
 		return decorateAgentExecutionRecovery(wrapTimeoutErr(err, timeout), recovery), nil
 	}
 
@@ -1203,7 +1206,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			SubAgentID:         teammate.AgentID,
 			SubAgentName:       teammate.Name,
 			SubAgentBackground: teammate.Background,
-			SubAgentStatus:     agent.StatusRunning.String(),
+			SubAgentStatus:     teammate.Snapshot().Status.String(),
 			TraceInvocationID:  parentTraceInvocationID,
 			TraceCallID:        parentTraceCallID,
 		})
@@ -1577,6 +1580,14 @@ func (a Agent) executeForeground(
 		}
 	}()
 
+	executionCtx, admissionErr := admitSubAgentExecution(childCtx, a.roster, teammate, parentOut, parentToolUseID, parentTraceCallID, parentTraceInvocationID)
+	if admissionErr != nil {
+		finalize()
+		finishSubAgentAdmissionFailure(teammate, admissionErr, timeout)
+		return wrapTimeoutErr(admissionErr, timeout), nil
+	}
+	childCtx = executionCtx
+
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() {
@@ -1767,6 +1778,16 @@ func (a Agent) executeBackground(
 			}
 		}()
 
+		executionCtx, admissionErr := admitSubAgentExecution(childCtx, a.roster, teammate, parentOut, parentToolUseID, parentTraceCallID, parentTraceInvocationID)
+		if admissionErr != nil {
+			finalize()
+			finishSubAgentAdmissionFailure(teammate, admissionErr, timeout)
+			publishTerminal()
+			notifyParent(parentNotify, teammate, time.Since(startedAt))
+			return
+		}
+		childCtx = executionCtx
+
 		events := make(chan agent.Event, 64)
 		done := make(chan error, 1)
 		go func() {
@@ -1842,17 +1863,61 @@ func (a Agent) executeBackground(
 		onRunnerStarted()
 	}
 
+	snapshot := teammate.Snapshot()
+	queueHint := ""
+	if snapshot.Status == agent.StatusQueued {
+		queueHint = " Queued agents start automatically when execution capacity is available."
+	}
 	return &tools.Result{
 		Output: fmt.Sprintf(
-			"sub-agent spawned in background (agent_id=%s, name=%s). Poll progress with SubAgentOutput, list active sub-agents with SubAgentList, terminate with SubAgentStop.",
-			teammate.AgentID, teammate.Name,
+			"sub-agent spawned in background (agent_id=%s, name=%s, status=%s).%s Poll progress with SubAgentOutput, list active sub-agents with SubAgentList, cancel queued or running work with SubAgentStop.",
+			snapshot.AgentID, snapshot.Name, snapshot.Status, queueHint,
 		),
 		Meta: map[string]any{
-			"agent_id":   teammate.AgentID,
-			"name":       teammate.Name,
+			"agent_id":   snapshot.AgentID,
+			"name":       snapshot.Name,
 			"background": true,
+			"status":     snapshot.Status.String(),
 		},
 	}, nil
+}
+
+// Admission runs inside the detached runner for background calls. A queued
+// identity remains visible and cancellable while no provider is executing.
+func admitSubAgentExecution(ctx context.Context, roster *agent.Roster, teammate *agent.Teammate, parentOut chan<- agent.Event, parentToolUseID, traceCallID, traceInvocationID string) (context.Context, error) {
+	if teammate == nil {
+		return ctx, ctx.Err()
+	}
+	wasQueued := teammate.Snapshot().Status == agent.StatusQueued
+	executionCtx, err := agent.AcquireDesktopTeammateExecution(ctx, roster, teammate)
+	if err != nil {
+		return ctx, err
+	}
+	if err := executionCtx.Err(); err != nil {
+		return ctx, err
+	}
+	if wasQueued {
+		publishSubAgentLifecycle(parentOut, agent.Event{
+			Kind: agent.EventSubAgentStart, SubAgentParentID: parentToolUseID,
+			SubAgentID: teammate.AgentID, SubAgentName: teammate.Name,
+			SubAgentBackground: teammate.Background, SubAgentStatus: agent.StatusRunning.String(),
+			TraceInvocationID: traceInvocationID, TraceCallID: traceCallID,
+		})
+	}
+	return executionCtx, nil
+}
+
+func finishSubAgentAdmissionFailure(teammate *agent.Teammate, err error, timeout time.Duration) {
+	if teammate == nil {
+		return
+	}
+	status, hint := agent.StatusFailed, "admission_failed"
+	if errors.Is(err, context.Canceled) {
+		status, hint = agent.StatusKilled, "cancelled"
+	} else if errors.Is(err, context.DeadlineExceeded) && timeout > 0 {
+		hint = fmt.Sprintf("timeout %s", timeout)
+	}
+	teammate.Finish(status, "", err, hint)
 }
 
 // dismissSubAgentAskUser is a defensive fallback for an interaction event
@@ -1941,7 +2006,7 @@ func recordSubAgentTerminal(transcript *agent.SubAgentTranscript, parentOut chan
 		return
 	}
 	snap := teammate.Snapshot()
-	if snap.Status == agent.StatusRunning {
+	if snap.Status.IsActive() {
 		return
 	}
 	exitError := ""

@@ -16,7 +16,16 @@ import (
 // acknowledgement rather than merely confirming a successful pipe write.
 type IsolatedSteerRequest struct {
 	Input string
-	Reply chan bool
+	// StopSubAgentID selects a child-only cancellation instead of steering.
+	// Input must be empty when it is set.
+	StopSubAgentID string
+	Reply          chan bool
+}
+
+type isolatedControlReply struct {
+	reply       chan bool
+	messageType string
+	agentID     string
 }
 
 type isolatedWorkerControls struct {
@@ -24,13 +33,13 @@ type isolatedWorkerControls struct {
 	encoder  *desktopipc.Encoder
 	failures chan<- error
 	mu       sync.Mutex
-	pending  map[string]chan bool
+	pending  map[string]isolatedControlReply
 	closed   bool
 	done     chan struct{}
 }
 
 func newIsolatedWorkerControls(ctx context.Context, encoder *desktopipc.Encoder, input <-chan IsolatedSteerRequest, failures chan<- error) *isolatedWorkerControls {
-	controls := &isolatedWorkerControls{ctx: ctx, encoder: encoder, failures: failures, pending: make(map[string]chan bool), done: make(chan struct{})}
+	controls := &isolatedWorkerControls{ctx: ctx, encoder: encoder, failures: failures, pending: make(map[string]isolatedControlReply), done: make(chan struct{})}
 	go controls.run(input)
 	return controls
 }
@@ -54,21 +63,28 @@ func (c *isolatedWorkerControls) run(input <-chan IsolatedSteerRequest) {
 				reportIsolatedReplyFailure(c.failures, errors.New("desktop worker steer requires a buffered reply channel"))
 				return
 			}
-			if c.ctx.Err() != nil || strings.TrimSpace(request.Input) == "" {
+			isStop := request.StopSubAgentID != ""
+			if c.ctx.Err() != nil || (!isStop && strings.TrimSpace(request.Input) == "") || (isStop && request.Input != "") {
 				replyIsolatedSteer(request.Reply, false)
 				continue
 			}
 			next++
 			id := "steer-" + strconv.FormatUint(next, 10)
+			message := desktopipc.Message{Version: desktopipc.Version, Type: desktopipc.TypeSteer, ID: id, Input: request.Input}
+			expected := isolatedControlReply{reply: request.Reply, messageType: desktopipc.TypeSteerResult}
+			if isStop {
+				message.Type, message.AgentID = desktopipc.TypeStopSubAgent, request.StopSubAgentID
+				expected.messageType, expected.agentID = desktopipc.TypeStopSubAgentResult, request.StopSubAgentID
+			}
 			c.mu.Lock()
 			if c.closed {
 				c.mu.Unlock()
 				replyIsolatedSteer(request.Reply, false)
 				return
 			}
-			c.pending[id] = request.Reply
+			c.pending[id] = expected
 			c.mu.Unlock()
-			if err := c.encoder.Encode(desktopipc.Message{Version: desktopipc.Version, Type: desktopipc.TypeSteer, ID: id, Input: request.Input}); err != nil {
+			if err := c.encoder.Encode(message); err != nil {
 				reportIsolatedReplyFailure(c.failures, fmt.Errorf("write desktop worker steer: %w", err))
 				return
 			}
@@ -79,6 +95,10 @@ func (c *isolatedWorkerControls) run(input <-chan IsolatedSteerRequest) {
 func (c *isolatedWorkerControls) acknowledge(message desktopipc.Message) error {
 	c.mu.Lock()
 	reply, exists := c.pending[message.ID]
+	if exists && (reply.messageType != message.Type || reply.agentID != message.AgentID) {
+		c.mu.Unlock()
+		return errors.New("desktop worker control acknowledgement does not match request")
+	}
 	if exists {
 		delete(c.pending, message.ID)
 	}
@@ -86,7 +106,7 @@ func (c *isolatedWorkerControls) acknowledge(message desktopipc.Message) error {
 	if !exists {
 		return errors.New("desktop worker steer acknowledgement references an unknown or resolved request")
 	}
-	if !replyIsolatedSteer(reply, message.Accepted) {
+	if !replyIsolatedSteer(reply.reply, message.Accepted) {
 		return errors.New("desktop worker steer acknowledgement has no waiting reply slot")
 	}
 	return nil
@@ -97,7 +117,7 @@ func (c *isolatedWorkerControls) rejectPending() {
 	defer c.mu.Unlock()
 	c.closed = true
 	for id, reply := range c.pending {
-		replyIsolatedSteer(reply, false)
+		replyIsolatedSteer(reply.reply, false)
 		delete(c.pending, id)
 	}
 }

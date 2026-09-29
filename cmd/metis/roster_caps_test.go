@@ -117,3 +117,16 @@ func TestSplitOneToTwo_Rounding(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveRosterCapsDesktopUsesSharedAdmissionPool(t *testing.T) {
+	t.Setenv("METIS_MAX_SUBAGENTS", "")
+	t.Setenv("METIS_MAX_SUBAGENTS_NAMED", "")
+	t.Setenv("METIS_MAX_SUBAGENTS_ANON", "")
+	t.Setenv("METIS_DESKTOP_SUBAGENT_CAP", "4")
+	// Desktop's combined execution budget is enforced by permits, not by
+	// dividing configured named/anonymous roster caps into unusable reserves.
+	named, anon := resolveRosterCaps(fresh(0, 0, 0))
+	if named != 20 || anon != 40 {
+		t.Fatalf("Desktop changed roster caps to %d/%d, want 20/40", named, anon)
+	}
+}

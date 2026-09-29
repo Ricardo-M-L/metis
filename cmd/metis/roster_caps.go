@@ -54,19 +54,9 @@ func resolveRosterCaps(cfg *config.Config) (named, anon int) {
 		anon = *v
 	}
 
-	// The native Desktop's isolated root workers share a global child-agent
-	// permit pool. Keep one root from consuming it all: this environment-only
-	// ceiling narrows (never raises) the user's configured caps and is ignored
-	// by normal CLI invocations.
-	if v := parseEnvInt("METIS_DESKTOP_SUBAGENT_CAP"); v != nil && *v > 0 {
-		capNamed, capAnon := splitOneToTwo(*v)
-		if named <= 0 || named > capNamed {
-			named = capNamed
-		}
-		if anon <= 0 || anon > capAnon {
-			anon = capAnon
-		}
-	}
+	// Desktop enforces its combined per-root budget using shared admission
+	// permits. Keep configured per-kind caps intact here; splitting that budget
+	// into named/anonymous reserves rejects valid all-named batches.
 	return named, anon
 }
 

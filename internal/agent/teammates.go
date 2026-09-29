@@ -131,6 +131,9 @@ const (
 	StatusFailed
 	// StatusKilled — SubAgentStop or Roster.CancelAll terminated it.
 	StatusKilled
+	// StatusQueued — identity registered, waiting for execution capacity.
+	// Append to preserve the numeric values of existing persisted statuses.
+	StatusQueued
 )
 
 func (s TeammateStatus) String() string {
@@ -143,9 +146,14 @@ func (s TeammateStatus) String() string {
 		return "failed"
 	case StatusKilled:
 		return "killed"
+	case StatusQueued:
+		return "queued"
 	}
 	return "unknown"
 }
+
+// IsActive includes queued work: it is cancellable and has not finished yet.
+func (s TeammateStatus) IsActive() bool { return s == StatusRunning || s == StatusQueued }
 
 // Teammate is one live sub-agent's roster entry.
 //
@@ -161,8 +169,9 @@ type Teammate struct {
 	// identity-aware roster unregister path. Session workspace switches wait
 	// on this lifecycle edge after cancellation before publishing a new shared
 	// Memory repository binding.
-	done     chan struct{}
-	doneOnce sync.Once
+	done       chan struct{}
+	doneOnce   sync.Once
+	doneClosed bool // guarded by mu; prevents a late execution lease after cleanup
 	// resourceRelease returns a Desktop-wide child-agent permit when the
 	// runner unwinds. It is nil for ordinary CLI use and is called only from
 	// signalDone, which already has exactly-once lifecycle semantics.
@@ -270,8 +279,14 @@ func (t *Teammate) SetResourceRelease(release func()) {
 		return
 	}
 	t.mu.Lock()
-	t.resourceRelease = release
+	closed := t.doneClosed
+	if !closed {
+		t.resourceRelease = release
+	}
 	t.mu.Unlock()
+	if closed {
+		release()
+	}
 }
 
 // RequestCancel records an authoritative cancellation request and invokes the
@@ -310,7 +325,7 @@ func (t *Teammate) AppendText(s string) {
 func (t *Teammate) Finish(status TeammateStatus, result string, exitErr error, hint string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.Status != StatusRunning {
+	if !t.Status.IsActive() {
 		return // monotonic — first finish wins
 	}
 	t.Status = status
@@ -539,6 +554,11 @@ func (r *Roster) lifecycleResetToken() chan struct{} {
 // retry later or scope down.
 var ErrCapacityExceeded = errors.New("sub-agent capacity exceeded")
 
+// DesktopQueuedIdentityLimit bounds outstanding work independently of permits.
+const DesktopQueuedIdentityLimit = 256
+
+var ErrQueueCapacityExceeded = errors.New("Desktop sub-agent queue capacity exceeded (256 outstanding identities); wait for work to finish or cancel queued agents")
+
 // ErrNameInUse is returned when Register encounters a duplicate Name.
 // Two named teammates can't co-exist with the same name — pick another
 // or wait for the prior one to finish.
@@ -567,10 +587,24 @@ var ErrRosterResetting = errors.New("sub-agent roster is resetting")
 // named teammate by name — auto-suffix there would silently spawn a
 // new agent instead of resuming, which is wrong).
 func (r *Roster) Register(t *Teammate) error {
+	return r.register(t, false)
+}
+
+// RegisterQueued publishes a cancellable Desktop identity without reserving
+// execution capacity. The Desktop scheduler owns the combined execution cap;
+// ordinary Register retains the CLI's existing per-kind admission limits.
+func (r *Roster) RegisterQueued(t *Teammate) error {
+	return r.register(t, true)
+}
+
+func (r *Roster) register(t *Teammate, queued bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.resetting {
 		return ErrRosterResetting
+	}
+	if queued && len(r.teammates) >= DesktopQueuedIdentityLimit {
+		return ErrQueueCapacityExceeded
 	}
 
 	// Determine the kind FIRST so the cap check below picks the
@@ -594,7 +628,7 @@ func (r *Roster) Register(t *Teammate) error {
 	} else {
 		cap = r.capNamed
 	}
-	if cap > 0 && inKind >= cap {
+	if !queued && cap > 0 && inKind >= cap {
 		return ErrCapacityExceeded
 	}
 	if _, ok := r.teammates[t.Name]; ok {
@@ -638,7 +672,32 @@ func (r *Roster) Register(t *Teammate) error {
 	}
 	t.done = make(chan struct{})
 	t.doneOnce = sync.Once{}
+	t.doneClosed = false
+	if queued {
+		t.Status = StatusQueued
+	}
 	r.teammates[t.Name] = t
+	return nil
+}
+
+// TryStartQueued commits a scheduler lease only while this exact identity is
+// still live and has not been cancelled. On error the caller owns release.
+func (r *Roster) TryStartQueued(t *Teammate, release func()) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.resetting || t == nil || r.teammates[t.Name] != t {
+		return ErrRosterResetting
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.cancelRequested || t.doneClosed {
+		return context.Canceled
+	}
+	if t.Status != StatusQueued {
+		return fmt.Errorf("sub-agent %s is %s, not queued", t.AgentID, t.Status)
+	}
+	t.resourceRelease = release
+	t.Status = StatusRunning
 	return nil
 }
 
@@ -695,6 +754,7 @@ func (t *Teammate) signalDone() {
 	}
 	t.doneOnce.Do(func() {
 		t.mu.Lock()
+		t.doneClosed = true
 		release := t.resourceRelease
 		t.resourceRelease = nil
 		t.mu.Unlock()

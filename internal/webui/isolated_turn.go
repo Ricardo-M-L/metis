@@ -57,10 +57,9 @@ type IsolatedTurnOptions struct {
 	// MaxConfigurableParallelism is the highest user-selectable foreground
 	// worker count. Zero keeps reduced embedders read-only.
 	MaxConfigurableParallelism int
-	// MaxTotalAgentSlots keeps root and child workers under one Desktop budget.
+	// MaxTotalAgentSlots is the shared execution budget for roots and children.
 	MaxTotalAgentSlots  int
 	SubagentSlotDir     string
-	MaxSubagentSlots    int
 	MaxSubagentsPerRoot int
 }
 
@@ -68,41 +67,42 @@ type processIsolatedTurnRunner struct {
 	executable          string
 	subagentSlotDir     string
 	limitsMu            sync.RWMutex
-	maxSubagentSlots    int
+	maxTotalAgentSlots  int
 	maxSubagentsPerRoot int
 	command             func(string, ...string) *exec.Cmd
 }
 
-// SetMaxSubagentSlots updates the permit count inherited by subsequently
-// launched root workers. Existing workers keep the environment they started
-// with, which is why Server only resizes while no isolated turn is active.
-func (r *processIsolatedTurnRunner) SetMaxSubagentSlots(slots int) {
-	if r == nil || slots < 1 {
+// SetDesktopAgentLimits updates the shared total and per-root child ceiling
+// inherited by subsequently launched workers. Existing workers retain their
+// environment, so Server only applies this while the scheduler is idle.
+func (r *processIsolatedTurnRunner) SetDesktopAgentLimits(total, perRoot int) {
+	if r == nil || total < 1 || perRoot < 1 {
 		return
 	}
 	r.limitsMu.Lock()
-	r.maxSubagentSlots = slots
+	r.maxTotalAgentSlots = total
+	r.maxSubagentsPerRoot = perRoot
 	r.limitsMu.Unlock()
 }
 
-func (r *processIsolatedTurnRunner) subagentLimits() (int, int) {
+func (r *processIsolatedTurnRunner) agentLimits() (int, int) {
 	if r == nil {
 		return 0, 0
 	}
 	r.limitsMu.RLock()
 	defer r.limitsMu.RUnlock()
-	return r.maxSubagentSlots, r.maxSubagentsPerRoot
+	return r.maxTotalAgentSlots, r.maxSubagentsPerRoot
 }
 
 func newProcessIsolatedTurnRunner(options IsolatedTurnOptions) (IsolatedTurnRunner, error) {
 	if strings.TrimSpace(options.Executable) == "" {
 		return nil, errors.New("isolated turn worker requires an executable")
 	}
-	if options.SubagentSlotDir != "" && (options.MaxSubagentSlots < 1 || options.MaxSubagentsPerRoot < 1) {
-		return nil, errors.New("isolated turn worker requires positive sub-agent limits")
+	if options.SubagentSlotDir != "" && (options.MaxTotalAgentSlots < 1 || options.MaxSubagentsPerRoot < 1) {
+		return nil, errors.New("isolated turn worker requires positive agent limits")
 	}
 	return &processIsolatedTurnRunner{
-		executable: options.Executable, subagentSlotDir: options.SubagentSlotDir, maxSubagentSlots: options.MaxSubagentSlots,
+		executable: options.Executable, subagentSlotDir: options.SubagentSlotDir, maxTotalAgentSlots: options.MaxTotalAgentSlots,
 		maxSubagentsPerRoot: options.MaxSubagentsPerRoot, command: exec.Command,
 	}, nil
 }
@@ -139,9 +139,9 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 		"METIS_DESKTOP_ISOLATED_WORKER": "1",
 	}
 	if r.subagentSlotDir != "" {
-		maxSubagentSlots, maxSubagentsPerRoot := r.subagentLimits()
+		maxTotalAgentSlots, maxSubagentsPerRoot := r.agentLimits()
 		env["METIS_DESKTOP_SUBAGENT_SLOT_DIR"] = r.subagentSlotDir
-		env["METIS_DESKTOP_SUBAGENT_SLOTS"] = strconv.Itoa(maxSubagentSlots)
+		env["METIS_DESKTOP_SUBAGENT_SLOTS"] = strconv.Itoa(maxTotalAgentSlots)
 		env["METIS_DESKTOP_SUBAGENT_CAP"] = strconv.Itoa(maxSubagentsPerRoot)
 	}
 	cmd.Env = withIsolatedWorkerEnv(os.Environ(), env)
@@ -173,7 +173,9 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 	replies := desktopipc.NewEncoder(stdin)
 	controls := newIsolatedWorkerControls(bridgeCtx, replies, request.Steer, replyErrors)
 	streamDone := make(chan isolatedWorkerOutput, 1)
+	streamClosed := make(chan struct{})
 	go func() {
+		defer close(streamClosed)
 		streamDone <- readIsolatedWorkerOutput(bridgeCtx, stdout, replies, request, &replyWorkers, replyErrors, controls)
 	}()
 
@@ -192,7 +194,10 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 	// In the successful path all stdout must be decoded before Wait closes
 	// StdoutPipe. Otherwise a fast-exiting worker can lose its final events.
 	waitDone := make(chan error, 1)
-	go func() { waitDone <- cmd.Wait() }()
+	go func() {
+		<-streamClosed
+		waitDone <- cmd.Wait()
+	}()
 	var waitErr error
 	if failure == nil {
 		select {
@@ -204,9 +209,11 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 	}
 	if failure != nil {
 		cancelBridge()
+		// EOF cancels the worker bridge. Keep reading stdout while its child
+		// runners persist terminals and Cleanup emits the final roster. Closing
+		// stdout first both loses that frame and can SIGPIPE the worker before
+		// its durable cleanup has run.
 		_ = stdin.Close()
-		_ = stdout.Close()
-		terminateIsolatedTurnProcess(cmd)
 		grace := time.NewTimer(workerTerminateGrace)
 		select {
 		case waitErr = <-waitDone:
@@ -214,8 +221,18 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 				<-grace.C
 			}
 		case <-grace.C:
-			jobs.KillProcessGroup(cmd.Process)
-			waitErr = <-waitDone
+			terminateIsolatedTurnProcess(cmd)
+			termination := time.NewTimer(workerTerminateGrace)
+			select {
+			case waitErr = <-waitDone:
+				if !termination.Stop() {
+					<-termination.C
+				}
+			case <-termination.C:
+				jobs.KillProcessGroup(cmd.Process)
+				_ = stdout.Close()
+				waitErr = <-waitDone
+			}
 		}
 		// Even a promptly-exiting leader may leave tool descendants behind.
 		jobs.KillProcessGroup(cmd.Process)
@@ -274,7 +291,7 @@ func readIsolatedWorkerOutput(ctx context.Context, reader io.Reader, replies *de
 			result.err = fmt.Errorf("decode desktop worker output: %w", err)
 			return result
 		}
-		if message.Type == desktopipc.TypeSteerResult {
+		if message.Type == desktopipc.TypeSteerResult || message.Type == desktopipc.TypeStopSubAgentResult {
 			if err := controls.acknowledge(message); err != nil {
 				result.err = err
 				return result

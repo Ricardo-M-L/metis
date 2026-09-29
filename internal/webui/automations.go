@@ -18,10 +18,13 @@ import (
 
 // AutomationOptions are trusted composition inputs, never browser-supplied executable or storage paths.
 type AutomationOptions struct {
-	Root       string
-	Executable string
-	WorkDir    string
-	Model      string
+	Root             string
+	Executable       string
+	WorkDir          string
+	Model            string
+	DesktopSlotDir   string
+	TotalAgentSlots  int
+	SubagentsPerRoot int
 }
 
 type automationSchedule struct {

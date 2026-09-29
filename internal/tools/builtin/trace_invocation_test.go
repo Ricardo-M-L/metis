@@ -48,18 +48,24 @@ func (p *gatedCancelProvider) Complete(context.Context, llm.Request) (*llm.Respo
 	return nil, nil
 }
 func (p *gatedCancelProvider) Stream(ctx context.Context, _ llm.Request) (llm.StreamReader, error) {
-	p.startOnce.Do(func() { close(p.started) })
-	return &gatedCancelStream{ctx: ctx, observed: p.observed, release: p.release}, nil
+	return &gatedCancelStream{
+		ctx: ctx, started: p.started, observed: p.observed, release: p.release, startOnce: &p.startOnce,
+	}, nil
 }
 
 type gatedCancelStream struct {
-	ctx      context.Context
-	observed chan struct{}
-	release  chan struct{}
-	once     sync.Once
+	ctx       context.Context
+	started   chan struct{}
+	observed  chan struct{}
+	release   chan struct{}
+	startOnce *sync.Once
+	once      sync.Once
 }
 
 func (s *gatedCancelStream) Recv() (llm.StreamEvent, error) {
+	// The test must cancel after Recv has entered, rather than after Stream
+	// returned: the child can otherwise unwind before reading the stream.
+	s.startOnce.Do(func() { close(s.started) })
 	<-s.ctx.Done()
 	s.once.Do(func() { close(s.observed) })
 	<-s.release
@@ -139,6 +145,14 @@ func TestForegroundTraceInvocationEndsOnlyAfterChildRunExits(t *testing.T) {
 	}
 	tool := NewAgent(permission.New(permission.ModeBypass), provider, tools.NewRegistry(), "model", "system")
 	ctx, cancel := context.WithCancel(traceInvocationContext("cancel-internal", "cancel-public"))
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-provider.release:
+		default:
+			close(provider.release)
+		}
+	})
 	result := make(chan *tools.Result, 1)
 	go func() {
 		res, _ := tool.Execute(ctx, map[string]any{"prompt": "wait"})

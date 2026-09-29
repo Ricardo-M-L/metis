@@ -54,20 +54,6 @@ func TestCmdDesktopDefaultsToNativeWorkspace(t *testing.T) {
 	}
 }
 
-func TestDesktopChildAgentSlotsKeepsAggregateBudget(t *testing.T) {
-	for _, tc := range []struct {
-		roots, want int
-	}{
-		{roots: 1, want: 15},
-		{roots: 8, want: 8},
-		{roots: 12, want: 4},
-	} {
-		if got := desktopChildAgentSlots(tc.roots); got != tc.want {
-			t.Fatalf("desktopChildAgentSlots(%d) = %d, want %d", tc.roots, got, tc.want)
-		}
-	}
-}
-
 func TestDesktopWorkerParallelismUsesSavedPreferenceAndEnvironmentOverride(t *testing.T) {
 	if got := desktopWorkerParallelism(nil, 12); got != 12 {
 		t.Fatalf("saved parallelism = %d, want 12", got)

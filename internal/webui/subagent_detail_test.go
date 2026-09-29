@@ -420,7 +420,7 @@ for (const id of ['statusPopover','statusChip','subAgentDetailOverlay','subAgent
 const overlay = byId.get('subAgentDetailOverlay'); overlay.dialog = new Element();
 const requested = [];
 const c = {
-  console, Promise, Map, Set, encodeURIComponent, requestAnimationFrame: fn => fn(),
+  console, Promise, Map, Set, encodeURIComponent, requestAnimationFrame: fn => fn(), setInterval:()=>1, clearInterval(){},
   currentSessionId:'session-a', lastStatusSnapshot:null,
   DESKTOP_I18N:{'zh-CN':{subAgents:'子代理',backgroundTasks:'后台任务'},en:{subAgents:'sub-agents',backgroundTasks:'background tasks'}},
   subAgentDetailState:{agentId:'',ownerSessionId:'',trigger:null,data:null,loading:false,error:'',requestGeneration:0},

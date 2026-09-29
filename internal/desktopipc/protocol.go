@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,13 +18,15 @@ import (
 )
 
 const (
-	Version         = 1
-	MaxMessageBytes = 8 << 20
-	TypeEvent       = "event"
-	TypeReply       = "reply"
-	TypeStatus      = "status"
-	TypeSteer       = "steer"
-	TypeSteerResult = "steer_result"
+	Version                = 1
+	MaxMessageBytes        = 8 << 20
+	TypeEvent              = "event"
+	TypeReply              = "reply"
+	TypeStatus             = "status"
+	TypeSteer              = "steer"
+	TypeSteerResult        = "steer_result"
+	TypeStopSubAgent       = "stop_subagent"
+	TypeStopSubAgentResult = "stop_subagent_result"
 )
 
 type Message struct {
@@ -37,6 +40,7 @@ type Message struct {
 	Answer   string                   `json:"answer,omitempty"`
 	Input    string                   `json:"input,omitempty"`
 	Accepted bool                     `json:"accepted"`
+	AgentID  string                   `json:"agentId,omitempty"`
 }
 
 // Event deliberately lists wire fields rather than embedding agent.Event,
@@ -182,11 +186,11 @@ func (d *Decoder) Decode() (Message, error) {
 			return Message{}, errors.New("desktop worker reply requires an explicit decision")
 		}
 	}
-	if message.Type == TypeSteerResult {
+	if message.Type == TypeSteerResult || message.Type == TypeStopSubAgentResult {
 		var fields map[string]json.RawMessage
 		_ = json.Unmarshal(data, &fields)
 		if raw, ok := fields["accepted"]; !ok || bytes.Equal(raw, []byte("null")) {
-			return Message{}, errors.New("desktop worker steer result requires explicit acceptance")
+			return Message{}, errors.New("desktop worker control result requires explicit acceptance")
 		}
 	}
 	return message, nil
@@ -196,6 +200,12 @@ func validate(message Message) error {
 		return fmt.Errorf("unsupported desktop worker protocol version %d", message.Version)
 	}
 	switch message.Type {
+	case TypeStopSubAgent, TypeStopSubAgentResult:
+		if message.ID == "" || message.Event != nil || message.Status != nil || message.Input != "" ||
+			message.AgentID == "" || message.AgentID != strings.TrimSpace(message.AgentID) ||
+			len(message.AgentID) > 128 || strings.ContainsAny(message.AgentID, "/\\") {
+			return errors.New("invalid desktop worker sub-agent stop message")
+		}
 	case TypeSteer, TypeSteerResult:
 		if message.ID == "" || message.Event != nil || message.Status != nil {
 			return errors.New("invalid desktop worker steer message")

@@ -51,7 +51,8 @@ class DesktopFixtureResponsesTest(unittest.TestCase):
         call = done["item"]
         self.assertEqual(call["name"], "Agent")
         self.assertEqual(json.loads(call["arguments"]),
-                         {"prompt": "CHILD_FIXTURE_TASK_1", "name": "probe", "isolation": "none"})
+                         {"prompt": "CHILD_FIXTURE_TASK_1", "name": "probe-1", "isolation": "none",
+                          "subagent_type": "explore", "run_in_background": False})
         terminal = next(event for event in events if event["type"] == "response.completed")
         self.assertEqual(terminal["response"]["output"], [call])
 

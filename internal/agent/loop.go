@@ -1548,6 +1548,15 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	// inspect another session while this turn or one of its sub-agents is still
 	// running; tool calls must continue writing to the originating session.
 	ctx = tasks.WithSessionID(ctx, tasks.SessionIDFromContext(ctx))
+	// Desktop roots and children share one execution budget. A child runner
+	// already supplied its own lease; ordinary CLI contexts remain unchanged.
+	var releaseDesktop func()
+	var desktopErr error
+	ctx, releaseDesktop, desktopErr = enterDesktopLoop(ctx)
+	if desktopErr != nil {
+		return desktopErr
+	}
+	defer releaseDesktop()
 
 	// A provider can finish at the same instant the caller cancels. Terminal
 	// events are cancellation-aware and may be dropped to avoid wedging a dead

@@ -62,18 +62,20 @@ type Server struct {
 	// turnCoordinator covers both legacy in-process turns and isolated worker
 	// turns. runMu remains for the one process-owned Loop; the coordinator is
 	// what lets independent workspaces make progress concurrently.
-	turnCoordinator    *TurnCoordinator
-	isolatedRunner     IsolatedTurnRunner
-	maxTurnParallelism int
-	maxTotalAgentSlots int
-	workerTurnsMu      sync.Mutex
-	workerTurns        map[string]*isolatedActiveTurn
-	workerSnapshots    map[string]isolatedWorkerSnapshot
-	hub                *eventHub
-	prefsMu            sync.Mutex
-	workspacesMu       sync.Mutex
-	providersMu        sync.Mutex
-	effortMu           sync.Mutex
+	turnCoordinator     *TurnCoordinator
+	isolatedRunner      IsolatedTurnRunner
+	maxTurnParallelism  int
+	maxTotalAgentSlots  int
+	maxSubagentsPerRoot int
+	desktopAgentSlotDir string
+	workerTurnsMu       sync.Mutex
+	workerTurns         map[string]*isolatedActiveTurn
+	workerSnapshots     map[string]isolatedWorkerSnapshot
+	hub                 *eventHub
+	prefsMu             sync.Mutex
+	workspacesMu        sync.Mutex
+	providersMu         sync.Mutex
+	effortMu            sync.Mutex
 
 	// cancelMu guards the identity, cancel func, and completion signal for the
 	// in-flight turn. Keeping the session identity separate from the session
@@ -421,6 +423,8 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		server.turnCoordinator = NewTurnCoordinator(binding.IsolatedTurns.MaxParallel)
 		server.maxTurnParallelism = binding.IsolatedTurns.MaxConfigurableParallelism
 		server.maxTotalAgentSlots = binding.IsolatedTurns.MaxTotalAgentSlots
+		server.maxSubagentsPerRoot = binding.IsolatedTurns.MaxSubagentsPerRoot
+		server.desktopAgentSlotDir = binding.IsolatedTurns.SubagentSlotDir
 		if server.isolatedRunner == nil {
 			if runner, err := newProcessIsolatedTurnRunner(*binding.IsolatedTurns); err != nil {
 				log.Printf("desktop isolated turns disabled: %v", err)
@@ -430,7 +434,11 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		}
 	}
 	if binding.Automations != nil {
-		server.automations = newAutomationManager(*binding.Automations)
+		options := *binding.Automations
+		options.DesktopSlotDir = server.desktopAgentSlotDir
+		options.TotalAgentSlots = server.maxTotalAgentSlots
+		options.SubagentsPerRoot = server.maxSubagentsPerRoot
+		server.automations = newAutomationManager(options)
 	}
 	var initialSessionCommit func()
 	var initialSessionSwitchErr error
@@ -513,28 +521,59 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 	return server
 }
 
-type subagentSlotResizer interface {
-	SetMaxSubagentSlots(int)
+type desktopAgentLimitResizer interface {
+	SetDesktopAgentLimits(total, perRoot int)
 }
 
-// applyDesktopTurnParallelism resizes new foreground worker admission only
-// while no turn holds a workspace lease. That keeps the shared child-slot
-// files and root ceiling one budget rather than changing one half beneath a
-// live worker. The saved preference remains valid and will apply on restart
-// when a task is in flight.
-func (s *Server) applyDesktopTurnParallelism(rootSlots int) bool {
-	if s == nil || s.turnCoordinator == nil || s.isolatedRunner == nil || s.maxTurnParallelism < 1 || s.maxTotalAgentSlots < 2 {
+// applyDesktopParallelism updates root admission and the agent execution
+// limits together only while neither a foreground turn nor a detached child
+// holds or waits for a Desktop scheduler slot. Busy changes remain saved and
+// take effect on restart.
+func (s *Server) applyDesktopParallelism(rootSlots, totalSlots, perRootSlots int) bool {
+	if s == nil || s.turnCoordinator == nil || s.isolatedRunner == nil || s.maxTurnParallelism < 1 {
 		return false
 	}
-	if rootSlots < 1 || rootSlots > s.maxTurnParallelism || rootSlots >= s.maxTotalAgentSlots {
+	if rootSlots < 1 || rootSlots > s.maxTurnParallelism || totalSlots < 1 || totalSlots > MaxDesktopTotalAgentParallelism || perRootSlots < 1 || perRootSlots > MaxDesktopSubagentParallelism {
 		return false
 	}
-	resizer, ok := s.isolatedRunner.(subagentSlotResizer)
+	resizer, ok := s.isolatedRunner.(desktopAgentLimitResizer)
 	if !ok {
 		return false
 	}
+	// In-process image turns and their background continuations share runMu.
+	// Hold it through the idle check and resize so a watcher cannot start with
+	// its captured old budget in between. Settings must never wait for a turn.
+	if !s.runMu.TryLock() {
+		return false
+	}
+	defer s.runMu.Unlock()
+	if s.loop != nil && s.loop.Jobs != nil &&
+		(s.loop.Jobs.HasPendingWork() || s.loop.Jobs.HasPendingNotifications()) {
+		return false
+	}
+	// A running cron scheduler has inherited fixed limits, even between jobs.
+	// Keep the saved/restart path until it exits; never mix old/new budgets.
+	if s.automations != nil {
+		s.automations.mu.Lock()
+		defer s.automations.mu.Unlock()
+		if s.automations.scheduler != nil || len(s.automations.manual) != 0 {
+			return false
+		}
+	}
+	if s.desktopAgentSlotDir != "" {
+		idle, err := agent.DesktopSchedulerIdle(s.desktopAgentSlotDir)
+		if err != nil || !idle {
+			return false
+		}
+	}
 	return s.turnCoordinator.ResizeWhenIdle(rootSlots, func() {
-		resizer.SetMaxSubagentSlots(s.maxTotalAgentSlots - rootSlots)
+		resizer.SetDesktopAgentLimits(totalSlots, perRootSlots)
+		s.maxTotalAgentSlots = totalSlots
+		s.maxSubagentsPerRoot = perRootSlots
+		if s.automations != nil {
+			s.automations.options.TotalAgentSlots = totalSlots
+			s.automations.options.SubagentsPerRoot = perRootSlots
+		}
 	})
 }
 
@@ -1741,6 +1780,15 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	input := strings.TrimSpace(body.Input)
 	modelInput := desktopModelInput(input)
 	nextMetricTurn := s.nextMessageMetricTurn(body.SessionID, history)
+	if s.desktopAgentSlotDir != "" {
+		// Image turns stay in this process, but their Loop and descendants
+		// must charge the same execution pool as isolated turns and cron.
+		turnCtx = agent.WithDesktopExecutionConfig(turnCtx, agent.DesktopExecutionConfig{
+			SlotDir: s.desktopAgentSlotDir, TotalAgentSlots: s.maxTotalAgentSlots,
+			SubagentsPerRoot: s.maxSubagentsPerRoot,
+			Owner:            fmt.Sprintf("inproc:%s:%d", body.SessionID, nextMetricTurn),
+		})
+	}
 	alignTraceTurnFloor(body.SessionID, nextMetricTurn)
 	messageMetric := session.MessageMetric{
 		Turn:      nextMetricTurn,
@@ -1852,6 +1900,7 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 		Steer:     steer,
 		OnStatus:  func(status desktopipc.Status) { s.setWorkerSnapshot(sessionID, status) },
 		OnEvent: func(ev agent.Event) {
+			s.recordWorkerSubAgentLifecycle(sessionID, ev)
 			if !s.publishInteraction(turnCtx, sessionID, ev) && ev.Kind != agent.EventLoopDone {
 				s.hub.publish(sessionID, ev)
 			}
@@ -1860,6 +1909,7 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 			s.hub.publish(sessionID, agent.Event{Kind: agent.EventTextDelta, TextDelta: delta})
 		},
 	})
+	s.finishWorkerSnapshot(sessionID, err != nil, errors.Is(err, context.Canceled) || result.Stopped)
 	if errors.Is(err, context.Canceled) || result.Stopped {
 		_ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "stopped"})
 		s.hub.publish(sessionID, agent.Event{Kind: agent.EventLoopDone, StopReason: "stopped"})
@@ -3427,7 +3477,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			if !s.subAgentBelongsToSession(activeSessionID, snap.AgentID) {
 				continue
 			}
-			if snap.Status == agent.StatusRunning {
+			if snap.Status.IsActive() {
 				subAgents++
 				if snap.IsNamed() {
 					namedAgents++
@@ -3599,14 +3649,20 @@ func trimSubAgentDetailOutput(value string) (string, bool) {
 // child deltas into the parent chat lane, where they would interleave with the
 // main agent's answer.
 func (s *Server) handleSubAgentDetail(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
+	path := strings.TrimPrefix(r.URL.Path, "/api/subagents/")
+	stop := strings.HasSuffix(path, "/stop")
+	method := http.MethodGet
+	if stop {
+		method = http.MethodPost
+		path = strings.TrimSuffix(path, "/stop")
+	}
+	if r.Method != method {
+		w.Header().Set("Allow", method)
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	path := strings.TrimPrefix(r.URL.Path, "/api/subagents/")
-	stream := strings.HasSuffix(path, "/events")
+	stream := !stop && strings.HasSuffix(path, "/events")
 	if stream {
 		path = strings.TrimSuffix(path, "/events")
 	}
@@ -3622,6 +3678,10 @@ func (s *Server) handleSubAgentDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	if stream {
 		s.handleSubAgentEvents(w, r, sessionID, agentID)
+		return
+	}
+	if stop {
+		s.handleSubAgentStop(w, r, sessionID, agentID)
 		return
 	}
 
@@ -3740,7 +3800,7 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, se
 	if !writeSubAgentSSE(w, "snapshot", map[string]any{"agent": current}) {
 		return
 	}
-	if current.Status != agent.StatusRunning.String() {
+	if !subAgentStatusActive(current.Status) {
 		_ = writeSubAgentSSE(w, "terminal", map[string]any{"agent": current})
 		flusher.Flush()
 		return
@@ -3769,10 +3829,19 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, se
 				flusher.Flush()
 				return
 			}
-			if next.Status != agent.StatusRunning.String() {
+			if !subAgentStatusActive(next.Status) {
 				_ = writeSubAgentSSE(w, "terminal", map[string]any{"agent": next})
 				flusher.Flush()
 				return
+			}
+			if next.Status != current.Status {
+				if !writeSubAgentSSE(w, "snapshot", map[string]any{"agent": next}) {
+					return
+				}
+				flusher.Flush()
+				current = next
+				lastPreviewSent = time.Now()
+				continue
 			}
 			if next.Output == current.Output && next.OutputTruncated == current.OutputTruncated {
 				current = next
@@ -4893,8 +4962,6 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		case "tool_result":
 			// Tool wall time is calculated after the scan so overlapping leaf
 			// tools and Agent orchestration spans are handled correctly.
-		case "error":
-			stats.Errors++
 		case "tokens":
 			var in, out, cw, cr int64
 			fmt.Sscanf(ev.Text, "input=%d output=%d cache_write=%d cache_read=%d", &in, &out, &cw, &cr)

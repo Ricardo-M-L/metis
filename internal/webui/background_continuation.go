@@ -34,7 +34,14 @@ func (s *Server) armBackgroundContinuation(turnCtx context.Context, sessionID st
 		return
 	}
 	s.stopBackgroundContinuationLocked()
-	ctx, cancel := context.WithCancel(context.Background())
+	// The request context is cancelled as soon as HTTP responds. Carry only
+	// this turn's immutable Desktop scheduler config into the continuation;
+	// copying the whole context could retain a closed root execution lease.
+	base := context.Background()
+	if config, ok := agent.DesktopExecutionConfigFromContext(turnCtx); ok {
+		base = agent.WithDesktopExecutionConfig(base, config)
+	}
+	ctx, cancel := context.WithCancel(base)
 	s.backgroundCancel = cancel
 	s.backgroundSession = sessionID
 	generation := s.backgroundGeneration
