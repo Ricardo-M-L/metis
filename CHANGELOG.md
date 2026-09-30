@@ -7,6 +7,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.82] - 2026-09-30
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Fixed
+
+- Start the verified Computer Use helper in a private sandbox directory, so
+  Desktop can connect when macOS launches the application with `/` as its
+  working directory. Ordinary MCP servers retain the filesystem-root guard.
+- Translate Computer Use installation and connection status into the selected
+  Desktop interface language.
+
 ## [0.4.81] - 2026-09-30
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

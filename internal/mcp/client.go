@@ -295,6 +295,18 @@ func NewStdioTransportWithEnvAndDirAndSandboxProfile(ctx context.Context, comman
 		if err := verifyManagedComputerUseLaunch(ctx, command, args, resolveManagedComputerUseExecutable); err != nil {
 			return nil, err
 		}
+		if manager != nil {
+			// This directory belongs to the runtime, stays alive under the
+			// transport's sandbox lease, and becomes the helper's working directory.
+			// In particular, a Desktop process started with cwd "/" must not
+			// ask the sandbox to make the filesystem root writable. Do this
+			// after executable verification and before cmd.Dir, PWD and the
+			// sandbox request consume workingDir.
+			workingDir = manager.TempDir()
+			if workingDir == "" {
+				return nil, sandbox.ErrManagerClosed
+			}
+		}
 	}
 	// Process lifetime is owned by StdioTransport.Close, not by the bounded
 	// launch/handshake context. Slash commands and lazy first-tool spawns use

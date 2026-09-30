@@ -57,6 +57,17 @@ vm.runInContext(source.slice(start), c);
   assert.match(panel.innerHTML, /Request access/);
   assert.doesNotMatch(panel.innerHTML, /Open System Settings/);
 
+  // Status notes from the component are localized using the selected UI language.
+  installed.message = 'Computer-use helper installed; permissions and process state are checked separately.';
+  c.paintComputerUse();
+  assert.match(panel.innerHTML, /Computer-use helper installed; permissions and process state are checked separately\./);
+  zh = true;
+  c.paintComputerUse();
+  assert.match(panel.innerHTML, /电脑操作组件已安装；权限和运行状态会分别检查。/);
+  assert.doesNotMatch(panel.innerHTML, /Computer-use helper installed/);
+  zh = false;
+  installed.message = '<script>untrusted</script>';
+
   // A deliberate button action posts only the fixed action. Double clicks
   // cannot initiate concurrent installs, and a delayed response does not
   // replace another settings page after navigation.

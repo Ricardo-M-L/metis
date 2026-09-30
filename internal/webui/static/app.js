@@ -1269,7 +1269,15 @@ async function refreshNativeComputerUsePermissions(operationID) {
 function computerUseLocalizedMessage(message) {
   if (!message) return '';
   const known = {
+    'Computer-use helper installed; permissions and process state are checked separately.': uiText('Computer-use helper installed; permissions and process state are checked separately.', '电脑操作组件已安装；权限和运行状态会分别检查。'),
+    'computer-use helper is not installed': uiText('The Computer Use component is not installed.', '电脑操作组件尚未安装。'),
+    "This METIS build's pinned computer-use helper is not installed.": uiText("This METIS build's pinned computer-use helper is not installed.", '此 METIS 版本指定的电脑操作组件尚未安装。'),
     'Explicit local build installed; this is not a verified official release.': uiText('Explicit local build installed; this is not a verified official release.', '当前安装的是本地构建，未经官方发布验证。'),
+    'Explicit local build installed; this is not a verified official release. Computer use on this platform is experimental and unverified.': uiText('Explicit local build installed; this is not a verified official release. Computer use on this platform is experimental and unverified.', '当前安装的是本地构建，未经官方发布验证。此平台上的电脑操作仍处于实验阶段，尚未验证。'),
+    'Computer Use stopped in this session.': uiText('Computer Use stopped in this session.', '本次会话中的电脑操作已停止。'),
+    'Startup disabled. Other running sessions must be stopped using their own /cu stop or Desktop Stop control.': uiText('Startup disabled. Other running sessions must be stopped using their own /cu stop or Desktop Stop control.', '已禁用启动。其他正在运行的会话需分别使用 /cu stop 或桌面端的“停止”按钮。'),
+    'Enabled for the next session. In an open CLI use /cu enable; in Desktop click Enable for immediate connection.': uiText('Enabled for the next session. In an open CLI use /cu enable; in Desktop click Enable for immediate connection.', '已为下次会话启用。在现有 CLI 会话中使用 /cu enable；在桌面端点击“启用”可立即连接。'),
+    'A custom/legacy Computer Use server is configured; it has not been replaced by the managed component.': uiText('A custom/legacy Computer Use server is configured; it has not been replaced by the managed component.', '当前配置了自定义或旧版电脑操作服务，尚未替换为托管组件。'),
     'System Settings opened; permissions must be granted by you. Restart Computer Use and refresh status afterwards.': uiText('System Settings opened; permissions must be granted by you. Restart Computer Use and refresh status afterwards.', '已打开系统设置，请自行授权。完成后重启电脑操作并刷新状态。'),
     'This macOS permission is already granted. Restart Computer Use if access is still unavailable.': uiText('This macOS permission is already granted. Restart Computer Use if access is still unavailable.', '这项 macOS 权限已经授予。如果仍无法使用，请重启电脑操作。'),
     'macOS permission granted. Restart Computer Use if access is still unavailable.': uiText('macOS permission granted. Restart Computer Use if access is still unavailable.', 'macOS 权限已授予。如果仍无法使用，请重启电脑操作。'),
