@@ -290,14 +290,32 @@ func (r *runtime) computerUseStatus(ctx context.Context, manager *computeruse.Ma
 		}
 	}
 	for _, srv := range r.computerUseServers() {
-		if !srv.IsSpawned() {
+		// Only a connected helper that passed the managed launch validation can
+		// contribute process state. A server with the reserved name alone cannot.
+		if !status.Installed || !srv.IsManagedComputerUseConnected() {
 			continue
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		description, running, probeErr := readComputerUseStatus(probeCtx, srv)
+		legacyConnection := errors.Is(probeErr, errComputerUseStatusResourceUnsupported)
+		if legacyConnection {
+			probeErr = confirmLegacyComputerUseConnection(probeCtx, srv)
+		}
 		cancel()
+		if !srv.IsManagedComputerUseConnected() {
+			continue
+		}
 		if probeErr != nil {
 			status.Message = "Computer Use connection is not healthy: " + probeErr.Error()
+			continue
+		}
+		if legacyConnection {
+			// metis-cu 0.0.2 has no resources capability. Its fixed prompt
+			// catalog is a second read-only round trip confirming that the
+			// verified managed MCP connection still responds. It cannot report
+			// the helper's own lifecycle or live OS permission state.
+			status.Running = true
+			status.Message = "Computer Use connection is responding; this helper does not expose detailed lifecycle status."
 			continue
 		}
 		status.Running = status.Running || running
@@ -306,12 +324,39 @@ func (r *runtime) computerUseStatus(ctx context.Context, manager *computeruse.Ma
 	return status, nil
 }
 
+var errComputerUseStatusResourceUnsupported = errors.New("Computer Use status resource is unsupported")
+
+func confirmLegacyComputerUseConnection(ctx context.Context, srv *mcptools.Server) error {
+	prompts, err := srv.ListPrompts(ctx)
+	if err != nil {
+		return err
+	}
+	// These are the fixed, read-only prompts registered by metis-cu 0.0.2.
+	// Missing prompts leave the status unconfirmed rather than turning an
+	// arbitrary resource-less MCP server into a running Computer Use helper.
+	required := map[string]bool{"computer_use_minimal": false, "tier_overview": false, "safe_browse": false}
+	for _, prompt := range prompts {
+		if _, ok := required[prompt.Name]; ok {
+			required[prompt.Name] = true
+		}
+	}
+	for _, found := range required {
+		if !found {
+			return errors.New("legacy Computer Use health prompts unavailable")
+		}
+	}
+	return nil
+}
+
 // Resource URIs are private to the MCP client. Resolve the status resource
 // through its current catalog instead of passing a raw URI to ReadResource.
 func readComputerUseStatus(ctx context.Context, srv *mcptools.Server) (*computeruse.Description, bool, error) {
 	resources, err := srv.ListResources(ctx)
 	if err != nil {
 		return nil, false, err
+	}
+	if resources == nil {
+		return nil, false, errComputerUseStatusResourceUnsupported
 	}
 	for _, resource := range resources {
 		if resource.Name != "Computer use status" {

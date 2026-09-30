@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	goruntime "runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,10 +25,10 @@ import (
 func TestComputerUseStatusUsesListedResourceHandle(t *testing.T) {
 	for _, state := range []string{"idle", "running", "stopping", "stopped"} {
 		t.Run(state, func(t *testing.T) {
-			home := t.TempDir()
-			t.Setenv("METIS_HOME", home)
+			home := cuTestHome(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			manager := installComputerUseStatusFixture(t, ctx, home)
 			server, err := mcptools.NewServerWithEnv(ctx, "computer-use", os.Args[0], []string{
 				"METIS_CU_STATUS_FIXTURE=1", "METIS_CU_STATUS_STATE=" + state,
 			}, "-test.run=^TestComputerUseStatusFixture$")
@@ -34,14 +36,102 @@ func TestComputerUseStatusUsesListedResourceHandle(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = server.Close() })
+			server.MarkManagedComputerUse()
 			rt := &runtime{mcpServers: []*mcptools.Server{server}}
-			status, err := rt.computerUseStatus(ctx, computeruse.New(home))
+			status, err := rt.computerUseStatus(ctx, manager)
 			if err != nil {
 				t.Fatal(err)
 			}
 			wantRunning := state == "idle" || state == "running"
 			if status.Running != wantRunning || status.Description == nil {
 				t.Fatalf("native state %s: running=%t description=%v message=%s", state, status.Running, status.Description, status.Message)
+			}
+		})
+	}
+}
+
+func installComputerUseStatusFixture(t *testing.T, ctx context.Context, home string) *computeruse.Manager {
+	t.Helper()
+	if goruntime.GOOS == "windows" {
+		t.Skip("status installer fixture uses a POSIX shell script")
+	}
+	description, err := json.Marshal(computeruse.Description{
+		Name:            "metis-cu",
+		Version:         "test",
+		ProtocolVersion: computeruse.ProtocolVersion,
+		Platform:        goruntime.GOOS,
+		Arch:            goruntime.GOARCH,
+		Capabilities:    []string{"status", "stop", "end-turn", "serialized-input", "input-ownership"},
+		Permissions:     map[string]string{"accessibility": "notGranted", "screenRecording": "notGranted"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	filename := filepath.Join(t.TempDir(), "metis-cu")
+	script := "#!/bin/sh\n[ \"$1\" = --describe ] && [ \"$2\" = --json ] || exit 2\nprintf '%s\\n' '" + string(description) + "'\n"
+	if err := os.WriteFile(filename, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager := computeruse.New(home)
+	if _, err := manager.InstallLocal(ctx, filename); err != nil {
+		t.Fatal(err)
+	}
+	return manager
+}
+
+func TestComputerUseStatusWithoutResourceRequiresVerifiedLiveConnection(t *testing.T) {
+	tests := []struct {
+		name        string
+		mode        string
+		managed     bool
+		installed   bool
+		wantRunning bool
+		wantMessage string
+	}{
+		{"official-0.0.2-method-not-found", "unsupported", true, true, true, "does not expose detailed lifecycle status"},
+		{"unmanaged-same-name", "unsupported", false, true, false, ""},
+		{"no-verified-installation", "unsupported", true, false, false, ""},
+		{"legacy-prompt-list-missing", "unsupported-no-prompts", true, true, false, "not healthy"},
+		{"legacy-prompt-list-incomplete", "unsupported-incomplete-prompts", true, true, false, "not healthy"},
+		{"legacy-prompt-list-error", "unsupported-prompt-error", true, true, false, "not healthy"},
+		{"legacy-prompt-list-timeout", "unsupported-no-response", true, true, false, "not healthy"},
+		{"legacy-transport-disconnected", "unsupported-disconnect", true, true, false, "not healthy"},
+		{"other-rpc-error", "rpc-error", true, true, false, "not healthy"},
+		{"empty-successful-catalog", "empty", true, true, false, "not healthy"},
+		{"null-catalog-without-legacy-prompts", "null", true, true, false, "not healthy"},
+		{"malformed-status-resource", "malformed", true, true, false, "not healthy"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home := cuTestHome(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			manager := computeruse.New(home)
+			if test.installed {
+				manager = installComputerUseStatusFixture(t, ctx, home)
+			}
+			server, err := mcptools.NewServerWithEnv(ctx, "computer-use", os.Args[0], []string{
+				"METIS_CU_STATUS_FIXTURE=1", "METIS_CU_STATUS_MODE=" + test.mode,
+			}, "-test.run=^TestComputerUseStatusFixture$")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = server.Close() })
+			if test.managed {
+				server.MarkManagedComputerUse()
+			}
+			status, err := (&runtime{mcpServers: []*mcptools.Server{server}}).computerUseStatus(ctx, manager)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status.Running != test.wantRunning {
+				t.Fatalf("running=%t, want %t; message=%q", status.Running, test.wantRunning, status.Message)
+			}
+			if test.wantMessage != "" && !strings.Contains(status.Message, test.wantMessage) {
+				t.Fatalf("message=%q, want substring %q", status.Message, test.wantMessage)
+			}
+			if test.wantRunning && (status.Description == nil || status.Description.Version != "test") {
+				t.Fatalf("verified installation description missing: %+v", status.Description)
 			}
 		})
 	}
@@ -63,21 +153,64 @@ func TestComputerUseStatusFixture(t *testing.T) {
 			continue
 		}
 		var result any = map[string]any{}
+		var rpcError any
+		mode := os.Getenv("METIS_CU_STATUS_MODE")
 		switch request.Method {
 		case "initialize":
-			result = map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{"resources": map[string]any{}, "tools": map[string]any{}}, "serverInfo": map[string]any{"name": "metis-cu", "version": "test"}}
+			capabilities := map[string]any{"tools": map[string]any{}}
+			if strings.HasPrefix(mode, "unsupported") {
+				capabilities["prompts"] = map[string]any{}
+			} else {
+				capabilities["resources"] = map[string]any{}
+			}
+			result = map[string]any{"protocolVersion": "2024-11-05", "capabilities": capabilities, "serverInfo": map[string]any{"name": "metis-cu", "version": "test"}}
 		case "tools/list":
 			result = map[string]any{"tools": []any{}}
 		case "resources/list":
-			result = map[string]any{"resources": []any{map[string]any{"uri": "metis-cu://status", "name": "Computer use status", "mimeType": "application/json"}}}
+			switch {
+			case strings.HasPrefix(mode, "unsupported"):
+				rpcError = map[string]any{"code": -32601, "message": "Method not found"}
+			case mode == "rpc-error":
+				rpcError = map[string]any{"code": -32000, "message": "status probe failed"}
+			case mode == "empty":
+				result = map[string]any{"resources": []any{}}
+			case mode == "null":
+				result = map[string]any{"resources": nil}
+			default:
+				result = map[string]any{"resources": []any{map[string]any{"uri": "metis-cu://status", "name": "Computer use status", "mimeType": "application/json"}}}
+			}
+		case "prompts/list":
+			switch mode {
+			case "unsupported-prompt-error":
+				rpcError = map[string]any{"code": -32000, "message": "prompt probe failed"}
+			case "unsupported-no-prompts", "null":
+				rpcError = map[string]any{"code": -32601, "message": "Method not found"}
+			case "unsupported-incomplete-prompts":
+				result = map[string]any{"prompts": []any{map[string]any{"name": "computer_use_minimal"}}}
+			case "unsupported-no-response":
+				continue
+			case "unsupported-disconnect":
+				os.Exit(0)
+			default:
+				result = map[string]any{"prompts": []any{map[string]any{"name": "computer_use_minimal"}, map[string]any{"name": "tier_overview"}, map[string]any{"name": "safe_browse"}}}
+			}
 		case "resources/read":
 			if request.Params["uri"] != "metis-cu://status" {
 				os.Exit(2)
 			}
 			descriptor, _ := json.Marshal(map[string]any{"name": "metis-cu", "protocolVersion": 1, "version": "test", "lifecycle": map[string]any{"state": os.Getenv("METIS_CU_STATUS_STATE")}})
+			if mode == "malformed" {
+				descriptor = []byte(`{"name":"other","protocolVersion":1,"lifecycle":{"state":"running"}}`)
+			}
 			result = map[string]any{"contents": []any{map[string]any{"uri": "metis-cu://status", "mimeType": "application/json", "text": string(descriptor)}}}
+		case "metis-cu/stop", "metis-cu/end-turn":
+			result = map[string]any{"stopped": true, "cleaned": true}
 		}
-		_ = writer.Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
+		if rpcError != nil {
+			_ = writer.Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": rpcError})
+		} else {
+			_ = writer.Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
+		}
 	}
 	os.Exit(0)
 }

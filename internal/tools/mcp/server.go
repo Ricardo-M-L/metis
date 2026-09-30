@@ -482,6 +482,15 @@ func (s *Server) IsSpawned() bool {
 	return s.client != nil
 }
 
+// IsManagedComputerUseConnected reports whether this live server was marked
+// managed only after the executable and handshake were verified. A matching
+// server name by itself is not sufficient to enable native input controls.
+func (s *Server) IsManagedComputerUseConnected() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return !s.closed && s.client != nil && s.managedComputerUse
+}
+
 // NotifyLive delivers lifecycle control only to an already connected server.
 // Stopping an unused lazy component must never start a new process.
 func (s *Server) NotifyLive(ctx context.Context, method string, params any) error {

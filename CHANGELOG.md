@@ -7,6 +7,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.83] - 2026-09-30
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Fixed
+
+- Report a verified Computer Use 0.0.2 MCP connection as responsive even
+  though that helper lacks a detailed status resource; keep live permissions
+  and lifecycle unknown in that compatibility mode.
+- Bundle Computer Use 0.0.3 with a real status resource and reject release
+  candidates whose advertised status capability is missing from MCP.
+- Translate the legacy connection state in the selected Desktop language.
+
 ## [0.4.82] - 2026-09-30
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

@@ -82,8 +82,13 @@ jobs:
           set -euo pipefail
           repository=$(jq -er .repository .github/computer-use-release.json)
           commit=$(jq -er .commit .github/computer-use-release.json)
+          expected_version=$(jq -r '.version // empty' .github/computer-use-release.json)
           [[ "$repository" =~ ^https://github\.com/[^/]+/[^/]+\.git$ ]]
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          if [ -n "$expected_version" ]; then
+            [[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            echo "CU_EXPECTED_VERSION=$expected_version" >> "$GITHUB_ENV"
+          fi
           git clone --filter=blob:none --no-checkout "$repository" "$RUNNER_TEMP/metis-cu-source"
           git -C "$RUNNER_TEMP/metis-cu-source" fetch --depth=1 origin "$commit"
           git -C "$RUNNER_TEMP/metis-cu-source" checkout --detach "$commit"
@@ -108,8 +113,15 @@ jobs:
           esac
           CGO_ENABLED=1 GOOS=darwin GOARCH="$host_arch" go build -trimpath -o "$RUNNER_TEMP/metis-cu-host" .
           version=$($RUNNER_TEMP/metis-cu-host --version | awk 'NR == 1 { print $2 }')
-          test -n "$version"
-          python3 "$GITHUB_WORKSPACE/release-tools/scripts/validate-computer-use-helper.py" \
+          if [ -n "${CU_EXPECTED_VERSION:-}" ]; then
+            test "$version" = "$CU_EXPECTED_VERSION"
+            validator="$GITHUB_WORKSPACE/release-tools/scripts/validate-computer-use-helper.py"
+          else
+            # Historical draft rebuilds retain the validator shipped by the
+            # source tag. Older helpers did not expose a status resource.
+            validator="$GITHUB_WORKSPACE/source/scripts/validate-computer-use-helper.py"
+          fi
+          python3 "$validator" \
             --binary "$RUNNER_TEMP/metis-cu-host" \
             --target "darwin-$host_arch" \
             --version "$version"
