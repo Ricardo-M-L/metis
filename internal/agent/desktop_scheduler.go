@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Requests have kernel-held liveness locks. A crashed worker therefore leaves
@@ -304,6 +306,54 @@ func DesktopSchedulerIdle(dir string) (bool, error) {
 	return len(active) == 0 && len(queue) == 0, err
 }
 
+// DesktopSchedulerOccupancy samples the kernel-held execution permits under
+// scheduler.lock. Unlike roster lifecycle states, this measures slots that are
+// actually occupied across all workers sharing dir at this instant.
+func DesktopSchedulerOccupancy(dir string, total int) (int, error) {
+	if strings.TrimSpace(dir) == "" {
+		return 0, nil
+	}
+	if total < 1 || total > 64 {
+		return 0, errors.New("desktop scheduler: invalid total capacity")
+	}
+	// Status is polled frequently; contention should skip one sample rather
+	// than hold an HTTP request for the longer idle-inspection timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	unlock, err := desktopSchedulerLock(ctx, dir)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+	active, _, err := scanDesktopSlots(dir, total)
+	return len(active), err
+}
+
+type desktopExecutionPhase uint32
+
+const (
+	desktopExecutionWaitingSlot desktopExecutionPhase = iota
+	desktopExecutionExecuting
+	desktopExecutionWaitingBackground
+	desktopExecutionWaitingChildren
+	desktopExecutionFinished
+)
+
+func (phase desktopExecutionPhase) String() string {
+	switch phase {
+	case desktopExecutionExecuting:
+		return "executing"
+	case desktopExecutionWaitingBackground:
+		return "waiting_background"
+	case desktopExecutionWaitingChildren:
+		return "waiting_children"
+	case desktopExecutionFinished:
+		return "finished"
+	default:
+		return "waiting_slot"
+	}
+}
+
 // DesktopExecutionLease belongs to one loop, never its descendants. Pausing a
 // coordinating parent releases both its global and per-root execution charge;
 // resuming joins the fair queue again. Logical agent identities remain intact.
@@ -313,6 +363,17 @@ type DesktopExecutionLease struct {
 	acquire func(context.Context) (func(), error)
 	release func()
 	closed  bool
+	// Read without mu so a status sampler can observe waiting_slot while a
+	// resume call is blocked in the scheduler queue holding mu.
+	phase atomic.Uint32
+}
+
+func (l *DesktopExecutionLease) executionSnapshot() (string, bool) {
+	if l == nil {
+		return "executing", false // ordinary CLI: no Desktop execution slot
+	}
+	phase := desktopExecutionPhase(l.phase.Load())
+	return phase.String(), phase == desktopExecutionExecuting
 }
 
 func (l *DesktopExecutionLease) Close() {
@@ -322,17 +383,25 @@ func (l *DesktopExecutionLease) Close() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.closed = true
+	// Publish a conservative held bit before freeing the permit. A status
+	// sampler must never count this lease and its replacement as both held.
+	l.phase.Store(uint32(desktopExecutionFinished))
 	if l.release != nil {
 		l.release()
 		l.release = nil
 	}
 }
-func (l *DesktopExecutionLease) pause() {
+func (l *DesktopExecutionLease) pause(reason desktopExecutionPhase) {
 	if l == nil {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if !l.closed {
+		// Clear the published held bit before another worker can acquire
+		// the released slot. The kernel lock remains the exact global count.
+		l.phase.Store(uint32(reason))
+	}
 	if l.release != nil {
 		l.release()
 		l.release = nil
@@ -350,9 +419,11 @@ func (l *DesktopExecutionLease) resume(ctx context.Context) error {
 	if l.release != nil {
 		return ctx.Err()
 	}
+	l.phase.Store(uint32(desktopExecutionWaitingSlot))
 	release, err := l.acquire(ctx)
 	if err == nil {
 		l.release = release
+		l.phase.Store(uint32(desktopExecutionExecuting))
 	}
 	return err
 }
@@ -367,7 +438,11 @@ func desktopLeaseFromContext(ctx context.Context) *DesktopExecutionLease {
 // YieldDesktopExecution is used only at explicit coordination/wait boundaries.
 // Ordinary file/command tool execution keeps its loop's execution charge.
 func YieldDesktopExecution(ctx context.Context) func(context.Context) error {
+	return yieldDesktopExecution(ctx, desktopExecutionWaitingChildren)
+}
+
+func yieldDesktopExecution(ctx context.Context, reason desktopExecutionPhase) func(context.Context) error {
 	lease := desktopLeaseFromContext(ctx)
-	lease.pause()
+	lease.pause(reason)
 	return lease.resume
 }

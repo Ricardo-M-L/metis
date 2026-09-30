@@ -899,7 +899,7 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 
 	var executionErr error
 	if len(coordinatingJobs) != 0 {
-		resume := YieldDesktopExecution(ctx)
+		resume := yieldDesktopExecution(ctx, desktopExecutionWaitingChildren)
 		for _, j := range coordinatingJobs {
 			if j.t.Concurrency(j.blk.ToolInput) == tools.ConcurrencyBackground {
 				results[j.idx] = l.runExecute(ctx, j.t, j.blk, out, tc, j.dispatchEpoch, j.traceInvocationID, j.traceParentInvocationID, j.traceCallID)

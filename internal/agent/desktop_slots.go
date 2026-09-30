@@ -132,7 +132,7 @@ func AcquireDesktopTeammateExecution(ctx context.Context, roster *Roster, t *Tea
 		return ctx, nil
 	}
 	if err = ctx.Err(); err == nil {
-		err = roster.TryStartQueued(t, lease.Close)
+		err = roster.tryStartQueued(t, lease.Close, lease)
 	}
 	if err != nil {
 		lease.Close()

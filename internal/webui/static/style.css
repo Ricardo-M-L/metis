@@ -3783,31 +3783,117 @@ html, body { font-size: var(--font-base); }
 @media (hover: none) {
   .tc-inspect, .tc-open-agent:not([hidden]) { opacity: 1; min-height: 28px; }
 }
-/* Expanded IN/OUT card (DSH ioCard). */
+/* Expanded tool details sit in the conversation rhythm. The full request and
+   response remain available in Inspect, so the inline preview stays quiet. */
 .tc-body { display: none; }
 .call-row.open .tc-body { display: block; }
 .tc-io {
   display: flex;
   flex-direction: column;
-  margin: 4px 0 4px 4px;
-  border: 1px solid var(--border-faint);
-  border-radius: 12px;
-  background: var(--code-bg);
-  font: 400 12px/18px var(--font-mono);
+  min-width: 0;
+  margin: 7px 0 6px 22px;
+  border-left: 1px solid var(--border-faint);
+  color: var(--fg-mid);
 }
 .tc-io-sec {
   display: grid;
-  grid-template-columns: max-content 1fr;
-  column-gap: 14px;
-  align-items: baseline;
-  padding: 12px 16px;
-  max-height: 150px;
+  grid-template-columns: 42px minmax(0, 1fr);
+  column-gap: 10px;
+  align-items: start;
+  padding: 6px 0 6px 13px;
+  max-height: 124px;
   overflow-y: auto;
 }
-.tc-io-label { position: sticky; top: 0; align-self: start; color: var(--fg-faint); }
-.tc-io-div { flex: none; height: 1px; background: var(--border); }
-.tc-io-text { min-width: 0; white-space: pre-wrap; word-break: break-word; color: var(--fg-mid); }
+.tc-io-label {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  color: var(--fg-faint);
+  font: 500 11px/19px var(--font-ui);
+}
+.tc-io-div { flex: none; height: 1px; margin-left: 13px; background: var(--border-faint); }
+.tc-io-text {
+  min-width: 0;
+  color: var(--fg-mid);
+  font: 400 12.5px/19px var(--font-mono);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
 .tc-io-text[data-error] { color: var(--error); }
+
+/* Web search is a result preview, not a JSON request log. The original
+   request and complete model-facing response live in Inspect. */
+.tc-io.tc-web {
+  display: block;
+  margin: 8px 0 6px 22px;
+  padding: 2px 0 2px 15px;
+  border-left: 1px solid var(--border-faint);
+  background: transparent;
+  font-family: var(--font-ui);
+}
+.tc-web-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 4px;
+}
+.tc-web-count { color: var(--fg-strong); font-size: 12.5px; font-weight: 600; line-height: 20px; }
+.tc-web-provider { color: var(--fg-faint); font-size: 11px; line-height: 18px; text-align: right; }
+.tc-web-empty { padding: 1px 0 7px; color: var(--fg-mid); font-size: 13px; line-height: 21px; }
+.tc-web-preview,
+.tc-web-error {
+  max-height: 78px;
+  overflow: hidden;
+  color: var(--fg-mid);
+  font: 400 12.5px/19px var(--font-ui);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.tc-web-error { color: var(--error); }
+.tc-web-list { min-width: 0; }
+.tc-web-result {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  padding: 9px 0;
+  border-top: 1px solid var(--border-faint);
+}
+.tc-web-result[hidden] { display: none; }
+.tc-web-index { color: var(--fg-faint); font: 500 11px/20px var(--font-mono); }
+.tc-web-content { display: flex; flex-direction: column; min-width: 0; }
+.tc-web-title {
+  min-width: 0;
+  color: var(--fg-strong);
+  font: 600 13px/20px var(--font-ui);
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+a.tc-web-title:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+a.tc-web-title:focus-visible,
+.tc-web-more:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+.tc-web-domain { color: var(--fg-faint); font: 400 11px/17px var(--font-ui); overflow-wrap: anywhere; }
+.tc-web-snippet {
+  display: -webkit-box;
+  max-width: 100%;
+  margin: 3px 0 0;
+  overflow: hidden;
+  color: var(--fg-mid);
+  font: 400 12.5px/18px var(--font-ui);
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.tc-web-more {
+  padding: 6px 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font: 500 12px/18px var(--font-ui);
+}
+.tc-web-more:hover { text-decoration: underline; text-underline-offset: 2px; }
 
 /* File edits use the persisted tool input to render the same compact diff in
    live turns and restored sessions. The raw input/output remains in Inspect. */
@@ -6623,7 +6709,15 @@ button.settings-item {
 .status-agent-name { display: grid; min-width: 0; gap: 2px; }
 .status-agent-name strong { overflow: hidden; color: inherit; font-size: 12.5px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .status-agent-name small { overflow: hidden; color: var(--fg-faint); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
-.status-agent-state { color: var(--fg-dim); font-size: 11px; white-space: nowrap; }
+.status-agent-state {
+  max-width: 148px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  text-align: right;
+  white-space: normal;
+}
 .status-dot.unknown { background: var(--fg-faint); }
 
 .subagent-detail-overlay {

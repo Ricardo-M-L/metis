@@ -245,20 +245,29 @@ func (t TaskUpdate) Execute(ctx context.Context, in map[string]any) (*tools.Resu
 	}
 	patch.AddBlocks = stringSlice(in["addBlocks"])
 	patch.AddBlockedBy = stringSlice(in["addBlockedBy"])
-	tk, err := store.Update(id, patch)
+	var tk *taskstore.Task
+	var snapshot *taskstore.UpdateSnapshot
+	if patch.Status != nil && *patch.Status == taskstore.TaskCompleted {
+		snapshot, err = store.UpdateWithSnapshot(id, patch)
+		if err == nil {
+			tk = snapshot.Task
+		}
+	} else {
+		tk, err = store.Update(id, patch)
+	}
 	if err != nil {
 		return nil, err
 	}
 	out := fmt.Sprintf("Updated task #%s status", tk.ID)
-	if nudge := verifierNudge(store, patch.Status); nudge != "" {
+	if nudge := verifierNudge(snapshot); nudge != "" {
 		out += "\n\n" + nudge
 	}
 	return &tools.Result{Output: out}, nil
 }
 
-// verifierNudge returns a non-empty message when the just-completed
-// task pushes the session over the "3+ completed, 0 verify steps"
-// threshold. The nudge lands inside the TaskUpdate tool result so
+// verifierNudge returns a non-empty message when this update first moves the
+// session to three completed tasks with no verify step. The nudge lands inside
+// the TaskUpdate tool result so
 // the LLM observes it on the same turn it claimed completion —
 // stronger than any system-prompt suggestion because tool results
 // are read on every loop iteration.
@@ -274,19 +283,16 @@ func (t TaskUpdate) Execute(ctx context.Context, in map[string]any) (*tools.Resu
 //     "vet" / "lint" / "audit" (case-insensitive), OR
 //   - task owner is "verify" / "verifier" / "reviewer".
 //
-// Returns "" when:
-//   - the patch didn't transition status to completed (other
-//     edits don't trip the nudge), or
-//   - <3 completed tasks total (small lists are noisy), or
-//   - at least one task already counts as a verify step.
-func verifierNudge(store *taskstore.TaskStore, status *taskstore.TaskStatus) string {
-	if status == nil || *status != taskstore.TaskCompleted {
+// Returns "" when this task was already completed, the threshold was not
+// crossed by this update, or a tracked task already counts as verification.
+func verifierNudge(snapshot *taskstore.UpdateSnapshot) string {
+	if snapshot == nil || snapshot.Task == nil || snapshot.Task.Status != taskstore.TaskCompleted ||
+		snapshot.PreviousStatus == taskstore.TaskCompleted {
 		return ""
 	}
-	all := store.List(false)
 	completed := 0
 	hasVerifyStep := false
-	for _, tk := range all {
+	for _, tk := range snapshot.Tasks {
 		if isVerifyTask(tk) {
 			hasVerifyStep = true
 		}
@@ -294,10 +300,10 @@ func verifierNudge(store *taskstore.TaskStore, status *taskstore.TaskStatus) str
 			completed++
 		}
 	}
-	if completed < 3 || hasVerifyStep {
+	if completed != 3 || hasVerifyStep {
 		return ""
 	}
-	return "NUDGE: you just closed task #" + idOf(all, status) +
+	return "NUDGE: you just closed task #" + snapshot.Task.ID +
 		" and the session now has " + intStr(completed) +
 		" completed tasks with no verify/test/review step among them.\n" +
 		"Per the dispatch contract: before claiming this work done, spawn\n" +
@@ -320,21 +326,6 @@ func isVerifyTask(tk *taskstore.Task) bool {
 	}
 	owner := strings.ToLower(tk.Owner)
 	return owner == "verify" || owner == "verifier" || owner == "reviewer"
-}
-
-// idOf is best-effort — the nudge references the last completed
-// task. We don't have the actual changed-task id wired through
-// (TaskStore.Update returns the patched task but verifierNudge runs
-// after the message is built), so we scan for the most-recent
-// completed entry. Cheap on small lists; the nudge text degrades
-// gracefully if List is empty.
-func idOf(all []*taskstore.Task, _ *taskstore.TaskStatus) string {
-	for i := len(all) - 1; i >= 0; i-- {
-		if all[i].Status == taskstore.TaskCompleted {
-			return all[i].ID
-		}
-	}
-	return "?"
 }
 
 // --- TaskOutput ---

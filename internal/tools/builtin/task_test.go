@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -390,6 +391,115 @@ func TestTaskUpdate_VerifierNudge_Fires(t *testing.T) {
 				t.Errorf("nudge should reference the verifier's VERDICT contract; got: %q", res.Output)
 			}
 		}
+	}
+}
+
+func TestTaskUpdate_VerifierNudge_NamesJustCompletedTask(t *testing.T) {
+	setupTaskTestEnv(t)
+	store := taskstore.CurrentTaskStore()
+	for _, subject := range []string{"build parser", "build emitter", "build CLI"} {
+		if _, err := store.Create(subject, "", "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	upd := TaskUpdate{gate: permission.New(permission.ModeBypass)}
+	for _, id := range []string{"1", "3", "2"} {
+		res, err := upd.Execute(context.Background(), map[string]any{
+			"taskId": id, "status": "completed",
+		})
+		if err != nil {
+			t.Fatalf("Update %s: %v", id, err)
+		}
+		if id == "2" {
+			if !strings.Contains(res.Output, "NUDGE: you just closed task #2 ") {
+				t.Errorf("third completion should identify task #2; got: %q", res.Output)
+			}
+		} else if strings.Contains(res.Output, "NUDGE:") {
+			t.Errorf("completion of task #%s is under threshold; got: %q", id, res.Output)
+		}
+	}
+}
+
+func TestTaskUpdate_VerifierNudge_OnlyOnFirstThresholdCrossing(t *testing.T) {
+	setupTaskTestEnv(t)
+	store := taskstore.CurrentTaskStore()
+	for _, subject := range []string{"build parser", "build emitter", "build CLI", "build renderer"} {
+		if _, err := store.Create(subject, "", "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	upd := TaskUpdate{gate: permission.New(permission.ModeBypass)}
+	for step, id := range []string{"1", "2", "3", "4", "3"} {
+		res, err := upd.Execute(context.Background(), map[string]any{
+			"taskId": id, "status": "completed",
+		})
+		if err != nil {
+			t.Fatalf("Update %s: %v", id, err)
+		}
+		// Only the first update of #3 crosses from two to three completed tasks.
+		hasNudge := strings.Contains(res.Output, "NUDGE:")
+		if want := step == 2; hasNudge != want {
+			t.Errorf("update %d of task #%s: nudge = %t, want %t; output: %q", step+1, id, hasNudge, want, res.Output)
+		}
+		if step == 2 && hasNudge && !strings.Contains(res.Output, "NUDGE: you just closed task #3 ") {
+			t.Errorf("threshold nudge has wrong attribution: %q", res.Output)
+		}
+	}
+}
+
+func TestTaskUpdate_VerifierNudge_ConcurrentCompletions(t *testing.T) {
+	setupTaskTestEnv(t)
+	store := taskstore.CurrentTaskStore()
+	const taskCount = 8
+	for i := 1; i <= taskCount; i++ {
+		if _, err := store.Create("implementation "+strconv.Itoa(i), "", "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type updateResult struct {
+		id     string
+		output string
+		err    error
+	}
+	upd := TaskUpdate{gate: permission.New(permission.ModeBypass)}
+	start := make(chan struct{})
+	results := make(chan updateResult, taskCount)
+	for i := 1; i <= taskCount; i++ {
+		id := strconv.Itoa(i)
+		go func() {
+			<-start
+			res, err := upd.Execute(context.Background(), map[string]any{
+				"taskId": id, "status": "completed",
+			})
+			if err != nil {
+				results <- updateResult{id: id, err: err}
+				return
+			}
+			results <- updateResult{id: id, output: res.Output}
+		}()
+	}
+	close(start)
+
+	nudges := 0
+	for i := 0; i < taskCount; i++ {
+		result := <-results
+		if result.err != nil {
+			t.Errorf("Update %s: %v", result.id, result.err)
+			continue
+		}
+		if !strings.Contains(result.output, "NUDGE:") {
+			continue
+		}
+		nudges++
+		if !strings.Contains(result.output, "NUDGE: you just closed task #"+result.id+" ") {
+			t.Errorf("task #%s received a nudge for another task: %q", result.id, result.output)
+		}
+	}
+	if nudges != 1 {
+		t.Errorf("concurrent completions produced %d nudges, want exactly one", nudges)
 	}
 }
 

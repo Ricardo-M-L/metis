@@ -104,15 +104,37 @@ func (s *Server) workerViewRoster(sessionID string) map[string]any {
 		"backgroundTasks": 0, "agents": make([]map[string]any, 0),
 		"jobs": make([]map[string]any, 0),
 	}
+	// This is a scheduler-lock snapshot of the Desktop-wide pool, independent
+	// of the selected session's lifecycle roster. Worker status is sampled on a
+	// separate cadence, so the two counts need not agree in the same response.
+	if s.desktopAgentSlotDir != "" {
+		view["heldExecutionSlots"] = 0
+		total := 0
+		if runner, ok := s.isolatedRunner.(*processIsolatedTurnRunner); ok {
+			total, _ = runner.agentLimits()
+		} else {
+			total = s.maxTotalAgentSlots
+		}
+		if total > 0 {
+			if held, err := agent.DesktopSchedulerOccupancy(s.desktopAgentSlotDir, total); err == nil {
+				view["executionSlots"] = map[string]int{"held": held, "total": total}
+			}
+		}
+	}
 	status, ok := s.workerSnapshot(sessionID)
 	if !ok {
 		return view
 	}
 	agents := make([]map[string]any, 0, len(status.Agents))
+	heldChildren := 0
 	for _, item := range status.Agents {
+		if item.HoldsExecutionSlot {
+			heldChildren++
+		}
 		agents = append(agents, map[string]any{
 			"sessionId": sessionID, "name": item.Name, "agentId": item.AgentID,
 			"status": item.Status, "background": item.Background,
+			"executionPhase": item.ExecutionPhase, "holdsExecutionSlot": item.HoldsExecutionSlot,
 			"startedAt": item.StartedAt,
 		})
 	}
@@ -127,6 +149,9 @@ func (s *Server) workerViewRoster(sessionID string) map[string]any {
 	view["subAgents"] = status.SubAgents
 	view["namedAgents"] = status.NamedAgents
 	view["backgroundTasks"] = status.BackgroundTasks
+	if s.desktopAgentSlotDir != "" {
+		view["heldExecutionSlots"] = heldChildren
+	}
 	view["agents"] = agents
 	view["jobs"] = jobs
 	return view
@@ -162,7 +187,8 @@ func (s *Server) workerSubAgentDetail(sessionID, agentID string) (subAgentDetail
 
 func subAgentDetailFromWorker(sessionID string, a desktopipc.Subagent) subAgentDetailView {
 	return subAgentDetailView{
-		SessionID: sessionID, Name: a.Name, AgentID: a.AgentID, Status: a.Status, Background: a.Background,
+		SessionID: sessionID, Name: a.Name, AgentID: a.AgentID, Status: a.Status,
+		ExecutionPhase: a.ExecutionPhase, HoldsExecutionSlot: a.HoldsExecutionSlot, Background: a.Background,
 		StartedAt: a.StartedAt, EndedAt: a.EndedAt, ElapsedMS: a.ElapsedMS,
 		Output: a.Output, OutputTruncated: a.OutputTruncated, Result: a.Result,
 		ResultTruncated: a.ResultTruncated, StopHint: a.StopHint, ExitError: a.ExitError,

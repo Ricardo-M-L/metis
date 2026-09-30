@@ -301,7 +301,8 @@ function applyActivityPresentationMode(value) {
 function activityToolKind(name) {
   const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
   if (['bash', 'pwsh', 'exec', 'execcommand', 'shell', 'runcommand'].includes(key)) return 'command';
-  if (['grep', 'glob', 'search', 'websearch', 'filesearch'].includes(key)) return 'search';
+  if (key === 'websearch') return 'websearch';
+  if (['grep', 'glob', 'search', 'filesearch'].includes(key)) return 'search';
   if (['read', 'webfetch', 'list', 'ls'].includes(key)) return 'read';
   if (['edit', 'write', 'applypatch', 'multiedit'].includes(key)) return 'edit';
   if (['agent', 'task', 'spawnagent'].includes(key)) return 'agent';
@@ -550,6 +551,7 @@ function activityKindLabels() {
   return {
     command: uiText('Ran commands', '执行了命令'),
     search: uiText('Searched code', '已搜索代码'),
+    websearch: uiText('Searched the web', '已搜索网页'),
     read: uiText('Read files', '已读取文件'),
     edit: uiText('Edited files', '修改了文件'),
     agent: uiText('Delegated work', '分派了任务'),
@@ -702,9 +704,14 @@ function refreshActivityGroupLanguage() {
       if (inspect) inspect.textContent = uiText('Inspect', '查看详情');
       const openAgent = row.querySelector('.tc-open-agent');
       if (openAgent) openAgent.textContent = uiText('Open agent', '打开子代理');
-      const labels = row.querySelectorAll('.tc-io-label');
-      if (labels[0]) labels[0].textContent = uiText('IN', '输入');
-      if (labels[1]) labels[1].textContent = uiText('OUT', '输出');
+      if (isWebSearchTool(row.dataset.tool)) {
+        const detail = toolDetails[row.dataset.rowKey];
+        renderWebSearchInline(row, detail?.output || '', row.dataset.state);
+      } else {
+        const labels = row.querySelectorAll('.tc-io-label');
+        if (labels[0]) labels[0].textContent = uiText('IN', '输入');
+        if (labels[1]) labels[1].textContent = uiText('OUT', '输出');
+      }
       updateToolRowAccessibleLabel(row);
     });
     updateActivityGroupSummary(group);
@@ -1722,7 +1729,7 @@ function renderDetailPanel() {
     const state = row?.dataset.state || d.state || (d.error ? 'error' : 'incomplete');
     const lines = [
       [uiText('Tool', '工具'), d.name],
-      [uiText('Status', '状态'), subagentRowStatusLabel(row?.dataset.subagentStatus) || toolRowStateLabel(state)],
+      [uiText('Status', '状态'), subagentRowVisibleStatus(row) || toolRowStateLabel(state)],
       [uiText('Duration', '用时'), d.elapsed ? fmtMs(d.elapsed) : '-'],
       [uiText('Input', '输入'), d.input ? uiText('(see Input tab)', '（见输入页）') : uiText('(none)', '（无）')],
       [uiText('Output', '输出'), d.output ? uiText('(see Output tab)', '（见输出页）') : uiText('(none)', '（无）')],
@@ -1807,12 +1814,32 @@ function subagentRowStatusLabel(status) {
   return labels[status] || '';
 }
 
+function subagentRowExecutionPhaseLabel(phase) {
+  const labels = {
+    queued: uiText('Queued', '排队中'),
+    executing: uiText('Executing', '执行中'),
+    waiting_background: uiText('Waiting for background task', '等待后台任务'),
+    waiting_children: uiText('Waiting for child agents', '等待子代理'),
+    waiting_slot: uiText('Waiting for execution slot', '等待执行槽'),
+  };
+  return labels[phase] || '';
+}
+
+function subagentRowVisibleStatus(row) {
+  if (!row) return '';
+  const status = row.dataset.subagentStatus;
+  const lifecycle = subagentRowStatusLabel(status);
+  if (!lifecycle || !['queued', 'running'].includes(status)) return lifecycle;
+  const phase = subagentRowExecutionPhaseLabel(row.dataset.subagentExecutionPhase);
+  return phase && phase !== lifecycle ? lifecycle + ' · ' + phase : lifecycle;
+}
+
 function updateToolRowAccessibleLabel(row) {
   const control = row && row.querySelector('.tc-disclosure');
   if (!control) return;
   const title = row.querySelector('.tc-title')?.textContent || toolVariantOf(row.dataset.tool).title;
   const summary = row.querySelector('.tc-summary')?.textContent || '';
-  const childStatus = isSubagentTool(row.dataset.tool) ? subagentRowStatusLabel(row.dataset.subagentStatus) : '';
+  const childStatus = isSubagentTool(row.dataset.tool) ? subagentRowVisibleStatus(row) : '';
   if (childStatus) {
     let badge = row.querySelector('.tc-subagent-state');
     if (!badge) {
@@ -1866,6 +1893,7 @@ function settleUnfinishedActivityTools(turn, turnState, reason = '') {
         toolDetails[id].error = toolState === 'error';
         toolDetails[id].stopped = toolState === 'stopped';
       }
+      if (isWebSearchTool(row.dataset.tool)) renderWebSearchInline(row, message, toolState);
       if (stats && toolState === 'error') stats.errors++;
     });
     if (stats) {
@@ -1936,6 +1964,160 @@ function toolSummaryText(name, input) {
   const base = firstLine(val || input);
   if (v === undefined && name && name !== 'tool') return name + ' \u00B7 ' + base;
   return base;
+}
+
+function isWebSearchTool(name) {
+  return String(name || '').toLowerCase().replace(/[^a-z]/g, '') === 'websearch';
+}
+
+// The inline view is a quick scan, not a second copy of the inspector's JSON.
+// Single-value arguments stay readable while the full request is preserved in
+// toolDetails and the Input tab.
+function inlineToolInputText(input) {
+  try {
+    const args = JSON.parse(input);
+    if (args && typeof args === 'object' && !Array.isArray(args)) {
+      const entries = Object.entries(args);
+      if (entries.length === 1 && typeof entries[0][1] === 'string') return entries[0][1];
+    }
+    return JSON.stringify(args, null, 2);
+  } catch (_) { return input; }
+}
+
+// WebSearch is a model-facing text format, not JSON. Only accept the exact
+// header/footer family emitted by formatSearchResults; future/foreign formats
+// fall back to a bounded plain-text preview rather than a false result count.
+function parseWebSearchOutput(output) {
+  const raw = String(output || '');
+  // Live SSE sends at most 600 runes; persisted history has the full text.
+  // Do not treat the model-facing header's total as that many visible items.
+  const truncated = raw.endsWith('...(truncated)');
+  const lines = (truncated ? raw.slice(0, -'...(truncated)'.length) : raw).replace(/\r\n/g, '\n').split('\n');
+  const header = lines[0] || '';
+  const empty = /^WebSearch ".*": no results\. Try rephrasing the query\.$/.test(header);
+  const match = /^WebSearch ".*" — (\d{1,2}) results:$/.exec(header);
+  if (!empty && !match) return null;
+  const expected = match ? Number(match[1]) : 0;
+  if (expected > 20) return null;
+  const items = [];
+  let current = null;
+  let via = '';
+  let fallback = false;
+  for (const line of lines.slice(1)) {
+    const provider = /^\[via ([^\]·]+)(?: · [^\]]*)?\]$/.exec(line);
+    if (provider) { via = provider[1].trim(); continue; }
+    if (/^\[fallback: /.test(line)) { fallback = true; continue; }
+    if (empty) continue;
+    const result = /^(\d{1,2})\. (.*)$/.exec(line);
+    if (result) {
+      if (current) items.push(current);
+      current = { position: Number(result[1]), title: result[2], link: '', snippet: '' };
+    } else if (current && /^   \S/.test(line)) {
+      const value = line.trim();
+      if (!current.link && /^https?:\/\//i.test(value)) current.link = value;
+      else current.snippet += (current.snippet ? ' ' : '') + value;
+    }
+  }
+  // The last row of a clipped SSE event may end in the middle of a title,
+  // URL, or snippet. Keep only entries closed by the next numbered row.
+  if (current && !truncated) items.push(current);
+  if (!empty && (expected === 0 || (!truncated && items.length !== expected) || (truncated && !items.length))) return null;
+  if (!via && !truncated && !empty) return null;
+  return { count: expected, items, via, fallback, truncated: truncated && !empty };
+}
+
+function safeWebSearchURL(raw) {
+  if (!raw || raw.length > 2048) return null;
+  try {
+    const link = new URL(raw);
+    if (!['http:', 'https:'].includes(link.protocol) || !link.hostname || link.username || link.password) return null;
+    return { href: link.href, domain: link.hostname.replace(/^www\./i, '') };
+  } catch (_) { return null; }
+}
+
+function webSearchNode(parent, tag, className, value) {
+  const node = document.createElement(tag);
+  node.className = className;
+  if (value !== undefined) node.textContent = String(value);
+  parent.appendChild(node);
+  return node;
+}
+
+function renderWebSearchInline(row, output, state, expanded) {
+  const root = row?.querySelector('.tc-io');
+  if (!root) return;
+  if (expanded === undefined) expanded = root.dataset.expanded === 'true';
+  root.classList.add('tc-web');
+  root.dataset.expanded = String(!!expanded);
+  [...root.children].forEach(child => child.remove());
+  const parsed = state === 'ok' ? parseWebSearchOutput(output) : null;
+  const summary = row.querySelector('.tc-summary');
+  if (summary) {
+    const query = boundedToolLabel(toolSummaryText(row.dataset.tool, row.getAttribute('data-args') || ''));
+    const count = parsed ? (parsed.truncated
+      ? uiText(`${parsed.items.length}/${parsed.count} results`, `${parsed.items.length}/${parsed.count} 条结果`)
+      : uiText(`${parsed.count} result${parsed.count === 1 ? '' : 's'}`, `${parsed.count} 条结果`)) : '';
+    const failure = state === 'error' ? uiText('Failed', '失败') : '';
+    summary.textContent = [query, count || failure].filter(Boolean).join(' · ') || uiText('Web search', '网页搜索');
+  }
+  if (state === 'running') {
+    webSearchNode(root, 'div', 'tc-web-preview', uiText('Searching…', '正在搜索…'));
+    return;
+  }
+  if (state !== 'ok') {
+    const message = state === 'stopped' ? uiText('Search interrupted', '搜索已中断')
+      : state === 'incomplete' ? uiText('Search result unavailable', '未收到搜索结果')
+      : uiText('Search failed', '搜索失败');
+    const error = webSearchNode(root, 'div', state === 'error' ? 'tc-web-error' : 'tc-web-empty', message);
+    if (state === 'error' && output) webSearchNode(error, 'p', 'tc-web-preview', firstLine(output).slice(0, 280));
+    return;
+  }
+  if (!parsed) {
+    webSearchNode(root, 'div', 'tc-web-head', uiText('Search response', '搜索响应'));
+    let preview = String(output || '').trim();
+    try {
+      const query = JSON.parse(row.getAttribute('data-args') || '{}').query;
+      const prefix = `WebSearch "${query}"`;
+      if (typeof query === 'string' && preview.startsWith(prefix)) {
+        preview = preview.slice(prefix.length).replace(/^[\s:—]+/, '');
+      }
+    } catch (_) {}
+    webSearchNode(root, 'div', 'tc-web-preview', (preview || uiText('No response text', '无响应内容')).slice(0, 360));
+    return;
+  }
+  const head = webSearchNode(root, 'div', 'tc-web-head');
+  webSearchNode(head, 'span', 'tc-web-count', parsed.truncated
+    ? uiText(`Showing ${parsed.items.length} of ${parsed.count} results`, `显示 ${parsed.items.length} / ${parsed.count} 条结果`)
+    : uiText(`${parsed.count} result${parsed.count === 1 ? '' : 's'}`, `${parsed.count} 条结果`));
+  if (parsed.via) webSearchNode(head, 'span', 'tc-web-provider', uiText('via ', '来源 ') + parsed.via + (parsed.fallback ? uiText(' · fallback', ' · 已回退') : ''));
+  if (!parsed.count) {
+    webSearchNode(root, 'div', 'tc-web-empty', uiText('No results. Try another query.', '未找到结果，试试调整关键词。'));
+    return;
+  }
+  const list = webSearchNode(root, 'div', 'tc-web-list');
+  parsed.items.forEach((item, index) => {
+    const result = webSearchNode(list, 'div', 'tc-web-result');
+    if (index >= 3 && !expanded) result.hidden = true;
+    webSearchNode(result, 'span', 'tc-web-index', String(item.position).padStart(2, '0'));
+    const content = webSearchNode(result, 'div', 'tc-web-content');
+    const safeURL = safeWebSearchURL(item.link);
+    const title = webSearchNode(content, safeURL ? 'a' : 'span', 'tc-web-title', item.title || uiText('Untitled result', '无标题结果'));
+    if (safeURL) {
+      title.setAttribute('href', safeURL.href);
+      title.setAttribute('target', '_blank');
+      title.setAttribute('rel', 'noopener noreferrer');
+      webSearchNode(content, 'span', 'tc-web-domain', safeURL.domain);
+    }
+    if (item.snippet) webSearchNode(content, 'p', 'tc-web-snippet', item.snippet);
+  });
+  if (parsed.items.length > 3) {
+    const more = webSearchNode(root, 'button', 'tc-web-more', expanded
+      ? uiText('Show fewer', '收起结果')
+      : uiText(`Show ${parsed.items.length - 3} more`, `显示其余 ${parsed.items.length - 3} 条`));
+    more.setAttribute('type', 'button');
+    more.setAttribute('aria-expanded', String(!!expanded));
+    more.addEventListener('click', () => renderWebSearchInline(row, output, state, !expanded));
+  }
 }
 
 const FILE_DIFF_MAX_LINES = 500;
@@ -2075,6 +2257,7 @@ function attachSubagentIdentity(row, info, status) {
   row.dataset.subagentName = boundedToolLabel(info.name || '');
   row.dataset.subagentBackground = String(!!info.background);
   updateSubagentRowStatus(row, status);
+  if (Object.prototype.hasOwnProperty.call(info, 'executionPhase')) updateSubagentRowExecutionPhase(row, info.executionPhase);
   const open = row.querySelector('.tc-open-agent');
   if (open) open.hidden = false;
   updateToolRowAccessibleLabel(row);
@@ -2088,8 +2271,20 @@ function updateSubagentRowStatus(row, status) {
   const lateActiveStatus = ['completed', 'failed', 'killed'].includes(priorStatus) && ['queued', 'running'].includes(status);
   if (status === priorStatus || lateActiveStatus || (status === 'queued' && priorStatus && priorStatus !== 'queued')) return false;
   row.dataset.subagentStatus = status;
+  delete row.dataset.subagentExecutionPhase;
   updateToolRowAccessibleLabel(row);
   updateSubagentStage(row.closest('.activity-group'));
+  if (selectedToolId === row.dataset.rowKey && detailTab === 'summary') renderDetailPanel();
+  return true;
+}
+
+function updateSubagentRowExecutionPhase(row, phase) {
+  if (!row || !['queued', 'running'].includes(row.dataset.subagentStatus)) return false;
+  const next = subagentRowExecutionPhaseLabel(phase) ? String(phase) : '';
+  if (row.dataset.subagentExecutionPhase === next) return false;
+  if (next) row.dataset.subagentExecutionPhase = next;
+  else delete row.dataset.subagentExecutionPhase;
+  updateToolRowAccessibleLabel(row);
   if (selectedToolId === row.dataset.rowKey && detailTab === 'summary') renderDetailPanel();
   return true;
 }
@@ -2103,7 +2298,10 @@ function reconcileSubagentToolRows(roster) {
     if (!row.isConnected || !isSubagentTool(row.dataset.tool) || row.dataset.ownerSession !== owner ||
         row.dataset.subagentSessionId !== owner || ['completed', 'failed', 'killed'].includes(row.dataset.subagentStatus)) return;
     const agent = agents.get(String(row.dataset.subagentId || ''));
-    if (agent) updateSubagentRowStatus(row, agent.status);
+    if (agent) {
+      updateSubagentRowStatus(row, agent.status);
+      updateSubagentRowExecutionPhase(row, agent.executionPhase);
+    }
   });
 }
 
@@ -2199,10 +2397,7 @@ function handleToolArgsDelta(d) {
   if (summary && text) summary.textContent = text;
   updateToolRowAccessibleLabel(card);
   const box = card.querySelector('.tc-io-text[data-in]');
-  if (box) {
-    try { box.textContent = JSON.stringify(JSON.parse(next), null, 2); }
-    catch (e) { box.textContent = next; }
-  }
+  if (box) box.textContent = inlineToolInputText(next);
 }
 
 function handleToolStart(d) {
@@ -2244,10 +2439,7 @@ function handleToolStart(d) {
     updateToolRowAccessibleLabel(existing);
     updateActivityGroupSummary(existing.closest('.activity-group'));
     const box = existing.querySelector('.tc-io-text[data-in]');
-    if (box) {
-      try { box.textContent = JSON.stringify(JSON.parse(full), null, 2); }
-      catch (e) { box.textContent = full; }
-    }
+    if (box) box.textContent = inlineToolInputText(full);
     return;
   }
   // A tool call starts after this assistant text segment. Settle it now;
@@ -2258,10 +2450,7 @@ function handleToolStart(d) {
   finishThinking();
   const v = toolVariantOf(name);
   const summary = toolSummaryText(name, input);
-  const pretty = (() => {
-    try { return JSON.stringify(JSON.parse(input), null, 2); }
-    catch (e) { return input; }
-  })();
+  const pretty = inlineToolInputText(input);
   const rowKey = 'tool-row-' + (++toolRowSequence);
   const bodyId = rowKey + '-body';
   toolDetails[rowKey] = { name: name, input: input, output: '', elapsed: 0, error: false, state: 'running' };
@@ -2291,6 +2480,7 @@ function handleToolStart(d) {
     </div>`);
   const row = area.lastElementChild;
   appendActivityRow(row);
+  if (isWebSearchTool(name)) renderWebSearchInline(row, '', 'running');
   updateToolRowAccessibleLabel(row);
   autoScroll();
 }
@@ -2390,7 +2580,7 @@ function handleToolResult(d) {
     const summary = chip.querySelector('.tc-summary');
     if (!ok && summary) {
       summary.classList.add('err');
-      summary.textContent = semanticToolSummary(name, '') === null
+      summary.textContent = isWebSearchTool(name) ? summary.textContent : semanticToolSummary(name, '') === null
         ? firstLine(d.output) || summary.textContent : semanticToolErrorSummary(name);
     }
     updateToolRowAccessibleLabel(chip);
@@ -2399,6 +2589,7 @@ function handleToolResult(d) {
       out.textContent = d.output || '(no output)';
       if (!ok) out.setAttribute('data-error', 'true');
     }
+    if (isWebSearchTool(name)) renderWebSearchInline(chip, d.output || '', ok ? 'ok' : 'error');
     // DSH SearchBlock parity: a successful Grep renders as a structured
     // search card (summary banner + per-file groups + line rows) instead
     // of the raw text dump. Details panel keeps the raw output.
@@ -2888,6 +3079,21 @@ async function sendMessage(busyBehavior) {
   const input = document.getElementById('inputField');
   const text = input.value.trim();
   if (!text && !attachments.length) return;
+  // Rename changes only the session label. It remains a local command while
+  // a turn (or an ask) is active, including when the composer defaults to
+  // queue/steer. Never forward its slash text to the model.
+  if (/^\/(?:rename|title)(?:\s|$)/i.test(text)) {
+    if (attachments.length) {
+      showToast(uiText('Remove attachments before renaming the session.', '重命名会话前请先移除附件。'));
+      return;
+    }
+    const owner = currentSessionId;
+    input.value = '';
+    autoResize(input);
+    closeCommandMenu();
+    await executeComposerCommand(text, owner);
+    return;
+  }
   if (pendingAsk) {
     input.value = '';
     autoResize(input);
@@ -3215,6 +3421,22 @@ async function syncViewedSessionHistory(sessionId, shouldApply = () => true) {
 }
 
 async function runTurnItem(item) {
+  // Older Desktop versions could queue /rename and /title as user text.
+  // Keep those saved queue items local after an upgrade too. An attachment
+  // cannot be part of a rename: retain that item for editing, pause this
+  // queue, and leave later queued messages untouched.
+  if (/^\/(?:rename|title)(?:\s|$)/i.test(String(item.text || '').trim())) {
+    if (Array.isArray(item.images) && item.images.length) {
+      if (drainingQueuedTurns && queuedSessionId === currentSessionId) {
+        queuedTurns.unshift(item);
+        renderQueuedTurns();
+      }
+      showToast(uiText('Remove attachments from the queued rename before continuing.', '请移除排队重命名中的附件后继续。'));
+      return false;
+    }
+    await executeComposerCommand(item.text, currentSessionId);
+    return true;
+  }
   clearTodoPlan();
   const text = item.text || '';
   const images = item.images || [];
@@ -4278,7 +4500,7 @@ function chooseComposerCommand(name) {
   input.setSelectionRange(input.value.length, input.value.length);
 }
 
-async function executeComposerCommand(text) {
+async function executeComposerCommand(text, targetSessionId = currentSessionId) {
   const match = String(text || '').trim().match(/^(\/[^\s]+)(?:\s+([\s\S]*))?$/);
   if (!match) return false;
   const name = match[1].toLowerCase();
@@ -4293,7 +4515,7 @@ async function executeComposerCommand(text) {
     case '/resume': openSessionFinder(); break;
     case '/history': switchView('chat'); showToast('Showing conversation history'); break;
     case '/rename':
-    case '/title': await renameCurrentSessionFromCommand(input); break;
+    case '/title': await renameCurrentSessionFromCommand(input, targetSessionId); break;
     case '/branch': await branchCurrentSessionFromCommand(); break;
     case '/clear-history': await runSessionCommand('clear-history'); break;
     case '/undo':
@@ -4465,13 +4687,14 @@ function openSessionFinder() {
   else if (input) input.focus();
 }
 
-async function renameCurrentSessionFromCommand(title) {
-  if (!currentSessionId) { showToast('Open a session before renaming it'); return false; }
-  const current = sessions.find(session => session.id === currentSessionId);
+async function renameCurrentSessionFromCommand(title, sessionId = currentSessionId) {
+  const owner = String(sessionId || '');
+  if (!owner) { showToast('Open a session before renaming it'); return false; }
+  const current = sessions.find(session => session.id === owner);
   const next = (title || prompt('Rename session', current ? current.title : '') || '').trim();
   if (!next) return false;
   try {
-    const res = await fetch('/api/sessions/rename', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: currentSessionId, title: next }) });
+    const res = await fetch('/api/sessions/rename', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: owner, title: next }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'rename: ' + res.status);
     await loadSessions();
@@ -5371,11 +5594,11 @@ function renderDesktopParallelismPreference() {
       label: uiText('Parallel workspaces', '并发工作区'),
       desc: uiText('Maximum top-level turns in different workspaces. Each workspace still has one writer.', '不同工作区同时运行的顶层任务上限。同一工作区仍只允许一个写入任务。') },
     { key: 'totalAgentParallelism', value: desktopPreferences.totalAgentParallelism, fallback: 16, max: 64,
-      label: uiText('Total running agents', '运行中代理总数'),
-      desc: uiText('One shared execution pool for top-level turns and child agents. Extra work waits for a free slot.', '顶层任务与子代理共用同一执行池；满额时其余任务等待空位。') },
+      label: uiText('Total execution slots', '总执行槽'),
+      desc: uiText('One shared execution pool for top-level turns and child agents. Extra work waits for a free slot. Waiting on background Bash releases the agent slot; the process itself is outside this limit.', '顶层任务与子代理共用执行槽；满额时其余任务等待空位。代理等待后台 Bash 时会让出执行槽；后台进程本身不计入此上限。') },
     { key: 'subagentParallelism', value: desktopPreferences.subagentParallelism, fallback: 8, max: 32,
-      label: uiText('Child agents per top-level turn', '每个顶层任务的子代理并发数'),
-      desc: uiText('Maximum child agents executing for one top-level turn; they also count toward the total.', '单个顶层任务同时执行的子代理上限；它们也计入代理总数。') },
+      label: uiText('Child execution slots per top-level turn', '每个顶层任务的子代理执行槽'),
+      desc: uiText('Maximum child agents holding an execution slot for one top-level turn. Waiting child agents may stay active without holding a slot.', '单个顶层任务可由子代理占用的执行槽上限；等待中的子代理仍可能显示为运行中，但不占槽。') },
   ];
   const rows = choices.map(choice => `<div class="settings-card-row"><div><div class="settings-card-label">${choice.label}</div><div class="settings-card-desc">${choice.desc} ${uiText(`Default ${choice.fallback}; choose 1–${choice.max}.`, `默认 ${choice.fallback}；可设 1–${choice.max}。`)}</div></div><input type="number" min="1" max="${choice.max}" step="1" class="settings-number" value="${escAttr(String(Number(choice.value) || choice.fallback))}" aria-label="${escAttr(choice.label)}" onchange="saveDesktopParallelism(this, '${choice.key}')"></div>`).join('');
   return `<div class="settings-section">

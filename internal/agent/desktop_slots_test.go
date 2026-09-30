@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/jobs"
 )
 
 func TestDesktopSubagentSlotsBoundAcrossAcquires(t *testing.T) {
@@ -57,6 +59,134 @@ func TestDesktopTeammatePublishesQueuedIdentityBeforeExecution(t *testing.T) {
 	idle, err = DesktopSchedulerIdle(dir)
 	if err != nil || !idle {
 		t.Fatalf("unregistered identity left an execution slot: idle=%v err=%v", idle, err)
+	}
+}
+
+func TestDesktopExecutionPhaseTracksYieldAndReacquire(t *testing.T) {
+	dir := t.TempDir()
+	config := DesktopExecutionConfig{SlotDir: dir, TotalAgentSlots: 2, SubagentsPerRoot: 2, Owner: "phase-test"}
+	base := WithDesktopExecutionConfig(context.Background(), config)
+	ctx, cancel := context.WithTimeout(base, 5*time.Second)
+	defer cancel()
+	roster := NewRoster(3, 3)
+	children := []*Teammate{{Name: "one"}, {Name: "two"}, {Name: "three"}}
+	for _, child := range children {
+		if err := RegisterDesktopTeammate(ctx, roster, child, false); err != nil {
+			t.Fatal(err)
+		}
+		defer roster.UnregisterTeammate(child)
+	}
+	assertPhase := func(child *Teammate, status TeammateStatus, phase string, held bool) {
+		t.Helper()
+		snap := child.Snapshot()
+		if snap.Status != status || snap.ExecutionPhase != phase || snap.HoldsExecutionSlot != held {
+			t.Fatalf("%s: status=%s phase=%s held=%v, want %s/%s/%v", child.Name, snap.Status, snap.ExecutionPhase, snap.HoldsExecutionSlot, status, phase, held)
+		}
+	}
+	assertHeld := func(want int) {
+		t.Helper()
+		held, err := DesktopSchedulerOccupancy(dir, 2)
+		if err != nil || held != want {
+			t.Fatalf("scheduler held=%d err=%v, want %d", held, err, want)
+		}
+	}
+	for _, child := range children {
+		assertPhase(child, StatusQueued, "queued", false)
+	}
+	firstCtx, err := AcquireDesktopTeammateExecution(ctx, roster, children[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcquireDesktopTeammateExecution(ctx, roster, children[1]); err != nil {
+		t.Fatal(err)
+	}
+	assertHeld(2)
+	assertPhase(children[0], StatusRunning, "executing", true)
+	assertPhase(children[1], StatusRunning, "executing", true)
+	result := make(chan error, 1)
+	go func() {
+		_, err := AcquireDesktopTeammateExecution(ctx, roster, children[2])
+		result <- err
+	}()
+	assertPhase(children[2], StatusQueued, "queued", false)
+	resume := yieldDesktopExecution(firstCtx, desktopExecutionWaitingBackground)
+	assertPhase(children[0], StatusRunning, "waiting_background", false)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	assertHeld(2)
+	for _, child := range children {
+		if child.Snapshot().Status != StatusRunning {
+			t.Fatalf("%s lifecycle should still be running", child.Name)
+		}
+	}
+	assertPhase(children[2], StatusRunning, "executing", true)
+	resumeResult := make(chan error, 1)
+	go func() { resumeResult <- resume(firstCtx) }()
+	deadline := time.After(2 * time.Second)
+	for children[0].Snapshot().ExecutionPhase != "waiting_slot" {
+		select {
+		case <-deadline:
+			t.Fatal("yielded child never displayed waiting_slot")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	assertHeld(2)
+	roster.UnregisterTeammate(children[1])
+	if err := <-resumeResult; err != nil {
+		t.Fatal(err)
+	}
+	assertPhase(children[0], StatusRunning, "executing", true)
+	assertHeld(2)
+	roster.UnregisterTeammate(children[0])
+	roster.UnregisterTeammate(children[2])
+	assertHeld(0)
+}
+
+func TestDesktopAwaitedBackgroundJobPublishesExecutionPhase(t *testing.T) {
+	config := DesktopExecutionConfig{SlotDir: t.TempDir(), TotalAgentSlots: 1, SubagentsPerRoot: 1, Owner: "job-wait-test"}
+	base := WithDesktopExecutionConfig(context.Background(), config)
+	ctx, cancel := context.WithTimeout(base, 3*time.Second)
+	defer cancel()
+	roster := NewRoster(1, 1)
+	child := &Teammate{Name: "job-waiter"}
+	if err := RegisterDesktopTeammate(ctx, roster, child, false); err != nil {
+		t.Fatal(err)
+	}
+	defer roster.UnregisterTeammate(child)
+	childCtx, err := AcquireDesktopTeammateExecution(ctx, roster, child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notify := make(chan jobs.Notification)
+	loop := &Loop{JobNotify: notify}
+	type waitResult struct {
+		completed bool
+		err       error
+	}
+	done := make(chan waitResult, 1)
+	go func() {
+		completed, err := loop.waitForAwaitedJobNotifications(childCtx, nil, map[string]struct{}{"bg-1": {}})
+		done <- waitResult{completed, err}
+	}()
+	deadline := time.After(2 * time.Second)
+	for child.Snapshot().ExecutionPhase != "waiting_background" {
+		select {
+		case <-deadline:
+			t.Fatal("awaited Bash wait did not publish waiting_background")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if held, err := DesktopSchedulerOccupancy(config.SlotDir, 1); err != nil || held != 0 {
+		t.Fatalf("background wait held=%d err=%v, want zero", held, err)
+	}
+	notify <- jobs.Notification{JobID: "bg-1", Status: jobs.StatusCompleted}
+	result := <-done
+	if !result.completed || result.err != nil {
+		t.Fatalf("wait result=%+v", result)
+	}
+	if snap := child.Snapshot(); snap.ExecutionPhase != "executing" || !snap.HoldsExecutionSlot {
+		t.Fatalf("resumed child=%+v", snap)
 	}
 }
 
@@ -214,12 +344,18 @@ func TestDesktopNestedExecutionCanYieldParentPermit(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	resume := YieldDesktopExecution(parentCtx)
+	if phase, held := desktopLeaseFromContext(parentCtx).executionSnapshot(); phase != "waiting_children" || held {
+		t.Fatalf("coordinating parent phase=%s held=%v", phase, held)
+	}
 	if err := <-result; err != nil {
 		t.Fatal(err)
 	}
 	roster.UnregisterTeammate(child)
 	if err := resume(parentCtx); err != nil {
 		t.Fatal(err)
+	}
+	if phase, held := desktopLeaseFromContext(parentCtx).executionSnapshot(); phase != "executing" || !held {
+		t.Fatalf("resumed parent phase=%s held=%v", phase, held)
 	}
 }
 

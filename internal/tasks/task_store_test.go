@@ -63,6 +63,56 @@ func TestTaskStore_CreateListGetUpdate(t *testing.T) {
 	}
 }
 
+func TestTaskStore_UpdateWithSnapshotCapturesTransition(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	store := NewTaskStore("snapshot-session")
+	for _, subject := range []string{"implement parser", "implement emitter"} {
+		if _, err := store.Create(subject, "", "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inProgress := TaskInProgress
+	if _, err := store.Update("1", TaskPatch{Status: &inProgress}); err != nil {
+		t.Fatal(err)
+	}
+	completed := TaskCompleted
+	snapshot, err := store.UpdateWithSnapshot("1", TaskPatch{Status: &completed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.PreviousStatus != TaskInProgress {
+		t.Errorf("PreviousStatus = %q, want in_progress", snapshot.PreviousStatus)
+	}
+	if snapshot.Task.ID != "1" || snapshot.Task.Status != TaskCompleted {
+		t.Errorf("updated task = %+v, want task #1 completed", snapshot.Task)
+	}
+	if len(snapshot.Tasks) != 2 {
+		t.Fatalf("snapshot has %d tasks, want 2", len(snapshot.Tasks))
+	}
+	if snapshot.Tasks[0].ID != "1" || snapshot.Tasks[0].Status != TaskCompleted ||
+		snapshot.Tasks[1].ID != "2" || snapshot.Tasks[1].Status != TaskPending {
+		t.Errorf("post-update task list = %+v, want #1 completed and #2 pending", snapshot.Tasks)
+	}
+
+	pending := TaskPending
+	if _, err := store.Update("1", TaskPatch{Status: &pending}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update("2", TaskPatch{Status: &completed}); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Task.Status != TaskCompleted || snapshot.Tasks[0].Status != TaskCompleted || snapshot.Tasks[1].Status != TaskPending {
+		t.Errorf("later updates changed earlier snapshot: task = %+v, list = %+v", snapshot.Task, snapshot.Tasks)
+	}
+	current := store.List(false)
+	if len(current) != 2 {
+		t.Fatalf("current task list has %d tasks, want 2", len(current))
+	}
+	if current[0].Status != TaskPending || current[1].Status != TaskCompleted {
+		t.Errorf("current task list = %+v, want #1 pending and #2 completed", current)
+	}
+}
+
 func TestTaskStore_PersistAcrossNewStore(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())
 	a := NewTaskStore("sess1")

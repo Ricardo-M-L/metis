@@ -187,6 +187,10 @@ func (s *TaskStore) Get(id string) (*Task, bool) {
 func (s *TaskStore) List(includeDeleted bool) []*Task {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.listLocked(includeDeleted)
+}
+
+func (s *TaskStore) listLocked(includeDeleted bool) []*Task {
 	out := make([]*Task, 0, len(s.tasks))
 	for _, t := range s.tasks {
 		if !includeDeleted && t.Status == TaskDeleted {
@@ -217,9 +221,40 @@ type TaskPatch struct {
 	Metadata     map[string]any // shallow-merged; nil value deletes the key
 }
 
+// UpdateSnapshot ties a task's prior status to the task list immediately after
+// its update. Both are captured under the same lock, so concurrent TaskUpdate
+// calls cannot change the snapshot before a caller evaluates a transition.
+type UpdateSnapshot struct {
+	Task           *Task
+	PreviousStatus TaskStatus
+	Tasks          []*Task
+}
+
 func (s *TaskStore) Update(id string, patch TaskPatch) (*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.updateLocked(id, patch)
+}
+
+// UpdateWithSnapshot applies a patch and captures its post-update task list
+// atomically. Other Update callers can keep using Update without paying for
+// the extra snapshot.
+func (s *TaskStore) UpdateWithSnapshot(id string, patch TaskPatch) (*UpdateSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tasks[id]
+	if !ok {
+		return nil, fmt.Errorf("task %s not found", id)
+	}
+	previousStatus := t.Status
+	updated, err := s.updateLocked(id, patch)
+	if err != nil {
+		return nil, err
+	}
+	return &UpdateSnapshot{Task: updated, PreviousStatus: previousStatus, Tasks: s.listLocked(false)}, nil
+}
+
+func (s *TaskStore) updateLocked(id string, patch TaskPatch) (*Task, error) {
 	t, ok := s.tasks[id]
 	if !ok {
 		return nil, fmt.Errorf("task %s not found", id)

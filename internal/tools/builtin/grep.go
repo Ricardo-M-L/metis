@@ -55,7 +55,7 @@ func (g Grep) SandboxManager() *sandbox.Manager { return g.sandbox }
 
 func (Grep) Name() string { return "Grep" }
 func (Grep) Description() string {
-	return `Search file contents with a Go regex. Returns matching lines with file:line prefix. Skips .git / node_modules / vendor by default.
+	return `Search file contents with a Go regex. The root may be a directory or a single file. Returns matching lines with file:line prefix. Skips .git / node_modules / vendor by default.
 
 Use Grep for content matching. Use Glob when you only need filenames (no content). Use Bash + grep -r only when you need flags Grep can't express (-A/-B context, -P perl regex).
 
@@ -91,7 +91,7 @@ func (Grep) InputSchema() map[string]any {
 		"required": []string{"pattern"},
 		"properties": map[string]any{
 			"pattern": map[string]any{"type": "string"},
-			"root":    map[string]any{"type": "string"},
+			"root":    map[string]any{"type": "string", "description": "directory or single file to search (default: current directory)"},
 			"glob":    map[string]any{"type": "string", "description": "filter file paths with this glob"},
 			"max":     map[string]any{"type": "integer", "description": "max matches to return (default 250). Pass 0 to unlimit."},
 			"offset":  map[string]any{"type": "integer", "description": "skip the first N matches. Pair with `max` for pagination."},
@@ -105,7 +105,7 @@ func (Grep) IsReadOnly(map[string]any) bool { return true }
 
 func (g Grep) PrepareAuthorizedInvocation(ctx context.Context, in map[string]any) error {
 	root := resolvePathAgainstAgentCWD(ctx, searchScopePath(in))
-	target, err := prepareExistingPath(root, true)
+	target, err := prepareGrepPath(root)
 	if err != nil {
 		return err
 	}
@@ -114,6 +114,16 @@ func (g Grep) PrepareAuthorizedInvocation(ctx context.Context, in map[string]any
 	}
 	g.authorizer.record(ctx, grepPathBinding{target: target, inputDigest: grepApprovalKey(in, root)})
 	return nil
+}
+
+func prepareGrepPath(path string) (approvedExistingPath, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return approvedExistingPath{}, err
+	}
+	// Keep the same inode and symlink binding for both supported scope types.
+	// The regular-file branch still rejects FIFOs, devices, and sockets.
+	return prepareExistingPath(path, info.IsDir())
 }
 
 func (g Grep) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
@@ -155,7 +165,7 @@ func searchScopePath(in map[string]any) string {
 	return root
 }
 
-// searchPermissionInput keeps both the directory scope and query visible to
+// searchPermissionInput keeps both the search scope and query visible to
 // substring rules and secret-path checks. Newline is deliberately simple and
 // unambiguous while preserving the existing pattern-only payload when root is
 // omitted (so saved rules continue to match).
@@ -165,7 +175,7 @@ func searchPermissionInput(in map[string]any) string {
 	if root == "" {
 		return pattern
 	}
-	// Root is a directory. Preserve an explicit separator so a credential
+	// Root can name a directory. Preserve an explicit separator so a credential
 	// directory such as `~/.ssh` matches the secret fragment `.ssh/` even
 	// when the caller omitted the trailing slash.
 	return strings.TrimRight(root, "/") + "/\n" + pattern
@@ -237,13 +247,13 @@ func (g Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	}
 	binding, hasInvocationID, foundBinding := g.authorizer.consume(ctx)
 	if hasInvocationID && !foundBinding {
-		if _, prepErr := prepareExistingPath(root, true); prepErr != nil {
+		if _, prepErr := prepareGrepPath(root); prepErr != nil {
 			return &tools.Result{Output: "Grep denied: " + security.RedactSubprocessText(prepErr.Error()), IsError: true}, nil
 		}
 		return &tools.Result{Output: "Grep denied: permission binding missing for this invocation", IsError: true}, nil
 	}
 	if !hasInvocationID {
-		target, prepErr := prepareExistingPath(root, true)
+		target, prepErr := prepareGrepPath(root)
 		if prepErr != nil {
 			return &tools.Result{Output: "Grep denied: " + security.RedactSubprocessText(prepErr.Error()), IsError: true}, nil
 		}
@@ -258,13 +268,26 @@ func (g Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	if binding.inputDigest != grepApprovalKey(in, root) {
 		return &tools.Result{Output: "Grep denied: invocation input changed after permission check", IsError: true}, nil
 	}
-	rootHandle, resolvedRoot, err := openPinnedReadRoot(root, g.afterRootOpen)
+	singleFile := !binding.target.targetInfo.IsDir()
+	openRoot, walkRoot := root, "."
+	if singleFile {
+		// Pin the parent only to open the approved file by name. Starting the
+		// walk at this basename never grants a search of its siblings.
+		openRoot = filepath.Dir(binding.target.resolvedPath)
+		walkRoot = filepath.Base(binding.target.resolvedPath)
+	}
+	rootHandle, resolvedRoot, err := openPinnedReadRoot(openRoot, g.afterRootOpen)
 	if err != nil {
 		return &tools.Result{Output: "Grep denied: " + security.RedactSubprocessText(err.Error()), IsError: true}, nil
 	}
 	defer rootHandle.Close()
-	openedRootInfo, statErr := rootHandle.Stat(".")
-	if statErr != nil || resolvedRoot != binding.target.resolvedPath || !os.SameFile(binding.target.targetInfo, openedRootInfo) {
+	openedRootInfo, statErr := rootHandle.Stat(walkRoot)
+	resolvedTarget := resolvedRoot
+	if singleFile {
+		resolvedTarget = filepath.Join(resolvedRoot, walkRoot)
+	}
+	if statErr != nil || resolvedTarget != binding.target.resolvedPath || !os.SameFile(binding.target.targetInfo, openedRootInfo) ||
+		(singleFile && !binding.target.matchesCurrent(openedRootInfo)) {
 		return &tools.Result{Output: "Grep denied: search root changed after permission check", IsError: true}, nil
 	}
 
@@ -289,13 +312,17 @@ func (g Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	credentialFilesSkipped := 0
 	var pathChangedErr error
 
-	err = fs.WalkDir(rootHandle.FS(), ".", func(relPath string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(rootHandle.FS(), walkRoot, func(relPath string, d fs.DirEntry, err error) error {
+		if singleFile && (err != nil || relPath != walkRoot || !d.Type().IsRegular()) {
+			pathChangedErr = fmt.Errorf("search file changed before opening: %s", logicalRoot)
+			return filepath.SkipAll
+		}
 		if err != nil {
 			return nil
 		}
 		path := logicalRoot
 		actualPath := root
-		if relPath != "." {
+		if !singleFile && relPath != "." {
 			path = filepath.Join(logicalRoot, filepath.FromSlash(relPath))
 			actualPath = filepath.Join(root, filepath.FromSlash(relPath))
 		}
@@ -337,7 +364,8 @@ func (g Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		// A broad project Grep must not accidentally surface .env/package
 		// registry/cloud credentials merely because the caller named the parent
 		// directory rather than the sensitive file itself.
-		if (g.gate == nil || g.gate.Mode() != permission.ModeFullAccess) && permission.IsSecretReadPath(actualPath) {
+		if (g.gate == nil || g.gate.Mode() != permission.ModeFullAccess) &&
+			(permission.IsSecretReadPath(actualPath) || (singleFile && permission.IsSecretReadPath(binding.target.resolvedPath))) {
 			credentialFilesSkipped++
 			return nil
 		}
@@ -372,7 +400,8 @@ func (g Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		openedInfo, openErr := f.Stat()
 		afterInfo, afterErr := rootHandle.Lstat(relPath)
 		if openErr != nil || afterErr != nil || !openedInfo.Mode().IsRegular() ||
-			!os.SameFile(info, openedInfo) || !os.SameFile(openedInfo, afterInfo) {
+			!os.SameFile(info, openedInfo) || !os.SameFile(openedInfo, afterInfo) ||
+			(singleFile && !binding.target.matchesCurrent(openedInfo)) {
 			_ = f.Close()
 			pathChangedErr = fmt.Errorf("search file changed while opening: %s", path)
 			return filepath.SkipAll

@@ -7,6 +7,30 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.80] - 2026-09-30
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Changed
+
+- Desktop distinguishes sub-agent lifecycle from execution-slot occupancy,
+  including waits for background jobs and child agents. Status shows the
+  scheduler's occupied slots separately from the number of active agents.
+- Desktop tool details present web search results and compact input/output
+  previews while retaining the complete request and result in the inspector.
+
+### Fixed
+
+- Keep sub-agent execution status and slot counts accurate as work yields,
+  resumes, or moves between sessions.
+- Apply the task-verification reminder only at the relevant completion
+  transition, even when task updates run concurrently.
+- Let Grep search a single file with the same path and permission checks used
+  for directory searches.
+- Handle session renaming during an active Desktop turn and improve trace error
+  statistics for restored conversations.
+
 ## [0.4.79] - 2026-09-29
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
@@ -1709,7 +1733,9 @@ NOT done in this round (deferred):
 - Config: `~/.metis/config.toml` with `api_key_env` for keeping secrets out of
   the file.
 
-[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.78...HEAD
+[Unreleased]: https://github.com/Ricardo-M-L/metis/compare/v0.4.80...HEAD
+[0.4.80]: https://github.com/Ricardo-M-L/metis/compare/v0.4.79...v0.4.80
+[0.4.79]: https://github.com/Ricardo-M-L/metis/compare/v0.4.78...v0.4.79
 [0.4.78]: https://github.com/Ricardo-M-L/metis/compare/v0.4.77...v0.4.78
 [0.4.77]: https://github.com/Ricardo-M-L/metis/compare/v0.4.76...v0.4.77
 [0.4.48]: https://github.com/Ricardo-M-L/metis/compare/v0.4.47...v0.4.48

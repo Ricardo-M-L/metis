@@ -21,6 +21,9 @@ func TestToolRowBrowserInteractions(t *testing.T) {
 	for _, scenario := range []string{
 		"keyboard_disclosure",
 		"inspect_and_language",
+		"websearch_results_live_language",
+		"websearch_empty_error_fallback",
+		"websearch_history_replay",
 		"subagent_semantic_rows",
 		"subagent_stage_lifecycle",
 		"subagent_background_lifecycle_across_turns",
@@ -250,8 +253,9 @@ class Element {
       header.appendChild(openAgent);
     }
     const body = new Element(); body.className = 'tc-body'; row.appendChild(body);
+    const io = new Element(); io.className = 'tc-io'; body.appendChild(io);
     for (const section of ['in', 'out']) {
-      const sec = new Element(); sec.className = 'tc-io-sec'; body.appendChild(sec);
+      const sec = new Element(); sec.className = 'tc-io-sec'; io.appendChild(sec);
       const label = new Element('span'); label.className = 'tc-io-label'; sec.appendChild(label);
       const labelRe = section === 'in'
         ? /<span class="tc-io-label">([^<]*)<\/span><span class="tc-io-text" data-in>/
@@ -295,7 +299,7 @@ area = new Element();
 const app = new Element(); app.className = 'app details-closed';
 const details = Object.fromEntries(['detailsPlaceholder', 'detailsTabs', 'detailsBody'].map(id => [id, new Element()]));
 context = {
-  Map, Set, WeakMap, WeakSet, Date, console,
+  Map, Set, WeakMap, WeakSet, Date, URL, console,
   requestAnimationFrame: callback => frames.push(callback),
   queueMicrotask: callback => callback(),
   document: {
@@ -392,6 +396,8 @@ if (scenario === 'keyboard_disclosure') {
   assert.equal(control.getAttribute('aria-expanded'), 'false');
 } else if (scenario === 'inspect_and_language') {
   const row = newRow('inspect');
+  assert.equal(row.querySelector('.tc-io-text[data-in]').textContent, 'Check repository',
+    'simple one-field input reads as text instead of duplicated JSON syntax');
   const control = row.querySelector('.tc-disclosure') || row.querySelector('.tc-row');
   const inspect = row.querySelector('.tc-inspect');
   assert(inspect, 'tool row exposes a separate Inspect control');
@@ -408,6 +414,126 @@ if (scenario === 'keyboard_disclosure') {
   assert.match(inspect.textContent, /Inspect|View details/, 'English UI translates Inspect');
   labels = row.querySelectorAll('.tc-io-label').map(label => label.textContent);
   assert.deepEqual(labels, ['IN', 'OUT'], 'English UI uses short tool input/output labels');
+} else if (scenario === 'websearch_results_live_language') {
+  const query = 'site:example.com METIS';
+  const input = JSON.stringify({query});
+  const output = [
+    'WebSearch "' + query + '" — 4 results:', '',
+    '1. First <img src=x onerror=alert(1)>', '   https://www.example.com/article?a=1&b=2', '   A concise first result.', '',
+    '2. Unsafe target', '   javascript:alert(1)', '   Still a visible snippet.', '',
+    '3. Third result', '   http://other.example.org/third', '   Third summary.', '',
+    '4. Fourth result', '   https://last.example.net/fourth', '   Fourth summary.', '',
+    '[via ddg · zero-config; for richer results set TAVILY_API_KEY or BRAVE_SEARCH_API_KEY]',
+  ].join('\n');
+  context.handleToolStart({tool:'WebSearch', id:'web-1', input});
+  flushFrames();
+  const row = area.querySelector('.call-row');
+  const root = row.querySelector('.tc-io');
+  assert(root.classList.contains('tc-web'), 'WebSearch keeps the common inline container with a dedicated result variant');
+  assert.equal(row.querySelector('.tc-io-text[data-in]'), null, 'query JSON never appears inline');
+  assert.equal(row.querySelector('.tc-io-label'), null, 'WebSearch does not use generic IN/OUT labels');
+  context.handleToolResult({tool:'WebSearch', id:'web-1', output});
+  assert.match(row.querySelector('.tc-summary').textContent, /site:example\.com METIS · 4 条结果/);
+  assert.doesNotMatch(visibleText(root), /site:example\.com METIS/, 'query is shown only in the row header');
+  assert.match(root.querySelector('.tc-web-count').textContent, /4 条结果/);
+  assert.match(root.querySelector('.tc-web-provider').textContent, /来源 ddg/);
+  const results = root.querySelectorAll('.tc-web-result');
+  assert.equal(results.length, 4);
+  assert.equal(results.filter(item => !item.hidden).length, 3, 'only first three results are initially visible');
+  const titles = root.querySelectorAll('.tc-web-title');
+  assert.equal(titles[0].textContent, 'First <img src=x onerror=alert(1)>');
+  assert.equal(titles[0].children.length, 0, 'untrusted title remains text, never HTML');
+  assert.equal(titles[0].getAttribute('href'), 'https://www.example.com/article?a=1&b=2');
+  assert.equal(titles[0].getAttribute('rel'), 'noopener noreferrer');
+  assert.equal(root.querySelector('.tc-web-domain').textContent, 'example.com');
+  assert.equal(titles[1].getAttribute('href'), null, 'non-http(s) result cannot become a link');
+  const more = root.querySelector('.tc-web-more');
+  assert.match(more.textContent, /显示其余 1 条/);
+  more.dispatch('click');
+  assert.equal(root.querySelectorAll('.tc-web-result').filter(item => !item.hidden).length, 4);
+  assert.equal(root.querySelector('.tc-web-more').getAttribute('aria-expanded'), 'true');
+  context.lang = 'en';
+  context.refreshActivityGroupLanguage();
+  assert.match(row.querySelector('.tc-summary').textContent, /4 results/);
+  assert.match(root.querySelector('.tc-web-count').textContent, /4 results/);
+  assert.match(root.querySelector('.tc-web-more').textContent, /Show fewer/);
+  assert.equal(root.querySelectorAll('.tc-web-result').filter(item => !item.hidden).length, 4,
+    'language switch preserves expanded state');
+  inspectRow(row);
+  context.switchDetailTab('input');
+  assert.match(details.detailsBody.innerHTML, /site:example\.com METIS/, 'raw input remains inspectable');
+  context.switchDetailTab('output');
+  assert.match(details.detailsBody.innerHTML, /BRAVE_SEARCH_API_KEY/, 'raw output remains inspectable');
+} else if (scenario === 'websearch_empty_error_fallback') {
+  const start = (id, query) => {
+    context.handleToolStart({tool:'WebSearch', id, input:JSON.stringify({query})});
+    flushFrames();
+    return area.querySelectorAll('.call-row').at(-1);
+  };
+  const empty = start('empty', 'nothing found');
+  context.handleToolResult({tool:'WebSearch', id:'empty', output:[
+    'WebSearch "nothing found": no results. Try rephrasing the query.',
+    '[via ddg · zero-config; for richer results set TAVILY_API_KEY or BRAVE_SEARCH_API_KEY]',
+  ].join('\n')});
+  assert.equal(empty.dataset.state, 'ok', 'zero results are a successful search, not an error');
+  assert.match(empty.querySelector('.tc-web-empty').textContent, /未找到结果/);
+  assert.match(empty.querySelector('.tc-summary').textContent, /0 条结果/);
+  const failed = start('failed', 'backend problem');
+  context.handleToolResult({tool:'WebSearch', id:'failed', isError:true,
+    output:'WebSearch: every backend failed — ddg failed: 429'});
+  assert.equal(failed.dataset.state, 'error');
+  assert.match(failed.querySelector('.tc-web-error').textContent, /搜索失败/);
+  assert.equal(failed.querySelector('.tc-web-empty'), null, 'failure is distinct from zero results');
+  const unknown = start('unknown', 'future backend');
+  context.handleToolResult({tool:'WebSearch', id:'unknown', output:'Future format\nA readable response'});
+  assert.equal(unknown.querySelector('.tc-web-count'), null, 'unknown format does not invent a result count');
+  assert.match(unknown.querySelector('.tc-web-preview').textContent, /Future format/);
+  const partial = start('partial', 'long result');
+  context.handleToolResult({tool:'WebSearch', id:'partial', output:[
+    'WebSearch "long result" — 4 results:', '',
+    '1. Complete result', '   https://example.com/one', '   Complete snippet.', '',
+    '2. Partial result', '   https://example.com/tw...(truncated)',
+  ].join('\n')});
+  assert.match(partial.querySelector('.tc-web-count').textContent, /显示 1 \/ 4 条结果/);
+  assert.equal(partial.querySelectorAll('.tc-web-result').length, 1,
+    'clipped SSE output never creates a half-written result or a false expand button');
+  assert.equal(partial.querySelector('.tc-web-more'), null);
+} else if (scenario === 'websearch_history_replay') {
+  const output = [
+    'WebSearch "old search" — 1 results:', '',
+    '1. Saved result', '   https://saved.example.com/doc', '   Historical summary.', '',
+    '[via brave]',
+  ].join('\n');
+  context.renderHistoryMessages([
+    {role:'user', content:[{type:'text', text:'Find saved search'}]},
+    {role:'assistant', content:[{type:'tool_use', name:'WebSearch', tool_use_id:'saved-web', input:{query:'old search'}}]},
+    {role:'user', content:[{type:'tool_result', tool_use_id:'saved-web', content:output}]},
+    {role:'assistant', content:[{type:'tool_use', name:'WebSearch', tool_use_id:'saved-empty', input:{query:'no matches'}}]},
+    {role:'user', content:[{type:'tool_result', tool_use_id:'saved-empty', content:
+      'WebSearch "no matches": no results. Try rephrasing the query.\n[via ddg]'}]},
+    {role:'assistant', content:[{type:'tool_use', name:'WebSearch', tool_use_id:'saved-unknown', input:{query:'future'}}]},
+    {role:'user', content:[{type:'tool_result', tool_use_id:'saved-unknown', content:'Future response format'}]},
+    {role:'assistant', content:[{type:'text', text:'Done'}]},
+  ]);
+  flushFrames();
+  const [row, empty, unknown] = area.querySelectorAll('.call-row');
+  assert.match(area.querySelector('.activity-group-summary').textContent, /已搜索网页/,
+    'WebSearch group does not describe a web query as code search');
+  assert.match(row.querySelector('.tc-web-title').textContent, /Saved result/);
+  assert.match(row.querySelector('.tc-summary').textContent, /1 条结果/);
+  assert.match(row.querySelector('.tc-web-provider').textContent, /brave/);
+  assert.equal(empty.dataset.state, 'ok');
+  assert.match(empty.querySelector('.tc-web-empty').textContent, /未找到结果/);
+  assert.equal(unknown.querySelector('.tc-web-count'), null);
+  assert.match(unknown.querySelector('.tc-web-preview').textContent, /Future response format/);
+  context.lang = 'en';
+  context.refreshActivityGroupLanguage();
+  assert.match(area.querySelector('.activity-group-summary').textContent, /Searched the web/);
+  assert.match(row.querySelector('.tc-web-count').textContent, /1 result/);
+  assert.match(row.querySelector('.tc-web-snippet').textContent, /Historical summary/);
+  assert.match(empty.querySelector('.tc-web-count').textContent, /0 results/);
+  assert.match(empty.querySelector('.tc-web-empty').textContent, /No results/);
+  assert.match(unknown.querySelector('.tc-web-head').textContent, /Search response/);
 } else if (scenario === 'subagent_semantic_rows') {
   const add = (tool, id, input) => {
     context.handleToolStart({tool, id, input:JSON.stringify(input)});

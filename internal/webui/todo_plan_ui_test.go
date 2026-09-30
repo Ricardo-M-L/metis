@@ -40,11 +40,16 @@ func TestDesktopTodoPlanProjectsComplexTaskProgress(t *testing.T) {
 		"function toggleTodoPlan()",
 		"applyTodoSnapshot(name, chip.getAttribute('data-args') || '')",
 		"queueMicrotask(() => restoreTodoPlanFromHistory(history))",
-		"async function runTurnItem(item) {\n  clearTodoPlan();",
+		"async function runTurnItem(item) {",
 	} {
 		if !strings.Contains(js, want) {
 			t.Fatalf("chat.js missing todo-plan behavior %q", want)
 		}
+	}
+	turnStart := strings.Index(js, "async function runTurnItem(item) {")
+	turnEnd := strings.Index(js[turnStart:], "const MESSAGE_ACTION_ICONS")
+	if turnEnd < 0 || !strings.Contains(js[turnStart:turnStart+turnEnd], "clearTodoPlan();") {
+		t.Fatal("runTurnItem must clear the prior todo plan before starting a model turn")
 	}
 
 	css := read("style.css")

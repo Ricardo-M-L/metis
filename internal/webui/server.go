@@ -3461,6 +3461,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	subAgents := 0
 	namedAgents := 0
+	heldInProcess := 0
 	agentDetails := make([]map[string]any, 0)
 	s.stateMu.RLock()
 	activeSessionID := s.activeSessionID
@@ -3483,13 +3484,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 					namedAgents++
 				}
 			}
-			agentDetails = append(agentDetails, map[string]any{
-				"name": snap.Name, "agentId": snap.AgentID, "sessionId": activeSessionID,
-				"status": snap.Status.String(), "background": snap.Background,
-				"startedAt": snap.Started,
-			})
-			if len(agentDetails) >= 12 {
-				break
+			if snap.HoldsExecutionSlot {
+				heldInProcess++
+			}
+			if len(agentDetails) < 12 {
+				agentDetails = append(agentDetails, map[string]any{
+					"name": snap.Name, "agentId": snap.AgentID, "sessionId": activeSessionID,
+					"status": snap.Status.String(), "background": snap.Background,
+					"executionPhase": snap.ExecutionPhase, "holdsExecutionSlot": snap.HoldsExecutionSlot,
+					"startedAt": snap.Started,
+				})
 			}
 		}
 	}
@@ -3552,7 +3556,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		subAgents, namedAgents, backgroundTasks = status.SubAgents, status.NamedAgents, status.BackgroundTasks
 		agentDetails = make([]map[string]any, 0, len(status.Agents))
 		for _, item := range status.Agents {
-			agentDetails = append(agentDetails, map[string]any{"name": item.Name, "agentId": item.AgentID, "sessionId": activeSessionID, "status": item.Status, "background": item.Background, "startedAt": item.StartedAt})
+			agentDetails = append(agentDetails, map[string]any{"name": item.Name, "agentId": item.AgentID, "sessionId": activeSessionID, "status": item.Status, "background": item.Background, "executionPhase": item.ExecutionPhase, "holdsExecutionSlot": item.HoldsExecutionSlot, "startedAt": item.StartedAt})
 		}
 		jobDetails = make([]map[string]any, 0, len(status.Jobs))
 		for _, item := range status.Jobs {
@@ -3585,10 +3589,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				// Loop. Its roster has already passed the transcript ownership
 				// check above; preserve that selected session's status without
 				// borrowing an unrelated worker's snapshot.
-				viewRoster = map[string]any{
-					"sessionId": viewSessionID, "subAgents": subAgents,
-					"namedAgents": namedAgents, "backgroundTasks": backgroundTasks,
-					"agents": agentDetails, "jobs": jobDetails,
+				viewRoster["subAgents"] = subAgents
+				viewRoster["namedAgents"] = namedAgents
+				viewRoster["backgroundTasks"] = backgroundTasks
+				viewRoster["agents"] = agentDetails
+				viewRoster["jobs"] = jobDetails
+				if s.desktopAgentSlotDir != "" {
+					viewRoster["heldExecutionSlots"] = heldInProcess
 				}
 			}
 		}
@@ -3618,20 +3625,22 @@ const subAgentDetailPreviewRefreshInterval = time.Second
 // SSE companion. Keeping this view detached from Teammate means the browser
 // never holds a pointer to mutable roster state.
 type subAgentDetailView struct {
-	SessionID       string    `json:"sessionId"`
-	Name            string    `json:"name"`
-	AgentID         string    `json:"agentId"`
-	Status          string    `json:"status"`
-	Background      bool      `json:"background"`
-	StartedAt       time.Time `json:"startedAt"`
-	EndedAt         time.Time `json:"endedAt"`
-	ElapsedMS       int64     `json:"elapsedMs"`
-	Output          string    `json:"output"`
-	OutputTruncated bool      `json:"outputTruncated"`
-	Result          string    `json:"result"`
-	ResultTruncated bool      `json:"resultTruncated"`
-	StopHint        string    `json:"stopHint"`
-	ExitError       string    `json:"exitError"`
+	SessionID          string    `json:"sessionId"`
+	Name               string    `json:"name"`
+	AgentID            string    `json:"agentId"`
+	Status             string    `json:"status"`
+	ExecutionPhase     string    `json:"executionPhase,omitempty"`
+	HoldsExecutionSlot bool      `json:"holdsExecutionSlot"`
+	Background         bool      `json:"background"`
+	StartedAt          time.Time `json:"startedAt"`
+	EndedAt            time.Time `json:"endedAt"`
+	ElapsedMS          int64     `json:"elapsedMs"`
+	Output             string    `json:"output"`
+	OutputTruncated    bool      `json:"outputTruncated"`
+	Result             string    `json:"result"`
+	ResultTruncated    bool      `json:"resultTruncated"`
+	StopHint           string    `json:"stopHint"`
+	ExitError          string    `json:"exitError"`
 }
 
 func trimSubAgentDetailOutput(value string) (string, bool) {
@@ -3724,20 +3733,22 @@ func subAgentDetailFromRoster(sessionID string, teammate *agent.Teammate) subAge
 		exitError = snap.ExitErr.Error()
 	}
 	return subAgentDetailView{
-		SessionID:       sessionID,
-		Name:            snap.Name,
-		AgentID:         snap.AgentID,
-		Status:          snap.Status.String(),
-		Background:      snap.Background,
-		StartedAt:       snap.Started,
-		EndedAt:         snap.EndTime,
-		ElapsedMS:       elapsed.Milliseconds(),
-		Output:          output,
-		OutputTruncated: outputTruncated,
-		Result:          result,
-		ResultTruncated: resultTruncated,
-		StopHint:        snap.StopHint,
-		ExitError:       exitError,
+		SessionID:          sessionID,
+		Name:               snap.Name,
+		AgentID:            snap.AgentID,
+		Status:             snap.Status.String(),
+		ExecutionPhase:     snap.ExecutionPhase,
+		HoldsExecutionSlot: snap.HoldsExecutionSlot,
+		Background:         snap.Background,
+		StartedAt:          snap.Started,
+		EndedAt:            snap.EndTime,
+		ElapsedMS:          elapsed.Milliseconds(),
+		Output:             output,
+		OutputTruncated:    outputTruncated,
+		Result:             result,
+		ResultTruncated:    resultTruncated,
+		StopHint:           snap.StopHint,
+		ExitError:          exitError,
 	}
 }
 
@@ -4952,6 +4963,11 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		}
 		if ev.Turn > stats.Turns {
 			stats.Turns = ev.Turn
+		}
+		// Match trajectory export: failed tool results at every depth count
+		// too, while an error event carrying IsError is still counted once.
+		if ev.Kind == "error" || ev.IsError {
+			stats.Errors++
 		}
 		switch ev.Kind {
 		case "text", "thinking", "thinking_redacted", "user", "context":

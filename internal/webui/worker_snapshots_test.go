@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -161,6 +162,129 @@ func TestStatusViewRosterReadsRequestedSessionWithoutChangingActiveStatus(t *tes
 		len(empty["agents"].([]any)) != 0 || len(empty["jobs"].([]any)) != 0 {
 		t.Fatalf("missing worker session must have empty roster: %#v", empty)
 	}
+}
+
+func TestStatusViewRosterSeparatesLifecycleFromExecutionSlots(t *testing.T) {
+	s, _ := testServer(t)
+	dir := t.TempDir()
+	t.Setenv("METIS_DESKTOP_SUBAGENT_SLOT_DIR", dir)
+	t.Setenv("METIS_DESKTOP_SUBAGENT_SLOTS", "2")
+	s.desktopAgentSlotDir = dir
+	s.maxTotalAgentSlots = 2
+	release, err := agent.AcquireDesktopSubagentSlot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	s.setWorkerSnapshot("session-a", desktopipc.Status{Agents: []desktopipc.Subagent{
+		{AgentID: "a-executing", Status: "running", ExecutionPhase: "executing", HoldsExecutionSlot: true},
+		{AgentID: "a-waiting", Status: "running", ExecutionPhase: "waiting_slot"},
+	}})
+	s.setWorkerSnapshot("session-b", desktopipc.Status{Agents: []desktopipc.Subagent{
+		{AgentID: "b-waiting", Status: "running", ExecutionPhase: "waiting_background"},
+	}})
+	for _, tc := range []struct {
+		session  string
+		wantHeld float64
+	}{
+		{session: "session-a", wantHeld: 1},
+		{session: "session-b", wantHeld: 0},
+	} {
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status?sessionId="+tc.session, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET status for %s = %d: %s", tc.session, rr.Code, rr.Body.String())
+		}
+		var body struct {
+			ViewRoster struct {
+				HeldExecutionSlots float64 `json:"heldExecutionSlots"`
+				ExecutionSlots     struct {
+					Held  float64 `json:"held"`
+					Total float64 `json:"total"`
+				} `json:"executionSlots"`
+				Agents []struct {
+					ExecutionPhase     string `json:"executionPhase"`
+					HoldsExecutionSlot bool   `json:"holdsExecutionSlot"`
+				} `json:"agents"`
+			} `json:"viewRoster"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		view := body.ViewRoster
+		if view.HeldExecutionSlots != tc.wantHeld || view.ExecutionSlots.Held != 1 || view.ExecutionSlots.Total != 2 {
+			t.Fatalf("%s: lifecycle/slot counts diverged: %s", tc.session, rr.Body.String())
+		}
+		if len(view.Agents) == 0 || view.Agents[0].ExecutionPhase == "" {
+			t.Fatalf("%s: execution phase missing: %s", tc.session, rr.Body.String())
+		}
+	}
+	if detail, ok := s.subAgentDetailView("session-a", "a-executing"); !ok ||
+		detail.ExecutionPhase != "executing" || !detail.HoldsExecutionSlot {
+		t.Fatalf("detail lost child execution state: %+v, found=%v", detail, ok)
+	}
+}
+
+func TestStatusViewRosterKeepsInProcessExecutionPhase(t *testing.T) {
+	s, store := testServer(t)
+	s.desktopAgentSlotDir = t.TempDir()
+	s.maxTotalAgentSlots = 2
+	s.roster = agent.NewRoster(1, 1)
+	s.stateMu.Lock()
+	s.activeSessionID = "session-a"
+	s.stateMu.Unlock()
+	child := &agent.Teammate{Name: "local-child", AgentID: "local-child-id"}
+	ctx := agent.WithDesktopExecutionConfig(context.Background(), agent.DesktopExecutionConfig{
+		SlotDir: s.desktopAgentSlotDir, TotalAgentSlots: 2, SubagentsPerRoot: 2, Owner: "in-process-test",
+	})
+	if err := agent.RegisterDesktopTeammate(ctx, s.roster, child, false); err != nil {
+		t.Fatal(err)
+	}
+	defer s.roster.UnregisterTeammate(child)
+	transcript, err := agent.NewSubAgentTranscript(store.Dir, child.AgentID,
+		agent.NewSubAgentHeader(child.AgentID, "model", "session-a", child.Name, t.TempDir(), "default"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transcript.Close(); err != nil {
+		t.Fatal(err)
+	}
+	childCtx, err := agent.AcquireDesktopTeammateExecution(ctx, s.roster, child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func() map[string]any {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status?sessionId=session-a", nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body["viewRoster"].(map[string]any)
+	}
+	assert := func(phase string, held float64) {
+		t.Helper()
+		view := read()
+		rows := view["agents"].([]any)
+		row := rows[0].(map[string]any)
+		global := view["executionSlots"].(map[string]any)
+		if view["subAgents"] != float64(1) || view["heldExecutionSlots"] != held ||
+			row["status"] != "running" || row["executionPhase"] != phase ||
+			global["held"] != held {
+			t.Fatalf("phase=%s held=%v, view=%#v", phase, held, view)
+		}
+	}
+	assert("executing", 1)
+	resume := agent.YieldDesktopExecution(childCtx)
+	assert("waiting_children", 0)
+	if err := resume(childCtx); err != nil {
+		t.Fatal(err)
+	}
+	assert("executing", 1)
 }
 
 func TestWorkerSnapshotRetentionProtectsActiveWorkers(t *testing.T) {

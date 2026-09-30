@@ -13,20 +13,22 @@ type Status struct {
 }
 
 type Subagent struct {
-	Name            string    `json:"name"`
-	AgentID         string    `json:"agentId"`
-	Anonymous       bool      `json:"anonymous"`
-	Status          string    `json:"status"`
-	Background      bool      `json:"background"`
-	StartedAt       time.Time `json:"startedAt"`
-	EndedAt         time.Time `json:"endedAt"`
-	ElapsedMS       int64     `json:"elapsedMs"`
-	Output          string    `json:"output"`
-	OutputTruncated bool      `json:"outputTruncated"`
-	Result          string    `json:"result"`
-	ResultTruncated bool      `json:"resultTruncated"`
-	StopHint        string    `json:"stopHint"`
-	ExitError       string    `json:"exitError"`
+	Name               string    `json:"name"`
+	AgentID            string    `json:"agentId"`
+	Anonymous          bool      `json:"anonymous"`
+	Status             string    `json:"status"`
+	ExecutionPhase     string    `json:"executionPhase"`
+	HoldsExecutionSlot bool      `json:"holdsExecutionSlot"`
+	Background         bool      `json:"background"`
+	StartedAt          time.Time `json:"startedAt"`
+	EndedAt            time.Time `json:"endedAt"`
+	ElapsedMS          int64     `json:"elapsedMs"`
+	Output             string    `json:"output"`
+	OutputTruncated    bool      `json:"outputTruncated"`
+	Result             string    `json:"result"`
+	ResultTruncated    bool      `json:"resultTruncated"`
+	StopHint           string    `json:"stopHint"`
+	ExitError          string    `json:"exitError"`
 }
 
 type Job struct {

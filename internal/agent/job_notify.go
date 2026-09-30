@@ -126,7 +126,7 @@ func (l *Loop) waitForAwaitedJobNotifications(
 	if len(pending) == 0 {
 		return false, nil
 	}
-	resume := YieldDesktopExecution(ctx)
+	resume := yieldDesktopExecution(ctx, desktopExecutionWaitingBackground)
 	defer func() {
 		if err == nil && ctx.Err() == nil {
 			err = resume(ctx)

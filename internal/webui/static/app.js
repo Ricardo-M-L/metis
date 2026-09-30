@@ -444,7 +444,7 @@ function renderStatusSnapshot(d) {
       chip.style.display = '';
       const listedAgents = Math.max(n, visibleAgents.length);
       chip.innerHTML = `<svg class="agent-status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.4" cy="5.2" r="2.1"/><circle cx="11.3" cy="6.4" r="1.65"/><path d="M1.9 13c.35-2.25 1.6-3.45 3.5-3.45S8.55 10.75 8.9 13M9.2 12.8c.23-1.55 1.08-2.38 2.45-2.38 1.32 0 2.1.76 2.38 2.18"/></svg><span>${listedAgents} ${escHtml(dict.subAgents)}</span><span class="agent-status-divider" aria-hidden="true"></span><span>${m} ${escHtml(dict.backgroundTasks)}</span>`;
-      const title = subAgentText('View sub-agent activity', '查看子代理活动');
+      const title = subAgentText('View sub-agent activity. Agent count is not execution-slot occupancy.', '查看子代理活动。子代理数量不等于执行槽占用数。');
       chip.title = title;
       chip.setAttribute('aria-label', title + ': ' + listedAgents + ' ' + dict.subAgents + ', ' + m + ' ' + dict.backgroundTasks);
     }
@@ -456,6 +456,7 @@ function renderStatusSnapshot(d) {
     // would fight the dedicated stream and make text arrive in three-second
     // batches instead of as it is produced.
     if (trackedAgent && !subAgentDetailStream && !(window && window.EventSource)) refreshSubAgentDetails();
+    if (trackedAgent && subAgentDetailState.data) updateSubAgentDetailExecutionPhase();
     if (d.workspace) {
       const pn = document.getElementById('wsGroupName');
       if (pn) pn.textContent = d.workspace;
@@ -566,6 +567,25 @@ function subAgentStatusLabel(status) {
   return labels[status] || subAgentText('Unknown', '未知');
 }
 
+function subAgentExecutionPhaseLabel(phase) {
+  const labels = {
+    queued: subAgentText('Queued', '排队中'),
+    executing: subAgentText('Executing', '执行中'),
+    waiting_background: subAgentText('Waiting for background task', '等待后台任务'),
+    waiting_children: subAgentText('Waiting for child agents', '等待子代理'),
+    waiting_slot: subAgentText('Waiting for execution slot', '等待执行槽'),
+  };
+  return labels[phase] || '';
+}
+
+function subAgentLifecycleAndPhaseLabel(agent) {
+  const status = String(agent && agent.status || '');
+  const lifecycle = subAgentStatusLabel(status);
+  if (status !== 'queued' && status !== 'running') return lifecycle;
+  const phase = subAgentExecutionPhaseLabel(agent.executionPhase);
+  return phase && phase !== lifecycle ? lifecycle + ' · ' + phase : lifecycle;
+}
+
 function statusRosterForSelectedSession(snapshot) {
   const selectedSessionId = String(currentSessionId || '');
   const roster = snapshot && snapshot.viewRoster;
@@ -590,6 +610,20 @@ function renderStatusPopover() {
   const jobs = roster && Array.isArray(roster.jobs) ? roster.jobs.filter(job =>
     !job.sessionId || String(job.sessionId) === String(currentSessionId || '')) : [];
   const rows = [];
+  const slots = roster && roster.executionSlots;
+  if (slots && Number.isInteger(slots.held) && Number.isInteger(slots.total) &&
+      slots.held >= 0 && slots.total > 0 && slots.held <= slots.total) {
+    rows.push('<div class="status-popover-label" title="' + escAttr(subAgentText(
+      'Sampled Desktop scheduler occupancy; background processes are not counted.',
+      'Desktop 调度器占用的采样值；后台进程不计入。')) + '">' +
+      escHtml(subAgentText('Execution slots (sampled)', '执行槽（采样）')) + ' · ' +
+      slots.held + ' / ' + slots.total + '</div>');
+  }
+  if (roster && Number.isInteger(roster.heldExecutionSlots) && roster.heldExecutionSlots >= 0) {
+    rows.push('<div class="status-popover-label">' +
+      escHtml(subAgentText('Child slots in this session', '当前会话子代理占用')) + ' · ' +
+      roster.heldExecutionSlots + '</div>');
+  }
   if (agents.length) {
     rows.push('<div class="status-popover-label">' + escHtml(subAgentText('Sub-agents', '子代理')) + '</div>');
     agents.forEach(a => {
@@ -600,7 +634,7 @@ function renderStatusPopover() {
         (canOpen ? ' title="' + escAttr(subAgentText('Open sub-agent details', '查看子代理详情')) + '"' : '') + '>' +
         '<span class="status-dot ' + subAgentStatusClass(a.status || '') + '"></span>' +
         '<span class="status-agent-name"><strong>' + escHtml(a.name || a.agentId || 'agent') + '</strong><small>' + escHtml(a.status === 'queued' ? subAgentText('Waiting to start · Open details', '等待执行 · 查看详情') : a.status === 'running' ? subAgentText('Open live output', '打开实时输出') : subAgentText('Open output', '查看输出')) + '</small></span>' +
-        '<span class="status-agent-state">' + escHtml(subAgentStatusLabel(a.status || '')) + '</span>' +
+        '<span class="status-agent-state">' + escHtml(subAgentLifecycleAndPhaseLabel(a)) + '</span>' +
       '</button>');
     });
   }
@@ -822,6 +856,35 @@ function subAgentDetailStatusLabel(agent) {
   return subAgentWasCancelled(agent) ? subAgentText('Cancelled', '已取消') : subAgentStatusLabel(agent.status);
 }
 
+function subAgentDetailExecutionPhase(agent) {
+  if (!agent || !['queued', 'running'].includes(agent.status)) return '';
+  const roster = statusRosterForSelectedSession(lastStatusSnapshot);
+  const sampled = roster && Array.isArray(roster.agents) && roster.agents.find(item =>
+    String(item.agentId || '') === String(agent.agentId || '') &&
+    String(item.sessionId || '') === String(agent.sessionId || '') && item.status === agent.status);
+  return String(sampled && sampled.executionPhase || agent.executionPhase || '');
+}
+
+function subAgentDetailHeading(agent) {
+  const lifecycle = subAgentDetailStatusLabel(agent);
+  const phase = subAgentExecutionPhaseLabel(subAgentDetailExecutionPhase(agent));
+  return phase && phase !== lifecycle ? lifecycle + ' · ' + phase : lifecycle;
+}
+
+function updateSubAgentDetailExecutionPhase() {
+  const agent = subAgentDetailState.data;
+  if (!agent || subAgentDetailState.ownerSessionId !== String(currentSessionId || '')) return;
+  const phase = subAgentExecutionPhaseLabel(subAgentDetailExecutionPhase(agent));
+  const phaseEl = document.getElementById('subAgentDetailPhase');
+  if (phaseEl) {
+    phaseEl.textContent = phase;
+    phaseEl.hidden = !phase || phase === subAgentDetailStatusLabel(agent);
+  }
+  const subtitle = document.getElementById('subAgentDetailDescription');
+  if (subtitle) subtitle.textContent = subAgentDetailHeading(agent) + ' · ' +
+    subAgentElapsedLabel(subAgentElapsedMilliseconds(agent));
+}
+
 function stopSubAgentElapsedTimer() {
   if (subAgentDetailState.elapsedTimer != null) clearInterval(subAgentDetailState.elapsedTimer);
   subAgentDetailState.elapsedTimer = null;
@@ -838,8 +901,9 @@ function updateSubAgentElapsedTime() {
   const elapsed = subAgentElapsedLabel(subAgentElapsedMilliseconds(state.data));
   const subtitle = document.getElementById('subAgentDetailDescription');
   const value = document.getElementById('subAgentDetailElapsed');
-  if (subtitle) subtitle.textContent = subAgentDetailStatusLabel(state.data) + ' · ' + elapsed;
+  if (subtitle) subtitle.textContent = subAgentDetailHeading(state.data) + ' · ' + elapsed;
   if (value) value.textContent = elapsed;
+  updateSubAgentDetailExecutionPhase();
 }
 
 async function stopSubAgent() {
@@ -909,12 +973,14 @@ function renderSubAgentDetails() {
   const status = subAgentStatusClass(String(agent.status || ''));
   const cancelled = subAgentWasCancelled(agent);
   const statusLabel = subAgentDetailStatusLabel(agent);
+  const phaseLabel = subAgentExecutionPhaseLabel(subAgentDetailExecutionPhase(agent));
   const elapsedLabel = subAgentElapsedLabel(subAgentElapsedMilliseconds(agent));
   title.textContent = agent.name || agent.agentId || subAgentText('Sub-agent', '子代理');
-  subtitle.textContent = statusLabel + ' · ' + elapsedLabel;
+  subtitle.textContent = subAgentDetailHeading(agent) + ' · ' + elapsedLabel;
   const mode = agent.background ? subAgentText('Background', '后台执行') : subAgentText('Foreground', '前台执行');
   body.innerHTML = '<div class="subagent-detail-summary">' +
     '<span class="status-dot ' + (cancelled ? 'unknown' : status) + '"></span><strong>' + escHtml(statusLabel) + '</strong>' +
+    '<span id="subAgentDetailPhase" class="status-agent-state"' + (!phaseLabel || phaseLabel === statusLabel ? ' hidden' : '') + '>' + escHtml(phaseLabel) + '</span>' +
     '<span class="subagent-detail-mode">' + escHtml(mode) + '</span>' +
     '</div><dl class="subagent-detail-meta">' +
       '<div><dt>' + escHtml(subAgentText('Agent ID', '代理 ID')) + '</dt><dd><code>' + escHtml(agent.agentId || '—') + '</code></dd></div>' +

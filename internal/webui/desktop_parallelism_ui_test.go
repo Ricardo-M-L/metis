@@ -39,13 +39,18 @@ const english = c.renderDesktopParallelismPreference();
 for (const key of ['rootTurnParallelism', 'totalAgentParallelism', 'subagentParallelism']) {
   assert(english.includes("saveDesktopParallelism(this, '" + key + "')"), key);
 }
+assert.match(english, /Total execution slots/);
 assert.match(english, /shared execution pool/);
+assert.match(english, /Waiting on background Bash releases the agent slot/);
+assert.match(english, /Child execution slots per top-level turn/);
 assert.match(english, /max="64"/);
 assert.match(english, /max="32"/);
 c.document.documentElement.lang = 'zh-CN';
 const chinese = c.renderDesktopParallelismPreference();
-assert.match(chinese, /运行中代理总数/);
-assert.match(chinese, /每个顶层任务的子代理并发数/);
+assert.match(chinese, /总执行槽/);
+assert.match(chinese, /代理等待后台 Bash 时会让出执行槽/);
+assert.match(chinese, /每个顶层任务的子代理执行槽/);
+assert.doesNotMatch(chinese, /运行中代理总数/);
 assert.match(chinese, /排队任务/);
 (async () => {
   await c.saveDesktopParallelism({value: '24'}, 'totalAgentParallelism');

@@ -123,7 +123,9 @@ func (k TeammateKind) String() string {
 type TeammateStatus int
 
 const (
-	// StatusRunning — sub-loop active, output growing.
+	// StatusRunning — sub-loop started and not yet terminal. In Desktop it
+	// may temporarily yield its execution permit while waiting for a job or
+	// other agents; use ExecutionPhase to see whether it currently holds one.
 	StatusRunning TeammateStatus = iota
 	// StatusCompleted — sub-loop ended cleanly (end_turn / no_tool_calls).
 	StatusCompleted
@@ -176,6 +178,9 @@ type Teammate struct {
 	// runner unwinds. It is nil for ordinary CLI use and is called only from
 	// signalDone, which already has exactly-once lifecycle semantics.
 	resourceRelease func()
+	// executionLease reports a Desktop child's current execution phase.
+	// Lifecycle Status remains running while a child yields its permit.
+	executionLease *DesktopExecutionLease
 
 	// Name is what callers pass via `Agent({name: ...})`. Anonymous
 	// sub-agents get an auto-generated `_anon-<8hex>` prefix so the
@@ -339,17 +344,19 @@ func (t *Teammate) Finish(status TeammateStatus, result string, exitErr error, h
 // + Roster.List(). Detaches caller from the mutex so the reader can't
 // accidentally race the runner.
 type TeammateSnapshot struct {
-	Name       string
-	AgentID    string
-	Anonymous  bool
-	Background bool
-	Started    time.Time
-	Status     TeammateStatus
-	Output     string
-	Result     string
-	EndTime    time.Time
-	ExitErr    error
-	StopHint   string
+	Name               string
+	AgentID            string
+	Anonymous          bool
+	Background         bool
+	Started            time.Time
+	Status             TeammateStatus
+	ExecutionPhase     string
+	HoldsExecutionSlot bool
+	Output             string
+	Result             string
+	EndTime            time.Time
+	ExitErr            error
+	StopHint           string
 }
 
 // IsNamed mirrors Teammate.IsNamed on the snapshot view so /agents
@@ -360,8 +367,7 @@ func (s TeammateSnapshot) IsNamed() bool { return !s.Anonymous }
 // SubAgentOutput uses this to read the running buffer + status atomically.
 func (t *Teammate) Snapshot() TeammateSnapshot {
 	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return TeammateSnapshot{
+	snapshot := TeammateSnapshot{
 		Name:       t.Name,
 		AgentID:    t.AgentID,
 		Anonymous:  t.Anonymous,
@@ -374,6 +380,20 @@ func (t *Teammate) Snapshot() TeammateSnapshot {
 		ExitErr:    t.ExitErr,
 		StopHint:   t.StopHint,
 	}
+	lease := t.executionLease
+	t.mu.RUnlock()
+	switch snapshot.Status {
+	case StatusQueued:
+		snapshot.ExecutionPhase = "queued"
+	case StatusRunning:
+		snapshot.ExecutionPhase, snapshot.HoldsExecutionSlot = lease.executionSnapshot()
+	default:
+		snapshot.ExecutionPhase = "finished"
+		// Finish may precede final runner cleanup by a few instructions.
+		// Keep the held bit tied to the actual lease until it is closed.
+		_, snapshot.HoldsExecutionSlot = lease.executionSnapshot()
+	}
+	return snapshot
 }
 
 // Kind returns the orchestration tag for this teammate (G.12,
@@ -673,6 +693,9 @@ func (r *Roster) register(t *Teammate, queued bool) error {
 	t.done = make(chan struct{})
 	t.doneOnce = sync.Once{}
 	t.doneClosed = false
+	t.mu.Lock()
+	t.executionLease = nil
+	t.mu.Unlock()
 	if queued {
 		t.Status = StatusQueued
 	}
@@ -683,6 +706,10 @@ func (r *Roster) register(t *Teammate, queued bool) error {
 // TryStartQueued commits a scheduler lease only while this exact identity is
 // still live and has not been cancelled. On error the caller owns release.
 func (r *Roster) TryStartQueued(t *Teammate, release func()) error {
+	return r.tryStartQueued(t, release, nil)
+}
+
+func (r *Roster) tryStartQueued(t *Teammate, release func(), lease *DesktopExecutionLease) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.resetting || t == nil || r.teammates[t.Name] != t {
@@ -697,6 +724,7 @@ func (r *Roster) TryStartQueued(t *Teammate, release func()) error {
 		return fmt.Errorf("sub-agent %s is %s, not queued", t.AgentID, t.Status)
 	}
 	t.resourceRelease = release
+	t.executionLease = lease
 	t.Status = StatusRunning
 	return nil
 }
