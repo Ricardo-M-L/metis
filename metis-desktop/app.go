@@ -30,20 +30,23 @@ type App struct {
 	metisBin string
 	sendMu   sync.Mutex
 
-	findMetis                        func() (string, error)
-	runMetis                         func(ctx context.Context, binary string, args []string, dir string) (stdout, stderr string, err error)
-	chooseWorkspace                  func(context.Context, string) (string, error)
-	checkDesktopUpdate               func(context.Context, string) (DesktopUpdateStatus, error)
-	installDesktopUpdate             func(context.Context, string, string) (DesktopUpdateStatus, error)
-	installDesktopUpdateWithProgress func(context.Context, string, string, desktopUpdateReporter) (DesktopUpdateStatus, error)
-	desktopPath                      func() (string, error)
-	restartDesktop                   func(path, workspace, metisBin string) error
-	resolveUpdatedMetis              func(current string) (string, error)
-	scheduleRestart                  func(func())
-	quit                             func(context.Context)
-	updateMu                         sync.Mutex
-	updateProgress                   DesktopUpdateProgress
-	updateRunning                    bool
+	findMetis                         func() (string, error)
+	runMetis                          func(ctx context.Context, binary string, args []string, dir string) (stdout, stderr string, err error)
+	chooseWorkspace                   func(context.Context, string) (string, error)
+	requestComputerUsePermission      func(string) (bool, error)
+	computerUsePermissionStatus       func() DesktopComputerUsePermissionStatus
+	openComputerUsePermissionSettings func(context.Context, string) error
+	checkDesktopUpdate                func(context.Context, string) (DesktopUpdateStatus, error)
+	installDesktopUpdate              func(context.Context, string, string) (DesktopUpdateStatus, error)
+	installDesktopUpdateWithProgress  func(context.Context, string, string, desktopUpdateReporter) (DesktopUpdateStatus, error)
+	desktopPath                       func() (string, error)
+	restartDesktop                    func(path, workspace, metisBin string) error
+	resolveUpdatedMetis               func(current string) (string, error)
+	scheduleRestart                   func(func())
+	quit                              func(context.Context)
+	updateMu                          sync.Mutex
+	updateProgress                    DesktopUpdateProgress
+	updateRunning                     bool
 
 	// webuiCmd is the in-process-browser backend child (metis desktop
 	// --web). The native window embeds it behind a tokenised frame URL; the
@@ -68,12 +71,15 @@ func NewApp() *App {
 				CanCreateDirectories: true,
 			})
 		},
-		checkDesktopUpdate:               updater.Check,
-		installDesktopUpdate:             updater.Install,
-		installDesktopUpdateWithProgress: updater.InstallWithProgress,
-		desktopPath:                      currentDesktopPath,
-		restartDesktop:                   restartDesktopProcess,
-		resolveUpdatedMetis:              resolveStableMetisBinary,
+		requestComputerUsePermission:      requestDesktopComputerUsePermission,
+		computerUsePermissionStatus:       desktopComputerUsePermissionStatus,
+		openComputerUsePermissionSettings: openDesktopComputerUsePermissionSettings,
+		checkDesktopUpdate:                updater.Check,
+		installDesktopUpdate:              updater.Install,
+		installDesktopUpdateWithProgress:  updater.InstallWithProgress,
+		desktopPath:                       currentDesktopPath,
+		restartDesktop:                    restartDesktopProcess,
+		resolveUpdatedMetis:               resolveStableMetisBinary,
 		scheduleRestart: func(fn func()) {
 			go func() {
 				time.Sleep(350 * time.Millisecond)
@@ -429,7 +435,7 @@ func freePort() (int, error) {
 }
 
 func (a *App) GetVersion() string {
-	return "0.4.80"
+	return "0.4.81"
 }
 
 // ChooseWorkspaceDirectory is the native half of the iframe bridge. The web
@@ -456,6 +462,66 @@ func (a *App) ChooseWorkspaceDirectory() (string, error) {
 		return "", errors.New("selected workspace is not a readable directory")
 	}
 	return abs, nil
+}
+
+// DesktopComputerUsePermissionResult describes only the current result of an
+// explicitly requested macOS permission. Accessibility prompts can complete
+// asynchronously, so a false Granted value is not a final denial.
+type DesktopComputerUsePermissionResult struct {
+	Kind           string `json:"kind"`
+	Granted        bool   `json:"granted"`
+	SettingsOpened bool   `json:"settingsOpened"`
+}
+
+// DesktopComputerUsePermissionStatus is a prompt-free snapshot of the native
+// Desktop process's own TCC grants. It does not claim that a separately
+// packaged helper has the same grants.
+type DesktopComputerUsePermissionStatus struct {
+	Accessibility   string `json:"accessibility"`
+	ScreenRecording string `json:"screenRecording"`
+}
+
+func (a *App) GetComputerUsePermissionStatus() DesktopComputerUsePermissionStatus {
+	if a.computerUsePermissionStatus == nil {
+		return DesktopComputerUsePermissionStatus{Accessibility: "unavailable", ScreenRecording: "unavailable"}
+	}
+	return a.computerUsePermissionStatus()
+}
+
+// RequestComputerUsePermission runs in the native Desktop process, which is
+// the app macOS must list in Privacy & Security. It is called only by the
+// authenticated Desktop frame's explicit permission button. Status reads do
+// not call this method and never trigger a system prompt.
+func (a *App) RequestComputerUsePermission(kind string) (DesktopComputerUsePermissionResult, error) {
+	result := DesktopComputerUsePermissionResult{Kind: kind}
+	if kind != "accessibility" && kind != "screen-recording" {
+		return result, errors.New("unsupported Computer Use permission")
+	}
+	if a.requestComputerUsePermission == nil {
+		return result, errors.New("native Computer Use permission request is unavailable")
+	}
+	granted, err := a.requestComputerUsePermission(kind)
+	if err != nil {
+		return result, err
+	}
+	result.Granted = granted
+	if granted {
+		return result, nil
+	}
+	if a.openComputerUsePermissionSettings == nil {
+		return result, errors.New("opening macOS permission settings is unavailable")
+	}
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := a.openComputerUsePermissionSettings(ctx, kind); err != nil {
+		return result, fmt.Errorf("open macOS Computer Use permission settings: %w", err)
+	}
+	result.SettingsOpened = true
+	return result, nil
 }
 
 // GetUpdateStatus checks only. It never downloads or changes the running app,

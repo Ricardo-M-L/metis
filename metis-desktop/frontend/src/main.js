@@ -24,6 +24,16 @@ window.addEventListener('load', async () => {
       'install-update': () => InstallUpdateAndRestart(),
       'start-install-update': () => StartInstallUpdateAndRestart(),
       'get-update-progress': () => GetUpdateProgress(),
+      'request-computer-use-permission': payload => {
+        const kind = String(payload && payload.kind || '');
+        if (kind !== 'accessibility' && kind !== 'screen-recording') {
+          throw new Error('Unsupported Computer Use permission');
+        }
+        // Call the Wails binding in this GUI process. The iframe's backend
+        // child cannot register METIS Desktop itself with macOS TCC.
+        return window['go']['main']['App']['RequestComputerUsePermission'](kind);
+      },
+      'get-computer-use-permission-status': () => window['go']['main']['App']['GetComputerUsePermissionStatus'](),
       'set-theme': payload => {
         const theme = String(payload && payload.theme || 'auto');
         return SetNativeTheme(theme);

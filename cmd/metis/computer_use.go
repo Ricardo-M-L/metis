@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	goruntime "runtime"
+	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/computeruse"
@@ -113,12 +116,7 @@ func (r *runtime) computerUseAction(ctx context.Context, action string) (compute
 	case "install":
 		return manager.Ensure(ctx)
 	case "permissions-accessibility", "permissions-screen-recording":
-		if err := openComputerUsePermissionSettings(ctx, action); err != nil {
-			return computeruse.Status{}, err
-		}
-		status, err := r.computerUseStatus(ctx, manager)
-		status.Message = "System Settings opened; permissions must be granted by you. Restart Computer Use and refresh status afterwards."
-		return status, err
+		return r.requestComputerUsePermission(ctx, manager, action, openComputerUsePermissionSettings)
 	case "stop", "disable":
 		if r == nil && action == "stop" {
 			return computeruse.Status{}, fmt.Errorf("use /cu stop in the active CLI or Stop in Desktop; this command does not own another session's process")
@@ -150,6 +148,130 @@ func (r *runtime) computerUseAction(ctx context.Context, action string) (compute
 		return r.enableComputerUse(ctx, manager)
 	}
 	panic("unreachable Computer Use action")
+}
+
+const computerUsePermissionRequestTimeout = 20 * time.Second
+
+// boundedPermissionOutput prevents a misbehaving helper from filling memory
+// while it is waiting for its macOS permission request to finish.
+type boundedPermissionOutput struct {
+	bytes.Buffer
+	limit    int
+	overflow bool
+}
+
+func (b *boundedPermissionOutput) Write(p []byte) (int, error) {
+	n := len(p)
+	remaining := b.limit - b.Len()
+	if len(p) > remaining {
+		b.overflow = true
+		p = p[:remaining]
+	}
+	_, _ = b.Buffer.Write(p)
+	return n, nil
+}
+
+func computerUsePermissionKind(action string) (string, error) {
+	switch action {
+	case "permissions-accessibility":
+		return "accessibility", nil
+	case "permissions-screen-recording":
+		return "screen-recording", nil
+	default:
+		return "", fmt.Errorf("unknown permission request action %q", action)
+	}
+}
+
+func (r *runtime) requestComputerUsePermission(ctx context.Context, manager *computeruse.Manager, action string, openSettings func(context.Context, string) error) (computeruse.Status, error) {
+	if goruntime.GOOS != "darwin" {
+		return computeruse.Status{}, errors.New("Computer Use OS permission requests are only supported on macOS")
+	}
+	kind, err := computerUsePermissionKind(action)
+	if err != nil {
+		return computeruse.Status{}, err
+	}
+	// Status checks the selected activation, executable digest, version, and
+	// descriptor. Never resolve a request helper from PATH or a browser value.
+	installed, err := manager.Status(ctx)
+	if err != nil {
+		return installed, err
+	}
+	if !installed.Installed || installed.Path == "" || installed.Description == nil {
+		return installed, errors.New("Computer Use component is not installed; install it before requesting macOS permissions")
+	}
+	permissionKey := kind
+	if kind == "screen-recording" {
+		permissionKey = "screenRecording"
+	}
+	// The read-only probe runs in a different process context from the direct
+	// request and the MCP worker. Even a "granted" probe cannot stand in for
+	// the explicit request from the installed helper's identity.
+	description, err := runComputerUsePermissionRequest(ctx, installed, kind)
+	if err != nil {
+		return installed, err
+	}
+	status, err := r.computerUseStatus(ctx, manager)
+	if err != nil {
+		return status, err
+	}
+	// The direct request describes the latest permission state. A running MCP
+	// connection may still report an older state until it restarts.
+	status.Description = &description
+	if description.Permissions[permissionKey] == "granted" {
+		status.Message = "macOS permission granted. Restart Computer Use if access is still unavailable."
+		return status, nil
+	}
+	if err := openSettings(ctx, action); err != nil {
+		return status, fmt.Errorf("macOS permission request was sent, but System Settings could not be opened: %w", err)
+	}
+	status.Message = "macOS permission requested; System Settings opened for you to grant access. Restart Computer Use and refresh status afterwards."
+	return status, nil
+}
+
+func runComputerUsePermissionRequest(ctx context.Context, installed computeruse.Status, kind string) (computeruse.Description, error) {
+	ctx, cancel := context.WithTimeout(ctx, computerUsePermissionRequestTimeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, installed.Path, "--request-permission", kind, "--json")
+	command.Dir = os.TempDir()
+	command.WaitDelay = 250 * time.Millisecond
+	// The OS prompt needs the helper's native process identity, not the
+	// read-only description sandbox. Do not pass credentials to this process.
+	command.Env = []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", "LC_ALL=C"}
+	if userHome, err := os.UserHomeDir(); err == nil {
+		command.Env = append(command.Env, "HOME="+userHome)
+	}
+	stdout := &boundedPermissionOutput{limit: 64 << 10}
+	stderr := &boundedPermissionOutput{limit: 8 << 10}
+	command.Stdout, command.Stderr = stdout, stderr
+	if err := command.Run(); err != nil {
+		if ctx.Err() != nil {
+			return computeruse.Description{}, fmt.Errorf("Computer Use permission request timed out or was canceled: %w", ctx.Err())
+		}
+		return computeruse.Description{}, fmt.Errorf("installed Computer Use helper could not request macOS permission (%v); update or reinstall the component if it predates permission requests", err)
+	}
+	if stdout.overflow || stderr.overflow {
+		return computeruse.Description{}, errors.New("Computer Use permission request exceeded its output limit")
+	}
+	var description computeruse.Description
+	decoder := json.NewDecoder(&stdout.Buffer)
+	if err := decoder.Decode(&description); err != nil {
+		return computeruse.Description{}, errors.New("installed Computer Use helper did not return a permission descriptor; update or reinstall the component")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return computeruse.Description{}, errors.New("installed Computer Use helper returned extra permission data; update or reinstall the component")
+	}
+	if description.Name != "metis-cu" || description.ProtocolVersion != computeruse.ProtocolVersion || description.Version != installed.Version || description.Platform != goruntime.GOOS || description.Arch != goruntime.GOARCH || description.Permissions == nil {
+		return computeruse.Description{}, errors.New("installed Computer Use helper returned an incompatible permission descriptor; update or reinstall the component")
+	}
+	permissionKey := kind
+	if kind == "screen-recording" {
+		permissionKey = "screenRecording"
+	}
+	if strings.TrimSpace(description.Permissions[permissionKey]) == "" {
+		return computeruse.Description{}, errors.New("installed Computer Use helper omitted the requested permission; update or reinstall the component")
+	}
+	return description, nil
 }
 
 func (r *runtime) computerUseStatus(ctx context.Context, manager *computeruse.Manager) (computeruse.Status, error) {

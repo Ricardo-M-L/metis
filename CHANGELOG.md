@@ -7,6 +7,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.81] - 2026-09-30
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Changed
+
+- Desktop requests Accessibility and Screen Recording access from its native
+  macOS process when the user clicks the permission controls, and opens the
+  matching System Settings pane when access still needs approval.
+- Show Desktop permission status separately from the Computer Use component's
+  preflight result, with messages in the selected interface language.
+
+### Fixed
+
+- The Computer Use component can request its own macOS permissions through an
+  explicit, version-checked helper action instead of merely opening Settings.
+- Keep permission status refreshes read-only and bound helper output and wait
+  time so an unresponsive component cannot hang the permission flow.
+
 ## [0.4.80] - 2026-09-30
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

@@ -1069,6 +1069,7 @@ html, body {
 }
 
 .computer-use-settings .settings-card-row { gap: 16px; }
+.computer-use-permission-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
 .computer-use-value { font-size: 13px; text-align: right; overflow-wrap: anywhere; }
 .computer-use-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 24px; }
 .computer-use-button {

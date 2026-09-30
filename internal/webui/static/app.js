@@ -1213,8 +1213,9 @@ function onWindowResize() {
 }
 
 // Computer Use settings only read status on entry. Installation, launch and
-// opening operating-system settings require a named button action.
+// macOS permission requests require a named button action.
 let computerUseStatus = null;
+let computerUseNativePermissions = null;
 let computerUseBusy = false;
 let computerUseError = '';
 let computerUsePendingAction = '';
@@ -1238,9 +1239,56 @@ function computerUsePermissionLabel(value) {
     unknown: uiText('Unknown', '未知'),
     unsupported: uiText('Unsupported', '不支持'),
     unavailable: uiText('Unavailable', '不可用'),
+    runtime: uiText('Checked when running', '运行时检查'),
     'not-required': uiText('Not required', '无需授权')
   };
   return labels[value] || value || uiText('Unknown — refresh after installing', '未知，请安装后刷新');
+}
+
+function isNativeComputerUseDesktop() {
+  return typeof window !== 'undefined' && window.parent && window.parent !== window;
+}
+
+function validNativeComputerUsePermissions(value) {
+  if (!value || typeof value !== 'object') return null;
+  const allowed = ['granted', 'notGranted', 'unavailable'];
+  if (!allowed.includes(value.accessibility) || !allowed.includes(value.screenRecording)) return null;
+  return {accessibility: value.accessibility, screenRecording: value.screenRecording};
+}
+
+async function refreshNativeComputerUsePermissions(operationID) {
+  if (!isNativeComputerUseDesktop()) return;
+  try {
+    const result = validNativeComputerUsePermissions(await requestNative('get-computer-use-permission-status', {}, 5000));
+    if (operationID === computerUseOperationID) computerUseNativePermissions = result;
+  } catch (_) {
+    if (operationID === computerUseOperationID) computerUseNativePermissions = null;
+  }
+}
+
+function computerUseLocalizedMessage(message) {
+  if (!message) return '';
+  const known = {
+    'Explicit local build installed; this is not a verified official release.': uiText('Explicit local build installed; this is not a verified official release.', '当前安装的是本地构建，未经官方发布验证。'),
+    'System Settings opened; permissions must be granted by you. Restart Computer Use and refresh status afterwards.': uiText('System Settings opened; permissions must be granted by you. Restart Computer Use and refresh status afterwards.', '已打开系统设置，请自行授权。完成后重启电脑操作并刷新状态。'),
+    'This macOS permission is already granted. Restart Computer Use if access is still unavailable.': uiText('This macOS permission is already granted. Restart Computer Use if access is still unavailable.', '这项 macOS 权限已经授予。如果仍无法使用，请重启电脑操作。'),
+    'macOS permission granted. Restart Computer Use if access is still unavailable.': uiText('macOS permission granted. Restart Computer Use if access is still unavailable.', 'macOS 权限已授予。如果仍无法使用，请重启电脑操作。'),
+    'macOS permission requested; System Settings opened for you to grant access. Restart Computer Use and refresh status afterwards.': uiText('macOS permission requested; System Settings opened for you to grant access. Restart Computer Use and refresh status afterwards.', '已向 macOS 请求权限，并打开系统设置供你手动授权。授权后请重启电脑操作并刷新状态。')
+  };
+  if (known[message]) return known[message];
+  if (message.includes('update or reinstall the component')) {
+    return uiText('The installed Computer Use component cannot request this macOS permission. Update or reinstall the component, then try again.', '已安装的电脑操作组件无法请求这项 macOS 权限。请更新或重新安装组件后重试。');
+  }
+  if (message.startsWith('Computer Use component is not installed;')) {
+    return uiText('Install the Computer Use component before requesting macOS permissions.', '请先安装电脑操作组件，再请求 macOS 权限。');
+  }
+  if (message.startsWith('Computer Use permission request timed out or was canceled:')) {
+    return uiText('The macOS permission request timed out or was canceled. Try again.', 'macOS 权限请求超时或已取消，请重试。');
+  }
+  if (message.startsWith('macOS permission request was sent, but System Settings could not be opened:')) {
+    return uiText('The permission request was sent, but System Settings could not be opened. Open the relevant privacy pane yourself and grant access.', '已发出权限请求，但未能打开系统设置。请自行打开对应隐私权限页面并授权。');
+  }
+  return message;
 }
 
 function computerUseMarkup() {
@@ -1257,9 +1305,25 @@ function computerUseMarkup() {
   const installation = status ? (status.installed ? uiText('Installed', '已安装') : uiText('Not installed', '未安装')) : uiText('Unknown', '未知');
   const state = status ? (status.enabled ? uiText('Enabled', '已启用') : uiText('Disabled', '已停用')) : uiText('Unknown', '未知');
   const connection = status ? (status.running ? uiText('Running', '运行中') : uiText('Stopped', '已停止')) : uiText('Unknown', '未知');
-  const permissionRow = (label, key, action) => `<div class="settings-card-row"><div><div class="settings-card-label">${escHtml(label)}</div><div class="settings-card-desc">${escHtml(computerUsePermissionLabel(permissions[key]))}</div></div>${description.platform === 'darwin' ? `<button type="button" class="computer-use-button" onclick="computerUseAction('${action}')"${disabled}>${uiText('Open System Settings', '打开系统设置')}</button>` : ''}</div>`;
+  const permissionRow = (label, key, action) => {
+    const nativeDesktop = isNativeComputerUseDesktop();
+    const nativeValue = computerUseNativePermissions && computerUseNativePermissions[key];
+    const componentValue = permissions[key];
+    const desktopLine = nativeDesktop ? `<div class="settings-card-desc">${uiText('METIS Desktop', '桌面应用')} · ${escHtml(computerUsePermissionLabel(nativeValue))}</div>` : '';
+    const componentLine = status && status.installed ? `<div class="settings-card-desc">${nativeDesktop ? `${uiText('Component check', '组件预检')} · ` : ''}${escHtml(computerUsePermissionLabel(componentValue))}</div>` : '';
+    const requestDesktop = nativeDesktop && description.platform === 'darwin'
+      && nativeValue !== 'granted' && nativeValue !== 'unavailable';
+    const requestComponent = status && status.installed && description.platform === 'darwin'
+      && ['denied', 'notGranted', 'not-granted', 'not-determined'].includes(componentValue);
+    const requestBrowser = !nativeDesktop && status && status.installed && description.platform === 'darwin'
+      && !['granted', 'unsupported', 'not-required'].includes(componentValue);
+    const desktopButton = requestDesktop ? `<button type="button" class="computer-use-button" onclick="computerUseAction('${action}')"${disabled}>${uiText('Request Desktop access', '请求桌面应用权限')}</button>` : '';
+    const componentButton = requestComponent && nativeDesktop ? `<button type="button" class="computer-use-button" onclick="computerUseAction('helper-${action}')"${disabled}>${uiText('Request component access', '请求组件权限')}</button>` : '';
+    const browserButton = requestBrowser ? `<button type="button" class="computer-use-button" onclick="computerUseAction('${action}')"${disabled}>${uiText('Request access', '请求权限')}</button>` : '';
+    return `<div class="settings-card-row"><div><div class="settings-card-label">${escHtml(label)}</div>${desktopLine}${componentLine}</div><div class="computer-use-permission-actions">${desktopButton}${componentButton}${browserButton}</div></div>`;
+  };
   return `<div class="computer-use-status" role="status">${computerUseBusy ? uiText('Working…', '正在处理…') : ''}</div>
-    ${computerUseError ? `<p class="computer-use-error" role="alert">${escHtml(computerUseError)}</p>` : ''}
+    ${computerUseError ? `<p class="computer-use-error" role="alert">${escHtml(computerUseLocalizedMessage(computerUseError))}</p>` : ''}
     ${computerUseError && status ? `<p class="settings-section-desc">${uiText('Last known status. Refresh to check again.', '以下为上次获取的状态，请刷新确认。')}</p>` : ''}
     <div class="settings-card">
       ${row(uiText('Installation', '安装'), installation)}
@@ -1268,7 +1332,7 @@ function computerUseMarkup() {
       ${row(uiText('Version', '版本'), status && status.version || '—')}
       ${row(uiText('Source', '来源'), status ? source : '—')}
     </div>
-    ${status && status.message ? `<p class="computer-use-note">${escHtml(status.message)}</p>` : ''}
+    ${status && status.message ? `<p class="computer-use-note">${escHtml(computerUseLocalizedMessage(status.message))}</p>` : ''}
     <div class="computer-use-actions">
       <button type="button" class="computer-use-button" onclick="loadComputerUse()"${disabled}>${uiText('Refresh', '刷新')}</button>
       <button type="button" class="computer-use-button primary" onclick="computerUseAction('enable')"${disabled}${!status || status.running ? ' disabled' : ''}>${status && status.installed ? uiText('Enable', '启用') : uiText('Install & enable', '安装并启用')}</button>
@@ -1276,7 +1340,7 @@ function computerUseMarkup() {
       <button type="button" class="computer-use-button" onclick="computerUseAction('disable')"${disabled}${!status || !status.enabled ? ' disabled' : ''}>${uiText('Disable', '停用')}</button>
     </div>
     <h3 class="settings-section-title">${uiText('Operating-system permissions', '操作系统权限')}</h3>
-    <p class="settings-section-desc">${uiText('Installing or enabling Computer Use does not grant these permissions. Open System Settings, grant access yourself, then refresh. An installed component may still be unable to see or control your screen.', '安装或启用电脑操作不会授予这些权限。请打开系统设置，自行授权后刷新。组件已安装时，仍可能无法查看或控制屏幕。')}</p>
+    <p class="settings-section-desc">${uiText('Request access from METIS Desktop. macOS may prompt or open System Settings for your approval. Component checks are shown separately; confirm actual screen and input access after approval, then restart Computer Use and refresh.', '点击“请求桌面应用权限”让 METIS Desktop 向 macOS 发起请求；系统可能弹出提示或打开设置，授权仍由你完成。组件预检单独显示，授权后请确认实际屏幕和输入操作，再重启电脑操作并刷新。')}</p>
     <div class="settings-card">
       ${permissionRow(uiText('Accessibility', '辅助功能'), 'accessibility', 'permissions-accessibility')}
       ${permissionRow(uiText('Screen Recording', '屏幕录制'), 'screenRecording', 'permissions-screen-recording')}
@@ -1297,12 +1361,14 @@ async function loadComputerUse() {
   computerUseBusy = true;
   computerUsePendingAction = 'status';
   computerUseError = '';
+  computerUseNativePermissions = null;
   paintComputerUse();
   try {
     const response = await fetch('/api/computer-use', {cache: 'no-store'});
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || uiText('Unable to read Computer Use status.', '无法读取电脑操作状态。'));
     if (operationID === computerUseOperationID) computerUseStatus = data;
+    await refreshNativeComputerUsePermissions(operationID);
   } catch (error) {
     if (operationID === computerUseOperationID) computerUseError = error.message || String(error);
   } finally {
@@ -1315,7 +1381,7 @@ async function loadComputerUse() {
 }
 
 async function computerUseAction(action) {
-  if (!['enable', 'stop', 'disable', 'permissions-accessibility', 'permissions-screen-recording'].includes(action)) return;
+  if (!['enable', 'stop', 'disable', 'permissions-accessibility', 'permissions-screen-recording', 'helper-permissions-accessibility', 'helper-permissions-screen-recording'].includes(action)) return;
   const interruptsEnable = action === 'stop' && computerUsePendingAction === 'enable';
   if (computerUseBusy && !interruptsEnable) return;
   // Stop cancels the runtime's installation/launch ticket. Its response owns
@@ -1326,10 +1392,22 @@ async function computerUseAction(action) {
   computerUseError = '';
   paintComputerUse();
   try {
-    const response = await fetch('/api/computer-use', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action})});
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || uiText('Computer Use action failed.', '电脑操作请求失败。'));
-    if (operationID === computerUseOperationID) computerUseStatus = data;
+    if (action.startsWith('permissions-') && isNativeComputerUseDesktop()) {
+      const kind = action === 'permissions-accessibility' ? 'accessibility' : 'screen-recording';
+      await requestNative('request-computer-use-permission', {kind}, 120000);
+      const response = await fetch('/api/computer-use', {cache: 'no-store'});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || uiText('Unable to read Computer Use status.', '无法读取电脑操作状态。'));
+      if (operationID === computerUseOperationID) computerUseStatus = data;
+      await refreshNativeComputerUsePermissions(operationID);
+    } else {
+      const backendAction = action.startsWith('helper-') ? action.slice('helper-'.length) : action;
+      const response = await fetch('/api/computer-use', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: backendAction})});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || uiText('Computer Use action failed.', '电脑操作请求失败。'));
+      if (operationID === computerUseOperationID) computerUseStatus = data;
+      if (action.startsWith('helper-')) await refreshNativeComputerUsePermissions(operationID);
+    }
   } catch (error) {
     if (operationID === computerUseOperationID) computerUseError = error.message || String(error);
   } finally {
