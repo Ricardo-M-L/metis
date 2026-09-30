@@ -7,6 +7,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.84] - 2026-09-30
+
+### Changed
+
+- Keep Desktop session activity, token usage, cache hit rate, and context usage
+  in compact footer indicators. Open each indicator to inspect its detailed
+  statistics, with labels following the selected interface language.
+
+### Fixed
+
+- Attribute context usage only to the session whose in-process agent state
+  supplied it. Clear stale ownership when a separate worker advances a
+  session, and keep status reads responsive during session compaction.
+- Avoid showing unverified context percentages or inferring uncached tokens
+  from incomplete provider accounting.
+
 ## [0.4.83] - 2026-09-30
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

@@ -50,7 +50,7 @@ function context() {
  const c={console,Map,Set,Array,URLSearchParams,window:{},currentSessionId:'A',runningSessionId:'A',turnRunning:true,
   pendingSessionId:null,showArchivedSessions:false,lastStatusSnapshot:null,statusRequestGeneration:0,stopRequestPending:false,
   DESKTOP_I18N:{en:{subAgents:'agents',backgroundTasks:'tasks'}},subAgentDetailState:{agentId:'',ownerSessionId:''},
-  document:{documentElement:{lang:'en'},getElementById:id=>id==='chatArea'?area:id==='inputField'?input:id==='statusChip'?chip:id==='statusPopover'?pop:null,
+  document:{documentElement:{lang:'en'},getElementById:id=>id==='chatArea'?area:id==='inputField'?input:id==='statusChip'?chip:id==='statusPopover'?pop:null,addEventListener(){},
    querySelectorAll:selector=>cards.filter(card=>card.isConnected&&(selector==='[data-ask]'?card.attrs['data-ask']:selector==='[data-perm]'?card.attrs['data-perm']:false)),querySelector:()=>null},
   sameSession:d=>String(d.session||'')===String(c.currentSessionId||''),
   uiText:en=>en,escHtml:String,escAttr:String,escOnclick:String,renderSessions(){},autoScroll(){},showToast:error=>errors.push(error),

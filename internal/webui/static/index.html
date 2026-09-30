@@ -216,14 +216,17 @@
               <span id="effortName">Default effort</span><span>&#9662;</span>
             </button>
             <div class="effort-menu" id="effortMenu" role="menu" style="display:none"></div>
-            <span class="context-meter" id="contextMeter" style="display:none" title="Context usage"></span>
             <button class="send-btn" id="sendBtn" type="button" title="Send message" aria-label="Send message" onclick="sendMessage()" disabled>&#8593;</button>
             <button class="send-btn stop-btn" id="stopBtn" type="button" title="Stop current turn" aria-label="Stop current turn" onclick="stopTurn()" style="display:none">&#9632;</button>
           </div>
         </div>
+        <div class="composer-runtime-dock" id="composerRuntimeDock" hidden>
+          <button class="context-meter" id="contextMeter" type="button" style="display:none" aria-label="Context usage" aria-expanded="false" aria-controls="contextMeterPopover" onclick="toggleContextMeter(event)"></button>
+          <div class="session-statsbar" id="sessionStatsbar" style="display:none"></div>
+        </div>
+        <div class="context-meter-popover" id="contextMeterPopover" role="region" aria-label="Context details" hidden></div>
       </div>
     </div>
-    <div class="session-statsbar" id="sessionStatsbar" style="display:none"></div>
 
     <div class="subagent-detail-overlay" id="subAgentDetailOverlay" hidden>
       <section class="subagent-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="subAgentDetailTitle" aria-describedby="subAgentDetailDescription" tabindex="-1">

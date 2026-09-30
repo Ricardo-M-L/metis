@@ -89,7 +89,7 @@ const DESKTOP_I18N = {
   en: {
     newSession: 'New session', workspaces: 'Workspaces', searchSessions: 'Search sessions…', settings: 'Settings', checkUpdates: 'Check for updates',
     searchSessionsLabel: 'Search sessions', collapseSidebar: 'Collapse sidebar', expandSidebar: 'Expand sidebar',
-    context: 'Context', autoCompactAt: 'auto-compact at', subAgents: 'sub-agents', backgroundTasks: 'background tasks',
+    context: 'Context', contextDetails: 'Context details', contextOpenDetails: 'Click to view details', contextUsed: 'Used', contextWindow: 'Window', autoCompactAt: 'Auto-compact at', subAgents: 'sub-agents', backgroundTasks: 'background tasks',
     chat: 'Chat', trajectory: 'Trajectory', welcome: 'From idea to done', preview: 'METIS Desktop', sessionLog: 'Session log',
     composerPlaceholder: 'Describe what you want to build', jumpLatest: 'Jump to latest', details: 'Details', detailsPlaceholder: 'Select a tool row to inspect details',
     backToApp: 'Back to app', searchSettings: 'Search settings…', personal: 'Personal', general: 'General', appearance: 'Appearance',
@@ -100,7 +100,7 @@ const DESKTOP_I18N = {
   'zh-CN': {
     newSession: '新会话', workspaces: '工作区', searchSessions: '搜索会话…', settings: '设置', checkUpdates: '检查更新',
     searchSessionsLabel: '搜索会话', collapseSidebar: '收起侧栏', expandSidebar: '展开侧栏',
-    context: '上下文', autoCompactAt: '自动压缩阈值', subAgents: '子代理', backgroundTasks: '后台任务',
+    context: '上下文', contextDetails: '上下文详情', contextOpenDetails: '点击查看详情', contextUsed: '已使用', contextWindow: '窗口', autoCompactAt: '自动压缩阈值', subAgents: '子代理', backgroundTasks: '后台任务',
     chat: '对话', trajectory: '轨迹', welcome: '从想法，到完成', preview: 'METIS Desktop', sessionLog: '会话日志',
     composerPlaceholder: '描述你想要构建的内容', jumpLatest: '回到最新', details: '详情', detailsPlaceholder: '点击消息流中的工具行查看详情',
     backToApp: '返回应用', searchSettings: '搜索设置…', personal: '个人', general: '通用', appearance: '外观',
@@ -127,6 +127,7 @@ function applyLanguage(value) {
   applyLayout();
   if (typeof syncApprovalChip === 'function') syncApprovalChip(approvalMode);
   if (lastStatusSnapshot) renderStatusSnapshot(lastStatusSnapshot);
+  if (typeof renderCurrentSessionStatsbar === 'function') renderCurrentSessionStatsbar();
   if (typeof subAgentDetailState !== 'undefined' && subAgentDetailState.agentId) renderSubAgentDetails();
   if (typeof renderSessions === 'function') renderSessions();
   if (typeof refreshMessageActionTimesLanguage === 'function') refreshMessageActionTimesLanguage();
@@ -423,6 +424,94 @@ async function pollStatus(shouldApply = () => true) {
   } catch (_) { /* status is best-effort */ }
 }
 
+function closeContextMeterPopover() {
+  const meter = document.getElementById('contextMeter');
+  const popover = document.getElementById('contextMeterPopover');
+  if (popover) popover.hidden = true;
+  if (meter) meter.setAttribute('aria-expanded', 'false');
+}
+
+function syncComposerRuntimeDock() {
+  const dock = document.getElementById('composerRuntimeDock');
+  if (!dock) return;
+  const meter = document.getElementById('contextMeter');
+  const stats = document.getElementById('sessionStatsbar');
+  dock.hidden = (!meter || meter.style.display === 'none') && (!stats || stats.style.display === 'none');
+}
+
+function toggleContextMeter(event) {
+  if (event) event.stopPropagation();
+  const meter = document.getElementById('contextMeter');
+  const popover = document.getElementById('contextMeterPopover');
+  if (!meter || !popover || meter.style.display === 'none') return;
+  const opening = popover.hidden;
+  if (opening) {
+    if (typeof closeSessionStatsPopover === 'function') closeSessionStatsPopover();
+    if (typeof closeTokenStatsPopover === 'function') closeTokenStatsPopover();
+  }
+  popover.hidden = !opening;
+  meter.setAttribute('aria-expanded', String(opening));
+}
+
+document.addEventListener('click', event => {
+  const meter = document.getElementById('contextMeter');
+  const popover = document.getElementById('contextMeterPopover');
+  if (popover && !popover.hidden && !popover.contains(event.target) && !(meter && meter.contains(event.target))) closeContextMeterPopover();
+});
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  const popover = document.getElementById('contextMeterPopover');
+  if (!popover || popover.hidden) return;
+  closeContextMeterPopover();
+  document.getElementById('contextMeter')?.focus();
+});
+
+function renderContextMeter(d, dict) {
+  const meter = document.getElementById('contextMeter');
+  const popover = document.getElementById('contextMeterPopover');
+  if (!meter || !popover) return;
+  const owner = String(d.contextSessionId || '');
+  const viewed = String(currentSessionId || '');
+  const hasNumbers = typeof d.contextUsed === 'number' && typeof d.contextWindow === 'number';
+  const used = Number(d.contextUsed);
+  const limit = Number(d.contextWindow);
+  // /api/status can describe a different Loop than the selected transcript,
+  // especially with parallel workers. Only a backend-proven owner may show it.
+  if (!owner || owner !== viewed || !hasNumbers || !Number.isFinite(used) || used < 0 || !Number.isFinite(limit) || limit <= 0) {
+    meter.style.display = 'none';
+    meter.classList.remove('warn');
+    meter.removeAttribute('data-session-id');
+    closeContextMeterPopover();
+    syncComposerRuntimeDock();
+    return;
+  }
+  if (meter.dataset.sessionId !== owner) closeContextMeterPopover();
+  meter.dataset.sessionId = owner;
+  const fraction = used / limit;
+  const percent = Math.max(0, Math.min(100, Math.round(fraction * 100)));
+  const percentLabel = used > 0 && fraction < 0.01 ? '<1%' : percent + '%';
+  const compactAtTokens = Number(d.compactAtTokens) || 0;
+  const compactAt = compactAtTokens > 0 ? compactAtTokens / limit : Number(d.compactThreshold) || 0;
+  const locale = document.documentElement.lang === 'en' ? 'en' : 'zh-CN';
+  const exactTokens = value => Math.round(value).toLocaleString(locale) + ' tokens';
+  meter.style.display = '';
+  meter.style.setProperty('--context-progress', percent + '%');
+  meter.innerHTML = `<span class="context-meter-ring" aria-hidden="true"></span><span>${escHtml(percentLabel)}</span>`;
+  meter.removeAttribute('title');
+  meter.setAttribute('aria-label', dict.context + ' ' + percentLabel + ' · ' + dict.contextOpenDetails);
+  meter.classList.toggle('warn', compactAt > 0 && used >= Math.max(0, compactAtTokens > 0 ? compactAtTokens * 0.9 : limit * (compactAt - 0.1)));
+  popover.classList.toggle('warn', meter.classList.contains('warn'));
+  const compactRow = compactAt > 0
+    ? `<div><dt>${escHtml(dict.autoCompactAt)}</dt><dd>${compactAtTokens > 0 ? exactTokens(compactAtTokens) + ' · ' : ''}${Math.round(compactAt * 100)}%</dd></div>`
+    : '';
+  popover.setAttribute('aria-label', dict.contextDetails);
+  popover.innerHTML = `<div class="context-meter-popover-title">${escHtml(dict.contextDetails)} <strong>${escHtml(percentLabel)}</strong></div>
+    <div class="context-meter-progress" aria-hidden="true"><span style="width:${percent}%"></span></div>
+    <dl class="context-meter-details"><div><dt>${escHtml(dict.contextUsed)}</dt><dd>${exactTokens(used)}</dd></div>
+    <div><dt>${escHtml(dict.contextWindow)}</dt><dd>${exactTokens(limit)}</dd></div>${compactRow}</dl>`;
+  syncComposerRuntimeDock();
+}
+
 function renderStatusSnapshot(d) {
   try {
     const chip = document.getElementById('statusChip');
@@ -461,51 +550,7 @@ function renderStatusSnapshot(d) {
       const pn = document.getElementById('wsGroupName');
       if (pn) pn.textContent = d.workspace;
     }
-    const meter = document.getElementById('contextMeter');
-    if (meter) {
-      const used = Number(d.contextUsed) || 0;
-      const limit = Number(d.contextWindow) || 0;
-      const activeSessionId = String(d.activeSessionId || '');
-      const selectedSessionId = String(currentSessionId || (turnRunning ? runningSessionId : '') || '');
-      const viewingNoSession = !selectedSessionId;
-      const viewingInactiveSession = !!(selectedSessionId && activeSessionId && selectedSessionId !== activeSessionId);
-      if (viewingNoSession) {
-        // The blank new-session composer does not own the backend Loop's
-        // previous context. Keep the meter hidden until a turn starts or the
-        // user selects a saved transcript.
-        meter.style.display = 'none';
-        meter.classList.remove('warn');
-      } else if (viewingInactiveSession) {
-        // /api/status reports the one active Loop. Do not attribute that
-        // background session's pressure to a different transcript that the
-        // user is only viewing.
-        meter.style.display = '';
-        meter.textContent = dict.context + ' —';
-        meter.title = dict.context;
-        meter.classList.remove('warn');
-      } else if (limit > 0) {
-        const fraction = used / limit;
-        // Context pressure can temporarily estimate above the provider limit
-        // while compaction is running or when fixed tool/system overhead is
-        // irreducible. A progress badge must remain a percentage, not display
-        // values such as 318%; preserve the raw token counts in the tooltip.
-        const percent = Math.max(0, Math.min(100, Math.round(fraction * 100)));
-        const percentLabel = used > 0 && fraction < 0.01 ? '<1%' : percent + '%';
-        const compactAtTokens = Number(d.compactAtTokens) || 0;
-        const compactAt = compactAtTokens > 0
-          ? compactAtTokens / limit
-          : Number(d.compactThreshold) || 0;
-        meter.style.display = '';
-        meter.textContent = dict.context + ' ' + percentLabel;
-        meter.title = dict.context + ' ' + fmtTokens(used) + ' / ' + fmtTokens(limit) + ' tokens' +
-          (compactAtTokens > 0
-            ? ' \u00B7 ' + dict.autoCompactAt + ' ' + fmtTokens(compactAtTokens) + ' tokens (' + Math.round(compactAt * 100) + '%)'
-            : compactAt > 0 ? ' \u00B7 ' + dict.autoCompactAt + ' ' + Math.round(compactAt * 100) + '%' : '');
-        meter.classList.toggle('warn', compactAt > 0 && used >= Math.max(0, compactAtTokens > 0 ? compactAtTokens * 0.9 : limit * (compactAt - 0.1)));
-      } else {
-        meter.style.display = 'none';
-      }
-    }
+    renderContextMeter(d, dict);
     if (typeof setTurnRunning === 'function') {
       if (typeof parallelTurnsEnabled === 'function' && parallelTurnsEnabled()) {
         syncTrackedRunningState(d);

@@ -427,6 +427,7 @@ const c = {
   subAgentDetailStream:null, subAgentDetailStreamGeneration:0,
   document:{documentElement:{lang:'zh-CN'}, body:new Element(), getElementById:id=>byId.get(id)||null, createElement:()=>new Element(), addEventListener(){}},
   uiText:(en,zh)=>zh, escHtml:v=>String(v), escAttr:v=>String(v),
+  renderContextMeter(){},
   fetch:async url=>{requested.push(url);return {ok:true,json:async()=>({agent:{name:'transport',agentId:'agt-transport',sessionId:'session-a',status:'completed',background:true,elapsedMs:2400,output:'正在读取 transport.go'}})};},
 };
 c.window=c; vm.createContext(c); vm.runInContext(source.replace('} catch (_) { /* status is best-effort */ }', '} catch (error) { throw error; }'),c);

@@ -16,6 +16,8 @@ let workspaceRemoveDialog = null;
 let resumeSessionGeneration = 0;
 let pendingSessionId = null;
 let sessionStatsGeneration = 0;
+let sessionStatsSnapshot = null;
+let sessionStatsSessionID = '';
 let removedWorkspaceIDs = new Set();
 
 function invalidateSessionAsyncLoads() {
@@ -868,58 +870,208 @@ async function confirmSessionDeletion(state) {
   }
 }
 
-// Render the DSH-style bottom stats bar (turns/steps/time/tokens).
-function renderSessionStatsbar(data) {
+// The compact indicator belongs to the composer dock. Its detail panel uses
+// only the selected session's /api/trace stats, never a global Loop snapshot.
+function closeSessionStatsPopover() {
+  const trigger = document.getElementById('sessionStatsTrigger');
+  const popover = document.getElementById('sessionStatsPopover');
+  if (popover) popover.hidden = true;
+  if (trigger) trigger.setAttribute('aria-expanded', 'false');
+}
+
+function closeTokenStatsPopover() {
+  const trigger = document.getElementById('tokenStatsTrigger');
+  const popover = document.getElementById('tokenStatsPopover');
+  if (popover) popover.hidden = true;
+  if (trigger) trigger.setAttribute('aria-expanded', 'false');
+}
+
+function toggleTokenStats(event) {
+  if (event) event.stopPropagation();
+  const trigger = document.getElementById('tokenStatsTrigger');
+  const popover = document.getElementById('tokenStatsPopover');
+  if (!trigger || !popover) return;
+  const opening = popover.hidden;
+  if (opening) {
+    closeSessionStatsPopover();
+    if (typeof closeContextMeterPopover === 'function') closeContextMeterPopover();
+  }
+  popover.hidden = !opening;
+  trigger.setAttribute('aria-expanded', String(opening));
+}
+
+function toggleSessionStats(event) {
+  if (event) event.stopPropagation();
+  const trigger = document.getElementById('sessionStatsTrigger');
+  const popover = document.getElementById('sessionStatsPopover');
+  if (!trigger || !popover) return;
+  const opening = popover.hidden;
+  if (opening) {
+    closeTokenStatsPopover();
+    if (typeof closeContextMeterPopover === 'function') closeContextMeterPopover();
+  }
+  popover.hidden = !opening;
+  trigger.setAttribute('aria-expanded', String(opening));
+}
+
+document.addEventListener('click', event => {
+  const trigger = document.getElementById('sessionStatsTrigger');
+  const popover = document.getElementById('sessionStatsPopover');
+  if (popover && !popover.hidden && !popover.contains(event.target) && !(trigger && trigger.contains(event.target))) closeSessionStatsPopover();
+});
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  const popover = document.getElementById('sessionStatsPopover');
+  if (!popover || popover.hidden) return;
+  closeSessionStatsPopover();
+  document.getElementById('sessionStatsTrigger')?.focus();
+});
+document.addEventListener('click', event => {
+  const trigger = document.getElementById('tokenStatsTrigger');
+  const popover = document.getElementById('tokenStatsPopover');
+  if (popover && !popover.hidden && !popover.contains(event.target) && !(trigger && trigger.contains(event.target))) closeTokenStatsPopover();
+});
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  const popover = document.getElementById('tokenStatsPopover');
+  if (!popover || popover.hidden) return;
+  closeTokenStatsPopover();
+  document.getElementById('tokenStatsTrigger')?.focus();
+});
+
+function renderCurrentSessionStatsbar() {
+  renderSessionStatsbar(sessionStatsSnapshot, sessionStatsSessionID);
+}
+
+function formatSessionDuration(ms) {
+  const value = Math.max(0, Number(ms) || 0);
+  if (document.documentElement.lang !== 'zh-CN') return fmtMs(value);
+  if (value < 1000) return Math.round(value) + '毫秒';
+  if (value < 60000) return (value / 1000).toFixed(value % 1000 ? 1 : 0) + '秒';
+  return Math.floor(value / 60000) + '分' + Math.round((value % 60000) / 1000) + '秒';
+}
+
+function sessionTokenCount(value) {
+  if (value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : null;
+}
+
+function renderSessionStatsbar(data, sessionId = currentSessionId) {
   const bar = document.getElementById('sessionStatsbar');
   if (!bar) return;
-  const st = data.stats || {};
-  if (!st.turns && !st.toolCalls && !st.inputTokens) {
+  const previousTrigger = document.getElementById('sessionStatsTrigger');
+  const previousTokenTrigger = document.getElementById('tokenStatsTrigger');
+  const triggerHadFocus = !!(previousTrigger && document.activeElement === previousTrigger);
+  const tokenTriggerHadFocus = !!(previousTokenTrigger && document.activeElement === previousTokenTrigger);
+  const selectedID = String(currentSessionId || '');
+  const st = data && data.stats || {};
+  const turns = Number(st.turns) || 0;
+  const steps = Number(st.steps) || 0;
+  const toolCalls = Number(st.toolCalls) || 0;
+  const inputTokens = Number(st.inputTokens) || 0;
+  const outputTokens = Number(st.outputTokens) || 0;
+  const hasSessionSummary = turns > 0 || steps > 0 || toolCalls > 0 ||
+    Number(st.durationMs) > 0 || Number(st.llmMs) > 0 || Number(st.toolMs) > 0 ||
+    Number(st.ttftAverageMs) > 0 || Number(st.tokPerSec) > 0;
+  if (!selectedID || String(sessionId || '') !== selectedID ||
+      !(hasSessionSummary || inputTokens > 0 || outputTokens > 0)) {
+    if (triggerHadFocus || tokenTriggerHadFocus) document.getElementById('inputField')?.focus?.();
     bar.style.display = 'none';
+    bar.innerHTML = '';
+    if (typeof syncComposerRuntimeDock === 'function') syncComposerRuntimeDock();
     return;
   }
-  const parts = [];
-  parts.push({ text: st.turns + uiText(' turns \u00B7 ', '\u8F6E \u00B7 ') + (st.steps || 0) + uiText(' steps', '\u6B65'), title: uiText('Conversation turns and recorded user/model/tool steps', '\u4F1A\u8BDD\u8F6E\u6570\u4E0E\u8BB0\u5F55\u7684\u7528\u6237/\u6A21\u578B/\u5DE5\u5177\u6B65\u9AA4\u6570') });
-  const durParts = [];
-  if (st.llmMs > 0) durParts.push('LLM ' + fmtMs(st.llmMs));
-  if (st.toolMs > 0) durParts.push(uiText('Tools ', '\u5DE5\u5177\u8C03\u7528 ') + fmtMs(st.toolMs));
-  if (durParts.length) parts.push({ text: durParts.join(' \u00B7 '), title: uiText('Recorded cumulative LLM and tool-call time', 'LLM \u4E0E\u5DE5\u5177\u8C03\u7528\u8BB0\u5F55\u7684\u7D2F\u8BA1\u8017\u65F6') });
-  const speedParts = [];
-  if (st.ttftAverageMs > 0) {
-    speedParts.push(uiText('Avg first token ', '\u9996 token \u5E73\u5747 ') + fmtMs(st.ttftAverageMs));
+  const wasOpen = !!(hasSessionSummary && previousTrigger && previousTrigger.getAttribute('aria-expanded') === 'true');
+  const summaryParts = [];
+  if (turns > 0) summaryParts.push(turns + uiText(turns === 1 ? ' turn' : ' turns', '轮'));
+  if (steps > 0) summaryParts.push(steps + uiText(steps === 1 ? ' step' : ' steps', '步'));
+  if (!summaryParts.length && toolCalls > 0) summaryParts.push(toolCalls + uiText(toolCalls === 1 ? ' tool call' : ' tool calls', '次工具调用'));
+  if (Number(st.tokPerSec) > 0) summaryParts.push((Math.round(Number(st.tokPerSec) * 10) / 10) + ' tok/s');
+  if (!summaryParts.length && hasSessionSummary) summaryParts.push(uiText('Session', '会话'));
+  const summary = summaryParts.join(' · ');
+  const detailRows = [];
+  const add = (label, value) => detailRows.push(`<div><dt>${escHtml(label)}</dt><dd>${escHtml(value)}</dd></div>`);
+  if (turns > 0) add(uiText('Turns', '轮数'), String(turns));
+  if (steps > 0) add(uiText('Recorded steps', '记录步数'), String(steps));
+  if (Number(st.durationMs) > 0) add(uiText('Total time', '总用时'), formatSessionDuration(st.durationMs));
+  if (Number(st.llmMs) > 0) add(uiText('Model time', '模型用时'), formatSessionDuration(st.llmMs));
+  if (Number(st.toolMs) > 0) add(uiText('Tool time', '工具用时'), formatSessionDuration(st.toolMs));
+  if (toolCalls > 0) add(uiText('Tool calls', '工具调用'), String(toolCalls));
+  if (Number(st.ttftAverageMs) > 0) add(uiText('Avg first token', '平均首 token'), formatSessionDuration(st.ttftAverageMs));
+  if (Number(st.tokPerSec) > 0) add(uiText('Output speed', '输出速度'), (Math.round(Number(st.tokPerSec) * 10) / 10) + ' tok/s');
+  const label = uiText('Session statistics', '会话统计');
+  const inputCount = sessionTokenCount(st.inputTokens);
+  const outputCount = sessionTokenCount(st.outputTokens);
+  const tokenTotal = (inputCount || 0) + (outputCount || 0);
+  const hasTokens = inputCount !== null && outputCount !== null && Number.isSafeInteger(tokenTotal) && tokenTotal > 0;
+  const cacheRead = sessionTokenCount(st.cacheReadTokens);
+  const cacheWrite = sessionTokenCount(st.cacheWriteTokens);
+  const consistentCache = inputCount !== null && cacheRead !== null && cacheWrite !== null && cacheRead + cacheWrite <= inputCount;
+  const locale = document.documentElement.lang === 'zh-CN' ? 'zh-CN' : 'en';
+  const exact = value => value.toLocaleString(locale) + ' tok';
+  const tokenSummary = fmtTokens(tokenTotal) + ' tok';
+  const cacheSummary = consistentCache && inputCount > 0
+    ? uiText('Cache hit ', '缓存命中 ') + Math.round(cacheRead / inputCount * 100) + '%'
+    : '';
+  const tokenLabel = uiText('Token usage', 'Token 用量');
+  const tokenRows = [];
+  const addToken = (name, value) => tokenRows.push(`<div><dt>${escHtml(name)}</dt><dd>${escHtml(exact(value))}</dd></div>`);
+  if (hasTokens) {
+    addToken(uiText('Total', '总量'), tokenTotal);
+    if (inputCount !== null) addToken(uiText('Input total', '输入总量'), inputCount);
+    if (consistentCache) addToken(uiText('Uncached input', '未缓存输入'), inputCount - cacheRead - cacheWrite);
+    if (cacheRead !== null) addToken(uiText('Cache read', '缓存读取'), cacheRead);
+    if (cacheWrite !== null) addToken(uiText('Cache write', '缓存写入'), cacheWrite);
+    if (outputCount !== null) addToken(uiText('Output', '输出'), outputCount);
   }
-  const tokPerSec = Number(st.tokPerSec) || 0;
-  if (tokPerSec > 0) {
-    const formattedTokPerSec = tokPerSec >= 10 ? Math.round(tokPerSec) : Math.round(tokPerSec * 10) / 10;
-    speedParts.push(formattedTokPerSec + ' tok/s');
-  }
-  if (speedParts.length) parts.push({ text: speedParts.join(' \u00B7 '), title: uiText('TTFT is request-to-first-text-token latency; tok/s is output generation speed', 'TTFT \u662F\u8BF7\u6C42\u5230\u9996\u4E2A\u6587\u672C token \u7684\u5E73\u5747\u65F6\u95F4\uFF1Btok/s \u662F\u8F93\u51FA\u751F\u6210\u901F\u7387') });
-  if (st.cacheHitRate > 0) {
-    parts.push({ text: uiText('Cache hit ', '\u7F13\u5B58\u547D\u4E2D ') + st.cacheHitRate.toFixed(0) + '%', title: uiText('Cache-read tokens as a share of total input tokens', '\u7F13\u5B58\u8BFB\u53D6 token \u5360\u8F93\u5165\u4E0E\u7F13\u5B58 token \u7684\u6BD4\u4F8B') });
-  }
-  if (st.inputTokens || st.outputTokens) {
-    parts.push({ text: uiText('Input ', '\u8F93\u5165 ') + fmtTokens(st.inputTokens) + ' tok \u00B7 ' + uiText('Output ', '\u8F93\u51FA ') + fmtTokens(st.outputTokens) + ' tok', title: uiText('Cumulative conversation token usage (tok)', '\u4F1A\u8BDD\u7D2F\u8BA1 token \u7528\u91CF\uFF08tok\uFF09') });
-  }
-  const text = parts.map(p => p.text).join(' | ');
-  bar.innerHTML = parts.map((p, i) => `${i ? '<span class="stats-separator" aria-hidden="true">|</span>' : ''}<span class="stats-metric" title="${escAttr(p.title)}">${escHtml(p.text)}</span>`).join('');
-  bar.setAttribute('aria-label', text);
-  bar.style.display = 'block';
+  const tokenWasOpen = !!(previousTokenTrigger && previousTokenTrigger.getAttribute('aria-expanded') === 'true' && hasTokens);
+  bar.innerHTML = `${hasSessionSummary ? `<button class="session-stats-trigger" id="sessionStatsTrigger" type="button" aria-expanded="${wasOpen}" aria-controls="sessionStatsPopover" aria-label="${escAttr(label + ': ' + summary)}" onclick="toggleSessionStats(event)">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12.8h12M3.5 10V6.8M7 10V3.2M10.5 10V7.5M13.5 10V5.2"/></svg>
+    <span>${escHtml(summary)}</span><svg class="session-stats-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 6.5 3 3 3-3"/></svg>
+    </button><section class="session-stats-popover" id="sessionStatsPopover" role="region" aria-label="${escAttr(label)}" ${wasOpen ? '' : 'hidden'}>
+      <div class="session-stats-popover-title">${escHtml(label)}</div>
+      <dl class="session-stats-details">${detailRows.join('')}</dl>
+    </section>` : ''}${hasTokens ? `<button class="token-stats-trigger" id="tokenStatsTrigger" type="button" aria-expanded="${tokenWasOpen}" aria-controls="tokenStatsPopover" aria-label="${escAttr(tokenLabel + ': ' + tokenSummary + (cacheSummary ? ' · ' + cacheSummary : ''))}" onclick="toggleTokenStats(event)">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="4" rx="5.5" ry="2.2"/><path d="M2.5 4v7.6c0 1.2 2.5 2.2 5.5 2.2s5.5-1 5.5-2.2V4M2.5 7.8c0 1.2 2.5 2.2 5.5 2.2s5.5-1 5.5-2.2"/></svg>
+      <span>${escHtml(tokenSummary)}</span>${cacheSummary ? `<span class="token-stats-cache">· ${escHtml(cacheSummary)}</span>` : ''}<svg class="session-stats-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 6.5 3 3 3-3"/></svg>
+    </button><section class="token-stats-popover" id="tokenStatsPopover" role="region" aria-label="${escAttr(tokenLabel)}" ${tokenWasOpen ? '' : 'hidden'}>
+      <div class="token-stats-popover-title">${escHtml(tokenLabel)}</div>
+      <dl class="token-stats-details">${tokenRows.join('')}</dl>
+    </section>` : ''}`;
+  bar.style.display = 'flex';
+  if (typeof syncComposerRuntimeDock === 'function') syncComposerRuntimeDock();
+  if (triggerHadFocus) (document.getElementById('sessionStatsTrigger') || document.getElementById('tokenStatsTrigger') || document.getElementById('inputField'))?.focus?.();
+  if (tokenTriggerHadFocus) (document.getElementById('tokenStatsTrigger') || document.getElementById('inputField'))?.focus?.();
 }
 
 async function loadSessionStatsbar(sessionId = currentSessionId) {
   const normalizedSession = String(sessionId || '');
   const generation = ++sessionStatsGeneration;
   const bar = document.getElementById('sessionStatsbar');
-  if (bar) {
-    bar.style.display = 'none';
-    bar.innerHTML = '';
-    bar.removeAttribute('aria-label');
+  const refreshingCurrentSession = !!(normalizedSession && normalizedSession === sessionStatsSessionID);
+  if (!refreshingCurrentSession) {
+    const trigger = document.getElementById('sessionStatsTrigger');
+    const tokenTrigger = document.getElementById('tokenStatsTrigger');
+    if ((trigger && document.activeElement === trigger) || (tokenTrigger && document.activeElement === tokenTrigger)) document.getElementById('inputField')?.focus?.();
+    sessionStatsSnapshot = null;
+    sessionStatsSessionID = '';
+    if (bar) {
+      bar.style.display = 'none';
+      bar.innerHTML = '';
+    }
+    if (typeof syncComposerRuntimeDock === 'function') syncComposerRuntimeDock();
   }
   if (!normalizedSession) return;
   try {
     const res = await fetch('/api/trace?sessionId=' + encodeURIComponent(normalizedSession));
     const data = await res.json();
     if (generation !== sessionStatsGeneration || normalizedSession !== String(currentSessionId || '')) return;
-    if (res.ok) renderSessionStatsbar(data);
+    if (res.ok) {
+      sessionStatsSnapshot = data;
+      sessionStatsSessionID = normalizedSession;
+      renderCurrentSessionStatsbar();
+    }
   } catch (_) { /* stats are best-effort */ }
 }
 

@@ -59,6 +59,15 @@ type Server struct {
 	loop  *agent.Loop
 	store *session.Store
 	runMu sync.Mutex
+	// contextMu guards the in-process Loop's proven session owner and its
+	// generation across session switches. Never hold it while reading Loop
+	// status: that may wait behind a long compaction's Loop lock. An isolated
+	// worker has a different Loop and invalidates this owner when it advances
+	// that session.
+	contextMu           sync.RWMutex
+	contextSessionID    string
+	contextOwnerEpoch   uint64
+	contextWorkerEpochs map[string]uint64
 	// turnCoordinator covers both legacy in-process turns and isolated worker
 	// turns. runMu remains for the one process-owned Loop; the coordinator is
 	// what lets independent workspaces make progress concurrently.
@@ -373,15 +382,26 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 
 	launchWorkDir, _ := os.Getwd()
 	initialWorkDir := launchWorkDir
+	initialContextSessionID := ""
 	if store != nil && binding.InitialSessionID != "" {
-		if hdr, _, err := store.LoadHeader(binding.InitialSessionID); err == nil && hdr != nil && strings.TrimSpace(hdr.WorkDir) != "" {
-			initialWorkDir = hdr.WorkDir
+		if hdr, _, err := store.LoadHeader(binding.InitialSessionID); err == nil && hdr != nil {
+			if strings.TrimSpace(hdr.WorkDir) != "" {
+				initialWorkDir = hdr.WorkDir
+			}
+			if loop != nil && validSessionID(binding.InitialSessionID) && hdr.ID == binding.InitialSessionID {
+				// InitialSessionID is the runtime's explicit binding for the Loop
+				// passed to NewServer. Without a durable matching header there is no
+				// reliable session owner for its context estimate.
+				initialContextSessionID = binding.InitialSessionID
+			}
 		}
 	}
 	server := &Server{
 		addr:                    addr,
 		loop:                    loop,
 		store:                   store,
+		contextSessionID:        initialContextSessionID,
+		contextWorkerEpochs:     make(map[string]uint64),
 		turnCoordinator:         NewTurnCoordinator(1),
 		isolatedRunner:          binding.IsolatedRunner,
 		workerTurns:             make(map[string]*isolatedActiveTurn),
@@ -1544,12 +1564,17 @@ func (s *Server) handleSessionActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.runMu.Unlock()
+	// A worker does not hold runMu. If it starts or finishes while this
+	// transcript is being loaded, the parent Loop's context remains unowned.
+	s.contextMu.RLock()
+	contextEpoch := s.contextWorkerEpochs[body.ID]
+	s.contextMu.RUnlock()
 	hdr, history, err := s.store.Load(body.ID)
 	if err != nil || hdr == nil {
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
-	if err := s.activateSession(body.ID, hdr, history); err != nil {
+	if err := s.activateSession(body.ID, hdr, history, contextEpoch); err != nil {
 		writeError(w, http.StatusConflict, "failed to activate session: "+err.Error())
 		return
 	}
@@ -1857,22 +1882,42 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 		writeError(w, http.StatusServiceUnavailable, "desktop is shutting down")
 		return
 	}
+	s.contextMu.Lock()
 	s.workerTurnsMu.Lock()
 	if _, exists := s.workerTurns[sessionID]; exists {
 		s.workerTurnsMu.Unlock()
+		s.contextMu.Unlock()
 		s.cancelMu.Unlock()
 		cancel()
 		writeError(w, http.StatusConflict, "this session already has a running turn")
 		return
 	}
 	s.workerTurns[sessionID] = &isolatedActiveTurn{cancel: cancel, done: done, steer: steer}
+	if s.contextWorkerEpochs == nil {
+		s.contextWorkerEpochs = make(map[string]uint64)
+	}
+	s.contextWorkerEpochs[sessionID]++
+	if s.contextSessionID == sessionID {
+		// This worker's private Loop will advance the durable transcript.
+		// The parent Loop stays stale even after the worker completes.
+		s.contextSessionID = ""
+		s.contextOwnerEpoch++
+	}
 	s.workerTurnsMu.Unlock()
+	s.contextMu.Unlock()
 	s.cancelMu.Unlock()
 	defer func() {
 		s.cancelSessionInteractions(sessionID)
+		s.contextMu.Lock()
 		s.workerTurnsMu.Lock()
 		delete(s.workerTurns, sessionID)
+		s.contextWorkerEpochs[sessionID]++
+		if s.contextSessionID == sessionID {
+			s.contextSessionID = ""
+			s.contextOwnerEpoch++
+		}
 		s.workerTurnsMu.Unlock()
+		s.contextMu.Unlock()
 		close(done)
 		cancel()
 	}()
@@ -2190,12 +2235,18 @@ func traceTurnCost(sessionID string, turn int) (session.CostSnapshot, bool) {
 // every session-keyed sidecar must cross the boundary together. Provider
 // construction and source-session persistence are the only fallible steps and
 // happen before any live state is changed.
-func (s *Server) activateSession(id string, hdr *session.Header, history []llm.Message) error {
+func (s *Server) activateSession(id string, hdr *session.Header, history []llm.Message, loadedContextEpoch ...uint64) error {
 	if s == nil || s.loop == nil || s.store == nil {
 		return errors.New("agent runtime unavailable")
 	}
 	if !validSessionID(id) || hdr == nil {
 		return errors.New("invalid session")
+	}
+	s.contextMu.RLock()
+	contextEpoch := s.contextWorkerEpochs[id]
+	s.contextMu.RUnlock()
+	if len(loadedContextEpoch) > 0 {
+		contextEpoch = loadedContextEpoch[0]
 	}
 	// Session activation may replace provider/model and always restores the
 	// persisted effort. Serialize that boundary with live /api/effort updates;
@@ -2253,6 +2304,7 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 			s.memoryBindingErr = nil
 		}
 		commitSessionSwitch()
+		s.contextMu.Lock()
 		s.loop.Restore(history)
 		s.loop.SetEffort(effortFromHeader(hdr.Effort))
 		s.loop.TimingSink = s.store.NewTimingRecorder(id).Record
@@ -2268,6 +2320,8 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		rtpkg.RebindLoopRuntime(s.loop, provider, activeModel, s.loop.System, id, rtpkg.LoopRuntimeRebindOptions{
 			ProviderName: activeProviderName, WorkingDirectory: targetWorkDir,
 		})
+		s.setContextOwnerAfterActivationLocked(id, contextEpoch)
+		s.contextMu.Unlock()
 		s.reconcilePersistedTraceUsage(id)
 		return nil
 	}
@@ -2418,6 +2472,7 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 			targetSystemPromptKind = session.SystemPromptKindDefault
 		}
 	}
+	s.contextMu.Lock()
 	s.loop.RebindProviderRuntime(provider, targetModel, targetMaxOutputTokens, targetSystem, targetSections)
 	s.loop.SetEffort(targetEffort)
 	if s.loop.Gate != nil {
@@ -2446,8 +2501,62 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		s.activeWorkDir = targetWorkDir
 	}
 	s.stateMu.Unlock()
+	s.setContextOwnerAfterActivationLocked(id, contextEpoch)
+	s.contextMu.Unlock()
 	s.reconcilePersistedTraceUsage(id)
 	return nil
+}
+
+// Caller holds contextMu after installing the requested history in s.loop.
+// A worker that overlapped the load or activation may have changed the
+// durable transcript, so that Loop cannot yet provide current context data.
+func (s *Server) setContextOwnerAfterActivationLocked(id string, loadedEpoch uint64) {
+	s.workerTurnsMu.Lock()
+	_, workerRunning := s.workerTurns[id]
+	s.workerTurnsMu.Unlock()
+	// Count every rebind, including A -> A and A -> B -> A. A status read
+	// begun before either transition cannot claim the newly loaded context.
+	s.contextOwnerEpoch++
+	if !workerRunning && s.contextWorkerEpochs[id] == loadedEpoch {
+		s.contextSessionID = id
+	} else {
+		s.contextSessionID = ""
+	}
+}
+
+type contextStatusSnapshot struct {
+	used             int
+	window           int
+	compactThreshold float64
+	compactAtTokens  int
+	sessionID        string
+}
+
+// readContextStatus observes Loop values without holding the provenance lock.
+// A session switch or isolated worker may publish a different owner while the
+// Loop read waits; discard that stale read rather than label another session's
+// context with the old owner.
+func (s *Server) readContextStatus(readLoop func() contextStatusSnapshot) contextStatusSnapshot {
+	if s == nil || s.loop == nil {
+		return contextStatusSnapshot{}
+	}
+	s.contextMu.RLock()
+	owner := s.contextSessionID
+	ownerEpoch := s.contextOwnerEpoch
+	workerEpoch := s.contextWorkerEpochs[owner]
+	s.contextMu.RUnlock()
+
+	snapshot := readLoop()
+
+	s.contextMu.RLock()
+	current := owner == s.contextSessionID && ownerEpoch == s.contextOwnerEpoch &&
+		workerEpoch == s.contextWorkerEpochs[owner]
+	s.contextMu.RUnlock()
+	if !current {
+		return contextStatusSnapshot{}
+	}
+	snapshot.sessionID = owner
+	return snapshot
 }
 
 // prepareSessionSwitchCommit adapts both the production two-phase binding and
@@ -3516,13 +3625,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if wd, err := os.Getwd(); err == nil {
 		workspace = filepath.Base(wd)
 	}
-	contextUsed, contextWindow := 0, 0
-	compactThreshold := 0.0
-	compactAtTokens := 0
+	contextStatus := contextStatusSnapshot{}
 	toolNames := make([]string, 0)
 	if s.loop != nil {
-		contextUsed = s.loop.EstimateContextTokens()
-		contextWindow, compactThreshold, compactAtTokens = s.loop.ContextStatusSnapshot()
+		contextStatus = s.readContextStatus(func() contextStatusSnapshot {
+			used := s.loop.EstimateContextTokens()
+			window, threshold, trigger := s.loop.ContextStatusSnapshot()
+			return contextStatusSnapshot{used: used, window: window, compactThreshold: threshold, compactAtTokens: trigger}
+		})
 		if s.loop.Registry != nil {
 			for _, tool := range s.loop.Registry.ModelToolsForCache() {
 				if tool != nil {
@@ -3572,14 +3682,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"subAgents": subAgents, "backgroundTasks": backgroundTasks, "workspace": workspace,
 		"agents": agentDetails, "jobs": jobDetails,
 		"toolCount": len(toolNames), "tools": toolNames,
-		"contextUsed": contextUsed, "contextWindow": contextWindow, "compactThreshold": compactThreshold,
-		"compactAtTokens": compactAtTokens,
+		"contextUsed": contextStatus.used, "contextWindow": contextStatus.window, "compactThreshold": contextStatus.compactThreshold,
+		"compactAtTokens": contextStatus.compactAtTokens,
 		"turnRunning":     turnRunning, "runningSessionId": runningSessionID, "isolatedTurnSessions": workerSessions,
 		"isolatedTurnsEnabled": s.isolatedRunner != nil,
 		"activeSessionId":      activeSessionID,
 		"planItems":            planItems,
 		"executionStrategy":    executionStrategy,
 		"build":                s.buildVersion,
+	}
+	if contextStatus.sessionID != "" {
+		payload["contextSessionId"] = contextStatus.sessionID
 	}
 	if viewSessionID != "" {
 		viewRoster := s.workerViewRoster(viewSessionID)

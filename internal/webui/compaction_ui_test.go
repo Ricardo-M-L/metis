@@ -235,7 +235,7 @@ func TestDesktopCompactionLifecycleContract(t *testing.T) {
 		t.Fatal("chat.js must not replace full request pressure with history-only compaction tokens")
 	}
 	app := get("/app.js")
-	for _, want := range []string{"d.compactAtTokens", "fmtTokens(compactAtTokens)"} {
+	for _, want := range []string{"d.compactAtTokens", "exactTokens(compactAtTokens)"} {
 		if !strings.Contains(app, want) {
 			t.Fatalf("app.js missing authoritative compaction status contract %q", want)
 		}

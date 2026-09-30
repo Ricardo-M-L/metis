@@ -4724,7 +4724,12 @@ async function openComposerSettingsTab(tab, buttonId) {
 
 function showRuntimeSummary(kind) {
   const d = lastStatusSnapshot || {};
-  const used = Number(d.contextUsed) || 0, limit = Number(d.contextWindow) || 0;
+  const contextOwner = String(d.contextSessionId || '');
+  const hasOwnedContext = contextOwner !== '' && contextOwner === String(currentSessionId || '') &&
+    typeof d.contextUsed === 'number' && Number.isFinite(d.contextUsed) && d.contextUsed >= 0 &&
+    typeof d.contextWindow === 'number' && Number.isFinite(d.contextWindow) && d.contextWindow > 0;
+  const used = hasOwnedContext ? d.contextUsed : 0;
+  const limit = hasOwnedContext ? d.contextWindow : 0;
   if (kind === 'agents') { showToast((d.subAgents || 0) + ' active sub-agents'); return; }
   if (kind === 'tasks') { showToast((d.backgroundTasks || 0) + ' active background tasks'); return; }
   if (kind === 'tools') {
@@ -4732,10 +4737,15 @@ function showRuntimeSummary(kind) {
     showToast((d.toolCount || names.length || 0) + ' tools' + (names.length ? ': ' + names.slice(0, 8).join(', ') + (names.length > 8 ? '…' : '') : ''));
     return;
   }
-  if (kind === 'context') { showToast('Context: ' + fmtTokens(used) + (limit ? ' / ' + fmtTokens(limit) + ' tokens' : ' tokens')); return; }
+  if (kind === 'context') {
+    showToast(hasOwnedContext
+      ? uiText('Context: ', '上下文：') + fmtTokens(used) + ' / ' + fmtTokens(limit) + uiText(' tokens', ' 词元')
+      : uiText('Context: unavailable for this session', '当前会话暂无上下文数据'));
+    return;
+  }
   const contextPercent = limit ? Math.max(0, Math.min(100, Math.round(used / limit * 100))) : 0;
   const strategy = String(d.executionStrategy || 'direct').replaceAll('_', ' ');
-  showToast((d.workspace || 'metis') + ' · ' + strategy + ' · ' + (d.subAgents || 0) + ' sub-agents · ' + (d.backgroundTasks || 0) + ' tasks' + (limit ? ' · context ' + contextPercent + '%' : ''));
+  showToast((d.workspace || 'metis') + ' · ' + strategy + ' · ' + (d.subAgents || 0) + ' sub-agents · ' + (d.backgroundTasks || 0) + ' tasks' + (limit ? uiText(' · context ', ' · 上下文 ') + contextPercent + '%' : ''));
 }
 
 async function compactCurrentSession(instructions) {

@@ -257,28 +257,6 @@ func TestDesktopChromeOmitsRetiredBrandAndSessionMetadata(t *testing.T) {
 	}
 }
 
-func TestContextMeterDistinguishesSmallAndInactiveContexts(t *testing.T) {
-	s, _ := testServer(t)
-	rr := httptest.NewRecorder()
-	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/app.js", nil))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("GET /app.js = %d", rr.Code)
-	}
-	app := rr.Body.String()
-	for _, want := range []string{
-		"const viewingNoSession = !selectedSessionId;",
-		"if (viewingNoSession)",
-		"const viewingInactiveSession =",
-		"meter.textContent = dict.context + ' —';",
-		"used > 0 && fraction < 0.01",
-		"'<1%'",
-	} {
-		if !strings.Contains(app, want) {
-			t.Fatalf("app.js missing context-meter behavior %q", want)
-		}
-	}
-}
-
 func TestComposerAddMenuPreservesAttachmentAndKeepsSlashCommandsIndependent(t *testing.T) {
 	s, _ := testServer(t)
 	get := func(path string) string {
@@ -899,7 +877,6 @@ func TestSessionResumeIgnoresStaleAsyncResponses(t *testing.T) {
 		"await loadEffort(isLatest);",
 		"await pollStatus(isLatest);",
 		"await loadArtifactsForSession(id, { rebuildCards: true });",
-		"bar.removeAttribute('aria-label');",
 		"if (isLatest()) showError('Unable to resume this session.');",
 	} {
 		if !strings.Contains(sessions, want) {
