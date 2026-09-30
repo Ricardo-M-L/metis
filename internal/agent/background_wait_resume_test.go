@@ -338,17 +338,29 @@ func TestAwaitedBackgroundWaitRecoversDroppedCompletionFromRegistry(t *testing.T
 		t.Fatalf("job %s did not become terminal", jobID)
 		return jobs.Job{}
 	}
+	waitPublished := func() {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for pool.HasPendingWork() {
+			if time.Now().After(deadline) {
+				t.Fatal("terminal job notification was not published")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
 
 	// Fill the one-slot notification buffer first. The awaited job then
 	// completes while the channel is full, so Registry.publish deliberately
 	// drops its edge notification while retaining the terminal Job state.
 	filler := spawn("printf FILLER_NOTIFICATION")
 	waitTerminal(filler.ID)
+	waitPublished()
 	if got := len(pool.Notify()); got != 1 {
 		t.Fatalf("notification buffer length = %d, want full buffer", got)
 	}
 	awaited := spawn("printf DROPPED_WAIT_MARKER")
 	waitTerminal(awaited.ID)
+	waitPublished()
 	if got := len(pool.Notify()); got != 1 {
 		t.Fatalf("awaited completion unexpectedly entered full buffer; len=%d", got)
 	}
