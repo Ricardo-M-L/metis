@@ -15,9 +15,11 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -73,14 +75,15 @@ type traceWriter struct {
 type TraceStore struct {
 	dir string
 
-	mu      sync.RWMutex
-	writers map[string]*traceWriter        // sessionID -> open append writer
-	loaded  map[string]bool                // sessionID -> already read from disk
-	seq     map[string]int64               // sessionID -> last sequence
-	index   map[string]map[string][]string // token -> sessionID -> event IDs
-	events  map[string][]*TraceEvent       // sessionID -> ordered events
-	ids     map[string]struct{}            // event ID -> exists (ingest dedup)
-	turned  map[string]int                 // sessionID -> current turn index
+	mu             sync.RWMutex
+	writers        map[string]*traceWriter        // sessionID -> open append writer
+	loaded         map[string]bool                // sessionID -> already read from disk
+	seq            map[string]int64               // sessionID -> last sequence
+	index          map[string]map[string][]string // token -> sessionID -> event IDs
+	events         map[string][]*TraceEvent       // sessionID -> ordered events
+	ids            map[string]struct{}            // event ID -> exists (ingest dedup)
+	turned         map[string]int                 // sessionID -> current turn index
+	diskReadOffset map[string]int64               // bytes imported by Refresh from another process
 }
 
 // NewTraceStore opens (lazily creating) the trace directory. Existing
@@ -90,14 +93,15 @@ func NewTraceStore(dir string) (*TraceStore, error) {
 		return nil, err
 	}
 	return &TraceStore{
-		dir:     dir,
-		writers: make(map[string]*traceWriter),
-		loaded:  make(map[string]bool),
-		seq:     make(map[string]int64),
-		index:   make(map[string]map[string][]string),
-		events:  make(map[string][]*TraceEvent),
-		ids:     make(map[string]struct{}),
-		turned:  make(map[string]int),
+		dir:            dir,
+		writers:        make(map[string]*traceWriter),
+		loaded:         make(map[string]bool),
+		seq:            make(map[string]int64),
+		index:          make(map[string]map[string][]string),
+		events:         make(map[string][]*TraceEvent),
+		ids:            make(map[string]struct{}),
+		turned:         make(map[string]int),
+		diskReadOffset: make(map[string]int64),
 	}, nil
 }
 
@@ -165,6 +169,63 @@ func (s *TraceStore) ensureLoaded(sid string) {
 	s.mu.Lock()
 	s.ensureLoadedLocked(sid)
 	s.mu.Unlock()
+}
+
+// Refresh imports complete rows appended by another process. Desktop workers
+// write their own trace files, so a parent's already-loaded empty/older cache
+// cannot be treated as the current session. The offset makes repeated refreshes
+// proportional to new data, and ingest de-duplicates rows already held locally.
+func (s *TraceStore) Refresh(sid string) error {
+	if !validTraceSessionID(sid) {
+		return fmt.Errorf("trace: invalid session_id %q", sid)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if writer := s.writers[sid]; writer != nil {
+		if err := writer.w.Flush(); err != nil {
+			return err
+		}
+	}
+	f, err := os.Open(filepath.Join(s.dir, sid+".jsonl"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	offset := s.diskReadOffset[sid]
+	if info.Size() < offset {
+		offset = 0
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	// A worker can be in the middle of writing the last row. Leave its bytes
+	// unconsumed until the newline arrives instead of losing a partial event.
+	sc.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			return i + 1, data[:i], nil
+		}
+		return 0, nil, nil
+	})
+	for sc.Scan() {
+		line := sc.Bytes()
+		offset += int64(len(line) + 1)
+		var event TraceEvent
+		if json.Unmarshal(line, &event) == nil && event.ID != "" && event.SessionID == sid {
+			s.ingest(sid, &event)
+		}
+	}
+	s.diskReadOffset[sid] = offset
+	s.loaded[sid] = true
+	return sc.Err()
 }
 
 // discoverSessions lists session IDs present on disk (for cross-session
@@ -670,6 +731,7 @@ func (s *TraceStore) Delete(sessionID string) error {
 		}
 	}
 	delete(s.loaded, sessionID)
+	delete(s.diskReadOffset, sessionID)
 	delete(s.seq, sessionID)
 	delete(s.events, sessionID)
 	delete(s.turned, sessionID)

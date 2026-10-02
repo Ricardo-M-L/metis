@@ -10,6 +10,16 @@ type Status struct {
 	BackgroundTasks int        `json:"backgroundTasks"`
 	Agents          []Subagent `json:"agents"`
 	Jobs            []Job      `json:"jobs"`
+	// Context belongs to this worker's root session, which the parent keys by
+	// its IsolatedTurnRequest.SessionID. nil means no trustworthy reading.
+	Context *ContextPressure `json:"context,omitempty"`
+}
+
+type ContextPressure struct {
+	Used             int     `json:"used"`
+	Window           int     `json:"window"`
+	CompactThreshold float64 `json:"compactThreshold"`
+	CompactAtTokens  int     `json:"compactAtTokens"`
 }
 
 type Subagent struct {

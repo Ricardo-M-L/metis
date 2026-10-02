@@ -429,6 +429,7 @@ function closeContextMeterPopover() {
   const popover = document.getElementById('contextMeterPopover');
   if (popover) popover.hidden = true;
   if (meter) meter.setAttribute('aria-expanded', 'false');
+  if (typeof refreshComposerStatPopovers === 'function') refreshComposerStatPopovers();
 }
 
 function syncComposerRuntimeDock() {
@@ -437,6 +438,7 @@ function syncComposerRuntimeDock() {
   const meter = document.getElementById('contextMeter');
   const stats = document.getElementById('sessionStatsbar');
   dock.hidden = (!meter || meter.style.display === 'none') && (!stats || stats.style.display === 'none');
+  if (typeof refreshComposerStatPopovers === 'function') refreshComposerStatPopovers();
 }
 
 function toggleContextMeter(event) {
@@ -451,6 +453,7 @@ function toggleContextMeter(event) {
   }
   popover.hidden = !opening;
   meter.setAttribute('aria-expanded', String(opening));
+  if (typeof refreshComposerStatPopovers === 'function') refreshComposerStatPopovers();
 }
 
 document.addEventListener('click', event => {

@@ -331,11 +331,52 @@ c.uiText = (en, zh) => zh;
 c.refreshActivityGroupLanguage();
 assert.match(summary(firstGroup).textContent, /执行了命令/);
 
+// An assistant can explain the plan before the first tool and again between
+// two tool groups. Both explanations belong to the completed process; only
+// the final answer remains outside the folded turn. Disclosure must restore
+// the original peer order, while independent permission/unknown rows remain.
+c.renderHistoryMessages([]);
+c.handleTextDelta({delta:'Opening assessment'});c.endStreamingMessage();
+c.handleToolStart({tool:'Read',id:'process-read',input:'{}'});
+c.handleToolResult({tool:'Read',id:'process-read',output:'read',elapsedMs:2});
+c.handleTextDelta({delta:'Intermediate explanation'});c.endStreamingMessage();
+const permission = new Element('div');permission.className='permission-card';area.appendChild(permission);
+const unknown = new Element('div');unknown.className='unknown-row';area.appendChild(unknown);
+c.handleToolStart({tool:'Bash',id:'process-command',input:'{}'});
+c.handleToolResult({tool:'Bash',id:'process-command',output:'ok',elapsedMs:2});
+c.handleTextDelta({delta:'Final answer outside'});c.endStreamingMessage();
+c.finishUserTurn();
+const processTurn=turns()[0], processMessages=area.querySelectorAll('.message-assistant');
+assert.equal(processMessages.length,3);
+assert.equal(processTurn.classList.contains('open'),false);
+assert.equal(processMessages[0].getAttribute('data-turn-collapsed'),'true','pre-tool assistant folds with process');
+assert.equal(processMessages[1].getAttribute('data-turn-collapsed'),'true','between-tool assistant folds with process');
+assert.equal(processMessages[2].getAttribute('data-turn-collapsed'),null,'final assistant stays visible');
+assert.equal(permission.getAttribute('data-turn-collapsed'),null,'permission stays independent');
+assert.equal(unknown.getAttribute('data-turn-collapsed'),null,'unknown row stays independent');
+const beforeExpansion=area.children.slice();
+c.toggleActivityTurn(turnToggle(processTurn));
+assert.equal(processMessages[0].getAttribute('data-turn-collapsed'),null);
+assert.equal(processMessages[1].getAttribute('data-turn-collapsed'),null);
+assert.deepEqual(area.children,beforeExpansion,'expansion preserves original DOM order');
+c.toggleActivityTurn(turnToggle(processTurn));
+assert.equal(processMessages[0].getAttribute('data-turn-collapsed'),'true');
+
+// A turn with process prose but no final answer has no safe answer anchor.
+// Keep both the process and the prose visible for inspection.
+c.renderHistoryMessages([]);
+c.handleTextDelta({delta:'Unresolved explanation'});c.endStreamingMessage();
+c.handleToolStart({tool:'Read',id:'unresolved-read',input:'{}'});
+c.handleToolResult({tool:'Read',id:'unresolved-read',output:'read',elapsedMs:2});
+c.finishUserTurn();
+assert.equal(turns()[0].classList.contains('open'),true);
+assert.equal(area.querySelector('.message-assistant').getAttribute('data-turn-collapsed'),null);
+
 // Saved JSONL replay has a single turn header even when an intermediate
 // answer separates two process sections. Trace metrics belong to that header.
 c.renderHistoryMessages([
   {role:'user', content:[{type:'text', text:'Please inspect README'}]},
-  {role:'assistant', content:[{type:'thinking', text:'Plan the read'}, {type:'tool_use', name:'Read', tool_use_id:'history-read', input:{path:'README.md'}}]},
+  {role:'assistant', content:[{type:'text',text:'Saved opening assessment'},{type:'thinking', text:'Plan the read'}, {type:'tool_use', name:'Read', tool_use_id:'history-read', input:{path:'README.md'}}]},
   {role:'user', content:[{type:'tool_result', tool_use_id:'history-read', content:'saved output'}]},
   {role:'assistant', content:[{type:'text', text:'Intermediate answer'}]},
   {role:'assistant', content:[{type:'tool_use', name:'Bash', tool_use_id:'history-command', input:{command:'check'}}]},
@@ -351,6 +392,14 @@ assert.equal(groups()[1].querySelector('.activity-group-duration'), null);
 assert.equal(rows(groups()[0])[0].getAttribute('data-state'), 'ok');
 assert.equal(rows(groups()[1])[0].getAttribute('data-state'), 'ok');
 assert.equal(area.lastElementChild.querySelector('.message-content').innerHTML, 'Saved final answer');
+const savedMessages=area.querySelectorAll('.message-assistant');
+assert.equal(savedMessages[0].getAttribute('data-turn-collapsed'),'true','history pre-tool text folds');
+assert.equal(savedMessages[1].getAttribute('data-turn-collapsed'),'true','history intermediate text folds');
+assert.equal(savedMessages[2].getAttribute('data-turn-collapsed'),null,'history final answer remains visible');
+c.toggleActivityTurn(turnToggle(turns()[0]));
+assert.equal(savedMessages[0].getAttribute('data-turn-collapsed'),null);
+assert.equal(savedMessages[1].getAttribute('data-turn-collapsed'),null);
+c.toggleActivityTurn(turnToggle(turns()[0]));
 c.fetch = async () => ({ok:true, json:async () => ({turnMetrics:[{turn:1,durationMs:107000}]})});
 await c.restoreHistoryMessageMetadata('A');
 assert.match(turns()[0].querySelector('.activity-turn-duration').textContent, /1 分 47 秒/);
@@ -361,13 +410,15 @@ c.fetch = async () => ({ok:false});
 // assistant's explanation, and its inner disclosure remains independent.
 c.renderHistoryMessages([
   {role:'user', content:[{type:'text', text:'Run the check'}]},
-  {role:'assistant', content:[{type:'tool_use', name:'Bash', tool_use_id:'failed-command', input:{command:'check'}}]},
+  {role:'assistant', content:[{type:'text', text:'Preparing the check'},{type:'tool_use', name:'Bash', tool_use_id:'failed-command', input:{command:'check'}}]},
   {role:'user', content:[{type:'tool_result', tool_use_id:'failed-command', content:'permission denied', is_error:true}]},
   {role:'assistant', content:[{type:'text', text:'The check could not run'}]},
 ]);
 const failed = groups()[0];
 assert.equal(rows(failed)[0].getAttribute('data-state'), 'error');
 assert.equal(failed.dataset.hasError, 'true');
+assert.equal(area.querySelector('.message-assistant').getAttribute('data-turn-collapsed'),null,'pre-tool failure explanation remains visible');
+assert.equal(area.lastElementChild.getAttribute('data-turn-collapsed'),null,'failure explanation remains visible');
 assert.equal(summary(failed).textContent, '执行了命令', 'visible group title stays about the work');
 assert.match(summary(failed).getAttribute('aria-label'), /执行了命令 · 1 项失败/);
 assert.equal(failed.classList.contains('open'), true, 'errors stay expanded');

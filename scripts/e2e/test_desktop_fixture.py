@@ -72,6 +72,26 @@ class DesktopFixtureResponsesTest(unittest.TestCase):
         evidence = (Path(self.temp.name) / "model-evidence.jsonl").read_text()
         self.assertNotIn("private test instruction", evidence)
 
+    def test_activity_fixture_preserves_commentary_tools_and_final_answer(self):
+        items = [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "[activity-fixture]"}]}]
+        for step in range(2):
+            events = self.response(items)
+            terminal = next(event for event in events if event["type"] == "response.completed")
+            output = terminal["response"]["output"]
+            self.assertEqual([item["type"] for item in output], ["message", "function_call"])
+            self.assertEqual(output[1]["name"], "Read")
+            self.assertIn(str(Path(self.temp.name) / "workspace"),
+                          json.loads(output[1]["arguments"])["path"])
+            self.assertTrue(any(event["type"] == "response.output_text.delta" for event in events))
+            items.extend(output)
+            items.append({"type": "function_call_output", "call_id": output[1]["call_id"],
+                          "output": "verified isolated fixture file"})
+        final = self.response(items, stream=False)
+        self.assertEqual(len(final["output"]), 1)
+        self.assertIn("验收完成", final["output"][0]["content"][0]["text"])
+        self.assertEqual(final["usage"]["input_tokens"], 128)
+
     def test_regular_echo_and_nonstream_agent_call(self):
         regular = self.response([{"type": "message", "role": "user", "content": [
             {"type": "input_text", "text": "ordinary prompt"}]}])

@@ -877,6 +877,7 @@ function closeSessionStatsPopover() {
   const popover = document.getElementById('sessionStatsPopover');
   if (popover) popover.hidden = true;
   if (trigger) trigger.setAttribute('aria-expanded', 'false');
+  if (typeof refreshComposerStatPopovers === 'function') refreshComposerStatPopovers();
 }
 
 function closeTokenStatsPopover() {
@@ -884,6 +885,7 @@ function closeTokenStatsPopover() {
   const popover = document.getElementById('tokenStatsPopover');
   if (popover) popover.hidden = true;
   if (trigger) trigger.setAttribute('aria-expanded', 'false');
+  if (typeof refreshComposerStatPopovers === 'function') refreshComposerStatPopovers();
 }
 
 function toggleTokenStats(event) {
@@ -898,6 +900,7 @@ function toggleTokenStats(event) {
   }
   popover.hidden = !opening;
   trigger.setAttribute('aria-expanded', String(opening));
+  if (typeof refreshComposerStatPopovers === 'function') refreshComposerStatPopovers();
 }
 
 function toggleSessionStats(event) {
@@ -912,6 +915,7 @@ function toggleSessionStats(event) {
   }
   popover.hidden = !opening;
   trigger.setAttribute('aria-expanded', String(opening));
+  if (typeof refreshComposerStatPopovers === 'function') refreshComposerStatPopovers();
 }
 
 document.addEventListener('click', event => {
@@ -1043,6 +1047,7 @@ function renderSessionStatsbar(data, sessionId = currentSessionId) {
   if (typeof syncComposerRuntimeDock === 'function') syncComposerRuntimeDock();
   if (triggerHadFocus) (document.getElementById('sessionStatsTrigger') || document.getElementById('tokenStatsTrigger') || document.getElementById('inputField'))?.focus?.();
   if (tokenTriggerHadFocus) (document.getElementById('tokenStatsTrigger') || document.getElementById('inputField'))?.focus?.();
+  if (typeof refreshComposerStatPopovers === 'function') refreshComposerStatPopovers();
 }
 
 async function loadSessionStatsbar(sessionId = currentSessionId) {

@@ -28,6 +28,7 @@ from urllib.request import Request, urlopen
 AGENT_FIXTURE_MARKER = "[agent-fixture]"
 AGENT_CHILD_PROMPT = "CHILD_FIXTURE_TASK_1"
 AGENT_CALL_PREFIX = "call_fixture_agent_"
+ACTIVITY_CALL_PREFIX = "call_fixture_activity_"
 
 
 def free_port() -> int:
@@ -77,6 +78,11 @@ def agent_fixture_phase(body: dict, user_input: str) -> str:
     last_result = max((index for index, item in enumerate(items)
                        if isinstance(item, dict) and item.get("type") == "function_call_output"
                        and str(item.get("call_id", "")).startswith(AGENT_CALL_PREFIX)), default=-1)
+    if "[activity-fixture]" in user_input:
+        results = sum(1 for item in items[last_user + 1:]
+                      if isinstance(item, dict) and item.get("type") == "function_call_output"
+                      and str(item.get("call_id", "")).startswith(ACTIVITY_CALL_PREFIX))
+        return "activity_final" if results >= 2 else f"activity_step_{results}"
     if last_result > last_user:
         return "parent_final"
     if AGENT_CHILD_PROMPT in user_input:
@@ -155,7 +161,13 @@ def handler_for(fixture: Fixture):
             if phase == "parent_final":
                 gate_match = re.search(r"\[parent-gate:([A-Za-z0-9_-]+)\]", user_input)
             delay_match = re.search(r"\[slow:(\d+)\]", user_input) if phase in ("echo", "child_stream") else None
-            if phase == "memory_extraction":
+            if phase == "activity_step_0":
+                text = "我先读取验收说明，再核对检查清单。执行过程会保留在本轮的折叠区域。"
+            elif phase == "activity_step_1":
+                text = "已读取说明，接下来核对检查清单；这段是过程说明，完成后可展开查看。"
+            elif phase == "activity_final":
+                text = "验收完成。已读取两份隔离测试文件。\n\n底栏展示执行统计、Token 用量和上下文占用，点击各项查看明细。上方可以展开本轮的过程说明与工具记录。\n\n这是本地测试模型的界面验收，不代表真实模型评测结果。"
+            elif phase == "memory_extraction":
                 text = "[]"
             elif phase == "child_stream":
                 text = f"CHILD_FIXTURE_STREAM_{number}: Inspecting the isolated workspace. Child task complete."
@@ -176,6 +188,13 @@ def handler_for(fixture: Fixture):
                            "status": "completed"} for index in range(count)]
             else:
                 output = [{"type": "message", "id": message_id, "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}]
+            if phase.startswith("activity_step_"):
+                step = int(phase.rsplit("_", 1)[1])
+                filename = ("fixture-notes.md", "fixture-checks.md")[step]
+                output.append({"type": "function_call", "id": f"fc_fixture_activity_{number}",
+                               "call_id": f"{ACTIVITY_CALL_PREFIX}{number}", "name": "Read",
+                               "arguments": json.dumps({"path": str(fixture.root / "workspace" / filename)}),
+                               "status": "completed"})
             envelope = {"id": response_id, "object": "response", "status": "completed", "model": body.get("model"), "output": output, "usage": {"input_tokens": 128, "output_tokens": 16, "total_tokens": 144, "input_tokens_details": {"cached_tokens": 64}}}
             if not body.get("stream"):
                 self.send_json(envelope)
@@ -199,6 +218,24 @@ def handler_for(fixture: Fixture):
                     self.wfile.flush()
 
                 emit("response.created", response={**envelope, "status": "in_progress", "output": []})
+                if phase.startswith("activity_"):
+                    fixture.stopped.wait(0.15)
+                    item = output[0]
+                    emit("response.output_item.added", output_index=0, item={**item, "status": "in_progress", "content": []})
+                    emit("response.output_text.delta", output_index=0, item_id=message_id, content_index=0, delta=text)
+                    fixture.stopped.wait(0.3)
+                    emit("response.output_text.done", output_index=0, item_id=message_id, content_index=0, text=text)
+                    emit("response.output_item.done", output_index=0, item=item)
+                    for index, item in enumerate(output[1:], start=1):
+                        emit("response.output_item.added", output_index=index, item={**item, "arguments": "", "status": "in_progress"})
+                        emit("response.output_item.done", output_index=index, item=item)
+                    emit("response.completed", response=envelope)
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    entry["state"] = "completed"
+                    entry["completed"] = time.time()
+                    fixture.record({"event": "completed", **entry})
+                    return
                 if phase == "parent_call":
                     for index, item in enumerate(output):
                         emit("response.output_item.added", output_index=index, item={"type": "function_call", "id": item["id"],
@@ -262,6 +299,8 @@ def main() -> int:
     home, workspace = root / "home", root / "workspace"
     for directory in (home, workspace, home / "skills"):
         directory.mkdir(mode=0o700)
+    (workspace / "fixture-notes.md").write_text("# Isolated UI acceptance\n\nInspect footer details and turn disclosure.\n", encoding="utf-8")
+    (workspace / "fixture-checks.md").write_text("# Checks\n\n- Preserve final answer\n- Expand the full process\n- Inspect actual recorded usage\n", encoding="utf-8")
     fixture = Fixture(root)
     provider = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(fixture))
     provider.daemon_threads = True
@@ -288,6 +327,8 @@ max_iterations = 5
 mode = "default"
 [[permission.allow]]
 tool = "Agent"
+[[permission.allow]]
+tool = "Read"
 '''
     (home / "config.toml").write_text(config)
     (home / "config.toml").chmod(0o600)

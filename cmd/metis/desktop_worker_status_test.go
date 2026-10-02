@@ -10,6 +10,8 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/desktopipc"
+	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 func TestDesktopWorkerStatusPreservesFinalSubagentAfterCleanup(t *testing.T) {
@@ -19,7 +21,10 @@ func TestDesktopWorkerStatusPreservesFinalSubagentAfterCleanup(t *testing.T) {
 	bridge := newDesktopWorkerBridge(context.Background(), input, &output)
 	defer bridge.Close()
 	roster := agent.NewRoster(4)
-	stop := bridge.startStatus(roster, nil)
+	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+	loop.ContextWindow = 128_000
+	loop.AppendUser(strings.Repeat("live worker prompt ", 80))
+	stop := bridge.startStatus(roster, nil, loop)
 	teammate := &agent.Teammate{Name: "review", AgentID: "agt-status", Started: time.Now(), Status: agent.StatusRunning}
 	if err := roster.Register(teammate); err != nil {
 		t.Fatal(err)
@@ -34,6 +39,7 @@ func TestDesktopWorkerStatusPreservesFinalSubagentAfterCleanup(t *testing.T) {
 	})
 	decoder := desktopipc.NewDecoder(&output)
 	var latest *desktopipc.Status
+	frames := 0
 	for {
 		message, err := decoder.Decode()
 		if err == io.EOF {
@@ -43,13 +49,43 @@ func TestDesktopWorkerStatusPreservesFinalSubagentAfterCleanup(t *testing.T) {
 			t.Fatal(err)
 		}
 		latest = message.Status
+		frames++
+		if frames == 1 && (latest == nil || latest.Context == nil || latest.Context.Used <= 0) {
+			t.Fatalf("running status lacked worker pressure: %+v", latest)
+		}
 	}
-	if latest == nil || latest.SubAgents != 0 || len(latest.Agents) != 1 {
+	if frames < 2 || latest == nil || latest.SubAgents != 0 || len(latest.Agents) != 1 {
 		t.Fatalf("final status lost child: %+v", latest)
+	}
+	if latest.Context == nil || latest.Context.Used <= 0 || latest.Context.Window != 128_000 {
+		t.Fatalf("final status lost worker context pressure: %+v", latest.Context)
 	}
 	child := latest.Agents[0]
 	if child.Status != "completed" || child.Output != "first streamed output" || child.Result != "final reply" {
 		t.Fatalf("bad final child: %+v", child)
+	}
+}
+
+func TestDesktopWorkerStatusSamplesLoopPressureAndKeepsFinalReading(t *testing.T) {
+	loop := agent.NewLoop(nil, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system", 2)
+	loop.ContextWindow = 128_000
+	loop.AppendUser(strings.Repeat("worker context ", 100))
+	sampler := desktopWorkerStatusSampler{loop: loop, known: make(map[string]*agent.Teammate)}
+	first := sampler.snapshot(false)
+	if first.Context == nil || first.Context.Used <= 0 || first.Context.Window != 128_000 {
+		t.Fatalf("running worker has no real pressure: %+v", first.Context)
+	}
+	loop.AppendUser(strings.Repeat("new turn ", 200))
+	latest := sampler.snapshot(false)
+	if latest.Context == nil || latest.Context.Used <= first.Context.Used {
+		t.Fatalf("worker pressure did not advance: first=%+v latest=%+v", first.Context, latest.Context)
+	}
+	// Cleanup can release the runtime before the final IPC frame. That frame
+	// must preserve the last sample instead of publishing a fabricated zero.
+	sampler.loop = nil
+	final := sampler.snapshot(true)
+	if final.Context == nil || *final.Context != *latest.Context {
+		t.Fatalf("final worker pressure was lost: latest=%+v final=%+v", latest.Context, final.Context)
 	}
 }
 

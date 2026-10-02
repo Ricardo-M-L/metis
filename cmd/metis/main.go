@@ -2520,7 +2520,7 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 		worker.setSteerHandler(func(input string) bool {
 			return rt.loop.SteerInjectWithAccepted(input, func() { rtpkg.RecordUserMessage(rt.sessionID, "[steer] "+input) })
 		})
-		stopStatus := worker.startStatus(rt.subAgentRoster, rt.loop.Jobs)
+		stopStatus := worker.startStatus(rt.subAgentRoster, rt.loop.Jobs, rt.loop)
 		defer stopStatus(rt.Cleanup)
 	} else {
 		defer rt.Cleanup()

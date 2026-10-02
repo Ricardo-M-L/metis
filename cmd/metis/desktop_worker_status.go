@@ -18,12 +18,12 @@ const desktopWorkerStatusTextLimit = 16_000
 // startStatus captures stable registry handles before runtime cleanup clears
 // them. The returned join must run after Cleanup so its last frame contains
 // the reaped child status, including agents removed from the live roster.
-func (b *desktopWorkerBridge) startStatus(roster *agent.Roster, registry *jobs.Registry) func(func()) {
+func (b *desktopWorkerBridge) startStatus(roster *agent.Roster, registry *jobs.Registry, loop *agent.Loop) func(func()) {
 	stop, done := make(chan struct{}), make(chan struct{})
 	flush := make(chan chan struct{})
 	go func() {
 		defer close(done)
-		sampler := desktopWorkerStatusSampler{roster: roster, jobs: registry, known: make(map[string]*agent.Teammate)}
+		sampler := desktopWorkerStatusSampler{roster: roster, jobs: registry, loop: loop, known: make(map[string]*agent.Teammate)}
 		var previous *desktopipc.Status
 		emit := func(final bool) {
 			status := sampler.snapshot(final)
@@ -66,11 +66,26 @@ func (b *desktopWorkerBridge) startStatus(roster *agent.Roster, registry *jobs.R
 type desktopWorkerStatusSampler struct {
 	roster *agent.Roster
 	jobs   *jobs.Registry
+	loop   *agent.Loop
 	known  map[string]*agent.Teammate
+	// The final IPC frame follows runtime cleanup. Keep the last reading
+	// captured before cleanup rather than inventing an empty context.
+	lastContext *desktopipc.ContextPressure
 }
 
 func (s *desktopWorkerStatusSampler) snapshot(final bool) desktopipc.Status {
 	status := desktopipc.Status{Agents: make([]desktopipc.Subagent, 0), Jobs: make([]desktopipc.Job, 0)}
+	if !final && s.loop != nil {
+		window, threshold, trigger := s.loop.ContextStatusSnapshot()
+		if window > 0 {
+			pressure := desktopipc.ContextPressure{
+				Used: s.loop.EstimateContextTokens(), Window: window,
+				CompactThreshold: threshold, CompactAtTokens: trigger,
+			}
+			s.lastContext = &pressure
+		}
+	}
+	status.Context = s.lastContext
 	if s.roster != nil {
 		summary := s.roster.Summary()
 		status.SubAgents, status.NamedAgents = summary.Total, summary.Named

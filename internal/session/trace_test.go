@@ -1,11 +1,70 @@
 package session
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestTraceRefreshReadsExternalWriterWithoutDuplicateOrPartialRows(t *testing.T) {
+	dir := t.TempDir()
+	reader, err := NewTraceStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if got := reader.Events("worker"); len(got) != 0 {
+		t.Fatal(got)
+	}
+	writer, err := NewTraceStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := writer.Append(&TraceEvent{SessionID: "worker", Kind: "tokens", Turn: 1, Text: "input=64 output=16 cache_write=0 cache_read=64"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.SyncSession("worker"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := reader.Refresh("worker"); err != nil {
+			t.Fatal(err)
+		}
+		if got := reader.Events("worker"); len(got) != 1 || got[0].Kind != "tokens" {
+			t.Fatalf("refresh %d: %+v", i, got)
+		}
+	}
+	row, _ := json.Marshal(TraceEvent{ID: "terminal", SessionID: "worker", Kind: "loop_done", Turn: 1, Sequence: 2})
+	f, err := os.OpenFile(filepath.Join(dir, "worker.jsonl"), os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write(row[:len(row)/2]); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Refresh("worker"); err != nil {
+		t.Fatal(err)
+	}
+	if got := reader.Events("worker"); len(got) != 1 {
+		t.Fatalf("partial row was ingested: %+v", got)
+	}
+	if _, err := f.Write(append(row[len(row)/2:], '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Refresh("worker"); err != nil {
+		t.Fatal(err)
+	}
+	if got := reader.Events("worker"); len(got) != 2 || got[1].Kind != "loop_done" {
+		t.Fatalf("completed external row missing: %+v", got)
+	}
+	if err := reader.Refresh("../escape"); err == nil {
+		t.Fatal("invalid session accepted")
+	}
+}
 
 func TestTraceAppendAndEvents(t *testing.T) {
 	store, err := NewTraceStore(t.TempDir())

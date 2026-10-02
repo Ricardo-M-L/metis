@@ -361,17 +361,36 @@ function activityTurnKey() {
   return activityCurrentTurnId;
 }
 
-// A turn header is independent of its process groups. Artifact cards and
-// assistant answers can therefore stay in their original transcript order.
+// A turn header is independent of its process groups. Keep assistant replies
+// as transcript peers, but fold only replies known to precede a later tool
+// group in the same turn. Replies after the final group remain visible: there
+// is no protocol flag that would safely classify unknown prose as process.
+function activityTurnProcessMessages(turn, groups = activityTurnGroups(turn)) {
+  const lastGroup = groups[groups.length - 1];
+  const area = turn && turn.parentElement;
+  if (!lastGroup || !area) return [];
+  const siblings = Array.from(area.children);
+  const cutoff = siblings.indexOf(lastGroup);
+  if (cutoff < 0) return [];
+  return siblings.slice(0, cutoff).filter(node =>
+    node.classList.contains('message-assistant') &&
+    node.dataset.activityTurnId === turn.dataset.turnId);
+}
+
 function setActivityTurnOpen(turn, open) {
   if (!turn) return;
   turn.classList.toggle('open', open);
   const button = turn.querySelector('.activity-turn-toggle');
   if (button) button.setAttribute('aria-expanded', String(open));
-  activityTurnGroups(turn).forEach(group => {
+  const groups = activityTurnGroups(turn);
+  groups.forEach(group => {
     if (open) group.removeAttribute('data-turn-collapsed');
     else group.dataset.turnCollapsed = 'true';
     if (open) scheduleActivityGroupFollow(group);
+  });
+  activityTurnProcessMessages(turn, groups).forEach(message => {
+    if (open || turn.dataset.hasFinalAnswer !== 'true') message.removeAttribute('data-turn-collapsed');
+    else message.dataset.turnCollapsed = 'true';
   });
 }
 
@@ -1590,11 +1609,12 @@ function startStreamingMessage() {
   streaming = true;
   streamMsgIdx = messages.length;
   const area = document.getElementById('chatArea');
+  const turnID = activityTurnKey();
   // No id here: getElementById returns the FIRST match, so a leftover id
   // from a previous turn would make later turns write into the old
   // message. lastElementChild is the node inserted right above.
   area.insertAdjacentHTML('beforeend', `
-    <div class="message message-assistant">
+    <div class="message message-assistant" data-activity-turn-id="${escAttr(turnID)}">
       <div class="message-avatar">M</div>
       <div class="message-body">
         <div class="message-content"></div>
@@ -2365,7 +2385,17 @@ function sameToolInput(left, right) {
   catch (e) { return false; }
 }
 
+function isChildToolEvent(d) {
+  // Child tools can arrive between any two parent text deltas. Their owning
+  // Agent card and detail stream already represent the child in this chat;
+  // individual calls remain in the saved child transcript and trajectory.
+  // Keep this check ahead of preview/result matching too: a child may reuse
+  // a parent's provider tool ID, or send a result without a visible start.
+  return !!String(d.subAgentParentId || '').trim();
+}
+
 function handleToolArgsDelta(d) {
+  if (isChildToolEvent(d)) return;
   const id = d.id || '';
   if (!id) return; // A preview with no provider ID cannot safely join its later start.
   const traced = d.traceCallId ? toolRowsInCurrentTurn().find(row =>
@@ -2401,6 +2431,7 @@ function handleToolArgsDelta(d) {
 }
 
 function handleToolStart(d) {
+  if (isChildToolEvent(d)) return;
   const area = document.getElementById('chatArea');
   const name = d.tool || 'tool';
   const id = d.id || '';
@@ -2516,6 +2547,7 @@ function showUnattributedToolResult(d) {
 }
 
 function handleToolResult(d) {
+  if (isChildToolEvent(d)) return;
   const id = d.id || '';
   if (d.traceCallId && toolRowsInCurrentTurn().some(row =>
     row.dataset.traceCallId === d.traceCallId &&
@@ -3643,6 +3675,8 @@ function addMessage(role, content, remember = true, idx = -1, historyTurn = 0, a
   const area = document.getElementById('chatArea');
   const idxAttr = index >= 0 ? ` data-idx="${index}"` : '';
   const turnAttr = historyTurn > 0 ? ` data-history-turn="${historyTurn}"` : '';
+  const activityAttr = role === 'assistant' && historyTurn > 0
+    ? ` data-activity-turn-id="history-${historyTurn}"` : '';
   const steerAttr = role === 'user' && activitySteer ? ' data-activity-steer="true"' : '';
 
   if (role === 'user') {
@@ -3653,7 +3687,7 @@ function addMessage(role, content, remember = true, idx = -1, historyTurn = 0, a
       </div>`);
   } else {
     area.insertAdjacentHTML('beforeend', `
-      <div class="message message-assistant"${idxAttr}${turnAttr}>
+      <div class="message message-assistant"${idxAttr}${turnAttr}${activityAttr}>
         <div class="message-avatar">M</div>
         <div class="message-body">
           <div class="message-content">${formatContent(content)}</div>

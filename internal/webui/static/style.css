@@ -4993,28 +4993,35 @@ a.tc-web-title:focus-visible,
   background: var(--bg);
 }
 .context-meter-popover, .session-stats-popover, .token-stats-popover {
-  position: absolute;
+  position: fixed;
   z-index: 105;
-  bottom: calc(100% + 8px);
-  left: 50%;
-  transform: translateX(-50%);
+  bottom: auto;
+  left: 0;
+  top: 0;
   box-sizing: border-box;
-  width: min(340px, calc(100% - 16px));
-  padding: 14px;
-  border: 1px solid var(--border-mid);
-  border-radius: 13px;
-  background: var(--surface);
-  box-shadow: var(--shadow-pop);
+  width: max-content;
+  min-width: min(300px, calc(100vw - 24px));
+  max-width: min(440px, calc(100vw - 24px));
+  padding: 16px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border-faint);
+  border-radius: 16px;
+  background: var(--surface-2);
+  box-shadow: 0 3px 8px rgb(0 0 0 / 8%), 0 0 20px rgb(0 0 0 / 6%);
   color: var(--fg-mid);
   font-size: 12px;
+  line-height: 18px;
 }
 .context-meter-popover-title, .session-stats-popover-title, .token-stats-popover-title {
   display: flex;
   justify-content: space-between;
   align-items: center;
   color: var(--fg-strong);
-  font-weight: 650;
-  margin-bottom: 12px;
+  font-weight: 550;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-faint);
+  margin-bottom: 10px;
 }
 .context-meter-popover-title strong { color: var(--accent); }
 .context-meter-progress {
@@ -5026,7 +5033,7 @@ a.tc-web-title:focus-visible,
 }
 .context-meter-progress span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 .context-meter-popover.warn .context-meter-progress span { background: var(--warn); }
-.context-meter-details, .session-stats-details, .token-stats-details { display: grid; gap: 8px; margin: 0; }
+.context-meter-details, .session-stats-details, .token-stats-details { display: grid; gap: 6px; margin: 0; }
 .context-meter-details > div, .session-stats-details > div, .token-stats-details > div { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
 .context-meter-details dt, .session-stats-details dt, .token-stats-details dt { color: var(--fg-faint); }
 .context-meter-details dd, .session-stats-details dd, .token-stats-details dd { margin: 0; min-width: 0; color: var(--fg-strong); text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
@@ -5093,8 +5100,6 @@ a.tc-web-title:focus-visible,
 .session-stats-chevron { width: 12px !important; height: 12px !important; opacity: .7; transition: transform var(--transition-fast); }
 .session-stats-trigger[aria-expanded="true"] .session-stats-chevron,
 .token-stats-trigger[aria-expanded="true"] .session-stats-chevron { transform: rotate(180deg); }
-.session-stats-popover, .token-stats-popover { bottom: calc(100% + 10px); }
-.session-stats-details, .token-stats-details { max-height: min(310px, 48vh); overflow-y: auto; }
 @media (max-width: 690px) {
   .session-stats-trigger, .token-stats-trigger, .context-meter { font-size: 11px; }
 }
@@ -6917,8 +6922,9 @@ body.subagent-detail-open { overflow: hidden; }
   .subagent-detail-meta { grid-template-columns: 1fr; }
 }
 
-/* The turn header and each process group are separate controls. Artifacts and
-   assistant messages remain direct chat children between process groups. */
+/* The turn header and each process group are separate controls. Process
+   assistant messages remain transcript peers so expansion restores their
+   original order; only messages followed by later tool work are hidden. */
 .chat-area > .activity-turn,
 .chat-area > .activity-group {
   box-sizing: border-box;
@@ -6930,13 +6936,14 @@ body.subagent-detail-open { overflow: hidden; }
   color: var(--fg-mid);
 }
 .chat-area > .activity-turn { margin-top: 8px; }
-.chat-area > .activity-turn[data-has-final-answer='true']:not(.open) { margin-bottom: 14px; }
+.chat-area > .activity-turn[data-has-final-answer='true']:not(.open) { margin-bottom: 5px; }
 .chat-area > .activity-group { margin-top: 5px; margin-bottom: 14px; }
 /* Keep an answer followed by tool activity in the same visual rhythm as
    adjacent transcript rows, without changing standalone answer spacing. */
 .chat-area > .message-assistant:has(+ .activity-group) { margin-bottom: 16px; }
 .chat-area > .message-assistant + .activity-group { margin-top: 0; }
 .chat-area > .activity-group[data-turn-collapsed='true'] { display: none; }
+.chat-area > .message-assistant[data-turn-collapsed='true'] { display: none; }
 .activity-turn-toggle {
   display: flex;
   align-items: center;

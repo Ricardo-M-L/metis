@@ -7,6 +7,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.85] - 2026-10-02
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Changed
+
+- Anchor Desktop statistics, token usage, and context popovers directly above
+  their footer indicators, with compact styling and viewport edge avoidance.
+- Collapse completed intermediate messages and tool activity together for each
+  turn while keeping the final answer visible.
+
+### Fixed
+
+- Refresh traces written by isolated Desktop workers and reconcile their token
+  and cache usage before reporting turn completion.
+- Report context usage from the selected session's worker instead of an
+  unrelated in-process runtime.
+- Keep child-agent tool events from interrupting parent text, replacing parent
+  tool records, or creating stray activity groups.
+
 ## [0.4.84] - 2026-10-01
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

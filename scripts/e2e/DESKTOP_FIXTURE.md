@@ -58,6 +58,18 @@ system prompts, or tool output. To check this
 contract without starting METIS, run
 `python3 -m unittest discover -s scripts/e2e -p 'test_desktop_fixture.py'`.
 
+## Turn disclosure and footer acceptance
+
+Send `[activity-fixture]` to run three actual Responses requests. The first two
+emit a progress message followed by `Read` of a fixture-owned Markdown file; the
+third emits a final answer. The fixture allows `Read` as well as `Agent` and seeds
+the two files only in its temporary workspace. Use this to check that collapsing
+a completed turn hides all progress messages and tools while preserving the final
+answer, and that expanding restores the original order. Every response supplies
+128 input tokens (64 cached) and 16 output tokens through the normal provider
+protocol; the UI must obtain statistics from METIS accounting, not injected DOM.
+Elapsed times and context estimates are produced by the actual backend.
+
 ## Native Desktop without Apple signing
 
 Build the frontend and native wrapper using the repository's installed Wails CLI:

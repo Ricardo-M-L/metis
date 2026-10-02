@@ -623,6 +623,9 @@ func (s *Server) reconcilePersistedTraceUsage(sessionID string) {
 	if s == nil || s.store == nil || s.traceStore == nil || !validSessionID(sessionID) {
 		return
 	}
+	if err := s.traceStore.Refresh(sessionID); err != nil {
+		log.Printf("refresh persisted trace usage for %s: %v", sessionID, err)
+	}
 	byTurn := make(map[int]session.CostSnapshot)
 	for _, ev := range s.traceStore.Events(sessionID) {
 		if ev.Turn <= 0 || ev.Kind != "tokens" {
@@ -1954,6 +1957,10 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 			s.hub.publish(sessionID, agent.Event{Kind: agent.EventTextDelta, TextDelta: delta})
 		},
 	})
+	// The worker owns tracing in a separate process. Import its terminal usage
+	// before publishing completion so footer refresh and reopened sessions see
+	// the provider's actual token/cache totals, including failed/cancelled runs.
+	s.reconcilePersistedTraceUsage(sessionID)
 	s.finishWorkerSnapshot(sessionID, err != nil, errors.Is(err, context.Canceled) || result.Stopped)
 	if errors.Is(err, context.Canceled) || result.Stopped {
 		_ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "stopped"})
@@ -2519,8 +2526,21 @@ func (s *Server) setContextOwnerAfterActivationLocked(id string, loadedEpoch uin
 	s.contextOwnerEpoch++
 	if !workerRunning && s.contextWorkerEpochs[id] == loadedEpoch {
 		s.contextSessionID = id
+		// The loaded parent transcript is newer than the completed worker's
+		// retained pressure. Keep its roster, but do not let an old reading
+		// obscure subsequent in-process/image turns on this same session.
+		s.invalidateWorkerContext(id)
 	} else {
 		s.contextSessionID = ""
+	}
+}
+
+func (s *Server) invalidateWorkerContext(sessionID string) {
+	s.workerTurnsMu.Lock()
+	defer s.workerTurnsMu.Unlock()
+	if snapshot, ok := s.workerSnapshots[sessionID]; ok {
+		snapshot.status.Context = nil
+		s.workerSnapshots[sessionID] = snapshot
 	}
 }
 
@@ -3467,6 +3487,10 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		rtpkg.RebindLoopRuntime(s.loop, built.Provider, selectedModel, newSystem, activeSessionID, rtpkg.LoopRuntimeRebindOptions{
 			ProviderName: body.Provider, WorkingDirectory: activeWorkDir,
 		})
+		// A completed worker measured the old model's prompt and window.
+		// The next owned Loop/worker reading replaces it; the old model's
+		// pressure must not remain visible under the newly selected model.
+		s.invalidateWorkerContext(activeSessionID)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"provider": body.Provider, "model": selectedModel,
 			"effortSupported": capability.Supported, "effortReason": capability.Reason,
@@ -3625,19 +3649,36 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if wd, err := os.Getwd(); err == nil {
 		workspace = filepath.Base(wd)
 	}
+	selectedContextSessionID := activeSessionID
+	if viewSessionID != "" {
+		selectedContextSessionID = viewSessionID
+	}
+	workerContext := (*desktopipc.ContextPressure)(nil)
+	if selectedContextSessionID != "" {
+		if status, ok := s.workerSnapshot(selectedContextSessionID); ok && status.Context != nil &&
+			status.Context.Window > 0 && status.Context.Used >= 0 {
+			workerContext = status.Context
+		}
+	}
 	contextStatus := contextStatusSnapshot{}
 	toolNames := make([]string, 0)
-	if s.loop != nil {
+	if workerContext != nil {
+		contextStatus = contextStatusSnapshot{
+			used: workerContext.Used, window: workerContext.Window,
+			compactThreshold: workerContext.CompactThreshold, compactAtTokens: workerContext.CompactAtTokens,
+			sessionID: selectedContextSessionID,
+		}
+	} else if s.loop != nil {
 		contextStatus = s.readContextStatus(func() contextStatusSnapshot {
 			used := s.loop.EstimateContextTokens()
 			window, threshold, trigger := s.loop.ContextStatusSnapshot()
 			return contextStatusSnapshot{used: used, window: window, compactThreshold: threshold, compactAtTokens: trigger}
 		})
-		if s.loop.Registry != nil {
-			for _, tool := range s.loop.Registry.ModelToolsForCache() {
-				if tool != nil {
-					toolNames = append(toolNames, tool.Name())
-				}
+	}
+	if s.loop != nil && s.loop.Registry != nil {
+		for _, tool := range s.loop.Registry.ModelToolsForCache() {
+			if tool != nil {
+				toolNames = append(toolNames, tool.Name())
 			}
 		}
 	}
@@ -4309,6 +4350,9 @@ func (s *Server) handleTraceExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "session tracing is not enabled for this process")
 		return
 	}
+	if err := store.Refresh(sid); err != nil {
+		log.Printf("refresh trace for %s: %v", sid, err)
+	}
 	nodes := store.Trace(sid)
 	if len(nodes) == 0 {
 		nodes = traceFromHistory(s, sid)
@@ -4972,6 +5016,9 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := store.Refresh(sid); err != nil {
+		log.Printf("refresh trace for %s: %v", sid, err)
+	}
 	nodes := store.Trace(sid)
 	source := "live"
 	if len(nodes) == 0 {
