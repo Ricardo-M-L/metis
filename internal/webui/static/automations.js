@@ -199,7 +199,9 @@ async function loadAutomationRuns(id, background = false) {
     if (generation !== automationState.runsGeneration || id !== automationState.selectedId || !automationState.active) return;
     automationState.runs = Array.isArray(data.runs) ? data.runs : [];
     automationState.runs.forEach(run => {
-      if (run.sessionId) automationSessionRuns.set(run.sessionId, {jobId:run.jobId || id,runId:run.id});
+      if (!run.sessionId) return;
+      if (run.status === 'running') automationSessionRuns.set(run.sessionId, {jobId:run.jobId || id,runId:run.id});
+      else if (automationSessionRuns.get(run.sessionId)?.runId === run.id) automationSessionRuns.delete(run.sessionId);
     });
     automationState.runsError = '';
     const latest = automationState.runs[0];
@@ -359,7 +361,9 @@ async function openAutomationRunSession(sessionId, runJobId, runId) {
     // saved titles and sidebar rows before committing the destination route.
     await loadSessions(false);
     if (!isLatest()) return false;
-    if (runJobId && runId) automationSessionRuns.set(sessionId, {jobId:runJobId,runId});
+    if (runJobId && runId) {
+      automationSessionRuns.set(sessionId, {jobId:runJobId,runId});
+    }
     const opened = await navigation.navigate({page:'session',sessionId,view:'chat'});
     if (opened) watchAutomationSession(sessionId);
     return opened;
@@ -370,7 +374,8 @@ async function openAutomationRunSession(sessionId, runJobId, runId) {
 }
 
 // Cron turns run in a separate CLI process, so they do not emit the Desktop's
-// foreground SSE events. Their durable run record is the live progress source.
+// foreground SSE events. Their saved session is the source of conversation
+// history; the run record only supplies status and terminal errors.
 const automationSessionRuns = new Map();
 let automationSessionWatch = null;
 
@@ -379,59 +384,224 @@ function stopAutomationSessionWatch() {
   automationSessionWatch = null;
 }
 
-function automationSessionCard(run, sessionId) {
+function automationUncheckpointedTail(run, watch) {
+  const live = String(run.liveText || '').trim();
+  if (!live) return '';
+  const tail = live.slice(-240).trim();
+  const persisted = watch?.persistedText || '';
+  if (persisted.includes(tail) || (tail.length > 80 && persisted.includes(tail.slice(-80)))) return '';
+  for (let overlap = Math.min(persisted.length, tail.length); overlap >= 24; overlap--) {
+    if (persisted.endsWith(tail.slice(0, overlap))) return tail.slice(overlap).trim();
+  }
+  return tail;
+}
+
+function automationSessionStatus(run, sessionId, watch, note = '') {
   const area = document.getElementById('chatArea');
   if (!area || currentSessionId !== sessionId) return;
-  let card = area.querySelector('.automation-live-run');
-  if (!card) {
-    area.insertAdjacentHTML('beforeend', '<section class="automation-live-run" role="status" aria-live="polite"></section>');
-    card = area.querySelector('.automation-live-run');
+  let status = area.querySelector('.automation-session-status');
+  if (run.status === 'succeeded' && run.output && !note) { status?.remove(); return; }
+  if (!status) {
+    area.insertAdjacentHTML('beforeend', '<div class="automation-session-status" role="status" aria-live="polite"></div>');
+    status = area.querySelector('.automation-session-status');
   }
   const running = run.status === 'running';
-  const label = automationRunLabel(run.status);
-  const body = running ? automationRunningText(run)
-    : run.error || automationText('The task ended without a text answer. Check its run record for details.','任务已结束，但没有文字回答。请查看运行记录了解详情。');
-  card.classList.toggle('is-running', running);
-  card.classList.toggle('is-error', !running && run.status !== 'succeeded');
-  card.innerHTML = '<div class="automation-live-head"><span class="automation-live-indicator" aria-hidden="true"></span><strong>'
-    +automationText('Scheduled task','定时任务')+'</strong><span>'+automationEscape(label)+'</span></div><pre>'
-    +automationEscape(body)+'</pre>';
-  if (typeof autoScroll === 'function') autoScroll();
+  const detail = note || (running
+    ? automationUncheckpointedTail(run, watch) || automationText('Conversation updates as work is saved.','会话将随工作保存而更新。')
+    : run.error || automationText('The task ended without a text answer. Check its run record for details.','任务已结束，但没有文字回答。请查看运行记录了解详情。'));
+  const markup = '<span class="automation-session-indicator" aria-hidden="true"></span><strong>'
+    +automationEscape(automationRunLabel(run.status))+'</strong><span>'+automationEscape(detail)+'</span>';
+  status.classList.toggle('is-running', running);
+  status.classList.toggle('is-error', !running && run.status !== 'succeeded');
+  if (status._automationMarkup !== markup) {
+    status.innerHTML = markup;
+    status._automationMarkup = markup;
+  }
+}
+
+function automationForegroundTurnActive(sessionId) {
+  return typeof turnRunning !== 'undefined' && turnRunning &&
+    typeof runningSessionId !== 'undefined' && String(runningSessionId || '') === sessionId;
+}
+
+function automationHistoryView(area) {
+  const rows = Array.from(area.querySelectorAll?.('.call-row') || []);
+  const selected = typeof selectedToolId === 'undefined' ? null : rows.find(row => row.dataset.rowKey === selectedToolId);
+  return {
+    scrollTop: area.scrollTop,
+    nearBottom: area.scrollHeight - area.scrollTop - area.clientHeight <= 56,
+    selectedTrace: selected?.dataset.traceCallId || '',
+    selectedIndex: selected ? rows.indexOf(selected) : -1,
+    selectedTab: typeof detailTab === 'undefined' ? 'summary' : detailTab,
+    openTools: rows.flatMap((row, index) => row.classList.contains('open') ? [{trace:row.dataset.traceCallId || '',index}] : []),
+    openTurns: Array.from(area.querySelectorAll?.('.activity-turn') || []).flatMap((turn, index) =>
+      turn.dataset.userTouched === 'true' && turn.classList.contains('open') ? [index] : []),
+    openGroups: Array.from(area.querySelectorAll?.('.activity-group') || []).flatMap((group, index) =>
+      group.dataset.userTouched === 'true' && group.classList.contains('open') ? [index] : []),
+    openThoughts: Array.from(area.querySelectorAll?.('.think-row') || []).flatMap((row, index) =>
+      row.classList.contains('open') ? [index] : []),
+  };
+}
+
+function automationRestoreHistoryView(area, view) {
+  const turns = Array.from(area.querySelectorAll?.('.activity-turn') || []);
+  view.openTurns.forEach(index => {
+    const turn = turns[index];
+    if (!turn || typeof setActivityTurnOpen !== 'function') return;
+    turn.dataset.userTouched = 'true';
+    turn.dataset.userOpen = 'true';
+    setActivityTurnOpen(turn, true);
+  });
+  const groups = Array.from(area.querySelectorAll?.('.activity-group') || []);
+  view.openGroups.forEach(index => {
+    const group = groups[index];
+    if (!group || typeof setActivityGroupOpen !== 'function') return;
+    group.dataset.userTouched = 'true';
+    setActivityGroupOpen(group, true);
+  });
+  const rows = Array.from(area.querySelectorAll?.('.call-row') || []);
+  const matchingRow = item => item.trace ? rows.find(row => row.dataset.traceCallId === item.trace) : rows[item.index];
+  view.openTools.forEach(item => {
+    const row = matchingRow(item);
+    if (row && !row.classList.contains('open') && typeof toggleToolInline === 'function') toggleToolInline(row.dataset.rowKey);
+  });
+  const thoughts = Array.from(area.querySelectorAll?.('.think-row') || []);
+  view.openThoughts.forEach(index => {
+    const row = thoughts[index];
+    if (row && !row.classList.contains('open') && typeof toggleThinkRow === 'function') toggleThinkRow(row.querySelector('.think-head'));
+  });
+  if (view.selectedIndex >= 0 && typeof openToolDetail === 'function') {
+    const selected = view.selectedTrace ? rows.find(row => row.dataset.traceCallId === view.selectedTrace) : rows[view.selectedIndex];
+    if (selected) {
+      openToolDetail(selected.dataset.rowKey);
+      if (view.selectedTab !== 'summary' && typeof switchDetailTab === 'function') {
+        const tabs = document.querySelectorAll('.detail-tab');
+        const index = view.selectedTab === 'input' ? 1 : 2;
+        switchDetailTab(view.selectedTab, tabs[index]);
+      }
+    }
+  }
+  if (view.nearBottom) { if (typeof autoScroll === 'function') autoScroll(true); }
+  else {
+    area.scrollTop = view.scrollTop;
+    if (typeof followOutput !== 'undefined') followOutput = false;
+    if (typeof updateScrollFollowUI === 'function') updateScrollFollowUI();
+  }
+}
+
+async function automationSyncSessionHistory(watch, current) {
+  const response = await fetch('/api/sessions/'+encodeURIComponent(watch.sessionId), {method:'GET',cache:'no-store'});
+  if (!response.ok) return false;
+  const data = await response.json();
+  if (!current()) return false;
+  const history = Array.isArray(data.messages) ? data.messages : [];
+  watch.persistedText = history.slice(-8).flatMap(message => (Array.isArray(message.content) ? message.content : []))
+    .map(block => typeof block?.text === 'string' ? block.text : typeof block?.content === 'string' ? block.content : '')
+    .filter(Boolean).join('\n').slice(-32768);
+  const signature = JSON.stringify(history);
+  if (signature === watch.historySignature && watch.historyRunning === watch.running) return true;
+  const area = document.getElementById('chatArea');
+  if (!area) return false;
+  const view = automationHistoryView(area);
+  messages = [];
+  streamedTextThisTurn = false;
+  renderHistoryMessages(history);
+  watch.historySignature = signature;
+  watch.historyRunning = watch.running;
+  automationRestoreHistoryView(area, view);
+  if (typeof restoreCompactionHistory === 'function') await restoreCompactionHistory(watch.sessionId, current);
+  if (!current()) return false;
+  return true;
+}
+
+function automationLikelyCronSession(sessionId) {
+  const session = typeof sessions === 'undefined' ? null : sessions.find(item => item.id === sessionId);
+  return /^Cron · /.test(String(session?.title || ''));
+}
+
+function automationRunFromJobs(jobs, sessionId) {
+  const job = jobs.find(item => item.lastRun?.sessionId === sessionId);
+  return job ? {jobId:job.id,runId:job.lastRun.id} : null;
 }
 
 function watchAutomationSession(sessionId) {
   const target = automationSessionRuns.get(sessionId);
-  if (!target || currentSessionId !== sessionId) { stopAutomationSessionWatch(); return; }
-  if (automationSessionWatch?.sessionId === sessionId && automationSessionWatch.runId === target.runId) return;
+  if (currentSessionId !== sessionId || (!target && !automationLikelyCronSession(sessionId))) {
+    stopAutomationSessionWatch();
+    return;
+  }
+  if (automationSessionWatch?.sessionId === sessionId && automationSessionWatch.runId === (target?.runId || '')) return;
   stopAutomationSessionWatch();
-  const watch = {sessionId, ...target, timer:null};
+  const watch = {sessionId, ...target, runId:target?.runId || '', timer:null, running:false,
+    historySignature:null, historyRunning:null, persistedText:'', discoveryAttempts:0};
   automationSessionWatch = watch;
-  const current = () => automationSessionWatch === watch && currentSessionId === sessionId;
-  const again = delay => { if (current()) watch.timer = setTimeout(poll, delay); };
-  async function poll() {
+  const current = () => {
+    if (automationSessionWatch !== watch || currentSessionId !== sessionId) return false;
+    if (automationForegroundTurnActive(sessionId)) {
+      document.getElementById('chatArea')?.querySelector('.automation-session-status')?.remove();
+      stopAutomationSessionWatch();
+      return false;
+    }
+    return true;
+  };
+  const again = (fn, delay) => { if (current()) watch.timer = setTimeout(fn, delay); };
+  async function discover() {
     if (!current()) return;
+    try {
+      let found = automationRunFromJobs(automationState.jobs, sessionId);
+      if (!found) {
+        const data = await automationRequest('');
+        if (!current()) return;
+        const jobs = Array.isArray(data.automations) ? data.automations : [];
+        found = automationRunFromJobs(jobs, sessionId);
+        if (!found) {
+          // An overlapping attempt can make lastRun skipped while the job's
+          // execution lock belongs to an earlier run, which may since have finished.
+          for (const job of jobs.filter(item => item.running || item.lastRun?.status === 'skipped')) {
+            const data = await automationRequest('/'+encodeURIComponent(job.id)+'/runs').catch(() => null);
+            if (!current()) return;
+            const matches = (Array.isArray(data?.runs) ? data.runs : []).filter(run => run.sessionId === sessionId);
+            const run = matches.find(item => item.status === 'running') || matches[0];
+            if (run) { found = {jobId:job.id,runId:run.id}; break; }
+          }
+        }
+      }
+      if (found) {
+        Object.assign(watch, found);
+        automationSessionRuns.set(sessionId, found);
+        void poll();
+      } else if (++watch.discoveryAttempts < 4) again(discover, 1800);
+      else stopAutomationSessionWatch();
+    } catch (_) {
+      if (current() && ++watch.discoveryAttempts < 4) again(discover, 2500);
+      else if (current()) stopAutomationSessionWatch();
+    }
+  }
+  async function poll() {
+    if (!current()) { if (automationSessionWatch === watch) stopAutomationSessionWatch(); return; }
     try {
       const run = await automationRequest('/'+encodeURIComponent(watch.jobId)+'/runs/'+encodeURIComponent(watch.runId));
       if (!current()) return;
-      if (run.status === 'running') {
-        automationSessionCard(run, sessionId);
-        again(document.visibilityState === 'hidden' ? 3000 : 900);
+      watch.running = run.status === 'running';
+      const synced = await automationSyncSessionHistory(watch, current);
+      if (!current()) return;
+      if (!synced) {
+        automationSessionStatus(run, sessionId, watch, automationText('Waiting for saved conversation updates…','正在等待读取已保存的会话…'));
+        again(poll, 1800);
         return;
       }
-      // Finish follows the CLI's final session checkpoint. Reload the saved
-      // conversation once instead of leaving the initial prompt-only view.
-      const synced = await syncViewedSessionHistory(sessionId, current);
-      if (!current()) return;
-      if (!synced) { again(1800); return; }
-      if (run.status !== 'succeeded' || !run.output) automationSessionCard(run, sessionId);
+      automationSessionStatus(run, sessionId, watch);
+      if (watch.running) { again(poll, document.visibilityState === 'hidden' ? 3000 : 900); return; }
+      if (automationSessionRuns.get(sessionId)?.runId === watch.runId) automationSessionRuns.delete(sessionId);
       stopAutomationSessionWatch();
     } catch (error) {
       if (!current()) return;
-      automationSessionCard({status:'running',liveText:automationText('Waiting for run updates: ','等待运行状态更新：')+error.message},sessionId);
-      again(2500);
+      automationSessionStatus({status:'running'}, sessionId, watch,
+        automationText('Waiting for run updates: ','等待运行状态更新：')+error.message);
+      again(poll, 2500);
     }
   }
-  void poll();
+  if (target) void poll(); else void discover();
 }
 
 function automationValidTimezone(timezone) {

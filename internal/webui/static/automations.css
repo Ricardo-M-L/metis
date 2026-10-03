@@ -142,18 +142,20 @@
 }
 @media (prefers-reduced-motion: reduce) { .automation-task-row { transition: none; } }
 
-.automation-live-run {
+.automation-session-status {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
   width: min(100%, 760px);
-  margin: 16px auto 24px;
-  padding: 16px 18px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: var(--surface);
-  color: var(--fg-body);
+  margin: 8px auto 20px;
+  color: var(--fg-dim);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
 }
-.automation-live-head { display: flex; align-items: center; gap: 9px; font-size: 13px; }
-.automation-live-head > span:last-child { margin-left: auto; color: var(--fg-dim); }
-.automation-live-indicator { width: 8px; height: 8px; border-radius: 50%; background: var(--fg-dim); }
-.automation-live-run.is-running .automation-live-indicator { background: var(--accent); animation: statusPulse 1.4s ease-in-out infinite; }
-.automation-live-run.is-error .automation-live-indicator { background: var(--error); }
-.automation-live-run pre { margin-top: 12px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.6; color: var(--fg-mid); }
+.automation-session-status strong { color: var(--fg-body); font-weight: 600; white-space: nowrap; }
+.automation-session-status > span:last-child { min-width: 0; white-space: pre-wrap; }
+.automation-session-status.is-error strong, .automation-session-status.is-error > span:last-child { color: var(--error); }
+.automation-session-indicator { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--fg-dim); align-self: center; }
+.automation-session-status.is-running .automation-session-indicator { background: var(--accent); animation: statusPulse 1.4s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .automation-session-indicator { animation: none !important; } }

@@ -7,6 +7,28 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.86] - 2026-10-03
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Changed
+
+- Render scheduled-task conversations with the same turn summaries, collapsible
+  tool activity, and final answers as ordinary Desktop conversations.
+- Replace the separate scheduled-task progress card with a compact live status
+  and a short text tail that has not yet been saved to the conversation.
+
+### Fixed
+
+- Refresh saved scheduled-task messages while a run is active and load its final
+  answer when it finishes, including sessions opened from the sidebar after an
+  application reload.
+- Preserve reading position, expanded activity, and selected tool details during
+  progress refreshes, and ignore stale responses after switching sessions.
+- Discover an active scheduled run even when a newer skipped trigger is listed
+  as the task's latest execution.
+
 ## [0.4.85] - 2026-10-02
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

@@ -742,6 +742,8 @@ function refreshActivityGroupLanguage() {
 function viewedHistoryTurnIsRunning() {
   const sessionId = String(currentSessionId || '');
   if (!sessionId) return false;
+  if (typeof automationSessionWatch !== 'undefined' &&
+      automationSessionWatch?.sessionId === sessionId && automationSessionWatch.running) return true;
   if (turnRunning && String(runningSessionId || '') === sessionId) return true;
   if (pendingForegroundRequest && String(pendingForegroundRequest.sessionId || '') === sessionId) return true;
   if (typeof foregroundRequests !== 'undefined' && foregroundRequests.has(sessionId)) return true;
