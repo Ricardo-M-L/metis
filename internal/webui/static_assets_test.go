@@ -512,7 +512,7 @@ func TestUserMessageActionsAndConversationSpacingFollowTurnHierarchy(t *testing.
 		}
 	}
 	assistantRule := lastRule(".message-assistant")
-	if !strings.Contains(assistantRule, "margin-bottom: 32px;") {
+	if !strings.Contains(assistantRule, "margin-bottom: 24px;") {
 		t.Fatalf("assistant replies do not separate completed turns; rule=%q", assistantRule)
 	}
 

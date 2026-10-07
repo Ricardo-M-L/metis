@@ -5,6 +5,29 @@ let composerStatPopoverObserver = null;
 let composerStatPopoverTargets = [];
 let composerStatPopoverFrame = false;
 
+// Sidebar details and composer disclosures share the same transient surface.
+// Close through their existing helpers so aria state and resize observers stay
+// synchronized when focus, navigation, or another disclosure takes ownership.
+function closeDesktopTransientPopovers(keep) {
+  if (keep !== 'session-detail' && typeof hideSessionDetail === 'function') hideSessionDetail();
+  if (keep !== 'session-stats' && typeof closeSessionStatsPopover === 'function') closeSessionStatsPopover();
+  if (keep !== 'token-stats' && typeof closeTokenStatsPopover === 'function') closeTokenStatsPopover();
+  if (keep !== 'context-meter' && typeof closeContextMeterPopover === 'function') closeContextMeterPopover();
+  if (keep !== 'agent-status' && typeof closeStatusPopover === 'function') closeStatusPopover();
+}
+
+function closeUnfocusedComposerStatPopovers(target) {
+  for (const [triggerID, panelID, close] of [
+    ['sessionStatsTrigger', 'sessionStatsPopover', typeof closeSessionStatsPopover === 'function' ? closeSessionStatsPopover : null],
+    ['tokenStatsTrigger', 'tokenStatsPopover', typeof closeTokenStatsPopover === 'function' ? closeTokenStatsPopover : null],
+    ['contextMeter', 'contextMeterPopover', typeof closeContextMeterPopover === 'function' ? closeContextMeterPopover : null],
+  ]) {
+    const trigger = document.getElementById(triggerID);
+    const panel = document.getElementById(panelID);
+    if (close && panel && !panel.hidden && !panel.contains(target) && !(trigger && trigger.contains(target))) close();
+  }
+}
+
 function positionComposerStatPopover(trigger, panel) {
   if (!trigger || !panel || panel.hidden) return;
   const anchor = trigger.getBoundingClientRect();
@@ -64,6 +87,7 @@ function scheduleComposerStatPopoverPosition() {
 
 window.addEventListener('resize', scheduleComposerStatPopoverPosition);
 window.addEventListener('scroll', scheduleComposerStatPopoverPosition, true);
+window.addEventListener('blur', () => closeDesktopTransientPopovers());
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', scheduleComposerStatPopoverPosition);
   window.visualViewport.addEventListener('scroll', scheduleComposerStatPopoverPosition);

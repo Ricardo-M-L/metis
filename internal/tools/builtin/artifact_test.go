@@ -3,6 +3,7 @@ package builtin
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -149,6 +150,96 @@ func TestArtifactValidationAndRegistration(t *testing.T) {
 	Register(disabledRegistry, cfg, permission.New(permission.ModeDefault))
 	if _, ok := disabledRegistry.Get("Artifact"); ok {
 		t.Fatal("disabled Artifact tool was registered")
+	}
+}
+
+func TestArtifactConditionalUpdateSchemaAndPermission(t *testing.T) {
+	tool := NewArtifact(permission.New(permission.ModeDefault))
+	properties := tool.InputSchema()["properties"].(map[string]any)
+	expected, ok := properties["expected_version"].(map[string]any)
+	if !ok || expected["type"] != "integer" || expected["minimum"] != 1 {
+		t.Fatalf("expected_version schema = %#v", properties["expected_version"])
+	}
+	in := map[string]any{"action": "update", "expected_version": 1}
+	if tool.IsReadOnly(in) || tool.Concurrency(in) != tools.ConcurrencyExclusive {
+		t.Fatal("conditional update must remain exclusive and state-changing")
+	}
+	if decision, _ := tool.CanUse(context.Background(), in); decision != tools.PermissionAsk {
+		t.Fatalf("conditional update permission = %v, want ask", decision)
+	}
+}
+
+func TestArtifactConditionalUpdatePreservesNewerVersionAndLegacyCalls(t *testing.T) {
+	store, err := artifactstore.NewStore(filepath.Join(t.TempDir(), "artifacts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := NewArtifact(nil, store)
+	setArtifactTestSession(t, "session-a")
+	created, err := store.Create("session-a", "Original", "<p>first</p>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Omitting expected_version keeps the existing CLI update behavior.
+	legacy, err := tool.Execute(context.Background(), map[string]any{
+		"action": "update", "id": created.ID, "title": "Current", "html": "<p>newer</p>",
+	})
+	if err != nil || legacy.IsError || legacy.Presentation["version"] != 2 {
+		t.Fatalf("legacy update: result=%+v err=%v", legacy, err)
+	}
+	stale, err := tool.Execute(context.Background(), map[string]any{
+		"action": "update", "id": created.ID, "title": "Stale", "html": "<p>stale</p>", "expected_version": 1,
+	})
+	if err != nil || stale == nil || !stale.IsError || !strings.Contains(stale.Output, "version changed") || !strings.Contains(stale.Output, "read the current artifact") || stale.Presentation != nil {
+		t.Fatalf("stale update must request a fresh read: result=%+v err=%v", stale, err)
+	}
+	manifest, err := store.Get("session-a", created.ID)
+	if err != nil || manifest.Title != "Current" || manifest.CurrentVersion != 2 || len(manifest.Versions) != 2 {
+		t.Fatalf("stale tool update changed metadata: %+v, %v", manifest, err)
+	}
+	body, _, err := store.ReadVersion("session-a", created.ID, 0)
+	if err != nil || !strings.Contains(string(body), "newer") {
+		t.Fatalf("stale tool update changed content: %q, %v", body, err)
+	}
+	for _, expected := range []any{float64(2), int64(3)} {
+		fresh, err := tool.Execute(context.Background(), map[string]any{
+			"action": "update", "id": created.ID, "html": "<p>fresh</p>", "expected_version": expected,
+		})
+		if err != nil || fresh.IsError {
+			t.Fatalf("valid expected version %v: result=%+v err=%v", expected, fresh, err)
+		}
+	}
+	tasks.SetCurrentSessionID("session-b")
+	foreign, err := tool.Execute(context.Background(), map[string]any{
+		"action": "update", "id": created.ID, "html": "<p>foreign</p>", "expected_version": 1,
+	})
+	if err != nil || !foreign.IsError || !strings.Contains(foreign.Output, artifactstore.ErrOwnerMismatch.Error()) || strings.Contains(foreign.Output, "current") || strings.Contains(foreign.Output, "Current") || strings.Contains(foreign.Output, store.Root()) {
+		t.Fatalf("foreign conditional update leaked metadata: result=%+v err=%v", foreign, err)
+	}
+}
+
+func TestArtifactConditionalUpdateRejectsInvalidExpectedVersion(t *testing.T) {
+	store, err := artifactstore.NewStore(filepath.Join(t.TempDir(), "artifacts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := NewArtifact(nil, store)
+	setArtifactTestSession(t, "session-a")
+	created, err := store.Create("session-a", "Original", "<p>first</p>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []any{nil, 0, -1, int64(-1), 0.0, 1.5, "1", true, []any{1}, math.NaN(), math.Inf(1), float64(math.MaxInt)} {
+		result, err := tool.Execute(context.Background(), map[string]any{
+			"action": "update", "id": created.ID, "html": "<p>invalid update</p>", "expected_version": invalid,
+		})
+		if err != nil || result == nil || !result.IsError || !strings.Contains(result.Output, "expected_version") {
+			t.Fatalf("invalid expected version %#v: result=%+v err=%v", invalid, result, err)
+		}
+	}
+	manifest, err := store.Get("session-a", created.ID)
+	if err != nil || manifest.CurrentVersion != 1 || len(manifest.Versions) != 1 {
+		t.Fatalf("invalid expected versions wrote updates: %+v, %v", manifest, err)
 	}
 }
 

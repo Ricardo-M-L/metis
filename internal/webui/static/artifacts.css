@@ -335,6 +335,7 @@ body.artifact-modal-open { overflow: hidden; }
   min-height: 420px;
   display: flex;
   flex-direction: column;
+  container: artifact-preview / inline-size;
   overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: 19px;
@@ -344,6 +345,7 @@ body.artifact-modal-open { overflow: hidden; }
 
 .artifact-preview-head {
   min-height: 62px;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 11px;
@@ -423,6 +425,7 @@ body.artifact-modal-open { overflow: hidden; }
 .artifact-preview-stage {
   position: relative;
   min-height: 0;
+  min-width: 0;
   flex: 1 1 auto;
   padding: 12px;
   background:
@@ -458,6 +461,70 @@ body.artifact-modal-open { overflow: hidden; }
 
 .artifact-preview-state[hidden] {
   display: none;
+}
+
+/* Point-to-edit stays beside the output, keeping the selected element and
+   the user's request visible together. Ordinary previews keep the full lane. */
+.artifact-preview-workspace { display: flex; flex: 1 1 auto; min-height: 0; min-width: 0; }
+.artifact-annotation-panel[hidden], .artifact-compare-controls[hidden] { display: none; }
+.artifact-annotation-panel {
+  box-sizing: border-box;
+  flex: 0 0 286px;
+  width: 286px;
+  min-width: 0;
+  padding: 20px 18px;
+  overflow-y: auto;
+  border-left: 1px solid var(--border-faint);
+  background: var(--bg-inset);
+  color: var(--fg-body);
+}
+.artifact-annotation-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.artifact-annotation-head strong { color: var(--fg-strong); font-size: 14px; font-weight: 600; }
+.artifact-annotation-version { padding: 2px 7px; border: 1px solid var(--border-faint); border-radius: 6px; font-size: 11px; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.artifact-annotation-hint { margin: 12px 0 16px; min-height: 38px; color: var(--fg-dim); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.artifact-annotation-selection { padding: 11px 12px; margin-bottom: 20px; border: 1px solid var(--border-faint); border-radius: 10px; background: var(--surface); color: var(--fg-mid); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.artifact-annotation-label { display: block; margin: 0 0 8px; color: var(--fg-mid); font-size: 12px; font-weight: 550; }
+.artifact-annotation-panel textarea { box-sizing: border-box; display: block; width: 100%; min-height: 144px; padding: 12px; resize: vertical; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--fg-strong); font: 13px/1.7 var(--font-ui); }
+.artifact-annotation-panel textarea::placeholder { color: var(--fg-faint); }
+.artifact-annotation-panel textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.artifact-annotation-panel textarea:disabled { opacity: .55; }
+.artifact-annotation-note { margin: 10px 0 20px; color: var(--fg-faint); font-size: 11px; line-height: 1.65; }
+.artifact-annotation-actions { display: flex; flex-direction: column; gap: 8px; }
+.artifact-annotation-actions button { min-height: 36px; padding: 7px 12px; border: 1px solid var(--border); border-radius: 9px; background: transparent; color: var(--fg-mid); font: 12px var(--font-ui); cursor: pointer; }
+.artifact-annotation-actions .artifact-annotation-apply { border-color: var(--accent); background: var(--accent); color: #fff; }
+.artifact-annotation-actions button:disabled { opacity: .4; cursor: default; }
+.artifact-annotation-actions button:not(:disabled):hover { filter: brightness(1.12); }
+.artifact-annotation-actions button:focus-visible, .artifact-compare-controls button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.artifact-annotation-toggle { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.artifact-annotation-toggle svg { width: 14px; height: 14px; flex: none; }
+.artifact-preview-actions .artifact-annotation-toggle[aria-pressed='true'] { border-color: var(--accent); color: var(--accent-hover); background: var(--accent-soft); }
+.artifact-preview-actions .artifact-annotation-toggle:disabled { opacity: .45; cursor: default; }
+.artifact-compare-controls { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--border-faint); border-radius: 9px; background: var(--surface); }
+.artifact-compare-controls button { padding: 5px 8px; white-space: nowrap; border: 0; border-radius: 6px; background: transparent; color: var(--fg-dim); font: 11px var(--font-ui); cursor: pointer; }
+.artifact-compare-controls button[aria-pressed='true'] { background: var(--surface-3); color: var(--fg-strong); }
+.artifact-edit-request-meta { color: var(--fg-dim); font-size: 12px; line-height: 1.6; }
+.artifact-edit-request-target { margin-top: 3px; color: var(--fg-dim); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.artifact-edit-request-text { margin-top: 8px; white-space: pre-wrap; }
+
+@media (max-width: 1000px) {
+  .artifact-preview-head { flex-wrap: wrap; }
+  .artifact-preview-copy { min-width: 140px; }
+  .artifact-preview-actions { order: 5; flex: 1 1 auto; }
+  .artifact-compare-controls { order: 4; }
+  .artifact-preview-close { margin-left: auto; }
+  .artifact-annotation-panel { width: 264px; flex-basis: 264px; padding: 18px 14px; }
+}
+
+@media (max-width: 700px) {
+  .artifact-annotation-active .artifact-preview-workspace { flex-direction: column; }
+  .artifact-annotation-active .artifact-preview-stage { flex: 1 1 auto; min-height: 180px; }
+  .artifact-annotation-panel { width: 100%; flex: 0 0 auto; max-height: 300px; padding: 14px 16px; border-left: 0; border-top: 1px solid var(--border-faint); }
+  .artifact-annotation-hint { margin: 6px 0 10px; min-height: 0; }
+  .artifact-annotation-selection { margin-bottom: 12px; }
+  .artifact-annotation-panel textarea { min-height: 80px; }
+  .artifact-annotation-note { margin: 8px 0 10px; }
+  .artifact-annotation-actions { flex-direction: row; }
+  .artifact-annotation-actions button { flex: 1; }
 }
 
 /* Destructive confirmation ------------------------------------------------ */
@@ -503,6 +570,46 @@ body.artifact-modal-open { overflow: hidden; }
   .artifact-version-control { order: 4; }
   .artifact-preview-actions { order: 5; flex: 1 1 auto; overflow-x: auto; }
   .artifact-preview-actions button { white-space: nowrap; }
+}
+
+/* Sidebars change the usable preview width without changing the window.
+   Keep wrapped controls above the workspace, then share its remaining height
+   between the full-width output and a separately scrollable edit request. */
+@container artifact-preview (max-width: 700px) {
+  .artifact-preview-head { flex-wrap: wrap; gap: 8px 11px; }
+  .artifact-preview-copy { min-width: calc(100% - 96px); }
+  .artifact-preview-close { margin-left: auto; }
+  .artifact-version-control, .artifact-compare-controls { order: 4; }
+  .artifact-preview-actions { order: 5; flex: 0 0 100%; min-width: 0; overflow-x: auto; }
+  .artifact-preview-actions button { flex: 0 0 auto; white-space: nowrap; }
+  .artifact-annotation-active .artifact-preview-workspace {
+    display: grid;
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    overflow: hidden;
+  }
+  .artifact-annotation-active .artifact-preview-stage { min-height: 0; overflow: hidden; }
+  .artifact-annotation-panel {
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    max-height: none;
+    padding: 14px 16px;
+    border-left: 0;
+    border-top: 1px solid var(--border-faint);
+    scroll-padding-block: 14px 64px;
+  }
+  .artifact-annotation-hint { margin: 6px 0 10px; min-height: 0; }
+  .artifact-annotation-selection { margin-bottom: 12px; }
+  .artifact-annotation-panel textarea { height: 96px; min-height: 80px; }
+  .artifact-annotation-note { margin: 8px 0 10px; }
+  .artifact-annotation-actions {
+    position: sticky;
+    bottom: 0;
+    flex-direction: row;
+    padding-top: 8px;
+    background: var(--bg-inset);
+  }
+  .artifact-annotation-actions button { flex: 1; }
 }
 
 @media (prefers-reduced-motion: reduce) {

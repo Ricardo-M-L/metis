@@ -5,6 +5,7 @@ package artifact
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -18,16 +19,31 @@ const (
 )
 
 var (
-	ErrInvalidID      = errors.New("artifact: invalid id")
-	ErrInvalidPath    = errors.New("artifact: invalid path")
-	ErrInvalidSession = errors.New("artifact: invalid session id")
-	ErrInvalidTitle   = errors.New("artifact: invalid title")
-	ErrNotFound       = errors.New("artifact: not found")
-	ErrAlreadyExists  = errors.New("artifact: already exists")
-	ErrTooLarge       = errors.New("artifact: HTML exceeds 2 MiB")
-	ErrOwnerMismatch  = errors.New("artifact: session does not own artifact")
-	ErrUnsafeFile     = errors.New("artifact: unsafe file")
+	ErrInvalidID       = errors.New("artifact: invalid id")
+	ErrInvalidPath     = errors.New("artifact: invalid path")
+	ErrInvalidSession  = errors.New("artifact: invalid session id")
+	ErrInvalidTitle    = errors.New("artifact: invalid title")
+	ErrInvalidVersion  = errors.New("artifact: expected version must be a positive integer")
+	ErrVersionConflict = errors.New("artifact: version changed")
+	ErrNotFound        = errors.New("artifact: not found")
+	ErrAlreadyExists   = errors.New("artifact: already exists")
+	ErrTooLarge        = errors.New("artifact: HTML exceeds 2 MiB")
+	ErrOwnerMismatch   = errors.New("artifact: session does not own artifact")
+	ErrUnsafeFile      = errors.New("artifact: unsafe file")
 )
+
+// VersionConflictError reports a conditional update based on an obsolete
+// snapshot. It is returned only after the caller's session ownership is checked.
+type VersionConflictError struct {
+	ExpectedVersion int
+	CurrentVersion  int
+}
+
+func (e *VersionConflictError) Error() string {
+	return fmt.Sprintf("%s (expected %d, current %d); read the current artifact and revise from that version", ErrVersionConflict, e.ExpectedVersion, e.CurrentVersion)
+}
+
+func (e *VersionConflictError) Unwrap() error { return ErrVersionConflict }
 
 // Version describes one immutable sanitized HTML snapshot.
 type Version struct {

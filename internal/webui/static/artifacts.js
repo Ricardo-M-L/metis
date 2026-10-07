@@ -15,6 +15,7 @@ const artifactState = {
   active: null,
   activeVersion: 0,
   previewURL: '',
+  previewError: '',
   restoreFocus: null,
   deletePending: false
 };
@@ -157,15 +158,40 @@ function formatArtifactSize(bytes) {
   return (size / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
+function artifactUIText(en, zh) {
+  if (typeof uiText === 'function') return uiText(en, zh);
+  return document.documentElement?.lang === 'zh-CN' ? zh : en;
+}
+
 function artifactVersionLabel(item, version) {
   const selected = artifactNumber(version, item.currentVersion);
   const details = item.versions.find(candidate => candidate.number === selected);
-  const bits = ['Version ' + selected];
+  const bits = [artifactUIText('Version ', '版本 ') + selected];
   const date = details && formatArtifactDate(details.createdAt);
   const size = (details && details.sizeBytes) || item.sizeBytes;
   if (date) bits.push(date);
   if (size) bits.push(formatArtifactSize(size));
   return bits.join(' · ');
+}
+
+function artifactVersionOptionLabel(item, version) {
+  return 'v' + version + (version === item.currentVersion ? artifactUIText(' · latest', ' · 最新') : '');
+}
+
+function refreshArtifactPreviewLanguage() {
+  const item = artifactState.active;
+  const meta = document.getElementById('artifactPreviewMeta');
+  const select = document.getElementById('artifactVersionSelect');
+  const state = document.getElementById('artifactPreviewState');
+  if (item) {
+    if (meta) meta.textContent = artifactVersionLabel(item, artifactState.activeVersion);
+    Array.from(select?.options || select?.children || []).forEach(option => {
+      option.textContent = artifactVersionOptionLabel(item, artifactNumber(option.value, 0));
+    });
+  }
+  if (state && !state.hidden) state.textContent = artifactState.previewError
+    ? artifactUIText('Preview unavailable: ', '预览暂不可用：') + artifactState.previewError
+    : artifactUIText('Preparing preview…', '正在准备预览…');
 }
 
 function createArtifactMark(className) {
@@ -439,6 +465,9 @@ async function fetchArtifactDetail(id, shouldApply = () => true) {
 
 async function previewArtifactByID(id, version) {
   const sequence = ++artifactState.previewSequence;
+  if (typeof resetArtifactAnnotation === 'function') resetArtifactAnnotation();
+  const annotationToggle = document.getElementById('artifactAnnotationToggle');
+  if (annotationToggle) annotationToggle.disabled = true;
   const generation = artifactState.sessionGeneration;
   const sessionId = String(currentSessionId || '');
   const isCurrent = () => sequence === artifactState.previewSequence && generation === artifactState.sessionGeneration &&
@@ -455,7 +484,7 @@ async function previewArtifactByID(id, version) {
     window.metisNavigation?.recordArtifact(item.id, selectedVersion);
     await loadArtifactPreviewURL(item, selectedVersion);
   } catch (error) {
-    if (isCurrent()) showToast('Unable to open artifact: ' + error.message);
+    if (isCurrent()) showToast(artifactUIText('Unable to open artifact: ', '无法打开产物：') + error.message);
   }
 }
 
@@ -471,12 +500,13 @@ function openArtifactPreviewShell(item) {
   item.versions.forEach(version => {
     const option = document.createElement('option');
     option.value = String(version.number);
-    option.textContent = 'v' + version.number + (version.number === item.currentVersion ? ' · latest' : '');
+    option.textContent = artifactVersionOptionLabel(item, version.number);
     option.selected = version.number === artifactState.activeVersion;
     select.appendChild(option);
   });
   overlay.hidden = false;
   document.body.classList.add('artifact-modal-open');
+  if (typeof refreshArtifactRevisionComparison === 'function') refreshArtifactRevisionComparison();
   requestAnimationFrame(() => document.querySelector('.artifact-preview-close')?.focus());
 }
 
@@ -504,6 +534,7 @@ async function resolveArtifactPreviewURL(item, version) {
 }
 
 async function loadArtifactPreviewURL(item, version) {
+  if (typeof resetArtifactAnnotation === 'function') resetArtifactAnnotation();
   const sequence = ++artifactState.previewSequence;
   const generation = artifactState.sessionGeneration;
   const sessionId = String(currentSessionId || '');
@@ -516,24 +547,32 @@ async function loadArtifactPreviewURL(item, version) {
   const meta = document.getElementById('artifactPreviewMeta');
   if (!frame || !state) return false;
   artifactState.previewURL = '';
+  artifactState.previewError = '';
   frame.onload = null;
+  frame.setAttribute('sandbox', '');
   frame.removeAttribute('src');
   state.hidden = false;
-  state.textContent = 'Preparing preview…';
+  state.textContent = artifactUIText('Preparing preview…', '正在准备预览…');
   if (meta) meta.textContent = artifactVersionLabel(item, version);
   try {
     const safe = await resolveArtifactPreviewURL(item, version);
     if (!isCurrent()) return false;
     artifactState.previewURL = safe;
-    frame.onload = () => { if (isCurrent()) state.hidden = true; };
+    frame.onload = () => {
+      if (!isCurrent()) return;
+      state.hidden = true;
+      if (typeof refreshArtifactAnnotationAvailability === 'function') refreshArtifactAnnotationAvailability();
+    };
     frame.src = safe;
     if (meta) meta.textContent = artifactVersionLabel(item, version);
+    if (typeof refreshArtifactAnnotationAvailability === 'function') refreshArtifactAnnotationAvailability();
     return true;
   } catch (error) {
     if (!isCurrent()) return false;
     artifactState.previewURL = '';
+    artifactState.previewError = error.message;
     state.hidden = false;
-    state.textContent = 'Preview unavailable: ' + error.message;
+    state.textContent = artifactUIText('Preview unavailable: ', '预览暂不可用：') + error.message;
     return false;
   }
 }
@@ -544,12 +583,23 @@ async function selectArtifactVersion(value) {
   const item = artifactState.active;
   if (item.sessionId && item.sessionId !== String(currentSessionId || '')) return;
   if (!item.versions.some(candidate => candidate.number === version)) return;
+  if (typeof resetArtifactAnnotation === 'function') resetArtifactAnnotation();
   artifactState.activeVersion = version;
+  // Before/after controls call this directly; onchange alone only updates
+  // the native select when the user changes the dropdown itself.
+  const select = document.getElementById('artifactVersionSelect');
+  if (select) {
+    select.value = String(version);
+    Array.from(select.options || select.children || []).forEach(option => {
+      option.selected = String(option.value) === String(version);
+    });
+  }
   window.metisNavigation?.recordArtifact(item.id, version);
   await loadArtifactPreviewURL(item, version);
 }
 
 function closeArtifactPreview(options = {}) {
+  if (typeof resetArtifactAnnotation === 'function') resetArtifactAnnotation();
   if (options.navigation !== false && window.metisNavigation?.closeArtifact()) return;
   artifactState.previewSequence++;
   const overlay = document.getElementById('artifactPreviewOverlay');
@@ -561,8 +611,10 @@ function closeArtifactPreview(options = {}) {
   }
   document.body.classList.remove('artifact-modal-open');
   artifactState.previewURL = '';
+  artifactState.previewError = '';
   artifactState.active = null;
   artifactState.activeVersion = 0;
+  if (typeof refreshArtifactAnnotationAvailability === 'function') refreshArtifactAnnotationAvailability();
   const restore = artifactState.restoreFocus;
   artifactState.restoreFocus = null;
   if (restore && restore.isConnected && typeof restore.focus === 'function') restore.focus();
@@ -698,6 +750,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('keydown', event => {
     if (event.key !== 'Escape') return;
     if (!document.getElementById('artifactDeleteOverlay')?.hidden) cancelArtifactDeletion();
+    else if (typeof artifactAnnotationHandleEscape === 'function' && artifactAnnotationHandleEscape(event)) return;
     else if (!document.getElementById('artifactPreviewOverlay')?.hidden) closeArtifactPreview();
   });
   renderArtifactGallery();

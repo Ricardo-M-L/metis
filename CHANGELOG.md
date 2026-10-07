@@ -7,6 +7,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.87] - 2026-10-07
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Added
+
+- Select an element in a saved HTML Artifact, describe the desired change, and
+  submit it through the normal Desktop task flow while preserving chat drafts.
+- Compare immutable Artifact revisions before and after an edit, including
+  after restarting Desktop.
+
+### Changed
+
+- Keep completed turn activity in one disclosure, with compact tool errors,
+  translated controls and statistics popovers anchored to their footer buttons.
+- Adapt the Artifact editor to its actual available width, with a stacked
+  preview and edit panel when a narrow window's sidebar is expanded.
+
+### Fixed
+
+- Bind Artifact edits to the selected session, version and content digest even
+  when a model omits the expected version; reject stale or mismatched writes.
+- Serialize Artifact mutations across processes and publish immutable version
+  files without replacing an existing revision.
+- Synchronize comparison controls, version selection and preview content; clear
+  stale popovers and selection state during navigation, cancellation and reload.
+
 ## [0.4.86] - 2026-10-03
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

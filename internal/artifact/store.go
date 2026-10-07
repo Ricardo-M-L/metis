@@ -31,6 +31,8 @@ var (
 // Store persists artifacts below one private root. Stores constructed for the
 // same resolved root share a process-wide lock, so registry rebuilds and
 // concurrent Desktop/agent operations cannot allocate the same version.
+// A stable private lock file additionally serializes all store write
+// transactions across independent worker processes.
 type Store struct {
 	root string
 	mu   *sync.RWMutex
@@ -98,6 +100,11 @@ func (s *Store) Create(sessionID, title, rawHTML string) (*Manifest, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lockFile, err := s.acquireWriteLock()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseArtifactWriteLock(lockFile)
 	id := uuid.NewString()
 	for {
 		if _, err := os.Lstat(s.artifactDir(id)); errors.Is(err, os.ErrNotExist) {
@@ -122,6 +129,20 @@ func (s *Store) Create(sessionID, title, rawHTML string) (*Manifest, error) {
 // Update appends an immutable version. Only the owning session may update an
 // artifact; an empty title preserves the current title.
 func (s *Store) Update(sessionID, id, title, rawHTML string) (*Manifest, error) {
+	return s.update(sessionID, id, title, rawHTML, 0)
+}
+
+// UpdateIfVersion appends an immutable version only when expectedVersion is
+// still current. The ownership check, version comparison and write share the
+// same store lock, so an older editing task cannot overwrite newer work.
+func (s *Store) UpdateIfVersion(sessionID, id, title, rawHTML string, expectedVersion int) (*Manifest, error) {
+	if expectedVersion < 1 {
+		return nil, ErrInvalidVersion
+	}
+	return s.update(sessionID, id, title, rawHTML, expectedVersion)
+}
+
+func (s *Store) update(sessionID, id, title, rawHTML string, expectedVersion int) (*Manifest, error) {
 	if err := validateArtifactID(id); err != nil {
 		return nil, err
 	}
@@ -141,12 +162,20 @@ func (s *Store) Update(sessionID, id, title, rawHTML string) (*Manifest, error) 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lockFile, err := s.acquireWriteLock()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseArtifactWriteLock(lockFile)
 	manifest, err := s.loadManifestLocked(id)
 	if err != nil {
 		return nil, err
 	}
 	if manifest.SessionID != sessionID {
 		return nil, ErrOwnerMismatch
+	}
+	if expectedVersion > 0 && manifest.CurrentVersion != expectedVersion {
+		return nil, &VersionConflictError{ExpectedVersion: expectedVersion, CurrentVersion: manifest.CurrentVersion}
 	}
 	now := time.Now().UTC()
 	version := newVersion(manifest.CurrentVersion+1, clean, now)
@@ -328,6 +357,11 @@ func (s *Store) Delete(sessionID, id string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lockFile, err := s.acquireWriteLock()
+	if err != nil {
+		return err
+	}
+	defer releaseArtifactWriteLock(lockFile)
 	manifest, err := s.loadManifestLocked(id)
 	if err != nil {
 		return err
@@ -350,6 +384,11 @@ func (s *Store) DeleteSession(sessionID string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lockFile, err := s.acquireWriteLock()
+	if err != nil {
+		return err
+	}
+	defer releaseArtifactWriteLock(lockFile)
 	entries, err := os.ReadDir(s.root)
 	if err != nil {
 		return err
@@ -440,7 +479,16 @@ func (s *Store) writeVersionLocked(id string, number int, body []byte) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	// Publish the complete immutable version without replacing an existing
+	// inode. The transaction lock is the primary allocation guard; this also
+	// refuses a collision from a writer that did not participate in that lock.
+	if err := os.Link(tmp, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return ErrAlreadyExists
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) writeManifestLocked(id string, manifest Manifest) error {

@@ -1548,6 +1548,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	// inspect another session while this turn or one of its sub-agents is still
 	// running; tool calls must continue writing to the originating session.
 	ctx = tasks.WithSessionID(ctx, tasks.SessionIDFromContext(ctx))
+	var artifactEditErr error
+	ctx, artifactEditErr = l.bindArtifactEditContext(ctx)
+	if artifactEditErr != nil {
+		return artifactEditErr
+	}
 	// Desktop roots and children share one execution budget. A child runner
 	// already supplied its own lease; ordinary CLI contexts remain unchanged.
 	var releaseDesktop func()

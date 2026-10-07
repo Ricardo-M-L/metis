@@ -29,6 +29,33 @@ AGENT_FIXTURE_MARKER = "[agent-fixture]"
 AGENT_CHILD_PROMPT = "CHILD_FIXTURE_TASK_1"
 AGENT_CALL_PREFIX = "call_fixture_agent_"
 ACTIVITY_CALL_PREFIX = "call_fixture_activity_"
+ARTIFACT_EDIT_MARKER = "[artifact-edit-fixture]"
+ARTIFACT_CALL_PREFIX = "call_fixture_artifact_"
+ARTIFACT_TITLE = "点选修改验收"
+ARTIFACT_CTA_TEXT = "探索工作成果"
+ARTIFACT_CTA_UPDATED = "开始体验"
+ARTIFACT_EDIT_INSTRUCTION = "把按钮改成青绿色，文案改为开始体验"
+ARTIFACT_HTML = """<!doctype html>
+<html lang="zh-CN"><head><title>点选修改验收</title><style>
+body { margin: 0; background: #f4f6fb; color: #182231; font-family: sans-serif; }
+main { max-width: 720px; margin: 48px auto; padding: 42px; background: #ffffff; border-radius: 24px; }
+.eyebrow { color: #667085; font-size: 13px; letter-spacing: 2px; }
+h1 { margin: 16px 0; font-size: 36px; line-height: 1.25; }
+p { color: #5b6677; line-height: 1.8; }
+.cta { display: inline-block; margin: 18px 0; padding: 14px 24px; background: #536dfe; color: #ffffff; border-radius: 12px; text-decoration: none; font-weight: 600; }
+.facts { display: flex; gap: 24px; margin-top: 32px; padding-top: 24px; border-top: 1px solid #e8edf5; }
+.fact { flex: 1; }
+.fact strong { display: block; margin-bottom: 8px; font-size: 16px; }
+.fact span { color: #667085; font-size: 13px; }
+</style></head><body><main>
+<div class="eyebrow">METIS · WORKSPACE</div>
+<h1>把想法变成可迭代的成果</h1>
+<p>点击页面上的一个元素，描述你希望怎样调整。METIS 会引用你选中的位置，保留旧版本，再创建新的成果版本。</p>
+<a id="fixture-cta" class="cta" role="button">探索工作成果</a>
+<div class="facts"><div class="fact"><strong>直接指点</strong><span>选择具体元素，需求更明确</span></div>
+<div class="fact"><strong>保留版本</strong><span>前后内容随时对比</span></div>
+<div class="fact"><strong>可查证据</strong><span>工具调用与修改记录可追溯</span></div></div>
+</main></body></html>"""
 
 
 def free_port() -> int:
@@ -68,6 +95,94 @@ def last_user_input(body: dict) -> str:
     return "fixture request"
 
 
+def artifact_annotation_context(user_input: str) -> dict | None:
+    """Read the backend's canonical quoted JSON, never execute quoted HTML."""
+    for match in re.finditer(r"```json\s*\n(.*?)\n```", user_input, re.DOTALL):
+        try:
+            value = json.loads(match.group(1))
+        except ValueError:
+            continue
+        context = value.get("metis_artifact_annotation") if isinstance(value, dict) else None
+        if not isinstance(context, dict):
+            continue
+        if (isinstance(context.get("artifactId"), str)
+                and isinstance(context.get("version"), int) and not isinstance(context["version"], bool)
+                and context["version"] > 0 and isinstance(context.get("instruction"), str)
+                and isinstance(context.get("selection"), dict)):
+            return context
+    return None
+
+
+def artifact_tool_results(body: dict) -> list[dict]:
+    items = body.get("input", body.get("messages", []))
+    if not isinstance(items, list):
+        return []
+    last_user = max((index for index, item in enumerate(items)
+                     if isinstance(item, dict) and item.get("role") == "user"), default=-1)
+    return [item for item in items[last_user + 1:]
+            if isinstance(item, dict) and item.get("type") == "function_call_output"
+            and str(item.get("call_id", "")).startswith(ARTIFACT_CALL_PREFIX)]
+
+
+def artifact_result_json(result: dict) -> dict | None:
+    try:
+        parsed = json.loads(result.get("output", ""))
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def artifact_fixture_phase(body: dict, user_input: str) -> str | None:
+    context = artifact_annotation_context(user_input)
+    results = artifact_tool_results(body)
+    if context:
+        if not results:
+            return "artifact_edit_read"
+        last = results[-1]
+        parsed = artifact_result_json(last)
+        if not parsed or parsed.get("artifact", {}).get("id") != context["artifactId"]:
+            return "artifact_edit_failed"
+        if str(last["call_id"]).startswith(ARTIFACT_CALL_PREFIX + "update_"):
+            return ("artifact_edit_final" if parsed.get("action") == "updated"
+                    and parsed["artifact"].get("current_version") == context["version"] + 1
+                    else "artifact_edit_failed")
+        selection = context["selection"]
+        if (str(last["call_id"]).startswith(ARTIFACT_CALL_PREFIX + "read_")
+                and isinstance(parsed.get("html"), str)
+                and parsed.get("version", {}).get("number") == context["version"]
+                and context["instruction"].strip() == ARTIFACT_EDIT_INSTRUCTION
+                and selection.get("tag") == "a" and selection.get("text") == ARTIFACT_CTA_TEXT
+                and ARTIFACT_CTA_TEXT in parsed["html"] and "#536dfe" in parsed["html"]):
+            return "artifact_edit_update"
+        return "artifact_edit_failed"
+    if ARTIFACT_EDIT_MARKER in user_input:
+        if not results:
+            return "artifact_create"
+        parsed = artifact_result_json(results[-1])
+        return ("artifact_create_final" if parsed and parsed.get("action") == "created"
+                and parsed.get("artifact", {}).get("current_version") == 1 else "artifact_edit_failed")
+    return None
+
+
+def artifact_fixture_call(phase: str, number: int, body: dict, context: dict | None) -> dict | None:
+    if phase == "artifact_create":
+        arguments = {"action": "create", "title": ARTIFACT_TITLE, "html": ARTIFACT_HTML}
+    elif phase == "artifact_edit_read":
+        arguments = {"action": "read", "id": context["artifactId"], "version": context["version"]}
+    elif phase == "artifact_edit_update":
+        # Use the actual Artifact.read payload supplied by METIS, not a local
+        # store mutation or a fabricated successful tool result.
+        parsed = artifact_result_json(artifact_tool_results(body)[-1])
+        html = parsed["html"].replace("#536dfe", "#0f9d83", 1).replace(ARTIFACT_CTA_TEXT, ARTIFACT_CTA_UPDATED, 1)
+        arguments = {"action": "update", "id": context["artifactId"],
+                     "expected_version": context["version"], "html": html}
+    else:
+        return None
+    return {"type": "function_call", "id": f"fc_fixture_artifact_{number}",
+            "call_id": f"{ARTIFACT_CALL_PREFIX}{arguments['action']}_{number}", "name": "Artifact",
+            "arguments": json.dumps(arguments, ensure_ascii=False), "status": "completed"}
+
+
 def agent_fixture_phase(body: dict, user_input: str) -> str:
     """Select the opt-in, three-request Agent exchange from Responses input."""
     items = body.get("input", body.get("messages", []))
@@ -92,7 +207,7 @@ def agent_fixture_phase(body: dict, user_input: str) -> str:
     return "echo"
 
 
-def handler_for(fixture: Fixture):
+def handler_for(fixture: Fixture, *, omit_artifact_expected_version: bool = False):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -147,7 +262,9 @@ def handler_for(fixture: Fixture):
                 return
             user_input = last_user_input(body)
             memory_extraction = user_input.startswith("Extract any DURABLE facts from this user-assistant exchange")
-            phase = "memory_extraction" if memory_extraction else agent_fixture_phase(body, user_input)
+            phase = ("memory_extraction" if memory_extraction else
+                     artifact_fixture_phase(body, user_input) or agent_fixture_phase(body, user_input))
+            annotation = artifact_annotation_context(user_input) if phase.startswith("artifact_") else None
             with fixture.lock:
                 number = len(fixture.calls) + 1
                 entry = {"number": number, "kind": "memory_extraction" if memory_extraction else "agent_turn", "phase": phase, "input": user_input, "model": body.get("model"), "started": time.time(), "state": "streaming"}
@@ -156,12 +273,27 @@ def handler_for(fixture: Fixture):
                 entry["tool_results"] = [item.get("output", "") for item in body.get("input", [])
                                          if isinstance(item, dict) and item.get("type") == "function_call_output"
                                          and str(item.get("call_id", "")).startswith(AGENT_CALL_PREFIX)]
-            fixture.record({"event": "started", **entry})
+            if phase.startswith("artifact_"):
+                if annotation:
+                    entry["annotation"] = annotation
+                entry["tool_results"] = artifact_tool_results(body)
             gate_match = re.search(r"\[gate:([A-Za-z0-9_-]+)\]", user_input) if phase in ("echo", "child_stream") else None
             if phase == "parent_final":
                 gate_match = re.search(r"\[parent-gate:([A-Za-z0-9_-]+)\]", user_input)
             delay_match = re.search(r"\[slow:(\d+)\]", user_input) if phase in ("echo", "child_stream") else None
-            if phase == "activity_step_0":
+            if phase == "artifact_create":
+                text = "我会创建一份可点选修改的静态 HTML 成果，保留真实工具调用和版本记录。"
+            elif phase == "artifact_create_final":
+                text = "已创建版本 1：点选修改验收。打开产物并启用点选修改，选择“探索工作成果”，输入“把按钮改成青绿色，文案改为开始体验”。这是隔离测试模型的固定验收场景。"
+            elif phase == "artifact_edit_read":
+                text = "我先读取你点选的成果版本，核对选中的按钮。"
+            elif phase == "artifact_edit_update":
+                text = "已读取指定版本。接下来将选中的按钮改为青绿色，并将文案改为“开始体验”。"
+            elif phase == "artifact_edit_final":
+                text = f"已创建版本 {annotation['version'] + 1}。按钮已改成青绿色，文案为“开始体验”；旧版本仍可打开对比。此次验收经过真实 Artifact.read 和 Artifact.update。"
+            elif phase == "artifact_edit_failed":
+                text = "未更新成果。读取、版本校验或工具执行未通过，请查看工具详情。此隔离夹具只支持点选示例中的“探索工作成果”按钮。"
+            elif phase == "activity_step_0":
                 text = "我先读取验收说明，再核对检查清单。执行过程会保留在本轮的折叠区域。"
             elif phase == "activity_step_1":
                 text = "已读取说明，接下来核对检查清单；这段是过程说明，完成后可展开查看。"
@@ -195,6 +327,18 @@ def handler_for(fixture: Fixture):
                                "call_id": f"{ACTIVITY_CALL_PREFIX}{number}", "name": "Read",
                                "arguments": json.dumps({"path": str(fixture.root / "workspace" / filename)}),
                                "status": "completed"})
+            artifact_call = artifact_fixture_call(phase, number, body, annotation)
+            if artifact_call:
+                if omit_artifact_expected_version and phase == "artifact_edit_update":
+                    arguments = json.loads(artifact_call["arguments"])
+                    arguments.pop("expected_version", None)
+                    artifact_call["arguments"] = json.dumps(arguments, ensure_ascii=False)
+                output.append(artifact_call)
+            if phase.startswith("artifact_"):
+                entry["tool_calls"] = [{"name": item["name"], "call_id": item["call_id"],
+                                        "arguments": json.loads(item["arguments"])}
+                                       for item in output if item["type"] == "function_call"]
+            fixture.record({"event": "started", **entry})
             envelope = {"id": response_id, "object": "response", "status": "completed", "model": body.get("model"), "output": output, "usage": {"input_tokens": 128, "output_tokens": 16, "total_tokens": 144, "input_tokens_details": {"cached_tokens": 64}}}
             if not body.get("stream"):
                 self.send_json(envelope)
@@ -218,7 +362,7 @@ def handler_for(fixture: Fixture):
                     self.wfile.flush()
 
                 emit("response.created", response={**envelope, "status": "in_progress", "output": []})
-                if phase.startswith("activity_"):
+                if phase.startswith(("activity_", "artifact_")):
                     fixture.stopped.wait(0.15)
                     item = output[0]
                     emit("response.output_item.added", output_index=0, item={**item, "status": "in_progress", "content": []})
@@ -293,6 +437,8 @@ def main() -> int:
     parser.add_argument("--no-web", action="store_true", help="Only serve the model; use launch-native.sh for native verification")
     parser.add_argument("--duration", type=int, default=1800, help="Maximum fixture lifetime in seconds")
     parser.add_argument("--seed", action="store_true", help="Create two real completed sessions over HTTP")
+    parser.add_argument("--omit-artifact-expected-version", action="store_true",
+                        help="Negative compatibility probe: omit expected_version only in Artifact.update output")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     root = Path(tempfile.mkdtemp(prefix="metis-desktop-e2e-"))
@@ -302,7 +448,8 @@ def main() -> int:
     (workspace / "fixture-notes.md").write_text("# Isolated UI acceptance\n\nInspect footer details and turn disclosure.\n", encoding="utf-8")
     (workspace / "fixture-checks.md").write_text("# Checks\n\n- Preserve final answer\n- Expand the full process\n- Inspect actual recorded usage\n", encoding="utf-8")
     fixture = Fixture(root)
-    provider = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(fixture))
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(
+        fixture, omit_artifact_expected_version=args.omit_artifact_expected_version))
     provider.daemon_threads = True
     threading.Thread(target=provider.serve_forever, daemon=True).start()
     provider_url = f"http://127.0.0.1:{provider.server_port}"
@@ -329,6 +476,8 @@ mode = "default"
 tool = "Agent"
 [[permission.allow]]
 tool = "Read"
+[[permission.allow]]
+tool = "Artifact"
 '''
     (home / "config.toml").write_text(config)
     (home / "config.toml").chmod(0o600)
@@ -365,7 +514,7 @@ tool = "Read"
                     time.sleep(0.1)
             else:
                 raise RuntimeError("Desktop fixture did not become ready within 20 seconds")
-        metadata = {"ready": True, "root": str(root), "web_url": web_url, "fixture_url": provider_url, "metis_home": str(home), "workspace": str(workspace), "metis_bin": str(binary), "native_launcher": str(launcher), "evidence": str(root / "model-evidence.jsonl")}
+        metadata = {"ready": True, "root": str(root), "web_url": web_url, "fixture_url": provider_url, "metis_home": str(home), "workspace": str(workspace), "metis_bin": str(binary), "native_launcher": str(launcher), "evidence": str(root / "model-evidence.jsonl"), "omit_artifact_expected_version": args.omit_artifact_expected_version}
         if args.seed and web_url:
             metadata["sessions"] = []
             for label in ("Fixture Alpha", "Fixture Beta"):

@@ -2643,8 +2643,13 @@ html, body { font-size: var(--font-base); }
 .message-avatar { display: none; }
 .message-assistant {
   gap: 0;
-  margin-bottom: 32px;
+  margin-bottom: 24px;
 }
+.message-assistant[data-activity-process='true'] { margin-bottom: var(--process-actions-height, 28px); }
+.message-assistant[data-activity-process='true'] .message-body { position: relative; }
+.message-assistant[data-activity-process='true'] .msg-actions { position: absolute; top: 100%; left: 0; margin-top: 0; }
+.message-assistant[data-activity-process='true'] .msg-time { opacity: 0; }
+.message-assistant[data-activity-process='true']:is(:hover, :focus-within) .msg-time { opacity: 1; }
 .message-body { padding-left: 0; }
 .message-content { font-size: var(--font-reading); line-height: 24px; color: var(--fg-strong); }
 
@@ -3179,6 +3184,7 @@ html, body { font-size: var(--font-base); }
   opacity: 1;
 }
 @media (hover: none), (pointer: coarse) {
+  .message-assistant[data-activity-process='true'] { --process-actions-height: 40px; }
   .msg-actions { min-height: 40px; }
   .msg-btn,
   .message:hover .msg-btn,
@@ -3685,6 +3691,7 @@ html, body { font-size: var(--font-base); }
 .tc-disclosure:focus-visible .tc-chevron,
 .call-row.open .tc-chevron { opacity: 1; }
 .tc-disclosure:focus-visible .tc-icon-idle { opacity: 0; }
+.call-row.open .tc-icon-idle { opacity: 0; }
 .call-row[data-state='error'] .tc-summary { color: var(--error); }
 .call-row[data-state='stopped'] .tc-icon-idle,
 .call-row[data-state='stopped'] .tc-title,
@@ -4964,10 +4971,10 @@ a.tc-web-title:focus-visible,
   padding: 3px 9px;
   border: 0;
   border-radius: 999px;
-  color: var(--fg-faint);
+  color: var(--fg-dim);
   background: transparent;
   font: inherit;
-  font-size: 11.5px;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   cursor: pointer;
@@ -5001,14 +5008,14 @@ a.tc-web-title:focus-visible,
   box-sizing: border-box;
   width: max-content;
   min-width: min(300px, calc(100vw - 24px));
-  max-width: min(440px, calc(100vw - 24px));
-  padding: 16px;
+  max-width: min(380px, calc(100vw - 24px));
+  padding: 14px;
   overflow-y: auto;
   overscroll-behavior: contain;
   border: 1px solid var(--border-faint);
-  border-radius: 16px;
+  border-radius: 12px;
   background: var(--surface-2);
-  box-shadow: 0 3px 8px rgb(0 0 0 / 8%), 0 0 20px rgb(0 0 0 / 6%);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 22%), 0 2px 8px rgb(0 0 0 / 12%);
   color: var(--fg-mid);
   font-size: 12px;
   line-height: 18px;
@@ -5087,9 +5094,9 @@ a.tc-web-title:focus-visible,
   border: 0;
   border-radius: 999px;
   background: transparent;
-  color: var(--fg-faint);
+  color: var(--fg-dim);
   font: inherit;
-  font-size: 11.5px;
+  font-size: 12px;
   white-space: nowrap;
   cursor: pointer;
   transition: color var(--transition-fast), background var(--transition-fast);
@@ -6941,6 +6948,7 @@ body.subagent-detail-open { overflow: hidden; }
 /* Keep an answer followed by tool activity in the same visual rhythm as
    adjacent transcript rows, without changing standalone answer spacing. */
 .chat-area > .message-assistant:has(+ .activity-group) { margin-bottom: 16px; }
+.chat-area > .message-assistant[data-activity-process='true']:has(+ .activity-group) { margin-bottom: var(--process-actions-height, 28px); }
 .chat-area > .message-assistant + .activity-group { margin-top: 0; }
 .chat-area > .activity-group[data-turn-collapsed='true'] { display: none; }
 .chat-area > .message-assistant[data-turn-collapsed='true'] { display: none; }
@@ -7024,26 +7032,24 @@ body.subagent-detail-open { overflow: hidden; }
 .activity-group-body { display: none; min-width: 0; padding: 0 0 3px; }
 .activity-group.open .activity-group-body { display: block; }
 .activity-group.open .activity-group-body {
-  margin: 8px 0 0 7px;
-  padding-left: 15px;
-  border-left: 1px solid var(--border-faint);
+  margin-top: 8px;
 }
 .activity-group-summary {
   position: relative;
   display: block;
   width: 100%;
   margin: 0 0 2px;
-  padding-left: 19px;
+  padding-left: 22px;
   border: 0;
   border-radius: 4px;
   background: transparent;
   color: var(--fg-mid);
-  font: 520 13px/22px var(--font-ui);
+  font: 500 14px/24px var(--font-ui);
   text-align: left;
   cursor: pointer;
   overflow-wrap: anywhere;
 }
-.activity-group.open .activity-group-summary { margin-bottom: 16px; }
+.activity-group.open .activity-group-summary { margin-bottom: 12px; }
 .activity-group-summary::before {
   content: '';
   position: absolute;
@@ -7060,28 +7066,9 @@ body.subagent-detail-open { overflow: hidden; }
 .activity-group-summary:hover::before { border-color: var(--fg-strong); }
 .activity-group-summary:hover { color: var(--fg-strong); }
 .activity-group-items {
-  max-height: min(400px, 50vh);
   min-width: 0;
-  padding-left: 3px;
-  overflow-y: auto;
-  overscroll-behavior-y: auto;
-  scrollbar-gutter: stable;
+  overflow: visible;
 }
-.activity-group-items[data-scroll-up]:not([data-scroll-up='false']) {
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 24px, #000 100%);
-  mask-image: linear-gradient(to bottom, transparent 0, #000 24px, #000 100%);
-}
-.activity-group-items[data-scroll-down]:not([data-scroll-down='false']) {
-  -webkit-mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 24px), transparent 100%);
-  mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 24px), transparent 100%);
-}
-.activity-group-items[data-scroll-up]:not([data-scroll-up='false'])[data-scroll-down]:not([data-scroll-down='false']) {
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 24px, #000 calc(100% - 24px), transparent 100%);
-  mask-image: linear-gradient(to bottom, transparent 0, #000 24px, #000 calc(100% - 24px), transparent 100%);
-}
-.activity-group-items::-webkit-scrollbar { width: 6px; }
-.activity-group-items::-webkit-scrollbar-track { background: transparent; }
-.activity-group-items::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 .activity-group-items > :is(.call-row, .think-row) {
   box-sizing: border-box;
   width: 100%;
@@ -7119,7 +7106,7 @@ body.subagent-detail-open { overflow: hidden; }
 .activity-group-items .tc-title,
 .activity-group-items .tc-summary,
 .activity-group-items .think-title,
-.activity-group-items .think-summary { font-size: 13px; }
+.activity-group-items .think-summary { font-size: 14px; }
 .activity-group-items .tc-title,
 .activity-group-items .think-title { color: var(--fg-mid); }
 .activity-group-items .tc-summary,

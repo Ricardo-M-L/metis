@@ -46,7 +46,7 @@ func (Artifact) Description() string {
 
 Actions:
   - create: requires title and html; stores sanitized static HTML as version 1.
-  - update: requires id and html; appends an immutable sanitized version. An optional title replaces the title.
+  - update: requires id and html; appends an immutable sanitized version. An optional title replaces the title. Supply expected_version when revising a particular snapshot; if that version is no longer current, read the artifact again and revise from the new current version.
   - list: lists artifact manifests owned by the current session.
   - read: requires id and optionally version; returns verified sanitized HTML. Omit version for the current version.
 
@@ -73,6 +73,9 @@ func (Artifact) InputSchema() map[string]any {
 			},
 			"version": map[string]any{
 				"type": "integer", "minimum": 1, "description": "Immutable version to read; omit for current.",
+			},
+			"expected_version": map[string]any{
+				"type": "integer", "minimum": 1, "description": "For update: the current version this edit is based on. Rejects stale edits; read the current artifact again if its version changed.",
 			},
 		},
 		"additionalProperties": false,
@@ -103,8 +106,8 @@ func (a Artifact) CanUse(ctx context.Context, in map[string]any) (tools.Permissi
 	return mapDecision(decision), source
 }
 
-func (a Artifact) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
-	sessionID := tasks.CurrentSessionID()
+func (a Artifact) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	sessionID := tasks.SessionIDFromContext(ctx)
 	if strings.TrimSpace(sessionID) == "" {
 		return artifactFailure(artifactstore.ErrInvalidSession), nil
 	}
@@ -139,8 +142,30 @@ func (a Artifact) Execute(_ context.Context, in map[string]any) (*tools.Result, 
 		if !ok || strings.TrimSpace(html) == "" {
 			return artifactFailure(errors.New("html is required for update")), nil
 		}
-		manifest, err := store.Update(sessionID, id, title, html)
+		expectedVersion, conditional, err := artifactExpectedVersion(in)
 		if err != nil {
+			return artifactFailure(err), nil
+		}
+		selectedVersion, selected, err := artifactstore.SelectedEditVersion(ctx, sessionID, id)
+		if err != nil {
+			return artifactFailure(err), nil
+		}
+		if selected {
+			if conditional && expectedVersion != selectedVersion {
+				return artifactFailure(errors.New("expected_version cannot replace the selected artifact's base; stop and ask the user to refresh and select again")), nil
+			}
+			expectedVersion, conditional = selectedVersion, true
+		}
+		var manifest *artifactstore.Manifest
+		if conditional {
+			manifest, err = store.UpdateIfVersion(sessionID, id, title, html, expectedVersion)
+		} else {
+			manifest, err = store.Update(sessionID, id, title, html)
+		}
+		if err != nil {
+			if selected && errors.Is(err, artifactstore.ErrVersionConflict) {
+				return artifactFailure(fmt.Errorf("%s (selected version %d); stop and ask the user to refresh and select again", artifactstore.ErrVersionConflict, selectedVersion)), nil
+			}
 			return artifactFailure(err), nil
 		}
 		return artifactManifestResult("updated", manifest, manifest.CurrentVersion)
@@ -280,4 +305,35 @@ func artifactVersion(in map[string]any) (int, error) {
 		return 0, errors.New("version must be a positive integer")
 	}
 	return version, nil
+}
+
+func artifactExpectedVersion(in map[string]any) (int, bool, error) {
+	value, present := in["expected_version"]
+	if !present {
+		return 0, false, nil
+	}
+	invalid := errors.New("expected_version must be a positive integer")
+	var version int
+	switch typed := value.(type) {
+	case int:
+		version = typed
+	case int64:
+		if typed < 1 || typed > int64(math.MaxInt) {
+			return 0, true, invalid
+		}
+		version = int(typed)
+	case float64:
+		// float64(math.MaxInt) rounds up on 64-bit platforms. Reject that
+		// boundary as well, rather than converting an out-of-range value.
+		if math.IsNaN(typed) || math.IsInf(typed, 0) || typed < 1 || typed >= float64(math.MaxInt) || typed != math.Trunc(typed) {
+			return 0, true, invalid
+		}
+		version = int(typed)
+	default:
+		return 0, true, invalid
+	}
+	if version < 1 {
+		return 0, true, invalid
+	}
+	return version, true, nil
 }

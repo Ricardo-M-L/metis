@@ -150,10 +150,7 @@ async function loadEffort(shouldApply = () => true) {
     const btn = document.getElementById('effortBtn');
     if (!btn) return;
     btn.style.display = data.supported ? '' : 'none';
-    btn.title = data.supported ? 'Reasoning effort for the next model request' : (data.reason || 'Reasoning effort unavailable');
-    const label = document.getElementById('effortName');
-    if (label) label.textContent = data.effort === 'default' ? 'Default effort' : data.effort.charAt(0).toUpperCase() + data.effort.slice(1);
-    paintEffortMenu();
+    refreshEffortLanguage();
   } catch (_) {
     if (generation !== effortRequestGeneration || !shouldApply()) return;
     const btn = document.getElementById('effortBtn');
@@ -161,11 +158,31 @@ async function loadEffort(shouldApply = () => true) {
   }
 }
 
+function effortLabel(value) {
+  const labels = {
+    default: uiText('Default effort', '默认思考'),
+    low: uiText('Low', '低强度'),
+    medium: uiText('Medium', '中强度'),
+    high: uiText('High', '高强度'),
+  };
+  const raw = String(value || 'default');
+  return labels[raw] || raw.charAt(0).toUpperCase() + raw.slice(1);
+}
+
+function refreshEffortLanguage() {
+  const btn = document.getElementById('effortBtn');
+  if (btn) btn.title = effortState.supported
+    ? uiText('Reasoning effort for the next model request', '下一次模型请求的思考强度')
+    : (effortState.reason || uiText('Reasoning effort unavailable', '无法设置思考强度'));
+  const label = document.getElementById('effortName');
+  if (label) label.textContent = effortLabel(effortState.effort);
+  paintEffortMenu();
+}
+
 function paintEffortMenu() {
   const menu = document.getElementById('effortMenu');
   if (!menu) return;
-  const labels = { default: 'Default', low: 'Low', medium: 'Medium', high: 'High' };
-  menu.innerHTML = (effortState.options || []).map(value => `<button type="button" role="menuitemradio" aria-checked="${effortState.effort === value ? 'true' : 'false'}" class="${effortState.effort === value ? 'selected' : ''}" onclick="chooseEffort('${value}')">${labels[value] || escHtml(value)}</button>`).join('');
+  menu.innerHTML = (effortState.options || []).map(value => `<button type="button" role="menuitemradio" aria-checked="${effortState.effort === value ? 'true' : 'false'}" class="${effortState.effort === value ? 'selected' : ''}" onclick="chooseEffort('${value}')">${escHtml(value === 'default' ? uiText('Default', '默认') : effortLabel(value))}</button>`).join('');
 }
 
 function toggleEffortMenu(e) {
@@ -187,9 +204,9 @@ async function chooseEffort(value) {
     document.getElementById('effortMenu').style.display = 'none';
     document.getElementById('effortBtn').setAttribute('aria-expanded', 'false');
     await loadEffort();
-    showToast('Reasoning effort: ' + data.effort);
+    showToast(uiText('Reasoning effort: ', '思考强度：') + effortLabel(data.effort));
   } catch (e) {
-    showToast('Effort change failed: ' + e.message);
+    showToast(uiText('Effort change failed: ', '思考强度修改失败：') + e.message);
   }
 }
 
@@ -388,8 +405,14 @@ function setActivityTurnOpen(turn, open) {
     else group.dataset.turnCollapsed = 'true';
     if (open) scheduleActivityGroupFollow(group);
   });
-  activityTurnProcessMessages(turn, groups).forEach(message => {
-    if (open || turn.dataset.hasFinalAnswer !== 'true') message.removeAttribute('data-turn-collapsed');
+  const processMessages = new Set(activityTurnProcessMessages(turn, groups));
+  const siblings = turn.parentElement ? Array.from(turn.parentElement.children) : [];
+  siblings.filter(message => message.classList.contains('message-assistant') &&
+    message.dataset.activityTurnId === turn.dataset.turnId).forEach(message => {
+    const isProcess = processMessages.has(message);
+    if (isProcess) message.dataset.activityProcess = 'true';
+    else message.removeAttribute('data-activity-process');
+    if (!isProcess || open || turn.dataset.hasFinalAnswer !== 'true') message.removeAttribute('data-turn-collapsed');
     else message.dataset.turnCollapsed = 'true';
   });
 }
@@ -700,6 +723,10 @@ function finishActivityGroup() {
 }
 
 function refreshActivityGroupLanguage() {
+  if (typeof refreshEffortLanguage === 'function') refreshEffortLanguage();
+  document.querySelectorAll('.md-copy-btn').forEach(button => {
+    button.textContent = button.dataset.copied === 'true' ? uiText('Copied', '已复制') : uiText('Copy', '复制');
+  });
   refreshTurnStatusLanguage();
   refreshTurnMetricsLanguage();
   document.querySelectorAll('.activity-turn').forEach(updateActivityTurnLabel);
@@ -717,14 +744,14 @@ function refreshActivityGroupLanguage() {
       if (title) title.textContent = toolVariantOf(row.dataset.tool).title;
       const semantic = semanticToolSummary(row.dataset.tool, row.getAttribute('data-args') || '');
       const summary = row.querySelector('.tc-summary');
-      if (semantic !== null && summary) summary.textContent = row.dataset.state === 'error'
-        ? semanticToolErrorSummary(row.dataset.tool) : semantic;
+      const detail = toolDetails[row.dataset.rowKey];
+      if (summary && row.dataset.state === 'error') summary.textContent = semanticToolErrorSummary(row.dataset.tool, detail?.output || '');
+      else if (semantic !== null && summary) summary.textContent = semantic;
       const inspect = row.querySelector('.tc-inspect');
       if (inspect) inspect.textContent = uiText('Inspect', '查看详情');
       const openAgent = row.querySelector('.tc-open-agent');
       if (openAgent) openAgent.textContent = uiText('Open agent', '打开子代理');
       if (isWebSearchTool(row.dataset.tool)) {
-        const detail = toolDetails[row.dataset.rowKey];
         renderWebSearchInline(row, detail?.output || '', row.dataset.state);
       } else {
         const labels = row.querySelectorAll('.tc-io-label');
@@ -1950,11 +1977,25 @@ function semanticToolSummary(name, input) {
   if (key === 'messageteammate') return field('to') || uiText('Recipient not specified', '未指定接收者');
   return uiText('External channel', '外部频道');
 }
-function semanticToolErrorSummary(name) {
+function semanticToolErrorSummary(name, output = '') {
   const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
+  const line = firstLine(output);
+  // Interpret only known runtime diagnostics. The full result stays in the
+  // expanded row and inspector, and successful page text never enters here.
+  if (/^denied by unattended admission policy:\s*unauthorized$/i.test(line)) {
+    return uiText('Unattended task is not authorized for this operation', '无人值守任务未获该操作授权');
+  }
+  if (key === 'webfetch') {
+    if (/^HTTP\s*403\b/i.test(line)) return uiText('Website refused access (HTTP 403)', '网页拒绝访问（HTTP 403）');
+    if (/^HTTP\s*404\b/i.test(line)) return uiText('Page not found (HTTP 404)', '页面不存在（HTTP 404）');
+  }
+  if (key === 'read' && /(?:^|[:：]\s*)(?:no such file or directory|文件不存在)[。.!！]?$/i.test(line)) {
+    return uiText('File not found; inspect details', '文件不存在，查看详情');
+  }
   if (key === 'agent') return uiText('Start failed; inspect details', '启动失败，查看详情');
   if (key === 'messageteammate') return uiText('Message failed; inspect details', '消息发送失败，查看详情');
   if (key === 'sendmessage') return uiText('External delivery failed; inspect details', '外部发送失败，查看详情');
+  if (semanticToolSummary(name, '') === null && line) return line;
   return uiText('Request failed; inspect details', '请求失败，查看详情');
 }
 function toolSummaryText(name, input) {
@@ -2614,8 +2655,7 @@ function handleToolResult(d) {
     const summary = chip.querySelector('.tc-summary');
     if (!ok && summary) {
       summary.classList.add('err');
-      summary.textContent = isWebSearchTool(name) ? summary.textContent : semanticToolSummary(name, '') === null
-        ? firstLine(d.output) || summary.textContent : semanticToolErrorSummary(name);
+      if (!isWebSearchTool(name)) summary.textContent = semanticToolErrorSummary(name, d.output);
     }
     updateToolRowAccessibleLabel(chip);
     const out = chip.querySelector('.tc-io-text[data-out]');
@@ -3682,9 +3722,11 @@ function addMessage(role, content, remember = true, idx = -1, historyTurn = 0, a
   const steerAttr = role === 'user' && activitySteer ? ' data-activity-steer="true"' : '';
 
   if (role === 'user') {
+    const artifactEditMarkup = typeof artifactAnnotationMessageMarkup === 'function'
+      ? artifactAnnotationMessageMarkup(content) : null;
     area.insertAdjacentHTML('beforeend', `
       <div class="message message-user"${idxAttr}${turnAttr}${steerAttr}>
-        <div class="message-bubble">${escHtml(content)}</div>
+        <div class="message-bubble">${artifactEditMarkup === null ? escHtml(content) : artifactEditMarkup}</div>
         ${messageActionsMarkup('user', now)}
       </div>`);
   } else {
@@ -4266,7 +4308,7 @@ function codeBlockHtml(b) {
   const label = b.lang ? escHtml(b.lang) : 'code';
   return '<div class="md-codeblock">' +
     '<div class="md-code-head"><span>' + label + '</span>' +
-    '<button class="md-copy-btn" onclick="copyCodeBlock(this)">Copy</button></div>' +
+    '<button class="md-copy-btn" onclick="copyCodeBlock(this)">' + uiText('Copy', '复制') + '</button></div>' +
     '<pre><code>' + escHtml(b.code) + '</code></pre></div>';
 }
 
@@ -4274,7 +4316,11 @@ function copyCodeBlock(btn) {
   const pre = btn.closest('.md-codeblock').querySelector('pre');
   if (!pre) return;
   const text = pre.textContent;
-  const done = () => { btn.textContent = 'Copied'; setTimeout(() => { btn.textContent = 'Copy'; }, 1500); };
+  const done = () => {
+    btn.dataset.copied = 'true';
+    btn.textContent = uiText('Copied', '已复制');
+    setTimeout(() => { btn.dataset.copied = 'false'; btn.textContent = uiText('Copy', '复制'); }, 1500);
+  };
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(done, () => {});
   }

@@ -21,6 +21,7 @@ let sessionStatsSessionID = '';
 let removedWorkspaceIDs = new Set();
 
 function invalidateSessionAsyncLoads() {
+  if (typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers();
   resumeSessionGeneration++;
   sessionStatsGeneration++;
   pendingSessionId = null;
@@ -479,6 +480,7 @@ function closeSessionMenu(restoreFocus) {
 }
 
 function toggleSessionMenu(btn) {
+  if (typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers();
   if (openMenuBtn && openMenuBtn !== btn) {
     closeSessionMenu(false);
   }
@@ -895,8 +897,11 @@ function toggleTokenStats(event) {
   if (!trigger || !popover) return;
   const opening = popover.hidden;
   if (opening) {
-    closeSessionStatsPopover();
-    if (typeof closeContextMeterPopover === 'function') closeContextMeterPopover();
+    if (typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers('token-stats');
+    else {
+      closeSessionStatsPopover();
+      if (typeof closeContextMeterPopover === 'function') closeContextMeterPopover();
+    }
   }
   popover.hidden = !opening;
   trigger.setAttribute('aria-expanded', String(opening));
@@ -910,8 +915,11 @@ function toggleSessionStats(event) {
   if (!trigger || !popover) return;
   const opening = popover.hidden;
   if (opening) {
-    closeTokenStatsPopover();
-    if (typeof closeContextMeterPopover === 'function') closeContextMeterPopover();
+    if (typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers('session-stats');
+    else {
+      closeTokenStatsPopover();
+      if (typeof closeContextMeterPopover === 'function') closeContextMeterPopover();
+    }
   }
   popover.hidden = !opening;
   trigger.setAttribute('aria-expanded', String(opening));
@@ -1293,6 +1301,9 @@ function renderSessionItem(s) {
 }
 
 function renderSessions() {
+  // The details live under body, so replacing a row cannot produce its normal
+  // mouseout/focusout cleanup. Release the old anchor before rebuilding it.
+  if (typeof hideSessionDetail === 'function') hideSessionDetail();
   const list = document.getElementById('sessionList');
   if (!sessions.length && (desktopPreferences.sidebarView !== 'grouped' || !workspaces.length)) {
     list.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:13px;">' +
@@ -1365,13 +1376,24 @@ async function moveSession(id, delta) {
 }
 
 let sessionDetailCard = null;
+let sessionDetailTrigger = null;
+let sessionDetailPointerItem = null;
+let sessionDetailFocusItem = null;
 function showSessionDetail(item) {
-	if (!item || !item.dataset.detailTitle) return;
+	if (!item || item.isConnected === false || !item.dataset.detailTitle) return;
+	if (typeof openMenuBtn !== 'undefined' && openMenuBtn && item.contains(openMenuBtn)) return;
+	if (typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers('session-detail');
 	if (!sessionDetailCard) {
 	  sessionDetailCard = document.createElement('div');
+	  sessionDetailCard.id = 'sessionDetailTooltip';
+	  sessionDetailCard.setAttribute('role', 'tooltip');
 	  sessionDetailCard.className = 'session-detail-card';
 	  document.body.appendChild(sessionDetailCard);
 	}
+	if (sessionDetailTrigger && sessionDetailTrigger !== item) sessionDetailTrigger.removeAttribute('aria-describedby');
+	sessionDetailTrigger = item;
+	item.setAttribute('aria-describedby', sessionDetailCard.id);
+	sessionDetailCard.setAttribute('aria-hidden', 'false');
 	sessionDetailCard.innerHTML = `<strong>${escHtml(item.dataset.detailTitle)}</strong><span>${escHtml(item.dataset.detailPath || uiText('No workspace path', '\u65e0\u5de5\u4f5c\u533a\u8def\u5f84'))}</span><span>${escHtml(item.dataset.detailModel || uiText('No model', '\u672a\u9009\u62e9\u6a21\u578b'))}</span><small>${escHtml(item.dataset.detailMeta || '')}</small>`;
 	const rect = item.getBoundingClientRect();
 	const left = Math.min(window.innerWidth - 330, rect.right + 8);
@@ -1379,11 +1401,53 @@ function showSessionDetail(item) {
 	sessionDetailCard.style.top = Math.max(8, Math.min(window.innerHeight - 150, rect.top)) + 'px';
 	sessionDetailCard.classList.add('show');
 }
-function hideSessionDetail() { if (sessionDetailCard) sessionDetailCard.classList.remove('show'); }
-document.addEventListener('mouseover', e => { const item = e.target.closest && e.target.closest('.session-item[data-detail-title]'); if (item) showSessionDetail(item); });
-document.addEventListener('mouseout', e => { if (e.target.closest && e.target.closest('.session-item[data-detail-title]')) hideSessionDetail(); });
-document.addEventListener('focusin', e => { const item = e.target.closest && e.target.closest('.session-item[data-detail-title]'); if (item) showSessionDetail(item); });
-document.addEventListener('focusout', e => { if (e.target.closest && e.target.closest('.session-item[data-detail-title]')) hideSessionDetail(); });
+function hideSessionDetail() {
+  if (sessionDetailCard) {
+    sessionDetailCard.classList.remove('show');
+    sessionDetailCard.setAttribute('aria-hidden', 'true');
+  }
+  if (sessionDetailTrigger) sessionDetailTrigger.removeAttribute('aria-describedby');
+  sessionDetailTrigger = sessionDetailPointerItem = sessionDetailFocusItem = null;
+}
+function syncSessionDetailOwner() {
+  const item = sessionDetailPointerItem || sessionDetailFocusItem;
+  if (item && item.isConnected !== false) showSessionDetail(item);
+  else hideSessionDetail();
+}
+document.addEventListener('mouseover', e => {
+  const item = e.target.closest && e.target.closest('.session-item[data-detail-title]');
+  if (!item || item.contains(e.relatedTarget)) return;
+  sessionDetailPointerItem = item;
+  showSessionDetail(item);
+});
+document.addEventListener('mouseout', e => {
+  const item = e.target.closest && e.target.closest('.session-item[data-detail-title]');
+  if (!item || item.contains(e.relatedTarget)) return;
+  if (sessionDetailPointerItem === item) sessionDetailPointerItem = null;
+  syncSessionDetailOwner();
+});
+document.addEventListener('focusin', e => {
+  if (typeof closeUnfocusedComposerStatPopovers === 'function') closeUnfocusedComposerStatPopovers(e.target);
+  const item = e.target.closest && e.target.closest('.session-item[data-detail-title]');
+  if (!item || item.contains(e.relatedTarget)) return;
+  sessionDetailFocusItem = item;
+  showSessionDetail(item);
+});
+document.addEventListener('focusout', e => {
+  const item = e.target.closest && e.target.closest('.session-item[data-detail-title]');
+  if (!item || item.contains(e.relatedTarget)) return;
+  if (sessionDetailFocusItem === item) sessionDetailFocusItem = null;
+  syncSessionDetailOwner();
+});
+document.addEventListener('click', () => hideSessionDetail());
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers();
+  else hideSessionDetail();
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers();
+});
 
 function toggleSessionsExpand() {
   sessionsExpanded = !sessionsExpanded;
@@ -1391,6 +1455,7 @@ function toggleSessionsExpand() {
 }
 
 async function resumeSession(id) {
+  if (typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers();
   const generation = ++resumeSessionGeneration;
   const isLatest = () => generation === resumeSessionGeneration;
   pendingSessionId = id;

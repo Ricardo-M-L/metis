@@ -213,7 +213,7 @@
               <div class="model-menu" id="modelMenu" style="display:none"></div>
             </span>
             <button type="button" class="input-chip effort-chip" id="effortBtn" style="display:none" aria-expanded="false" onclick="toggleEffortMenu(event)">
-              <span id="effortName">Default effort</span><span>&#9662;</span>
+              <span id="effortName">默认思考</span><span>&#9662;</span>
             </button>
             <div class="effort-menu" id="effortMenu" role="menu" style="display:none"></div>
             <button class="send-btn" id="sendBtn" type="button" title="Send message" aria-label="Send message" onclick="sendMessage()" disabled>&#8593;</button>
@@ -303,20 +303,36 @@
         <span id="artifactPreviewMeta">Local preview</span>
       </div>
       <label class="artifact-version-control" for="artifactVersionSelect">
-        <span>Version</span>
+        <span id="artifactVersionLabel">版本</span>
         <select id="artifactVersionSelect" onchange="selectArtifactVersion(this.value)"></select>
       </label>
-      <div class="artifact-preview-actions">
-        <button type="button" onclick="downloadActiveArtifact()">Download</button>
-        <button type="button" onclick="exportActiveArtifact()">Export</button>
-        <button type="button" onclick="openActiveArtifactExternally()">Open externally</button>
-        <button type="button" class="danger" onclick="requestArtifactDeletion()">Delete</button>
+      <div id="artifactCompareControls" class="artifact-compare-controls" role="group" aria-label="修改前后对照" hidden>
+        <button id="artifactCompareBefore" type="button" onclick="compareArtifactRevision('before')">修改前</button>
+        <button id="artifactCompareAfter" type="button" onclick="compareArtifactRevision('after')">修改后</button>
       </div>
-      <button class="artifact-preview-close" type="button" title="Close preview" aria-label="Close preview" onclick="closeArtifactPreview()">&#10005;</button>
+      <div class="artifact-preview-actions">
+        <button id="artifactAnnotationToggle" class="artifact-annotation-toggle" type="button" aria-pressed="false" aria-controls="artifactAnnotationPanel" onclick="toggleArtifactAnnotation()"><svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m3 2 9 6-4 1-2 4-3-11Z"/><path d="m9 11 3 3"/></svg><span id="artifactAnnotationToggleLabel">指点修改</span></button>
+        <button id="artifactDownloadBtn" type="button" onclick="downloadActiveArtifact()">下载</button>
+        <button id="artifactExportBtn" type="button" onclick="exportActiveArtifact()">导出</button>
+        <button id="artifactOpenExternalBtn" type="button" onclick="openActiveArtifactExternally()">外部打开</button>
+        <button id="artifactDeleteBtn" type="button" class="danger" onclick="requestArtifactDeletion()">删除</button>
+      </div>
+      <button id="artifactCloseBtn" class="artifact-preview-close" type="button" title="关闭预览" aria-label="关闭预览" onclick="closeArtifactPreview()">&#10005;</button>
     </header>
-    <div class="artifact-preview-stage">
-      <div class="artifact-preview-state" id="artifactPreviewState" role="status">Preparing preview…</div>
-      <iframe id="artifactPreviewFrame" title="Artifact preview" sandbox referrerpolicy="no-referrer"></iframe>
+    <div class="artifact-preview-workspace">
+      <div class="artifact-preview-stage">
+        <div class="artifact-preview-state" id="artifactPreviewState" role="status">Preparing preview…</div>
+        <iframe id="artifactPreviewFrame" title="Artifact preview" sandbox referrerpolicy="no-referrer"></iframe>
+      </div>
+      <aside id="artifactAnnotationPanel" class="artifact-annotation-panel" aria-label="指点修改" hidden>
+        <header class="artifact-annotation-head"><strong id="artifactAnnotationTitle">指点修改</strong><span id="artifactAnnotationVersion" class="artifact-annotation-version"></span></header>
+        <p id="artifactAnnotationHint" class="artifact-annotation-hint" role="status" aria-live="polite">点选页面中的元素，再描述你想怎么改。</p>
+        <div id="artifactAnnotationSelection" class="artifact-annotation-selection" aria-label="选中的元素">尚未选择元素</div>
+        <label id="artifactAnnotationInstructionLabel" class="artifact-annotation-label" for="artifactAnnotationInstruction">修改要求</label>
+        <textarea id="artifactAnnotationInstruction" rows="5" maxlength="4000" placeholder="例如：缩小这个按钮，把文案改成“开始体验”"></textarea>
+        <p id="artifactAnnotationNote" class="artifact-annotation-note">修改会保存为新版本，原版会保留。</p>
+        <div class="artifact-annotation-actions"><button id="artifactAnnotationApply" type="button" class="artifact-annotation-apply" disabled onclick="submitArtifactAnnotation()">交给 METIS 修改</button><button id="artifactAnnotationCancel" type="button" onclick="endArtifactAnnotation()">退出点选</button></div>
+      </aside>
     </div>
   </section>
 </div>
@@ -392,6 +408,8 @@
 <script src="sessions.js?v=__BUILD__"></script>
 <script src="chat.js?v=__BUILD__"></script>
 <script src="artifacts.js?v=__BUILD__"></script>
+<script src="artifact_edit_submit.js?v=__BUILD__"></script>
+<script src="artifact_annotation.js?v=__BUILD__"></script>
 <script src="vendor/prism/prism.min.js?v=__BUILD__"></script>
 <script src="session_file_render.js?v=__BUILD__"></script>
 <script src="session_files.js?v=__BUILD__"></script>

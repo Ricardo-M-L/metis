@@ -340,6 +340,9 @@ c.handleTextDelta({delta:'Opening assessment'});c.endStreamingMessage();
 c.handleToolStart({tool:'Read',id:'process-read',input:'{}'});
 c.handleToolResult({tool:'Read',id:'process-read',output:'read',elapsedMs:2});
 c.handleTextDelta({delta:'Intermediate explanation'});c.endStreamingMessage();
+const unconfirmedMessage=area.querySelectorAll('.message-assistant').at(-1);
+assert.equal(unconfirmedMessage.getAttribute('data-activity-process'),null,
+  'prose after the current last tool is not yet confirmed as process');
 const permission = new Element('div');permission.className='permission-card';area.appendChild(permission);
 const unknown = new Element('div');unknown.className='unknown-row';area.appendChild(unknown);
 c.handleToolStart({tool:'Bash',id:'process-command',input:'{}'});
@@ -352,12 +355,20 @@ assert.equal(processTurn.classList.contains('open'),false);
 assert.equal(processMessages[0].getAttribute('data-turn-collapsed'),'true','pre-tool assistant folds with process');
 assert.equal(processMessages[1].getAttribute('data-turn-collapsed'),'true','between-tool assistant folds with process');
 assert.equal(processMessages[2].getAttribute('data-turn-collapsed'),null,'final assistant stays visible');
+assert.equal(processMessages[0].getAttribute('data-activity-process'),'true','pre-tool explanation is confirmed process');
+assert.equal(processMessages[1].getAttribute('data-activity-process'),'true','later tool confirms intermediate prose as process');
+assert.equal(processMessages[2].getAttribute('data-activity-process'),null,'final answer receives no process styling');
 assert.equal(permission.getAttribute('data-turn-collapsed'),null,'permission stays independent');
 assert.equal(unknown.getAttribute('data-turn-collapsed'),null,'unknown row stays independent');
+assert.equal(permission.getAttribute('data-activity-process'),null,'permission is not process prose');
+assert.equal(unknown.getAttribute('data-activity-process'),null,'unknown row is not process prose');
 const beforeExpansion=area.children.slice();
 c.toggleActivityTurn(turnToggle(processTurn));
 assert.equal(processMessages[0].getAttribute('data-turn-collapsed'),null);
 assert.equal(processMessages[1].getAttribute('data-turn-collapsed'),null);
+assert.equal(processMessages[0].getAttribute('data-activity-process'),'true','expanded process keeps its classification');
+assert.equal(processMessages[1].getAttribute('data-activity-process'),'true');
+assert.equal(processMessages[2].getAttribute('data-activity-process'),null,'expanded final answer is still distinct');
 assert.deepEqual(area.children,beforeExpansion,'expansion preserves original DOM order');
 c.toggleActivityTurn(turnToggle(processTurn));
 assert.equal(processMessages[0].getAttribute('data-turn-collapsed'),'true');
@@ -396,6 +407,9 @@ const savedMessages=area.querySelectorAll('.message-assistant');
 assert.equal(savedMessages[0].getAttribute('data-turn-collapsed'),'true','history pre-tool text folds');
 assert.equal(savedMessages[1].getAttribute('data-turn-collapsed'),'true','history intermediate text folds');
 assert.equal(savedMessages[2].getAttribute('data-turn-collapsed'),null,'history final answer remains visible');
+assert.equal(savedMessages[0].getAttribute('data-activity-process'),'true','history opening explanation uses the same process classification');
+assert.equal(savedMessages[1].getAttribute('data-activity-process'),'true');
+assert.equal(savedMessages[2].getAttribute('data-activity-process'),null,'history final answer receives no process styling');
 c.toggleActivityTurn(turnToggle(turns()[0]));
 assert.equal(savedMessages[0].getAttribute('data-turn-collapsed'),null);
 assert.equal(savedMessages[1].getAttribute('data-turn-collapsed'),null);
@@ -483,6 +497,8 @@ c.applyActivityPresentationMode('compact');
 c.applyActivityPresentationMode('standard');
 assert.equal(answerlessTurn.classList.contains('open'), true,
   'next pure-text answer cannot fold an earlier answerless process');
+assert.equal(area.querySelectorAll('.message-assistant').at(-1).getAttribute('data-activity-process'),null,
+  'next turn pure-text reply must not inherit process styling');
 
 // A steer is still part of the current turn, so an answer following it can
 // legitimately close that turn's process disclosure.

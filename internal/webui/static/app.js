@@ -124,6 +124,7 @@ function applyLanguage(value) {
   document.querySelectorAll('[data-i18n-label]').forEach(el => { const text = dict[el.dataset.i18nLabel]; if (text) el.setAttribute('aria-label', text); });
   document.querySelectorAll('[data-i18n-title]').forEach(el => { const text = dict[el.dataset.i18nTitle]; if (text) el.title = text; });
   if (typeof refreshActivityGroupLanguage === 'function') refreshActivityGroupLanguage();
+  if (typeof refreshArtifactAnnotationLanguage === 'function') refreshArtifactAnnotationLanguage();
   applyLayout();
   if (typeof syncApprovalChip === 'function') syncApprovalChip(approvalMode);
   if (lastStatusSnapshot) renderStatusSnapshot(lastStatusSnapshot);
@@ -448,8 +449,11 @@ function toggleContextMeter(event) {
   if (!meter || !popover || meter.style.display === 'none') return;
   const opening = popover.hidden;
   if (opening) {
-    if (typeof closeSessionStatsPopover === 'function') closeSessionStatsPopover();
-    if (typeof closeTokenStatsPopover === 'function') closeTokenStatsPopover();
+    if (typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers('context-meter');
+    else {
+      if (typeof closeSessionStatsPopover === 'function') closeSessionStatsPopover();
+      if (typeof closeTokenStatsPopover === 'function') closeTokenStatsPopover();
+    }
   }
   popover.hidden = !opening;
   meter.setAttribute('aria-expanded', String(opening));
@@ -581,6 +585,7 @@ function toggleStatusPopover(e) {
   const chip = document.getElementById('statusChip');
   if (!pop || !chip) return;
   const open = pop.style.display === 'none';
+  if (open && typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers('agent-status');
   pop.style.display = open ? 'block' : 'none';
   chip.setAttribute('aria-expanded', open ? 'true' : 'false');
   if (open) renderStatusPopover();
@@ -1171,6 +1176,7 @@ function applyLayout() {
 }
 
 function toggleSidebar() {
+  if (typeof hideSessionDetail === 'function') hideSessionDetail();
   const app = document.querySelector('.app');
   const narrow = app && app.clientWidth < SIDEBAR_AUTO_COLLAPSE;
   if (narrow) {

@@ -334,7 +334,13 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 2 {
 		action = parts[1]
 	}
-	sessionID, ok := s.artifactSession(w, r)
+	var sessionID string
+	var ok bool
+	if action == "annotate" || action == "annotation-preview" {
+		sessionID, ok = s.artifactAnnotationSession(w, r)
+	} else {
+		sessionID, ok = s.artifactSession(w, r)
+	}
 	if !ok {
 		return
 	}
@@ -350,6 +356,14 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
+		return
+	}
+	if action == "annotate" {
+		s.handleArtifactAnnotation(w, r, store, sessionID, id)
+		return
+	}
+	if action == "annotation-preview" {
+		s.handleArtifactAnnotationPreview(w, r, store, sessionID, id)
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
