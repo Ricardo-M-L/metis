@@ -45,6 +45,16 @@ func (s *Server) handleSessionCommand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "agent runtime unavailable")
 		return
 	}
+	turnLock, acquired, err := s.store.TryAcquireTurnLock(body.SessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session lock failed: "+err.Error())
+		return
+	}
+	if !acquired {
+		writeError(w, http.StatusConflict, "a turn is running; stop it before editing history")
+		return
+	}
+	defer turnLock.Release()
 	if !s.runMu.TryLock() {
 		writeError(w, http.StatusConflict, "a turn is running; stop it before editing history")
 		return
@@ -93,7 +103,7 @@ func (s *Server) handleSessionCommand(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	cursor := session.NewHistoryCursor(history)
-	if err := s.store.ReplaceHistoryAndMark(body.SessionID, next, &cursor); err != nil {
+	if err := s.replaceDesktopHistory(body.SessionID, next, &cursor); err != nil {
 		writeError(w, http.StatusInternalServerError, "history update failed: "+err.Error())
 		return
 	}
@@ -195,6 +205,16 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "compactor unavailable")
 		return
 	}
+	turnLock, acquired, err := s.store.TryAcquireTurnLock(body.SessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session lock failed: "+err.Error())
+		return
+	}
+	if !acquired {
+		writeError(w, http.StatusConflict, "a turn is running; stop it before compacting history")
+		return
+	}
+	defer turnLock.Release()
 	if !s.runMu.TryLock() {
 		writeError(w, http.StatusConflict, "a turn or compaction is already running")
 		return
@@ -234,7 +254,7 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 		Force:        true,
 		Instructions: strings.TrimSpace(body.Instructions),
 		Persist: func(replacement []llm.Message) error {
-			return s.store.ReplaceHistoryAndMark(body.SessionID, replacement, &cursor)
+			return s.replaceDesktopHistory(body.SessionID, replacement, &cursor)
 		},
 		Emit: func(ev agent.Event) {
 			s.hub.publish(body.SessionID, ev)

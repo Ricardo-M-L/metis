@@ -7,6 +7,33 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.88] - 2026-10-12
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Added
+
+- Pause a Desktop task after saving its checkpoint, then resume the same task
+  with the play button while retaining completed tool results and queued input.
+- Fence saved resume checkpoints with durable single-use tokens and per-session
+  process locks; reject stale, concurrent or unsafely interrupted resumptions.
+
+### Changed
+
+- Present queued messages in one compact composer panel with a collapsible
+  multi-message list and a menu that stays positioned while scrolling.
+- Select workspaces in the current Desktop window and preserve workspace drafts.
+
+### Fixed
+
+- Move queued input back to the composer when adjusting direction, without
+  dropping its attachments or overwriting an unsent draft.
+- Keep historical sessions and background tasks bound to their own workspace
+  directories when selecting another workspace.
+- Clear resume eligibility after history edits and preserve repaired interrupted
+  tool history before starting the resumed model invocation.
+
 ## [0.4.87] - 2026-10-07
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

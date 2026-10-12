@@ -72,6 +72,10 @@ func (s *Server) watchBackgroundContinuation(ctx context.Context, sessionID stri
 		// The running Loop alone drains Notifications. The separate wakeup
 		// signal never steals a completion from it. Waiting for runMu also
 		// closes the race where completion arrives during Run's final unwind.
+		turnLock, err := s.store.AcquireTurnLock(ctx, sessionID)
+		if err != nil {
+			return
+		}
 		s.runMu.Lock()
 		s.stateMu.RLock()
 		activeSession, workDir := s.activeSessionID, s.activeWorkDir
@@ -80,11 +84,13 @@ func (s *Server) watchBackgroundContinuation(ctx context.Context, sessionID stri
 		if ctx.Err() != nil || s.closing || s.backgroundGeneration != generation || activeSession != sessionID {
 			s.cancelMu.Unlock()
 			s.runMu.Unlock()
+			turnLock.Release()
 			return
 		}
 		if !registry.HasPendingNotifications() {
 			s.cancelMu.Unlock()
 			s.runMu.Unlock()
+			turnLock.Release()
 			continue
 		}
 		turnCtx, cancel := context.WithCancel(agent.WithCwd(ctx, workDir))
@@ -96,6 +102,18 @@ func (s *Server) watchBackgroundContinuation(ctx context.Context, sessionID stri
 			Turn: s.nextMessageMetricTurn(sessionID, s.loop.History()), StartedAt: time.Now(),
 		}
 		alignTraceTurnFloor(sessionID, metric.Turn)
+		if err := s.store.StartDesktopTurn(sessionID, "", false); err != nil {
+			cancel()
+			s.cancelMu.Lock()
+			if s.turnDone == turnDone {
+				s.cancelTurn, s.runningSession, s.turnDone = nil, "", nil
+			}
+			s.cancelMu.Unlock()
+			close(turnDone)
+			s.runMu.Unlock()
+			turnLock.Release()
+			return
+		}
 		s.hub.publish(sessionID, agent.Event{Kind: agent.EventInfo}, map[string]any{"backgroundContinuation": "started"})
 		_, runErr, _, mayContinue := s.runAndPersistTurn(turnCtx, sessionID, metric)
 		interrupted := turnCtx.Err() != nil
@@ -110,6 +128,7 @@ func (s *Server) watchBackgroundContinuation(ctx context.Context, sessionID stri
 			"backgroundContinuation": "finished", "succeeded": runErr == nil && !interrupted && mayContinue,
 		})
 		s.runMu.Unlock()
+		turnLock.Release()
 		if runErr != nil || interrupted || !mayContinue {
 			if runErr != nil && !interrupted {
 				log.Printf("background continuation for %s stopped: %v", sessionID, runErr)

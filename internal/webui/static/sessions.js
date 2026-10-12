@@ -19,6 +19,109 @@ let sessionStatsGeneration = 0;
 let sessionStatsSnapshot = null;
 let sessionStatsSessionID = '';
 let removedWorkspaceIDs = new Set();
+let workspacesLoadGeneration = 0;
+let workspaceSelectionRequests = Promise.resolve();
+let pendingWorkspaceSelectionGeneration = 0;
+let unavailableWorkspaceViewId = '';
+const composerDraftsByView = new Map();
+
+function mergeServerSessionMetadata(session) {
+  if (!session || !session.id) return;
+  const cached = sessions.find(item => item.id === session.id);
+  const latest = { ...(cached || {}), ...session };
+  sessions = cached ? sessions.map(item => item.id === session.id ? latest : item) : [latest, ...sessions];
+}
+
+function isWorkspaceSelectionPending() {
+  return !!pendingWorkspaceSelectionGeneration && pendingWorkspaceSelectionGeneration === resumeSessionGeneration;
+}
+
+function beginSessionNavigationGeneration() {
+  const previousViewGeneration = resumeSessionGeneration;
+  const generation = ++resumeSessionGeneration;
+  // A pending navigation leaves the old view visible. Keep its first turn
+  // attached until a successful selection actually detaches that view.
+  if (!currentSessionId && typeof pendingForegroundRequest !== 'undefined' && pendingForegroundRequest &&
+      pendingForegroundRequest.viewGeneration === previousViewGeneration) pendingForegroundRequest.viewGeneration = generation;
+  return generation;
+}
+
+function composerDraftViewKey() {
+  return currentSessionId ? 'session:' + currentSessionId : 'workspace:' + activeWorkspaceId;
+}
+
+function forgetWorkspaceComposerDraft(workspaceId) {
+  composerDraftsByView.delete('workspace:' + String(workspaceId || ''));
+}
+
+function selectedWorkspaceCanRun() {
+  const workspace = workspaces.find(item => item.id === activeWorkspaceId);
+  if (!workspace || workspace.available !== false) return true;
+  showToast(uiText('This workspace directory is unavailable. Restore it or choose another workspace before running a task.', '该工作区目录不可用。请恢复目录或选择其他工作区后再运行任务。'));
+  return false;
+}
+
+function saveComposerDraftForView() {
+  const input = document.getElementById('inputField');
+  if (!input) return;
+  composerDraftsByView.set(composerDraftViewKey(), {
+    text: input.value,
+    images: typeof attachments !== 'undefined' ? attachments.slice() : []
+  });
+}
+
+function restoreComposerDraftForView() {
+  const input = document.getElementById('inputField');
+  const draft = composerDraftsByView.get(composerDraftViewKey());
+  if (input) {
+    input.value = draft ? draft.text : '';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  if (typeof attachments !== 'undefined') {
+    attachments = draft ? draft.images.slice() : [];
+    if (typeof renderAttachments === 'function') renderAttachments();
+  }
+}
+
+function applySelectedWorkspace(workspace, id) {
+  activeWorkspaceId = String(id || workspace && workspace.id || '');
+  unavailableWorkspaceViewId = workspace && workspace.available === false ? activeWorkspaceId : '';
+  if (workspace && workspace.id) {
+    const index = workspaces.findIndex(item => item.id === workspace.id);
+    if (index < 0) workspaces = [...workspaces, workspace];
+    else workspaces = workspaces.map(item => item.id === workspace.id ? workspace : item);
+  }
+  workspaces = workspaces.map(item => ({ ...item, active: item.id === activeWorkspaceId }));
+  if (typeof refreshSelectedWorkspaceTitle === 'function') refreshSelectedWorkspaceTitle();
+}
+
+// Serialize navigation writes so a delayed older click cannot become the
+// backend's selected workspace after a newer click has already completed.
+function requestWorkspaceSelection(id, isLatest) {
+  const request = workspaceSelectionRequests.catch(() => {}).then(async () => {
+    if (isLatest && !isLatest()) return null;
+    const res = await fetch('/api/workspaces/select', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'select workspace: ' + res.status);
+    return data;
+  });
+  workspaceSelectionRequests = request.catch(() => {});
+  return request;
+}
+
+function requestSessionActivation(id, isLatest) {
+  const request = workspaceSelectionRequests.catch(() => {}).then(() => {
+    if (isLatest && !isLatest()) return null;
+    return fetch('/api/sessions/activate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id })
+    });
+  });
+  workspaceSelectionRequests = request.catch(() => {});
+  return request;
+}
 
 function invalidateSessionAsyncLoads() {
   if (typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers();
@@ -30,18 +133,28 @@ function invalidateSessionAsyncLoads() {
 }
 
 async function loadWorkspaces() {
+  const generation = ++workspacesLoadGeneration;
+  const viewGeneration = resumeSessionGeneration;
   try {
     const res = await fetch('/api/workspaces');
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'workspaces: ' + res.status);
+    if (generation !== workspacesLoadGeneration || viewGeneration !== resumeSessionGeneration) return;
     workspaces = Array.isArray(data.workspaces) ? data.workspaces : [];
     removedWorkspaceIDs = new Set(Array.isArray(data.removedIds) ? data.removedIds : []);
-    activeWorkspaceId = data.activeId || '';
+    if (unavailableWorkspaceViewId && workspaces.some(item => item.id === unavailableWorkspaceViewId) && !removedWorkspaceIDs.has(unavailableWorkspaceViewId)) {
+      activeWorkspaceId = unavailableWorkspaceViewId;
+    } else {
+      unavailableWorkspaceViewId = '';
+      activeWorkspaceId = data.activeId || '';
+    }
+    if (typeof refreshSelectedWorkspaceTitle === 'function') refreshSelectedWorkspaceTitle();
     renderSessions();
   } catch (e) {
+    if (generation !== workspacesLoadGeneration || viewGeneration !== resumeSessionGeneration) return;
     workspaces = [];
     removedWorkspaceIDs = new Set();
-    showToast('Unable to load workspaces: ' + e.message);
+    showToast(uiText('Unable to load workspaces: ', '无法加载工作区：') + e.message);
   }
 }
 
@@ -68,17 +181,40 @@ async function addWorkspace() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'add workspace: ' + res.status);
     await loadWorkspaces();
-    showToast('Workspace added. Open it to start an independent Desktop window.');
+    await openWorkspace(data.id);
   } catch (e) {
-    showToast('Add workspace failed: ' + e.message);
+    showToast(uiText('Add workspace failed: ', '添加工作区失败：') + e.message);
   }
 }
 
 async function openWorkspace(id) {
-  if (id === activeWorkspaceId) {
-    showToast('This workspace is already open in the current window');
-    return;
+  if (id === activeWorkspaceId && !currentSessionId && !isWorkspaceSelectionPending() && !pendingSessionId) return true;
+  const generation = beginSessionNavigationGeneration();
+  pendingSessionId = null;
+  pendingWorkspaceSelectionGeneration = generation;
+  if (typeof updateSendBtn === 'function') updateSendBtn();
+  const isLatest = () => generation === resumeSessionGeneration;
+  try {
+    const data = await requestWorkspaceSelection(id, isLatest);
+    if (!data || !isLatest()) return false;
+    saveComposerDraftForView();
+    applySelectedWorkspace(data.workspace, data.activeId || id);
+    newChat({ workspaceSelection: true, draftSaved: true });
+    if (typeof switchView === 'function') switchView('chat');
+    if (typeof pollStatus === 'function') void pollStatus();
+    document.getElementById('inputField')?.focus();
+    return true;
+  } catch (e) {
+    if (isLatest()) showToast(uiText('Select workspace failed: ', '切换工作区失败：') + e.message);
+    return false;
+  } finally {
+    if (pendingWorkspaceSelectionGeneration === generation) pendingWorkspaceSelectionGeneration = 0;
+    if (typeof updateSendBtn === 'function') updateSendBtn();
   }
+}
+
+async function openWorkspaceInNewWindow(id) {
+  closeWorkspaceMenu(false);
   try {
     const res = await fetch('/api/workspaces/open', {
       method: 'POST',
@@ -87,9 +223,9 @@ async function openWorkspace(id) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'open workspace: ' + res.status);
-    showToast('Opening workspace in a new Desktop window');
+    showToast(uiText('Opening workspace in a new Desktop window', '正在新桌面窗口中打开工作区'));
   } catch (e) {
-    showToast('Open workspace failed: ' + e.message);
+    showToast(uiText('Open workspace failed: ', '打开工作区失败：') + e.message);
   }
 }
 
@@ -1172,21 +1308,22 @@ function workspaceLabel(workDir) {
 
 function renderWorkspaceHeader(ws, count, index) {
   const unavailable = ws.available === false;
-  const active = ws.id === activeWorkspaceId || ws.active;
-  const pathTitle = unavailable ? ws.path + ' (unavailable)' : ws.path;
+  const active = ws.id === activeWorkspaceId;
+  const pathTitle = unavailable ? ws.path + uiText(' (unavailable)', '（不可用）') : ws.path;
   return `<div class="ws-group-head${active ? ' active' : ''}${unavailable ? ' unavailable' : ''}" title="${escAttr(pathTitle)}">
-    <button type="button" class="ws-group-open" aria-label="${active ? 'Current workspace ' : 'Open workspace '}${escAttr(ws.name)}${active ? '' : ' in a new window'}" onclick="openWorkspace('${escOnclick(ws.id)}')">
+    <button type="button" class="ws-group-open" aria-label="${escAttr((active ? uiText('Current workspace ', '当前工作区：') : uiText('Select workspace ', '选择工作区：')) + ws.name)}" aria-current="${active ? 'true' : 'false'}" onclick="openWorkspace('${escOnclick(ws.id)}')">
       <svg class="ws-folder" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.5 1.8h4.9A1.5 1.5 0 0 1 14 6.3v5.2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/></svg>
       <span class="ws-group-name">${escHtml(ws.name)}</span>
       <span class="ws-group-count">${count}</span>
     </button>
-    <button type="button" class="ws-more" aria-label="Workspace actions for ${escAttr(ws.name)}" aria-expanded="false" onclick="event.stopPropagation();toggleWorkspaceMenu(this)">&#8943;</button>
+    <button type="button" class="ws-more" aria-label="${escAttr(uiText('Workspace actions for ', '工作区操作：') + ws.name)}" aria-expanded="false" onclick="event.stopPropagation();toggleWorkspaceMenu(this)">&#8943;</button>
     <div class="workspace-menu" style="display:none">
-      <button type="button" onclick="event.stopPropagation();renameWorkspace('${escOnclick(ws.id)}')">Rename</button>
-      <button type="button" onclick="event.stopPropagation();moveWorkspace('${escOnclick(ws.id)}',-1)"${index === 0 ? ' disabled' : ''}>Move up</button>
-      <button type="button" onclick="event.stopPropagation();moveWorkspace('${escOnclick(ws.id)}',1)"${index === workspaces.length - 1 ? ' disabled' : ''}>Move down</button>
+      <button type="button" onclick="event.stopPropagation();openWorkspaceInNewWindow('${escOnclick(ws.id)}')">${uiText('Open in a new window', '在新窗口打开')}</button>
+      <button type="button" onclick="event.stopPropagation();renameWorkspace('${escOnclick(ws.id)}')">${uiText('Rename', '重命名')}</button>
+      <button type="button" onclick="event.stopPropagation();moveWorkspace('${escOnclick(ws.id)}',-1)"${index === 0 ? ' disabled' : ''}>${uiText('Move up', '上移')}</button>
+      <button type="button" onclick="event.stopPropagation();moveWorkspace('${escOnclick(ws.id)}',1)"${index === workspaces.length - 1 ? ' disabled' : ''}>${uiText('Move down', '下移')}</button>
       <div class="session-menu-sep"></div>
-      <button type="button" class="danger" onclick="event.stopPropagation();removeWorkspace('${escOnclick(ws.id)}')">Remove from list</button>
+      <button type="button" class="danger" onclick="event.stopPropagation();removeWorkspace('${escOnclick(ws.id)}')">${uiText('Remove from list', '从列表移除')}</button>
     </div>
   </div>`;
 }
@@ -1456,9 +1593,11 @@ function toggleSessionsExpand() {
 
 async function resumeSession(id) {
   if (typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers();
-  const generation = ++resumeSessionGeneration;
+  const generation = typeof beginSessionNavigationGeneration === 'function'
+    ? beginSessionNavigationGeneration() : ++resumeSessionGeneration;
   const isLatest = () => generation === resumeSessionGeneration;
   pendingSessionId = id;
+  if (typeof updateSendBtn === 'function') updateSendBtn();
   renderSessions();
   try {
     let viewOnly = typeof turnRunning !== 'undefined' && turnRunning;
@@ -1468,8 +1607,10 @@ async function resumeSession(id) {
     let options = viewOnly
       ? { method: 'GET' }
       : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) };
-    let res = await fetch(endpoint, options);
+    let res = !viewOnly && typeof requestSessionActivation === 'function'
+      ? await requestSessionActivation(id, isLatest) : await fetch(endpoint, options);
     if (!isLatest()) return;
+    if (!res) return;
     // The status poll/SSE can race a click by a few milliseconds. If the
     // backend already owns a running turn, fall back to the transcript-only
     // endpoint instead of reviving the old "stop before switching" bug.
@@ -1489,13 +1630,40 @@ async function resumeSession(id) {
     if (!res.ok) throw new Error(`resume: ${res.status}`);
     const data = await res.json();
     if (!isLatest()) return;
+    const selectedSession = data.session && data.session.id === id ? data.session : sessions.find(session => session.id === id);
+    const registeredWorkspaces = typeof workspaces !== 'undefined' ? workspaces : [];
+    const workspace = selectedSession && (data.workspace && data.workspace.id === selectedSession.workspaceId && data.workspace ||
+      registeredWorkspaces.find(item => item.id === selectedSession.workspaceId) ||
+      registeredWorkspaces.find(item => item.path === selectedSession.workDir));
+    const workspaceId = selectedSession && selectedSession.workspaceId || workspace && workspace.id;
+    if (workspaceId && typeof requestWorkspaceSelection === 'function') {
+      let selectedWorkspace;
+      try {
+        selectedWorkspace = await requestWorkspaceSelection(workspaceId, isLatest);
+      } catch (error) {
+        if (!viewOnly || !isLatest()) throw error;
+        // Saved messages remain readable after their directory is removed.
+        // Keep the historical owner visible; new tasks/settings are blocked
+        // until a successful selection verifies this directory again.
+        selectedWorkspace = { activeId: workspaceId, workspace: {
+          ...(workspace || {}), id: workspaceId, path: selectedSession.workDir || workspace && workspace.path || '',
+          name: workspace && workspace.name || workspaceLabel(selectedSession.workDir), available: false
+        } };
+        showToast(uiText('Opened saved history. Its workspace directory is unavailable; new tasks cannot run there.', '已打开保存的历史记录。原工作区目录不可用，暂时无法在该目录运行新任务。'));
+      }
+      if (!selectedWorkspace || !isLatest()) return;
+      // This request changes only this window's navigation. A viewed history
+      // must never rebind a running task's loop or saved working directory.
+      if (typeof saveComposerDraftForView === 'function') saveComposerDraftForView();
+      applySelectedWorkspace(selectedWorkspace.workspace, selectedWorkspace.activeId || workspaceId);
+    } else if (typeof saveComposerDraftForView === 'function') saveComposerDraftForView();
     // Direct links (for example, automation runs) may target a saved session
     // outside the current list page. Cache only its verified server metadata.
-    if (data.session && data.session.id === id && !sessions.some(session => session.id === id)) {
-      sessions = [data.session, ...sessions];
-    }
+    if (data.session && data.session.id === id) mergeServerSessionMetadata(data.session);
     if (id !== currentSessionId && typeof detachRunningTurnView === 'function') detachRunningTurnView();
     currentSessionId = id;
+    if (typeof applyResumeSnapshot === 'function') applyResumeSnapshot(data, id);
+    if (typeof restoreComposerDraftForView === 'function') restoreComposerDraftForView();
     if (typeof subAgentDetailState !== 'undefined' && subAgentDetailState.agentId &&
         subAgentDetailState.ownerSessionId !== String(currentSessionId || '') &&
         typeof closeSubAgentDetails === 'function') closeSubAgentDetails(false);
@@ -1540,7 +1708,8 @@ async function resumeSession(id) {
     if (typeof syncTurnControls === 'function') syncTurnControls();
     renderSessions();
     const selectedRunning = typeof isViewedTurnRunning === 'function' ? isViewedTurnRunning() : turnRunning;
-    if (!selectedRunning && queuedTurns.length && (!queuedSessionId || queuedSessionId === currentSessionId)) {
+    if (!selectedRunning && queuedTurns.length && (!queuedSessionId || queuedSessionId === currentSessionId) &&
+        !(typeof isSessionQueuePaused === 'function' && isSessionQueuePaused(id))) {
       setTimeout(drainQueuedTurns, 0);
     }
     return true;
@@ -1550,6 +1719,7 @@ async function resumeSession(id) {
   } finally {
     if (isLatest()) {
       pendingSessionId = null;
+      if (typeof updateSendBtn === 'function') updateSendBtn();
       renderSessions();
     }
   }

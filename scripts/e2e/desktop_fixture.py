@@ -29,6 +29,14 @@ AGENT_FIXTURE_MARKER = "[agent-fixture]"
 AGENT_CHILD_PROMPT = "CHILD_FIXTURE_TASK_1"
 AGENT_CALL_PREFIX = "call_fixture_agent_"
 ACTIVITY_CALL_PREFIX = "call_fixture_activity_"
+ACTIVITY_FIXTURE_MARKER = "[activity-fixture]"
+WORKSPACE_FIXTURE_MARKER = "[workspace-fixture]"
+WORKSPACE_CALL_PREFIX = "call_fixture_workspace_"
+WORKSPACE_PROBE_COMMAND = "pwd && cat ./fixture-notes.md ./fixture-checks.md"
+PAUSE_FIXTURE_MARKER = "[pause-resume-fixture]"
+PAUSE_CALL_PREFIX = "call_fixture_pause_"
+PAUSE_WRITE_COMMAND = "printf 'METIS_PAUSE_TOOL\\n' >> ./pause-counter.log; printf 'PAUSE_COUNTER='; wc -l < ./pause-counter.log"
+PAUSE_CHECK_COMMAND = "printf 'PAUSE_COUNTER='; wc -l < ./pause-counter.log"
 ARTIFACT_EDIT_MARKER = "[artifact-edit-fixture]"
 ARTIFACT_CALL_PREFIX = "call_fixture_artifact_"
 ARTIFACT_TITLE = "点选修改验收"
@@ -183,6 +191,98 @@ def artifact_fixture_call(phase: str, number: int, body: dict, context: dict | N
             "arguments": json.dumps(arguments, ensure_ascii=False), "status": "completed"}
 
 
+def workspace_tool_results(body: dict) -> list[dict]:
+    items = body.get("input", body.get("messages", []))
+    if not isinstance(items, list):
+        return []
+    last_user = max((index for index, item in enumerate(items)
+                     if isinstance(item, dict) and item.get("role") == "user"), default=-1)
+    return [item for item in items[last_user + 1:]
+            if isinstance(item, dict) and item.get("type") == "function_call_output"
+            and str(item.get("call_id", "")).startswith(WORKSPACE_CALL_PREFIX)]
+
+
+def workspace_result_summary(result: dict, user_input: str) -> dict | None:
+    output = result.get("output")
+    if not isinstance(output, str) or result.get("is_error"):
+        return None
+    lines = output.splitlines()
+    if not lines or not Path(lines[0].strip()).is_absolute():
+        return None
+    if re.search(r"\[(?:exit status|command exceeded|blocked)|permission denied|no such file|command not found",
+                 output, re.IGNORECASE):
+        return None
+    notes = re.findall(r"\bWORKSPACE_([A-Za-z0-9_-]+)_NOTES\b", output)
+    checks = re.findall(r"\bWORKSPACE_([A-Za-z0-9_-]+)_CHECKS\b", output)
+    if len(notes) != 1 or checks != notes:
+        return None
+    expected = re.search(r"\[workspace:([A-Za-z0-9_-]+)\]", user_input)
+    if expected and expected.group(1) != notes[0]:
+        return None
+    return {"cwd": lines[0].strip(), "marker": notes[0]}
+
+
+def workspace_fixture_phase(body: dict, user_input: str) -> str | None:
+    if WORKSPACE_FIXTURE_MARKER not in user_input:
+        return None
+    results = workspace_tool_results(body)
+    if not results:
+        return "workspace_probe"
+    return "workspace_final" if workspace_result_summary(results[-1], user_input) else "workspace_failed"
+
+
+def pause_tool_results(body: dict) -> list[dict]:
+    items = body.get("input", body.get("messages", []))
+    if not isinstance(items, list):
+        return []
+    last_user = max((i for i, item in enumerate(items)
+                     if isinstance(item, dict) and item.get("role") == "user"
+                     and PAUSE_FIXTURE_MARKER in last_user_input({"input": [item]})), default=-1)
+    return [item for item in items[last_user + 1:]
+            if isinstance(item, dict) and item.get("type") == "function_call_output"
+            and str(item.get("call_id", "")).startswith(PAUSE_CALL_PREFIX)]
+
+
+def pause_user_input(body: dict) -> str | None:
+    items = body.get("input", body.get("messages", []))
+    if not isinstance(items, list):
+        return None
+    for item in reversed(items):
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        text = last_user_input({"input": [item]})
+        # METIS's actual runtime can append a synthetic contract reminder
+        # after a file mutation. It does not replace the original task.
+        if text.startswith("<system-reminder>"):
+            continue
+        return text if PAUSE_FIXTURE_MARKER in text else None
+    return None
+
+
+def pause_result_is_one(result: dict) -> bool:
+    output = result.get("output")
+    return (isinstance(output, str) and not result.get("is_error")
+            and re.fullmatch(r"PAUSE_COUNTER=\s*1\s*", output) is not None)
+
+
+def pause_fixture_phase(body: dict, user_input: str, fixture: Fixture) -> str | None:
+    if PAUSE_FIXTURE_MARKER not in user_input:
+        return None
+    results = pause_tool_results(body)
+    if not results:
+        return "pause_prepare"
+    if not pause_result_is_one(results[-1]):
+        return "pause_failed"
+    if str(results[-1]["call_id"]).startswith(PAUSE_CALL_PREFIX + "check_"):
+        return "pause_final"
+    # The first request after the actual write waits for user cancellation.
+    # A subsequent invocation must retain that tool result and may only read.
+    with fixture.lock:
+        waited = any(call["phase"] == "pause_wait" and call["input"] == user_input
+                     for call in fixture.calls)
+    return "pause_check" if waited else "pause_wait"
+
+
 def agent_fixture_phase(body: dict, user_input: str) -> str:
     """Select the opt-in, three-request Agent exchange from Responses input."""
     items = body.get("input", body.get("messages", []))
@@ -193,7 +293,7 @@ def agent_fixture_phase(body: dict, user_input: str) -> str:
     last_result = max((index for index, item in enumerate(items)
                        if isinstance(item, dict) and item.get("type") == "function_call_output"
                        and str(item.get("call_id", "")).startswith(AGENT_CALL_PREFIX)), default=-1)
-    if "[activity-fixture]" in user_input:
+    if ACTIVITY_FIXTURE_MARKER in user_input:
         results = sum(1 for item in items[last_user + 1:]
                       if isinstance(item, dict) and item.get("type") == "function_call_output"
                       and str(item.get("call_id", "")).startswith(ACTIVITY_CALL_PREFIX))
@@ -261,9 +361,14 @@ def handler_for(fixture: Fixture, *, omit_artifact_expected_version: bool = Fals
                 self.send_json({"error": {"message": "Unknown model endpoint"}}, 404)
                 return
             user_input = last_user_input(body)
+            pause_input = pause_user_input(body)
             memory_extraction = user_input.startswith("Extract any DURABLE facts from this user-assistant exchange")
             phase = ("memory_extraction" if memory_extraction else
-                     artifact_fixture_phase(body, user_input) or agent_fixture_phase(body, user_input))
+                     pause_fixture_phase(body, pause_input or user_input, fixture)
+                     or workspace_fixture_phase(body, user_input) or artifact_fixture_phase(body, user_input)
+                     or agent_fixture_phase(body, user_input))
+            if phase.startswith("pause_") and pause_input:
+                user_input = pause_input
             annotation = artifact_annotation_context(user_input) if phase.startswith("artifact_") else None
             with fixture.lock:
                 number = len(fixture.calls) + 1
@@ -277,11 +382,34 @@ def handler_for(fixture: Fixture, *, omit_artifact_expected_version: bool = Fals
                 if annotation:
                     entry["annotation"] = annotation
                 entry["tool_results"] = artifact_tool_results(body)
+            workspace_probe = phase.startswith("workspace_")
+            pause_probe = phase.startswith("pause_")
+            if pause_probe:
+                entry["tool_results"] = pause_tool_results(body)
+                entry["user_messages"] = sum(1 for item in body.get("input", [])
+                                             if isinstance(item, dict) and item.get("role") == "user"
+                                             and not last_user_input({"input": [item]}).startswith("<system-reminder>"))
+            if workspace_probe:
+                entry["tool_results"] = workspace_tool_results(body)
+                if phase == "workspace_final":
+                    entry["workspace_result"] = workspace_result_summary(entry["tool_results"][-1], user_input)
             gate_match = re.search(r"\[gate:([A-Za-z0-9_-]+)\]", user_input) if phase in ("echo", "child_stream") else None
             if phase == "parent_final":
                 gate_match = re.search(r"\[parent-gate:([A-Za-z0-9_-]+)\]", user_input)
+            if phase == "pause_wait":
+                gate_match = re.search(r"\[pause-gate:([A-Za-z0-9_-]+)\]", user_input)
             delay_match = re.search(r"\[slow:(\d+)\]", user_input) if phase in ("echo", "child_stream") else None
-            if phase == "artifact_create":
+            if phase == "pause_prepare":
+                text = "我先完成一次实际工具写入，再等待你点击暂停。"
+            elif phase == "pause_wait":
+                text = "已完成第一个工具步骤，计数为 1。现在可以点击暂停，再点击播放按钮继续验收。"
+            elif phase == "pause_check":
+                text = "已读取原会话里的工具结果。接下来只检查计数，不重复之前的写入。"
+            elif phase == "pause_final":
+                text = "恢复验收完成：原会话继续生成，实际文件计数仍为 1，已完成的工具没有重复执行。这是本机受控模型与真实 Bash 工具的验收。"
+            elif phase == "pause_failed":
+                text = "恢复验收未通过：实际工具计数异常或工具返回错误，不能声明工具未重复执行。"
+            elif phase == "artifact_create":
                 text = "我会创建一份可点选修改的静态 HTML 成果，保留真实工具调用和版本记录。"
             elif phase == "artifact_create_final":
                 text = "已创建版本 1：点选修改验收。打开产物并启用点选修改，选择“探索工作成果”，输入“把按钮改成青绿色，文案改为开始体验”。这是隔离测试模型的固定验收场景。"
@@ -293,6 +421,15 @@ def handler_for(fixture: Fixture, *, omit_artifact_expected_version: bool = Fals
                 text = f"已创建版本 {annotation['version'] + 1}。按钮已改成青绿色，文案为“开始体验”；旧版本仍可打开对比。此次验收经过真实 Artifact.read 和 Artifact.update。"
             elif phase == "artifact_edit_failed":
                 text = "未更新成果。读取、版本校验或工具执行未通过，请查看工具详情。此隔离夹具只支持点选示例中的“探索工作成果”按钮。"
+            elif phase == "workspace_probe":
+                text = "我会执行固定只读命令，核对实际工作目录和两份验收文件的目录标记。"
+            elif phase == "workspace_final":
+                summary = entry["workspace_result"]
+                text = (f"工作区验收完成。实际工具工作目录：{summary['cwd']}；"
+                        f"两份文件的标记均为 WORKSPACE_{summary['marker']}。\n\n"
+                        "这是本地受控 provider 的工作目录验收，不代表真实模型评测结果。")
+            elif phase == "workspace_failed":
+                text = "工作区验收未通过。工具返回错误、目录路径无效或文件标记不匹配；请查看实际工具详情。这是本地受控 provider 的验收，不代表真实模型评测结果。"
             elif phase == "activity_step_0":
                 text = "我先读取验收说明，再核对检查清单。执行过程会保留在本轮的折叠区域。"
             elif phase == "activity_step_1":
@@ -327,6 +464,12 @@ def handler_for(fixture: Fixture, *, omit_artifact_expected_version: bool = Fals
                                "call_id": f"{ACTIVITY_CALL_PREFIX}{number}", "name": "Read",
                                "arguments": json.dumps({"path": str(fixture.root / "workspace" / filename)}),
                                "status": "completed"})
+            if phase == "workspace_probe":
+                output.append({"type": "function_call", "id": f"fc_fixture_workspace_{number}",
+                               "call_id": f"{WORKSPACE_CALL_PREFIX}{number}", "name": "Bash",
+                               "arguments": json.dumps({"command": WORKSPACE_PROBE_COMMAND,
+                                                        "description": "Verify selected workspace path and fixture markers",
+                                                        "timeout_ms": 10000}), "status": "completed"})
             artifact_call = artifact_fixture_call(phase, number, body, annotation)
             if artifact_call:
                 if omit_artifact_expected_version and phase == "artifact_edit_update":
@@ -334,7 +477,14 @@ def handler_for(fixture: Fixture, *, omit_artifact_expected_version: bool = Fals
                     arguments.pop("expected_version", None)
                     artifact_call["arguments"] = json.dumps(arguments, ensure_ascii=False)
                 output.append(artifact_call)
-            if phase.startswith("artifact_"):
+            if phase in ("pause_prepare", "pause_check"):
+                action = "prepare" if phase == "pause_prepare" else "check"
+                output.append({"type": "function_call", "id": f"fc_fixture_pause_{number}",
+                               "call_id": f"{PAUSE_CALL_PREFIX}{action}_{number}", "name": "Bash",
+                               "arguments": json.dumps({"command": PAUSE_WRITE_COMMAND if action == "prepare" else PAUSE_CHECK_COMMAND,
+                                                        "description": "Pause/resume actual tool counter " + action,
+                                                        "timeout_ms": 10000}), "status": "completed"})
+            if phase.startswith("artifact_") or workspace_probe or pause_probe:
                 entry["tool_calls"] = [{"name": item["name"], "call_id": item["call_id"],
                                         "arguments": json.loads(item["arguments"])}
                                        for item in output if item["type"] == "function_call"]
@@ -362,7 +512,7 @@ def handler_for(fixture: Fixture, *, omit_artifact_expected_version: bool = Fals
                     self.wfile.flush()
 
                 emit("response.created", response={**envelope, "status": "in_progress", "output": []})
-                if phase.startswith(("activity_", "artifact_")):
+                if phase.startswith(("activity_", "artifact_", "workspace_")) or phase in ("pause_prepare", "pause_check", "pause_final", "pause_failed"):
                     fixture.stopped.wait(0.15)
                     item = output[0]
                     emit("response.output_item.added", output_index=0, item={**item, "status": "in_progress", "content": []})
@@ -476,6 +626,8 @@ mode = "default"
 tool = "Agent"
 [[permission.allow]]
 tool = "Read"
+[[permission.allow]]
+tool = "Bash"
 [[permission.allow]]
 tool = "Artifact"
 '''

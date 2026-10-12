@@ -2,10 +2,30 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/session"
 )
+
+// Restore repairs interrupted tool calls in memory. The checkpoint must start
+// from the actual durable history, so it cannot mistake those repairs for
+// already-saved messages. Cross the persistence barrier before provider work
+// and only then install the ordinary invocation checkpoint hooks.
+func prepareDesktopResumeCheckpoint(loop *agent.Loop, store *session.Store, id string) (*headlessCheckpoint, error) {
+	if loop == nil || store == nil || id == "" {
+		return nil, errors.New("desktop resume requires a loop and durable session")
+	}
+	_, durable, err := store.Load(id)
+	if err != nil {
+		return nil, fmt.Errorf("load desktop resume checkpoint: %w", err)
+	}
+	cursor := session.NewHistoryCursor(durable)
+	if err := store.CheckpointHistory(id, loop.History(), &cursor); err != nil {
+		return nil, fmt.Errorf("save desktop resume repair checkpoint: %w", err)
+	}
+	return newHeadlessCheckpoint(loop, store, id), nil
+}
 
 // headlessCheckpoint owns one cursor for the entire invocation, including
 // compaction and schema-correction Runs. Save may only be called before the

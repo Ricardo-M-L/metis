@@ -104,6 +104,23 @@ Stopping a root cancels its running and queued children. Kernel locks release
 execution permits after a worker crash; this does not restart abandoned jobs
 or provide durable queue recovery after the application exits.
 
+## Pause and resume a task
+
+Click **Pause** while a task is running. Once execution has stopped and its
+history has been saved, an empty composer shows **Resume**. Clicking it continues
+the same session from its saved messages and tool results without adding another
+user prompt. Typing a message or attaching an image keeps the normal Send action.
+Pausing retains follow-up messages in the open Desktop queue; they run after a
+successful continuation. The `/stop` command still clears that queue.
+
+Resume starts a new execution from saved history. It does not freeze a network
+request or operating-system command. Completed files and recorded tool results
+are preserved, and the model is instructed to check uncertain interrupted tools
+before retrying them. A resumable checkpoint survives a Desktop restart; a
+consumed checkpoint, a new input, or a Desktop history edit cannot be resumed
+again. Forked sessions start without the parent's checkpoint. A force-killed
+worker or failed save does not expose Resume.
+
 ## In-app updates
 
 The update icon beside Settings performs a read-only release check. Merely

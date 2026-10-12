@@ -132,6 +132,8 @@ function applyLanguage(value) {
   if (typeof subAgentDetailState !== 'undefined' && subAgentDetailState.agentId) renderSubAgentDetails();
   if (typeof renderSessions === 'function') renderSessions();
   if (typeof refreshMessageActionTimesLanguage === 'function') refreshMessageActionTimesLanguage();
+  if (typeof syncTurnControls === 'function') syncTurnControls();
+  if (typeof updateSendBtn === 'function') updateSendBtn();
   if (typeof window !== 'undefined' && window.metisNavigation && typeof window.metisNavigation.refresh === 'function') window.metisNavigation.refresh();
 }
 
@@ -381,6 +383,14 @@ function detectProject() {
   el.textContent = parts[0] || 'metis';
 }
 
+function refreshSelectedWorkspaceTitle(fallback) {
+  const el = document.getElementById('wsGroupName');
+  if (!el) return;
+  const selected = workspaces.find(workspace => workspace.id === activeWorkspaceId);
+  el.textContent = selected && selected.name || fallback || 'metis';
+  el.title = selected && selected.path || '';
+}
+
 function toggleSearch() {
   // Placeholder for search functionality
 }
@@ -421,6 +431,7 @@ async function pollStatus(shouldApply = () => true) {
     d.requestGeneration = generation;
     lastStatusSnapshot = d;
     renderStatusSnapshot(d);
+    if (typeof applyResumeSnapshot === 'function') applyResumeSnapshot(d, selectedSessionId);
     if (typeof applyStatusPlanSnapshot === 'function') applyStatusPlanSnapshot(d);
   } catch (_) { /* status is best-effort */ }
 }
@@ -553,7 +564,8 @@ function renderStatusSnapshot(d) {
     // batches instead of as it is produced.
     if (trackedAgent && !subAgentDetailStream && !(window && window.EventSource)) refreshSubAgentDetails();
     if (trackedAgent && subAgentDetailState.data) updateSubAgentDetailExecutionPhase();
-    if (d.workspace) {
+    if (typeof refreshSelectedWorkspaceTitle === 'function') refreshSelectedWorkspaceTitle(d.workspace);
+    else if (d.workspace) {
       const pn = document.getElementById('wsGroupName');
       if (pn) pn.textContent = d.workspace;
     }

@@ -42,6 +42,7 @@ function fixture() {
     document: {getElementById: id => id === 'inputField' ? input : null},
     currentSessionId:'S', runningSessionId:'S', turnRunning:true, pendingAsk:null,
     attachments:[], queuedTurns:[], queuedSessionId:null, queuedTurnMenuIndex:-1,
+    pausedQueueSessions:new Set(), pendingStopSessions:new Set(),
     drainingQueuedTurns:false, desktopPreferences:{busyEnter:'queue'},
     sessions:[{id:'S', title:'Old title'}, {id:'B', title:'Other title'}],
     COMPOSER_COMMANDS:[{name:'/rename'}, {name:'/title'}],
@@ -58,6 +59,7 @@ function fixture() {
     submitBusyInput:async()=>{throw new Error('rename went through the busy message queue');},
   };
   vm.createContext(c);
+  vm.runInContext(extract('function isSessionQueuePaused(', 'function parallelTurnsEnabled('), c);
   vm.runInContext(extract('async function sendMessage(', 'async function submitBusyInput('), c);
   vm.runInContext(extract('async function drainQueuedTurns(', 'async function syncViewedSessionHistory('), c);
   vm.runInContext(extract('async function runTurnItem(', 'const MESSAGE_ACTION_ICONS'), c);

@@ -56,8 +56,13 @@ type Header struct {
 	// states (approval, question, delegation) remain process-local, while this
 	// field lets Desktop distinguish completed, stopped, failed, and an
 	// interrupted running session after restart.
-	Status      string      `json:"status,omitempty"`
-	AlwaysAllow []SavedRule `json:"always_allow,omitempty"`
+	Status string `json:"status,omitempty"`
+	// ResumeToken authorizes continuing a durably checkpointed, stopped Desktop
+	// turn without appending a user message. ClearResumeToken is its append-only
+	// tombstone; a running/new turn must consume the old token before work starts.
+	ResumeToken      string      `json:"resume_token,omitempty"`
+	ClearResumeToken bool        `json:"clear_resume_token,omitempty"`
+	AlwaysAllow      []SavedRule `json:"always_allow,omitempty"`
 	// ClearAlwaysAllow is an append-only tombstone used when a later header
 	// must remove every previously persisted interactive grant.
 	ClearAlwaysAllow bool   `json:"clear_always_allow,omitempty"`

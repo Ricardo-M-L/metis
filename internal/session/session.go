@@ -544,6 +544,12 @@ func mergeHeader(dst *Header, src *Header) {
 	if src.Status != "" {
 		dst.Status = src.Status
 	}
+	if src.ClearResumeToken {
+		dst.ResumeToken = ""
+		dst.ClearResumeToken = false
+	} else if src.ResumeToken != "" {
+		dst.ResumeToken = src.ResumeToken
+	}
 	if src.ClearAlwaysAllow {
 		dst.AlwaysAllow = nil
 		dst.ClearAlwaysAllow = false

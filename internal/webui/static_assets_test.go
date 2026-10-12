@@ -77,7 +77,7 @@ func TestStaticAssetsServed(t *testing.T) {
 	if strings.Contains(sessionsScript, ">Open in new window</button>") {
 		t.Fatal("workspace context menu still contains the retired Open in new window action")
 	}
-	for _, want := range []string{"removedWorkspaceIDs", "data.removedIds", ">Remove from list</button>"} {
+	for _, want := range []string{"removedWorkspaceIDs", "data.removedIds", "uiText('Remove from list', '从列表移除')"} {
 		if !strings.Contains(sessionsScript, want) {
 			t.Fatalf("sessions.js missing workspace removal behavior %q", want)
 		}
@@ -914,7 +914,7 @@ func TestRunningTurnCanBeViewedInBackgroundAndStoppedBySession(t *testing.T) {
 	for _, want := range []string{
 		"let runningSessionId = null;",
 		"function detachRunningTurnView()",
-		"body: JSON.stringify({ sessionId: runningSessionId })",
+		"body: JSON.stringify({ sessionId: stoppedSessionId })",
 		"const turnSessionId = currentSessionId;",
 		"currentSessionId === turnSessionId",
 	} {

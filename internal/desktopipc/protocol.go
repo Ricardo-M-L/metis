@@ -27,6 +27,7 @@ const (
 	TypeSteerResult        = "steer_result"
 	TypeStopSubAgent       = "stop_subagent"
 	TypeStopSubAgentResult = "stop_subagent_result"
+	TypeCheckpoint         = "checkpoint"
 )
 
 type Message struct {
@@ -36,11 +37,12 @@ type Message struct {
 	Event   *Event  `json:"event,omitempty"`
 	Status  *Status `json:"status,omitempty"`
 	// Always encode the decision: an omitted field must not silently mean allow.
-	Decision agent.PermissionDecision `json:"decision"`
-	Answer   string                   `json:"answer,omitempty"`
-	Input    string                   `json:"input,omitempty"`
-	Accepted bool                     `json:"accepted"`
-	AgentID  string                   `json:"agentId,omitempty"`
+	Decision     agent.PermissionDecision `json:"decision"`
+	Answer       string                   `json:"answer,omitempty"`
+	Input        string                   `json:"input,omitempty"`
+	Accepted     bool                     `json:"accepted"`
+	AgentID      string                   `json:"agentId,omitempty"`
+	Checkpointed bool                     `json:"checkpointed,omitempty"`
 }
 
 // Event deliberately lists wire fields rather than embedding agent.Event,
@@ -200,6 +202,10 @@ func validate(message Message) error {
 		return fmt.Errorf("unsupported desktop worker protocol version %d", message.Version)
 	}
 	switch message.Type {
+	case TypeCheckpoint:
+		if !message.Checkpointed || message.Event != nil || message.Status != nil || message.ID != "" || message.Input != "" || message.AgentID != "" {
+			return errors.New("invalid desktop worker checkpoint")
+		}
 	case TypeStopSubAgent, TypeStopSubAgentResult:
 		if message.ID == "" || message.Event != nil || message.Status != nil || message.Input != "" ||
 			message.AgentID == "" || message.AgentID != strings.TrimSpace(message.AgentID) ||

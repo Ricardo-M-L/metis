@@ -132,7 +132,7 @@ c.currentSessionId = 'A';
         json: async () => ({sessionId:'A', stopped:outcome === 'stopped', error:'HTTP/2 stream INTERNAL_ERROR'}) };
     };
     const succeeded = await c.runTurnItem({text:'Continue'});
-    assert.equal(succeeded, outcome === 'done' || outcome === 'stopped', outcome);
+    assert.equal(succeeded, outcome === 'done', outcome);
     assert.equal(c.turnRunning, false, outcome + ' releases the run');
     assertStopped(outcome + ' settles the plan without fabricating completion');
   }

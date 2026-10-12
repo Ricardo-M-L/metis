@@ -25,6 +25,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/channels"
 	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/desktopipc"
 	"github.com/Ricardo-M-L/metis/internal/exitcode"
 	"github.com/Ricardo-M-L/metis/internal/helpdocs"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
@@ -316,7 +317,7 @@ func earlyGlobalFlagTakesValue(name string) bool {
 
 func earlyGlobalBoolFlag(name string) bool {
 	switch name {
-	case "--no-markdown", "--no-stream", "--streamlined", "--desktop-worker", "-c", "--continue",
+	case "--no-markdown", "--no-stream", "--streamlined", "--desktop-worker", "--desktop-resume-turn", "-c", "--continue",
 		"--tui", "--no-auth-wizard", "--fast", "-W", "-d", "--debug", "--bare",
 		"--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox",
 		"--coordinator", "--agent-teams", "--tmux", "--auto-memory", "--cache",
@@ -873,30 +874,31 @@ const (
 )
 
 type cliFlags struct {
-	model         string
-	provider      string
-	modelSet      bool // true when --model/-m was present, even with an empty value
-	providerSet   bool // true when --provider/-p was present, even with an empty value
-	mode          string
-	noMarkdown    bool
-	noStream      bool // reserved compatibility flag; currently no runtime effect
-	streamlined   bool // --streamlined: distillation-resistant output (thinking stripped, tools summarized)
-	desktopWorker bool // private native Desktop JSONL event/reply transport
-	maxIter       int
-	maxBudgetUSD  float64 // --max-budget-usd: session USD spend cap (0 = unlimited)
-	system        string
-	systemSet     bool // true when --system was present, even with an empty value
-	resumeID      string
-	newSessionID  string // internal/native-client hook: choose ID for a fresh run
-	cont          bool   // -c / --continue: pick up the most recently modified session
-	useTUI        bool
-	noAuthWizard  bool   // skip the first-run wizard (CI / scripted use)
-	effort        string // "low" | "medium" | "high" — Anthropic thinking budget / OpenAI reasoning_effort
-	fast          bool   // collapse one turn: effort=low + halved max_tokens
-	addDirs       stringList
-	agentProfile  string // --agent=NAME — load .metis/agents/<name>.md
-	worktree      string // --worktree=slug — spin up git worktree with explicit slug
-	worktreeOn    bool   // -W — spin up worktree with auto slug
+	model             string
+	provider          string
+	modelSet          bool // true when --model/-m was present, even with an empty value
+	providerSet       bool // true when --provider/-p was present, even with an empty value
+	mode              string
+	noMarkdown        bool
+	noStream          bool // reserved compatibility flag; currently no runtime effect
+	streamlined       bool // --streamlined: distillation-resistant output (thinking stripped, tools summarized)
+	desktopWorker     bool // private native Desktop JSONL event/reply transport
+	desktopResumeTurn bool // private Desktop continuation without new user input
+	maxIter           int
+	maxBudgetUSD      float64 // --max-budget-usd: session USD spend cap (0 = unlimited)
+	system            string
+	systemSet         bool // true when --system was present, even with an empty value
+	resumeID          string
+	newSessionID      string // internal/native-client hook: choose ID for a fresh run
+	cont              bool   // -c / --continue: pick up the most recently modified session
+	useTUI            bool
+	noAuthWizard      bool   // skip the first-run wizard (CI / scripted use)
+	effort            string // "low" | "medium" | "high" — Anthropic thinking budget / OpenAI reasoning_effort
+	fast              bool   // collapse one turn: effort=low + halved max_tokens
+	addDirs           stringList
+	agentProfile      string // --agent=NAME — load .metis/agents/<name>.md
+	worktree          string // --worktree=slug — spin up git worktree with explicit slug
+	worktreeOn        bool   // -W — spin up worktree with auto slug
 
 	// --debug / -d: write a verbose trace to ~/.metis/debug.log alongside
 	// METIS_DEBUG=1's stderr output. Doesn't change visible behavior; just
@@ -1084,6 +1086,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.BoolVar(&out.noStream, "no-stream", false, "reserved compatibility flag (currently no runtime effect)")
 	f.BoolVar(&out.streamlined, "streamlined", false, "distillation-resistant output: drop thinking, collapse tool calls into cumulative summaries (per-call override of [ui] streamlined_output)")
 	f.BoolVar(&out.desktopWorker, "desktop-worker", false, "internal Desktop worker event transport")
+	f.BoolVar(&out.desktopResumeTurn, "desktop-resume-turn", false, "internal Desktop continuation of a stopped turn")
 	f.IntVar(&out.maxIter, "max-iter", 0, "max tool iterations per turn")
 	f.Float64Var(&out.maxBudgetUSD, "max-budget-usd", 0, "stop the session once cumulative LLM spend reaches this many USD (0 = unlimited)")
 	f.StringVar(&out.system, "system", "", "override system prompt")
@@ -1181,6 +1184,9 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	})
 	if out.agentTeams {
 		out.coordinator = true
+	}
+	if err := validateDesktopResumeFlags(out, f.Args()); err != nil {
+		return nil, nil, err
 	}
 	return out, f.Args(), nil
 }
@@ -2306,6 +2312,9 @@ func cmdChat(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if flags.desktopResumeTurn {
+		return errors.New("--desktop-resume-turn is only supported by metis run")
+	}
 	flags.autoMemoryStartup = autoMemoryStartupInteractive
 	var confirmTrust func() error
 	if term.IsTerminal(int(os.Stdin.Fd())) {
@@ -2476,7 +2485,7 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 			returnErr = errors.Join(returnErr, worker.Err())
 		}()
 	}
-	if len(rest) == 0 && !flags.preflightOnly {
+	if len(rest) == 0 && !flags.preflightOnly && !flags.desktopResumeTurn {
 		return errors.New("run: prompt is required")
 	}
 	if flags.preflightOnly {
@@ -2598,31 +2607,55 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 		llmPrompt = llmPrompt + "\n\n" + schemaEnforcer.Instruction()
 		rt.loop.ResponseFormat = schemaEnforcer.ResponseFormat()
 	}
-	checkpoint := newHeadlessCheckpoint(rt.loop, rt.store, rt.sessionID)
+	var checkpoint *headlessCheckpoint
+	if flags.desktopResumeTurn {
+		checkpoint, err = prepareDesktopResumeCheckpoint(rt.loop, rt.store, rt.sessionID)
+		if err != nil {
+			return err
+		}
+		// This reminder belongs to this worker invocation. History and the
+		// persisted system header continue to describe the original user turn.
+		applyDesktopResumeTurnReminder(rt.loop)
+	} else {
+		checkpoint = newHeadlessCheckpoint(rt.loop, rt.store, rt.sessionID)
+	}
 	// Flush once more after the producer has joined on every return path,
 	// including schema retries and errors. The same cursor is used by Run's
 	// synchronous checkpoints and compaction, so this final save is idempotent.
 	defer func() {
 		if err := checkpoint.Save(); err != nil {
 			returnErr = errors.Join(returnErr, fmt.Errorf("save headless session checkpoint: %w", err))
+			return
+		}
+		if worker != nil {
+			if err := worker.encoder.Encode(desktopipc.Message{Version: desktopipc.Version, Type: desktopipc.TypeCheckpoint, Checkpointed: true}); err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("report headless session checkpoint: %w", err))
+			}
 		}
 	}()
-	rt.loop.AppendUser(llmPrompt)
-	if rt.store != nil && rt.sessionID != "" {
-		if err := rt.store.AppendMessage(rt.sessionID, llm.Message{
-			Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: prompt}},
-		}); err != nil {
-			return fmt.Errorf("save headless session prompt: %w", err)
+	if !flags.desktopResumeTurn {
+		if rt.store != nil && rt.sessionID != "" {
+			if err := rt.store.InvalidateDesktopResume(rt.sessionID); err != nil {
+				return fmt.Errorf("invalidate desktop resume before new input: %w", err)
+			}
 		}
-		// The loop intentionally sees llmPrompt (subdir hints / schema
-		// contract), while the exported transcript keeps the raw prompt.
-		// The first producer checkpoint fsyncs this corresponding position.
-		checkpoint.MarkPrompt(llmPrompt, prompt)
+		rt.loop.AppendUser(llmPrompt)
+		if rt.store != nil && rt.sessionID != "" {
+			if err := rt.store.AppendMessage(rt.sessionID, llm.Message{
+				Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: prompt}},
+			}); err != nil {
+				return fmt.Errorf("save headless session prompt: %w", err)
+			}
+			// The loop intentionally sees llmPrompt (subdir hints / schema
+			// contract), while the exported transcript keeps the raw prompt.
+			// The first producer checkpoint fsyncs this corresponding position.
+			checkpoint.MarkPrompt(llmPrompt, prompt)
+		}
+		rtpkg.RecordUserInput(rt.sessionID, []llm.ContentBlock{{Type: "text", Text: prompt}})
+		_ = rtpkg.AppendHistory(rtpkg.HistoryEntry{
+			SessionID: rt.sessionID, Input: prompt, Source: "run",
+		})
 	}
-	rtpkg.RecordUserInput(rt.sessionID, []llm.ContentBlock{{Type: "text", Text: prompt}})
-	_ = rtpkg.AppendHistory(rtpkg.HistoryEntry{
-		SessionID: rt.sessionID, Input: prompt, Source: "run",
-	})
 
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)

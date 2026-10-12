@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -120,6 +121,8 @@ type Server struct {
 	activePreset           string
 	activeSystemPromptKind string
 	activeWorkDir          string
+	selectedWorkDir        string // Per-window navigation; does not rebind running turns.
+	selectedWorkspaceEpoch uint64
 	freshWorkDir           string
 	memoryBinding          *rtpkg.WorkspaceMemoryBinding
 	memoryBindingErr       error
@@ -415,6 +418,7 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		activePreset:            binding.PresetName,
 		activeSystemPromptKind:  binding.FreshSystemPromptKind,
 		activeWorkDir:           initialWorkDir,
+		selectedWorkDir:         workspacePathKey(initialWorkDir),
 		freshWorkDir:            launchWorkDir,
 		freshProviderName:       binding.ProviderName,
 		freshPermissionMode:     binding.FreshPermissionMode,
@@ -470,6 +474,7 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 			// until then no Memory/AllowedDirs split state is published.
 			initialWorkDir = launchWorkDir
 			server.activeWorkDir = launchWorkDir
+			server.selectedWorkDir = workspacePathKey(launchWorkDir)
 		}
 	}
 	if loop != nil {
@@ -686,6 +691,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/workspaces/remove", s.handleWorkspaceRemove)
 	mux.HandleFunc("/api/workspaces/reorder", s.handleWorkspaceReorder)
 	mux.HandleFunc("/api/workspaces/open", s.handleWorkspaceOpen)
+	mux.HandleFunc("/api/workspaces/select", s.handleWorkspaceSelect)
 	mux.HandleFunc("/api/providers", s.handleProviders)
 	mux.HandleFunc("/api/providers/default", s.handleProviderDefault)
 	mux.HandleFunc("/api/providers/validate", s.handleProviderValidate)
@@ -1201,20 +1207,29 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"sessions": items[cursor:end], "nextCursor": nextCursor, "total": len(items)})
 	case http.MethodPost:
+		var body struct {
+			Model       string `json:"model"`
+			WorkspaceID string `json:"workspaceId"`
+		}
+		if r.Body != nil {
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+				writeError(w, http.StatusBadRequest, "invalid body")
+				return
+			}
+		}
+		workDir, status, err := s.freshTaskWorkspace(body.WorkspaceID)
+		if err != nil {
+			writeError(w, status, err.Error())
+			return
+		}
 		s.stateMu.RLock()
 		header := session.Header{
 			Provider: s.freshProviderName, Model: s.freshModel, System: s.freshSystem,
-			SystemPromptKind: s.freshSystemPromptKind, WorkDir: s.freshWorkDir,
+			SystemPromptKind: s.freshSystemPromptKind, WorkDir: workDir,
 			Mode: string(s.freshPermissionMode), Preset: s.freshPreset, Status: "idle",
 		}
 		s.stateMu.RUnlock()
 		model := header.Model
-		var body struct {
-			Model string `json:"model"`
-		}
-		if r.Body != nil {
-			_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body)
-		}
 		if body.Model != "" {
 			model = body.Model
 		}
@@ -1233,13 +1248,13 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "desktop is shutting down")
 			return
 		}
-		err := s.store.WriteHeaderFull(header)
+		err = s.store.WriteHeaderFull(header)
 		s.cancelMu.Unlock()
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to create session")
 			return
 		}
-		writeJSON(w, http.StatusCreated, sessionItem{ID: id, Title: "Untitled", Model: model, Status: "idle", CreatedAt: createdAt, UpdatedAt: createdAt})
+		writeJSON(w, http.StatusCreated, sessionItem{ID: id, Title: "Untitled", Model: model, WorkDir: header.WorkDir, WorkspaceID: workspaceIDForPath(header.WorkDir), Status: "idle", CreatedAt: createdAt, UpdatedAt: createdAt})
 	default:
 		w.Header().Set("Allow", "GET, POST")
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1266,11 +1281,14 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"session": sessionItem{
-		ID: id, Title: hdr.Title, Model: hdr.Model, WorkDir: hdr.WorkDir, WorkspaceID: workspaceIDForPath(hdr.WorkDir), Mode: hdr.Mode,
+	workspace := s.sessionWorkspaceView(hdr, "")
+	payload := map[string]any{"session": sessionItem{
+		ID: id, Title: hdr.Title, Model: hdr.Model, WorkDir: workspace.Path, WorkspaceID: workspace.ID, Mode: hdr.Mode,
 		Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status,
 		Archived: s.store.IsArchived(id), CreatedAt: hdr.CreatedAt,
-	}, "messages": agent.PresentationHistory(messages)})
+	}, "messages": agent.PresentationHistory(messages), "workspace": workspace}
+	s.addDesktopResumeSnapshot(payload, id)
+	writeJSON(w, http.StatusOK, payload)
 }
 
 // handleSessionDelete permanently removes one session and every Metis-owned
@@ -1555,6 +1573,9 @@ func (s *Server) handleSessionActivate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "valid session id is required")
 		return
 	}
+	s.stateMu.RLock()
+	selectionEpoch := s.selectedWorkspaceEpoch
+	s.stateMu.RUnlock()
 	if !s.runMu.TryLock() {
 		s.cancelMu.Lock()
 		runningSessionID := s.runningSession
@@ -1581,10 +1602,17 @@ func (s *Server) handleSessionActivate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "failed to activate session: "+err.Error())
 		return
 	}
+	// Only explicit navigation updates the selected folder. A queued turn's
+	// execution activation must not replace a newer workspace selection.
+	s.stateMu.RLock()
+	selectedWorkDir := s.activeWorkDir
+	s.stateMu.RUnlock()
+	s.selectWorkspacePathIfCurrent(selectedWorkDir, selectionEpoch)
+	workspace := s.sessionWorkspaceView(hdr, selectedWorkDir)
 	writeJSON(w, http.StatusOK, map[string]any{"session": sessionItem{
-		ID: body.ID, Title: hdr.Title, Model: hdr.Model, WorkDir: hdr.WorkDir, WorkspaceID: workspaceIDForPath(hdr.WorkDir),
+		ID: body.ID, Title: hdr.Title, Model: hdr.Model, WorkDir: workspace.Path, WorkspaceID: workspace.ID,
 		Mode: hdr.Mode, Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status, Archived: s.store.IsArchived(body.ID), CreatedAt: hdr.CreatedAt,
-	}, "messages": agent.PresentationHistory(history)})
+	}, "messages": agent.PresentationHistory(history), "workspace": workspace})
 }
 
 func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
@@ -1598,16 +1626,32 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		SessionID string `json:"sessionId"`
-		Input     string `json:"input"`
-		Images    []struct {
+		SessionID   string `json:"sessionId"`
+		WorkspaceID string `json:"workspaceId"`
+		Resume      bool   `json:"resume"`
+		ResumeToken string `json:"resumeToken"`
+		Input       string `json:"input"`
+		Images      []struct {
 			MediaType string `json:"mediaType"`
 			Data      string `json:"data"`
 		} `json:"images"`
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 12<<20))
-	if err := dec.Decode(&body); err != nil {
+	rawBody, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 12<<20))
+	if readErr != nil || json.Unmarshal(rawBody, &body) != nil {
 		writeError(w, http.StatusBadRequest, "input is required")
+		return
+	}
+	if body.Resume {
+		var fields map[string]json.RawMessage
+		_ = json.Unmarshal(rawBody, &fields)
+		_, inputPresent := fields["input"]
+		_, imagesPresent := fields["images"]
+		if body.SessionID == "" || body.ResumeToken == "" || inputPresent || imagesPresent {
+			writeError(w, http.StatusBadRequest, "resume requires an existing session and resumeToken, without input or images")
+			return
+		}
+	} else if body.ResumeToken != "" {
+		writeError(w, http.StatusBadRequest, "resumeToken requires resume")
 		return
 	}
 	// Image attachments: base64-decoded, sanity-capped, and only
@@ -1627,7 +1671,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	if len(imgBlocks) > 6 {
 		imgBlocks = imgBlocks[:6]
 	}
-	if strings.TrimSpace(body.Input) == "" && len(imgBlocks) == 0 {
+	if !body.Resume && strings.TrimSpace(body.Input) == "" && len(imgBlocks) == 0 {
 		writeError(w, http.StatusBadRequest, "input is required")
 		return
 	}
@@ -1635,10 +1679,20 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid session id")
 		return
 	}
+	newWorkDir := ""
+	if body.SessionID == "" {
+		var status int
+		var err error
+		newWorkDir, status, err = s.freshTaskWorkspace(body.WorkspaceID)
+		if err != nil {
+			writeError(w, status, err.Error())
+			return
+		}
+	}
 	// Reduced embedders do not install an isolated runner. Preserve their
 	// established runMu-before-session-allocation ordering, including the
 	// shutdown guarantee that a queued request cannot create a ghost session.
-	legacyPrelocked := s.isolatedRunner == nil
+	legacyPrelocked := s.isolatedRunner == nil && body.SessionID == ""
 	if legacyPrelocked {
 		s.runMu.Lock()
 		defer s.runMu.Unlock()
@@ -1649,7 +1703,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	var lease *TurnLease
 	if body.SessionID == "" {
 		s.stateMu.RLock()
-		workDir := s.freshWorkDir
+		workDir := newWorkDir
 		providerName := s.freshProviderName
 		model := s.freshModel
 		system := s.freshSystem
@@ -1702,6 +1756,15 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The lock spans admission, worker cleanup and persistence. It is acquired
+	// before loading a token, so another Desktop instance cannot validate the
+	// same stopped checkpoint and queue a duplicate continuation.
+	turnLock, err := s.store.AcquireTurnLock(r.Context(), body.SessionID)
+	if err != nil {
+		writeError(w, http.StatusRequestTimeout, "turn cancelled while waiting for its session: "+err.Error())
+		return
+	}
+	defer turnLock.Release()
 
 	t0 := time.Now()
 	hdr, history, err := s.store.Load(body.SessionID)
@@ -1728,12 +1791,27 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	defer lease.Release()
+	// Consume only after the workspace queue wait. A stale token cannot start
+	// even if it was valid when this HTTP request first arrived.
+	if err := s.store.StartDesktopTurn(body.SessionID, body.ResumeToken, body.Resume); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, session.ErrResumeUnavailable) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	hdr, history, err = s.store.Load(body.SessionID)
+	if err != nil || hdr == nil {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
 
 	// Image inputs currently retain the in-process path. Text turns in every
 	// valid permission mode use a fresh process; interactive replies are routed
 	// through that worker's private channel without changing its permission policy.
 	if len(imgBlocks) == 0 && s.isolatedRunner != nil && s.isolatedRunner.Eligible(hdr) {
-		s.handleIsolatedTurn(w, r, body.SessionID, body.Input, turnWorkDir)
+		s.handleIsolatedTurn(w, r, body.SessionID, body.Input, turnWorkDir, body.Resume)
 		return
 	}
 
@@ -1829,20 +1907,22 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		user.Content = append(user.Content, llm.ContentBlock{Type: "text", Text: input})
 	}
 	user.Content = append(user.Content, imgBlocks...)
-	rtpkg.RecordUserInput(body.SessionID, user.Content)
-	if len(imgBlocks) > 0 {
-		modelBlocks := make([]llm.ContentBlock, 0, len(user.Content))
-		if modelInput != "" {
-			modelBlocks = append(modelBlocks, llm.ContentBlock{Type: "text", Text: modelInput})
+	if !body.Resume {
+		rtpkg.RecordUserInput(body.SessionID, user.Content)
+		if len(imgBlocks) > 0 {
+			modelBlocks := make([]llm.ContentBlock, 0, len(user.Content))
+			if modelInput != "" {
+				modelBlocks = append(modelBlocks, llm.ContentBlock{Type: "text", Text: modelInput})
+			}
+			modelBlocks = append(modelBlocks, imgBlocks...)
+			s.loop.AppendUserBlocks(modelBlocks)
+		} else {
+			s.loop.AppendUser(modelInput)
 		}
-		modelBlocks = append(modelBlocks, imgBlocks...)
-		s.loop.AppendUserBlocks(modelBlocks)
-	} else {
-		s.loop.AppendUser(modelInput)
-	}
-	if err := s.store.AppendMessage(body.SessionID, user); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to persist input")
-		return
+		if err := s.store.AppendMessage(body.SessionID, user); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to persist input")
+			return
+		}
 	}
 	if len(history) == 0 {
 		title := []rune(input)
@@ -1851,7 +1931,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = s.store.SetTitle(body.SessionID, string(title))
 	}
-	text, runErr, status, mayContinue := s.runAndPersistTurn(turnCtx, body.SessionID, messageMetric)
+	text, runErr, status, mayContinue := s.runAndPersistTurn(turnCtx, body.SessionID, messageMetric, body.Resume)
 	if errors.Is(runErr, context.Canceled) {
 		writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text, "stopped": true})
 		return
@@ -1870,7 +1950,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 // metis process. The separate process gives its Loop, provider, tool registry,
 // cwd scope, task routers and memory binding private ownership; this is the
 // safety boundary that makes Desktop parallelism possible.
-func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sessionID, input, workDir string) {
+func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sessionID, input, workDir string, resume ...bool) {
 	if s == nil || s.isolatedRunner == nil || s.store == nil {
 		writeError(w, http.StatusServiceUnavailable, "isolated turn runtime unavailable")
 		return
@@ -1945,6 +2025,7 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 		SessionID: sessionID,
 		WorkDir:   workDir,
 		Input:     input,
+		Resume:    len(resume) > 0 && resume[0],
 		Steer:     steer,
 		OnStatus:  func(status desktopipc.Status) { s.setWorkerSnapshot(sessionID, status) },
 		OnEvent: func(ev agent.Event) {
@@ -1963,18 +2044,24 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 	s.reconcilePersistedTraceUsage(sessionID)
 	s.finishWorkerSnapshot(sessionID, err != nil, errors.Is(err, context.Canceled) || result.Stopped)
 	if errors.Is(err, context.Canceled) || result.Stopped {
-		_ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "stopped"})
+		if persistErr := s.store.FinishDesktopTurn(sessionID, "stopped", result.Checkpointed); persistErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to persist stopped checkpoint: "+persistErr.Error())
+			return
+		}
 		s.hub.publish(sessionID, agent.Event{Kind: agent.EventLoopDone, StopReason: "stopped"})
 		writeJSON(w, http.StatusOK, map[string]any{"sessionId": sessionID, "text": result.Text, "stopped": true})
 		return
 	}
 	if err != nil {
-		_ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "failed"})
+		_ = s.store.FinishDesktopTurn(sessionID, "failed", false)
 		s.hub.publish(sessionID, agent.Event{Kind: agent.EventError, Err: err})
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	_ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: "completed"})
+	if persistErr := s.store.FinishDesktopTurn(sessionID, "completed", result.Checkpointed); persistErr != nil {
+		writeError(w, http.StatusInternalServerError, "failed to persist turn completion: "+persistErr.Error())
+		return
+	}
 	// CLI output is streamed directly. Prefer the durable transcript if a
 	// provider used a response format whose stdout is intentionally suppressed.
 	if result.Text == "" {
@@ -2009,7 +2096,7 @@ func latestAssistantText(history []llm.Message) string {
 // runAndPersistTurn is shared by explicit prompts and background-job resumptions.
 // The caller owns runMu and the registered cancellation slot. A resumption does
 // not invent a user message; Loop remains the sole job-notification consumer.
-func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, messageMetric session.MessageMetric) (string, error, int, bool) {
+func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, messageMetric session.MessageMetric, resume ...bool) (string, error, int, bool) {
 	defer s.cancelSessionInteractions(sessionID)
 	// The user-facing prompt written above can intentionally differ from the
 	// loop-only message (for example a synthetic plan reminder). Anchor the
@@ -2017,7 +2104,28 @@ func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, me
 	// that display-safe on-disk prompt, while still detecting a later history
 	// replacement caused by automatic compaction.
 	persistedBoundary := s.loop.History()
+	resuming := len(resume) > 0 && resume[0]
+	if resuming {
+		_, durable, err := s.store.Load(sessionID)
+		if err != nil {
+			return "", err, http.StatusInternalServerError, false
+		}
+		persistedBoundary = durable
+		restoreReminder := applyDesktopResumeReminder(s.loop)
+		defer restoreReminder()
+	}
 	historyCursor := session.NewHistoryCursor(persistedBoundary)
+	if resuming {
+		if err := s.store.CheckpointHistory(sessionID, s.loop.History(), &historyCursor); err != nil {
+			_ = s.store.FinishDesktopTurn(sessionID, "failed", false)
+			return "", fmt.Errorf("failed to persist resumed history: %w", err), http.StatusInternalServerError, false
+		}
+	}
+	previousHistoryCheckpoint := s.loop.HistoryCheckpoint
+	s.loop.HistoryCheckpoint = func(history []llm.Message) error {
+		return s.store.CheckpointHistory(sessionID, history, &historyCursor)
+	}
+	defer func() { s.loop.HistoryCheckpoint = previousHistoryCheckpoint }()
 	previousCheckpoint := s.loop.CompactionCheckpoint
 	s.loop.CompactionCheckpoint = func(before, after []llm.Message) error {
 		return s.store.CheckpointCompaction(sessionID, before, after, &historyCursor)
@@ -2027,7 +2135,6 @@ func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, me
 		return "", err, http.StatusInternalServerError, false
 	}
 	finalStatus := "failed"
-	defer func() { _ = s.store.WriteHeaderFull(session.Header{ID: sessionID, Status: finalStatus}) }()
 
 	turnCtx, traceOrigin := rtpkg.BindTraceTurn(turnCtx, sessionID)
 	if traceOrigin.Turn > 0 {
@@ -2126,9 +2233,16 @@ func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, me
 	// produced after it, while still falling back to history_replace for any
 	// other same-length prefix rewrite. Persist before handling Run errors so
 	// completed tool rounds and orphan repairs survive cancellation/failure.
-	persistErr := s.store.AppendHistoryTail(sessionID, updated, &historyCursor)
+	persistErr := s.store.CheckpointHistory(sessionID, updated, &historyCursor)
 	if persistErr != nil {
+		_ = s.store.FinishDesktopTurn(sessionID, "failed", false)
 		return text.String(), fmt.Errorf("failed to persist turn history: %w", persistErr), http.StatusInternalServerError, false
+	}
+	if runErr == nil {
+		finalStatus = "completed"
+	}
+	if persistErr := s.store.FinishDesktopTurn(sessionID, finalStatus, true); persistErr != nil {
+		return text.String(), fmt.Errorf("failed to persist turn status: %w", persistErr), http.StatusInternalServerError, false
 	}
 	if errors.Is(runErr, context.Canceled) {
 		return text.String(), runErr, http.StatusOK, false
@@ -2136,7 +2250,6 @@ func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, me
 	if runErr != nil {
 		return text.String(), runErr, http.StatusBadGateway, false
 	}
-	finalStatus = "completed"
 	return text.String(), nil, http.StatusOK, completionReason == "end_turn"
 }
 
@@ -3162,6 +3275,11 @@ func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 	newHeader := *hdr
 	newHeader.ID = newID
 	newHeader.CreatedAt = time.Now()
+	// A branch is a fresh turn lifetime. The parent's stopped checkpoint and
+	// its one-use continuation token authorize only the parent session.
+	newHeader.Status = "idle"
+	newHeader.ResumeToken = ""
+	newHeader.ClearResumeToken = false
 	// A branch copies conversation/model lineage, not the parent's permission
 	// lifetime. Start it from the invocation baseline and clear plan ancestry
 	// plus every session-scoped always-allow grant.
@@ -3598,6 +3716,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	agentDetails := make([]map[string]any, 0)
 	s.stateMu.RLock()
 	activeSessionID := s.activeSessionID
+	selectedWorkDir := s.selectedWorkDir
 	s.stateMu.RUnlock()
 	if s.roster != nil {
 		for _, teammate := range s.roster.List() {
@@ -3646,8 +3765,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	workspace := "metis"
-	if wd, err := os.Getwd(); err == nil {
-		workspace = filepath.Base(wd)
+	if selectedWorkDir != "" {
+		workspace = workspaceDisplayName(selectedWorkDir, "")
 	}
 	selectedContextSessionID := activeSessionID
 	if viewSessionID != "" {
@@ -3721,7 +3840,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	executionStrategy := executionStrategyForStatus(len(planItems), subAgents, namedAgents)
 	payload := map[string]any{
 		"subAgents": subAgents, "backgroundTasks": backgroundTasks, "workspace": workspace,
-		"agents": agentDetails, "jobs": jobDetails,
+		"activeWorkspaceId": workspaceIDForPath(selectedWorkDir),
+		"agents":            agentDetails, "jobs": jobDetails,
 		"toolCount": len(toolNames), "tools": toolNames,
 		"contextUsed": contextStatus.used, "contextWindow": contextStatus.window, "compactThreshold": contextStatus.compactThreshold,
 		"compactAtTokens": contextStatus.compactAtTokens,
@@ -3755,6 +3875,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		payload["viewRoster"] = viewRoster
 	}
+	resumeSessionID := viewSessionID
+	if resumeSessionID == "" {
+		resumeSessionID = activeSessionID
+	}
+	s.addDesktopResumeSnapshot(payload, resumeSessionID)
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -4204,7 +4329,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		s.cancelSessionInteractions(workerID)
 		select {
 		case <-worker.done:
-			writeJSON(w, http.StatusOK, map[string]any{"stopped": true, "sessionId": workerID})
+			s.writeDesktopResumeJSON(w, http.StatusOK, workerID, map[string]any{"stopped": true, "sessionId": workerID})
 		case <-time.After(2 * time.Second):
 			writeJSON(w, http.StatusAccepted, map[string]any{"stopping": true, "sessionId": workerID})
 		}
@@ -4246,7 +4371,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if done != nil {
 		select {
 		case <-done:
-			writeJSON(w, http.StatusOK, map[string]any{"stopped": true, "sessionId": runningSession})
+			s.writeDesktopResumeJSON(w, http.StatusOK, runningSession, map[string]any{"stopped": true, "sessionId": runningSession})
 			return
 		case <-time.After(2 * time.Second):
 			writeJSON(w, http.StatusAccepted, map[string]any{"stopping": true, "sessionId": runningSession})

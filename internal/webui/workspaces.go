@@ -192,8 +192,11 @@ func workspaceAvailable(path string) bool {
 
 func (s *Server) knownWorkspacePaths() map[string]string {
 	paths := make(map[string]string)
-	if cwd, err := os.Getwd(); err == nil {
-		if path := workspacePathKey(cwd); path != "" {
+	s.stateMu.RLock()
+	launchPath := s.freshWorkDir
+	s.stateMu.RUnlock()
+	for _, raw := range []string{launchPath, s.selectedWorkspacePath()} {
+		if path := workspacePathKey(raw); path != "" {
 			paths[workspaceIDForPath(path)] = path
 		}
 	}
@@ -218,10 +221,7 @@ func (s *Server) knownWorkspacePaths() map[string]string {
 
 func (s *Server) workspaceViews(reg workspaceRegistry) ([]workspaceView, string) {
 	known := s.knownWorkspacePaths()
-	activePath := ""
-	if cwd, err := os.Getwd(); err == nil {
-		activePath = workspacePathKey(cwd)
-	}
+	activePath := workspacePathKey(s.selectedWorkspacePath())
 	activeID := workspaceIDForPath(activePath)
 
 	records := make(map[string]workspaceRecord, len(reg.Workspaces))
@@ -370,7 +370,7 @@ func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusCreated, workspaceView{
 			ID: record.ID, Path: record.Path, Name: workspaceDisplayName(record.Path, record.Name), Order: record.Order,
-			Registered: true, Available: true, Active: record.ID == workspaceIDForPath(mustCurrentWorkspace()),
+			Registered: true, Available: true, Active: record.ID == workspaceIDForPath(s.selectedWorkspacePath()),
 		})
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -378,9 +378,160 @@ func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func mustCurrentWorkspace() string {
-	cwd, _ := os.Getwd()
-	return cwd
+// selectedWorkspacePath is navigation state owned by this Desktop window. It
+// deliberately does not change the parent Loop, process cwd, or an executing
+// worker's immutable session/workspace binding.
+func (s *Server) selectedWorkspacePath() string {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	if s.selectedWorkDir != "" {
+		return s.selectedWorkDir
+	}
+	return s.freshWorkDir
+}
+
+func (s *Server) selectWorkspacePath(path string) {
+	s.stateMu.Lock()
+	s.selectedWorkDir = path
+	s.selectedWorkspaceEpoch++
+	s.stateMu.Unlock()
+}
+
+// A slow explicit session activation can finish after the user selected a
+// different folder. Keep its runtime/session binding without replacing that
+// newer navigation intent.
+func (s *Server) selectWorkspacePathIfCurrent(path string, epoch uint64) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.selectedWorkspaceEpoch == epoch {
+		s.selectedWorkDir = path
+		s.selectedWorkspaceEpoch++
+	}
+}
+
+// Session responses describe the execution owner's effective directory even
+// for legacy headers without WorkDir. This is display metadata only: reading
+// old or unavailable history never rewrites its header or authorizes a new
+// task in that directory.
+func (s *Server) sessionWorkspaceView(hdr *session.Header, activatedPath string) workspaceView {
+	s.stateMu.RLock()
+	launchPath := s.freshWorkDir
+	selectedPath := s.selectedWorkDir
+	s.stateMu.RUnlock()
+	path := strings.TrimSpace(activatedPath)
+	if path == "" && hdr != nil {
+		path = strings.TrimSpace(hdr.WorkDir)
+	}
+	if path == "" {
+		path = launchPath
+	}
+	path = workspacePathKey(path)
+	id := workspaceIDForPath(path)
+	view := workspaceView{
+		ID: id, Path: path, Name: workspaceDisplayName(path, ""), Available: workspaceAvailable(path),
+		Active: id != "" && id == workspaceIDForPath(selectedPath),
+	}
+	s.workspacesMu.Lock()
+	defer s.workspacesMu.Unlock()
+	if reg, err := loadWorkspaceRegistry(); err == nil {
+		for _, record := range reg.Workspaces {
+			if record.ID == id {
+				view.Name = workspaceDisplayName(path, record.Name)
+				view.Order, view.Registered = record.Order, !record.Removed
+				break
+			}
+		}
+	}
+	return view
+}
+
+// resolveWorkspaceSelection accepts only registered or durable-history-known
+// identities. Removed, inaccessible, and retargeted aliases fail before any
+// navigation state or transcript is written. Caller holds workspacesMu.
+func (s *Server) resolveWorkspaceSelection(reg workspaceRegistry, id string) (workspaceView, int, error) {
+	if id == "" || id != strings.TrimSpace(id) {
+		return workspaceView{}, http.StatusBadRequest, errors.New("workspace id is required")
+	}
+	view := workspaceView{ID: id}
+	for _, record := range reg.Workspaces {
+		if record.ID != id {
+			continue
+		}
+		if record.Removed {
+			return workspaceView{}, http.StatusNotFound, errors.New("workspace not found")
+		}
+		view.Path, view.Name, view.Order, view.Registered = record.Path, workspaceDisplayName(record.Path, record.Name), record.Order, true
+		break
+	}
+	if view.Path == "" {
+		view.Path = s.knownWorkspacePaths()[id]
+		view.Name = workspaceDisplayName(view.Path, "")
+	}
+	if view.Path == "" {
+		return workspaceView{}, http.StatusNotFound, errors.New("workspace not found")
+	}
+	path, err := validateWorkspacePath(view.Path)
+	if err != nil {
+		return workspaceView{}, http.StatusBadRequest, err
+	}
+	if workspaceIDForPath(path) != id {
+		return workspaceView{}, http.StatusNotFound, errors.New("workspace identity changed; refresh the workspace list")
+	}
+	view.Path, view.Available, view.Active = path, true, true
+	return view, http.StatusOK, nil
+}
+
+// Capture the fresh task's workspace before it queues for a lease. Later
+// navigation must not move that queued task into another directory.
+func (s *Server) freshTaskWorkspace(id string) (string, int, error) {
+	if id == "" {
+		path, err := validateWorkspacePath(s.selectedWorkspacePath())
+		if err != nil {
+			return "", http.StatusBadRequest, err
+		}
+		return path, http.StatusOK, nil
+	}
+	s.workspacesMu.Lock()
+	defer s.workspacesMu.Unlock()
+	reg, err := loadWorkspaceRegistry()
+	if err != nil {
+		return "", http.StatusInternalServerError, errors.New("workspace registry unreadable")
+	}
+	view, status, err := s.resolveWorkspaceSelection(reg, id)
+	return view.Path, status, err
+}
+
+func (s *Server) handleWorkspaceSelect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "workspace id is required")
+		return
+	}
+	s.workspacesMu.Lock()
+	defer s.workspacesMu.Unlock()
+	reg, err := loadWorkspaceRegistry()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "workspace registry unreadable")
+		return
+	}
+	view, status, err := s.resolveWorkspaceSelection(reg, body.ID)
+	if err != nil {
+		writeError(w, status, err.Error())
+		return
+	}
+	if err := r.Context().Err(); err != nil {
+		writeError(w, http.StatusRequestTimeout, "workspace selection cancelled")
+		return
+	}
+	s.selectWorkspacePath(view.Path)
+	writeJSON(w, http.StatusOK, map[string]any{"activeId": view.ID, "workspace": view})
 }
 
 func (s *Server) findWorkspacePath(reg workspaceRegistry, id string) string {

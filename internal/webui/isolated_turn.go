@@ -29,6 +29,7 @@ type IsolatedTurnRequest struct {
 	SessionID string
 	WorkDir   string
 	Input     string
+	Resume    bool
 	OnText    func(string)
 	OnEvent   func(agent.Event)
 	OnStatus  func(desktopipc.Status)
@@ -36,9 +37,10 @@ type IsolatedTurnRequest struct {
 }
 
 type IsolatedTurnResult struct {
-	Text    string
-	Stopped bool
-	Done    *agent.Event
+	Text         string
+	Stopped      bool
+	Done         *agent.Event
+	Checkpointed bool
 }
 
 // IsolatedTurnRunner runs a top-level turn outside the WebUI process. It is an
@@ -128,7 +130,16 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 	// `run --resume` uses the session's durable provider/model/system/mode and
 	// persists the user and assistant messages itself. The parent only relays
 	// the streaming presentation events and owns Desktop-level scheduling.
-	cmd := r.command(r.executable, "run", "--resume", request.SessionID, "--desktop-worker", "--streamlined", "--", request.Input)
+	args := []string{"run", "--resume", request.SessionID, "--desktop-worker", "--streamlined"}
+	if request.Resume {
+		if request.Input != "" {
+			return IsolatedTurnResult{}, errors.New("resume worker cannot receive input")
+		}
+		args = append(args, "--desktop-resume-turn")
+	} else {
+		args = append(args, "--", request.Input)
+	}
+	cmd := r.command(r.executable, args...)
 	cmd.Dir = request.WorkDir
 	// A worker's parent request must be able to return as soon as its answer is
 	// durable. Auto-memory's secondary model call is deliberately kept out of
@@ -199,6 +210,7 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 		waitDone <- cmd.Wait()
 	}()
 	var waitErr error
+	forceTerminated := false
 	if failure == nil {
 		select {
 		case waitErr = <-waitDone:
@@ -221,6 +233,7 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 				<-grace.C
 			}
 		case <-grace.C:
+			forceTerminated = true
 			terminateIsolatedTurnProcess(cmd)
 			termination := time.NewTimer(workerTerminateGrace)
 			select {
@@ -244,7 +257,7 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 	_ = stdin.Close()
 	replyWorkers.Wait()
 	<-controls.done
-	result := IsolatedTurnResult{Text: output.text, Stopped: ctx.Err() != nil}
+	result := IsolatedTurnResult{Text: output.text, Stopped: ctx.Err() != nil, Checkpointed: output.checkpointed && !forceTerminated && output.err == nil}
 	if ctx.Err() != nil {
 		return result, ctx.Err()
 	}
@@ -269,9 +282,10 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 }
 
 type isolatedWorkerOutput struct {
-	text string
-	done *agent.Event
-	err  error
+	text         string
+	done         *agent.Event
+	err          error
+	checkpointed bool
 }
 
 func readIsolatedWorkerOutput(ctx context.Context, reader io.Reader, replies *desktopipc.Encoder, request IsolatedTurnRequest, workers *sync.WaitGroup, failures chan<- error, controls *isolatedWorkerControls) (result isolatedWorkerOutput) {
@@ -282,7 +296,7 @@ func readIsolatedWorkerOutput(ctx context.Context, reader io.Reader, replies *de
 	for {
 		message, err := decoder.Decode()
 		if errors.Is(err, io.EOF) {
-			if result.done == nil {
+			if result.done == nil && !result.checkpointed {
 				result.err = errors.New("desktop worker output closed before loop completion")
 			}
 			return result
@@ -290,6 +304,14 @@ func readIsolatedWorkerOutput(ctx context.Context, reader io.Reader, replies *de
 		if err != nil {
 			result.err = fmt.Errorf("decode desktop worker output: %w", err)
 			return result
+		}
+		if message.Type == desktopipc.TypeCheckpoint {
+			if result.checkpointed {
+				result.err = errors.New("desktop worker repeated final checkpoint")
+				return result
+			}
+			result.checkpointed = true
+			continue
 		}
 		if message.Type == desktopipc.TypeSteerResult || message.Type == desktopipc.TypeStopSubAgentResult {
 			if err := controls.acknowledge(message); err != nil {

@@ -159,24 +159,13 @@ func TestManualCompactionHoldsWorkspaceUntilDurableReplacement(t *testing.T) {
 		server.handler().ServeHTTP(response, request)
 		turnDone <- response
 	}()
-	deadline := time.Now().Add(time.Second)
-	queued := false
-	for time.Now().Before(deadline) {
-		server.turnCoordinator.mu.Lock()
-		queued = len(server.turnCoordinator.waiters) == 1
-		server.turnCoordinator.mu.Unlock()
-		if queued {
-			break
-		}
-		select {
-		case <-runner.started:
-			t.Fatal("worker started before manual compaction persisted its replacement")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if !queued {
-		t.Fatal("same-workspace turn did not wait for the compaction lease")
+	// Same-session requests now wait at the cross-process session lock before
+	// reaching the workspace queue. Verify execution ownership rather than the
+	// scheduler's private waiter representation.
+	select {
+	case <-runner.started:
+		t.Fatal("worker started before manual compaction persisted its replacement")
+	case <-time.After(30 * time.Millisecond):
 	}
 	close(providerRelease)
 	select {

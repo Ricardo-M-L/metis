@@ -55,6 +55,7 @@ function context() {
  c.uiText=(en,zh)=>c.document.documentElement.lang==='zh-CN'?zh:en;
  vm.createContext(c);
  vm.runInContext(extract('app.js','const DESKTOP_I18N','function presetDisplayName'),c);
+ vm.runInContext(extract('sessions.js','function mergeServerSessionMetadata(session)','function isWorkspaceSelectionPending()'),c);
  vm.runInContext(extract('sessions.js','async function resumeSession(id)'),c);
  vm.runInContext(extract('sessions.js','async function loadSessions(append)','async function loadMoreSessions('),c);
  vm.runInContext(extract('chat.js','async function runTurnItem(item)','const MESSAGE_ACTION_ICONS'),c);
@@ -220,7 +221,7 @@ function context() {
   assert.match(stop.title,/Beta/,'background stop action does not name its real session');
   assert.equal(stop['aria-label'],stop.title);
   c.currentSessionId='B';c.syncTurnControls();
-  assert.match(stop.title,/current turn/i);
+  assert.match(stop.title,/Pause current task/i);
   c.currentSessionId='A';c.stopRequestPending=true;c.syncTurnControls();
   assert.match(stop.title,/Beta/);assert.equal(stop.disabled,true);
  }

@@ -196,9 +196,12 @@ function toggleEffortMenu(e) {
 }
 
 async function chooseEffort(value) {
+  const target = typeof ensureComposerSessionSettingsTarget === 'function' ? await ensureComposerSessionSettingsTarget() : undefined;
+  if (target === null || target && !target.isCurrent()) return;
   try {
     const res = await fetch('/api/effort', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ effort: value }) });
     const data = await res.json();
+    if (target && !target.isCurrent()) return;
     if (!res.ok) throw new Error(data.error || 'effort: ' + res.status);
     effortState.effort = data.effort;
     document.getElementById('effortMenu').style.display = 'none';
@@ -218,7 +221,10 @@ function sameSession(d) {
   const eventSessionId = String(d && d.session || '');
   if (!eventSessionId) return true;
   const pendingSessionId = pendingForegroundRequest && pendingForegroundRequest.sessionId;
-  const matchesPending = !!pendingForegroundRequest && (!pendingSessionId || pendingSessionId === eventSessionId);
+  const pendingViewGeneration = pendingForegroundRequest && pendingForegroundRequest.viewGeneration;
+  const sameView = pendingViewGeneration === undefined || pendingViewGeneration ===
+    (typeof resumeSessionGeneration === 'number' ? resumeSessionGeneration : 0);
+  const matchesPending = !!pendingForegroundRequest && (!!currentSessionId || sameView) && (!pendingSessionId || pendingSessionId === eventSessionId);
   if (turnRunning && !runningSessionId && matchesPending) {
     runningSessionId = eventSessionId;
     renderSessions();
@@ -226,7 +232,7 @@ function sameSession(d) {
   if (currentSessionId) return eventSessionId === currentSessionId;
   // A blank composer has no transcript owner. Only the outstanding first
   // foreground request may claim a server-assigned session from its events.
-  return matchesPending && (!runningSessionId || runningSessionId === eventSessionId);
+  return sameView && matchesPending && (!runningSessionId || runningSessionId === eventSessionId);
 }
 
 let thinkingEl = null;
@@ -1429,8 +1435,60 @@ const foregroundRequests = new Map();
 const completedForegroundSessions = new Map();
 const liveBackgroundSessions = new Set();
 const pendingStopSessions = new Set();
+const stopRequestsInFlight = new Set();
+const resumeStatesBySession = new Map();
+const pausedQueueSessions = new Set();
 const sessionQueues = new Map();
 let draftSessionCreation = null;
+
+// A resumable checkpoint belongs to a server-proven session, never to the
+// last viewed row or to a locally observed SSE stop event.
+function applyResumeSnapshot(snapshot, expectedSessionId = currentSessionId) {
+  const sessionId = String(expectedSessionId || '');
+  if (!sessionId || !snapshot || String(snapshot.resumeSessionId || '') !== sessionId ||
+      !Object.prototype.hasOwnProperty.call(snapshot, 'resumeAvailable')) return false;
+  const token = typeof snapshot.resumeToken === 'string' ? snapshot.resumeToken : '';
+  const available = snapshot.resumeAvailable === true && !!token;
+  resumeStatesBySession.set(sessionId, { available, token: available ? token : '' });
+  if (available) pausedQueueSessions.add(sessionId);
+  const serverRunning = !!(snapshot.turnRunning && String(snapshot.runningSessionId || '') === sessionId) ||
+    Array.isArray(snapshot.isolatedTurnSessions) && snapshot.isolatedTurnSessions.some(id => String(id) === sessionId);
+  const hasRuntimeState = typeof snapshot.turnRunning === 'boolean' || Array.isArray(snapshot.isolatedTurnSessions);
+  if ((available || hasRuntimeState && !serverRunning) && !stopRequestsInFlight.has(sessionId)) pendingStopSessions.delete(sessionId);
+  if (sessionId === String(currentSessionId || '')) {
+    stopRequestPending = pendingStopSessions.has(sessionId);
+    if (typeof syncTurnControls === 'function') syncTurnControls();
+    if (typeof updateSendBtn === 'function') updateSendBtn();
+  }
+  return true;
+}
+
+function canResumeCurrentTurn() {
+  const sessionId = String(currentSessionId || '');
+  const state = resumeStatesBySession.get(sessionId);
+  const input = document.getElementById('inputField');
+  if (!sessionId || !state || !state.available || !state.token || !input || input.value.trim() || attachments.length || pendingAsk) return false;
+  if (typeof pendingSessionId !== 'undefined' && pendingSessionId) return false;
+  if (typeof isWorkspaceSelectionPending === 'function' && isWorkspaceSelectionPending()) return false;
+  if (typeof workspaces !== 'undefined' && typeof activeWorkspaceId !== 'undefined' &&
+      workspaces.some(workspace => workspace.id === activeWorkspaceId && workspace.available === false)) return false;
+  if (pendingStopSessions.has(sessionId) || foregroundRequests.has(sessionId) ||
+      pendingForegroundRequest && String(pendingForegroundRequest.sessionId || '') === sessionId) return false;
+  return !isViewedTurnRunning();
+}
+
+async function resumeCurrentTurn() {
+  if (!canResumeCurrentTurn()) return false;
+  const state = resumeStatesBySession.get(String(currentSessionId));
+  // runTurnItem binds the session, workspace and view generation, and owns
+  // the foreground lock synchronously before its first await.
+  return runTurnItem({ resume: true, resumeToken: state.token, skipAddMessage: true, skipClearTodoPlan: true });
+}
+
+function isSessionQueuePaused(sessionId = currentSessionId) {
+  const id = String(sessionId || '');
+  return pausedQueueSessions.has(id) || pendingStopSessions.has(id);
+}
 
 function parallelTurnsEnabled() {
   return !!(lastStatusSnapshot && lastStatusSnapshot.isolatedTurnsEnabled);
@@ -1497,22 +1555,28 @@ function restoreSessionQueue(sessionId) {
 // Allocate an ID before listening for the first token. With concurrent turns,
 // an unrelated worker's event must never claim a blank composer as its own.
 async function prepareDraftSession() {
-  if (currentSessionId || !parallelTurnsEnabled()) return true;
+  const options = arguments[0] || {};
+  if (typeof isWorkspaceSelectionPending === 'function' && isWorkspaceSelectionPending()) return false;
+  if (typeof selectedWorkspaceCanRun === 'function' && !selectedWorkspaceCanRun()) return false;
+  if (currentSessionId || !parallelTurnsEnabled() && !options.force) return true;
   const generation = resumeSessionGeneration;
-  if (!draftSessionCreation || draftSessionCreation.generation !== generation) {
-    const promise = fetch('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+  const workspaceId = typeof activeWorkspaceId === 'string' ? activeWorkspaceId : '';
+  if (!draftSessionCreation || draftSessionCreation.generation !== generation || draftSessionCreation.workspaceId !== workspaceId) {
+    const promise = fetch('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workspaceId }) })
       .then(async res => {
         const data = await res.json();
         if (!res.ok || !data.id) throw new Error(data.error || 'Unable to create session');
         return data;
       });
-    draftSessionCreation = { generation, promise };
+    draftSessionCreation = { generation, workspaceId, promise };
   }
   const creation = draftSessionCreation;
   try {
     const data = await creation.promise;
     if (generation !== resumeSessionGeneration) return false;
+    if (workspaceId !== (typeof activeWorkspaceId === 'string' ? activeWorkspaceId : '')) return false;
     if (currentSessionId && currentSessionId !== data.id) return false;
+    if (typeof forgetWorkspaceComposerDraft === 'function') forgetWorkspaceComposerDraft(workspaceId);
     currentSessionId = data.id;
     closeMismatchedSubAgentDetails();
     if (!sessions.some(session => session.id === data.id)) sessions = [data, ...sessions];
@@ -1527,15 +1591,42 @@ async function prepareDraftSession() {
   }
 }
 
+// Composer controls mutate the active parent session. A blank view first
+// needs its own saved ID and activation; selecting a workspace alone is only
+// navigation and must not redirect these controls into the previous session.
+async function ensureComposerSessionSettingsTarget() {
+  if (typeof isWorkspaceSelectionPending === 'function' && isWorkspaceSelectionPending()) return null;
+  if (typeof selectedWorkspaceCanRun === 'function' && !selectedWorkspaceCanRun()) return null;
+  const generation = resumeSessionGeneration;
+  const workspaceId = typeof activeWorkspaceId === 'string' ? activeWorkspaceId : '';
+  if (!currentSessionId && !await prepareDraftSession({ force: true })) return null;
+  const sessionId = currentSessionId;
+  const isCurrent = () => generation === resumeSessionGeneration && sessionId === currentSessionId &&
+    workspaceId === (typeof activeWorkspaceId === 'string' ? activeWorkspaceId : '');
+  if (!sessionId || !isCurrent()) return null;
+  try {
+    const res = typeof requestSessionActivation === 'function'
+      ? await requestSessionActivation(sessionId, isCurrent)
+      : await fetch('/api/sessions/activate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: sessionId }) });
+    if (!res || !isCurrent()) return null;
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || uiText('The session could not be activated.', '无法激活该会话。'));
+    return isCurrent() ? { sessionId, workspaceId, generation, isCurrent } : null;
+  } catch (error) {
+    if (isCurrent()) showToast(uiText('Session settings unavailable: ', '暂时无法修改会话设置：') + error.message);
+    return null;
+  }
+}
+
 function syncTurnControls() {
   const visibleRunning = typeof isViewedTurnRunning === 'function' ? isViewedTurnRunning() : turnRunning;
   const visibleStopping = typeof parallelTurnsEnabled === 'function' && parallelTurnsEnabled()
     ? pendingStopSessions.has(String(currentSessionId || '')) : stopRequestPending;
   const sendBtn = document.getElementById('sendBtn');
   const stopBtn = document.getElementById('stopBtn');
-  if (sendBtn) sendBtn.style.display = visibleRunning ? 'none' : '';
+  if (sendBtn) sendBtn.style.display = visibleRunning || visibleStopping ? 'none' : '';
   if (stopBtn) {
-    stopBtn.style.display = visibleRunning ? '' : 'none';
+    stopBtn.style.display = visibleRunning || visibleStopping ? '' : 'none';
     stopBtn.disabled = visibleStopping;
     stopBtn.classList.toggle('stopping', visibleStopping);
     const background = runningSessionId && runningSessionId !== currentSessionId;
@@ -1543,9 +1634,9 @@ function syncTurnControls() {
     const runningTitle = runningSession && runningSession.title || runningSessionId;
     const label = background
       ? (visibleStopping
-        ? uiText(`Stopping other running session: ${runningTitle}…`, `正在停止其他会话：${runningTitle}…`)
-        : uiText(`Stop other running session: ${runningTitle}`, `停止正在运行的其他会话：${runningTitle}`))
-      : (visibleStopping ? uiText('Stopping current turn…', '正在停止当前轮次…') : uiText('Stop current turn', '停止当前轮次'));
+        ? uiText(`Pausing other running session: ${runningTitle}…`, `正在暂停其他会话：${runningTitle}…`)
+        : uiText(`Pause other running session: ${runningTitle}`, `暂停正在运行的其他会话：${runningTitle}`))
+      : (visibleStopping ? uiText('Pausing current task…', '正在暂停当前任务…') : uiText('Pause current task', '暂停当前任务'));
     stopBtn.title = label;
     stopBtn.setAttribute('aria-label', label);
   }
@@ -1590,7 +1681,12 @@ function detachRunningTurnView() {
   closeToolDetail();
 }
 
+async function pauseTurn() {
+  return stopTurn({ keepQueue: true });
+}
+
 async function stopTurn() {
+  const options = arguments[0] || {};
   if (!turnRunning) return;
   if (!parallelTurnsEnabled() && stopRequestPending) return;
   if (parallelTurnsEnabled()) {
@@ -1598,15 +1694,20 @@ async function stopTurn() {
     runningSessionId = currentSessionId;
   }
   const stoppedSessionId = runningSessionId;
-  if (pendingStopSessions.has(String(stoppedSessionId || ''))) return;
-  pendingStopSessions.add(String(stoppedSessionId || ''));
+  const stopKey = String(stoppedSessionId || '');
+  if (pendingStopSessions.has(stopKey)) return;
+  pendingStopSessions.add(stopKey);
+  stopRequestsInFlight.add(stopKey);
+  if (options.keepQueue) pausedQueueSessions.add(stopKey);
+  resumeStatesBySession.delete(stopKey);
   stopRequestPending = true;
   syncTurnControls();
+  let waitingForStop = false;
   try {
     const res = await fetch('/api/stop', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: runningSessionId })
+      body: JSON.stringify({ sessionId: stoppedSessionId })
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -1614,7 +1715,9 @@ async function stopTurn() {
       if (res.status === 409 && request && request.controller) request.controller.abort();
       else throw new Error(data.error || 'stop: ' + res.status);
     }
-    if (data.stopping) showToast('Stopping the running turn…');
+    waitingForStop = !!data.stopping || res.status === 202;
+    if (waitingForStop) showToast(uiText('Pausing the running task…', '正在暂停当前任务…'));
+    if (options.keepQueue) return;
     const stoppedQueue = sessionQueues.get(String(stoppedSessionId || ''));
     if (stoppedQueue) { stoppedQueue.items.length = 0; stoppedQueue.pending = null; }
     if (parallelTurnsEnabled() && currentSessionId !== stoppedSessionId) return;
@@ -1626,10 +1729,14 @@ async function stopTurn() {
     if (dropped) showToast('Stopped; cleared ' + dropped + ' queued message' + (dropped === 1 ? '' : 's'));
   } catch (e) {
     showToast('Stop failed: ' + e.message);
+    if (options.keepQueue) pausedQueueSessions.delete(stopKey);
   } finally {
-    pendingStopSessions.delete(String(stoppedSessionId || ''));
+    stopRequestsInFlight.delete(stopKey);
+    if (!waitingForStop) pendingStopSessions.delete(stopKey);
     stopRequestPending = parallelTurnsEnabled() ? pendingStopSessions.has(String(currentSessionId || '')) : false;
     syncTurnControls();
+    updateSendBtn();
+    if (typeof pollStatus === 'function') void pollStatus();
   }
 }
 
@@ -2930,11 +3037,16 @@ function closeMismatchedSubAgentDetails() {
       typeof closeSubAgentDetails === 'function') closeSubAgentDetails(false);
 }
 function newChat() {
-  if (turnRunning && !parallelTurnsEnabled()) {
-    showToast('Stop the current turn before starting a new session');
-    return;
+  const options = arguments[0] || {};
+  if (!options.workspaceSelection && typeof isWorkspaceSelectionPending === 'function' && isWorkspaceSelectionPending()) return false;
+  if (turnRunning && !parallelTurnsEnabled() && !options.workspaceSelection) {
+    showToast(uiText('Stop the current turn before starting a new session', '请先停止当前任务，再创建新会话'));
+    return false;
   }
+  const detachedRunningSessionId = turnRunning && !parallelTurnsEnabled() ? runningSessionId : null;
+  if (!options.draftSaved && typeof saveComposerDraftForView === 'function') saveComposerDraftForView();
   saveSessionQueue();
+  if (typeof detachRunningTurnView === 'function') detachRunningTurnView();
   if (typeof invalidateSessionAsyncLoads === 'function') invalidateSessionAsyncLoads();
   currentSessionId = null;
   closeMismatchedSubAgentDetails();
@@ -2945,12 +3057,14 @@ function newChat() {
   queuedSessionId = null;
   queuedTurnMenuIndex = -1;
   queuedTurnPendingItem = null;
+  drainingQueuedTurns = false;
   renderQueuedTurns();
   resetTurnState();
   if (typeof activityGroupsByTurn !== 'undefined') activityGroupsByTurn.clear();
   if (typeof activityHistoryLastTurn !== 'undefined') activityHistoryLastTurn = 0;
   if (typeof activityHistoryGeneration !== 'undefined') activityHistoryGeneration++;
   syncTrackedRunningState();
+  if (detachedRunningSessionId) setTurnRunning(true, detachedRunningSessionId);
   messages = [];
   followOutput = true;
   updateScrollFollowUI();
@@ -2965,7 +3079,9 @@ function newChat() {
   if (bar) { bar.style.display = 'none'; bar.textContent = ''; }
   renderSessions();
   updateEmptyLayout();
+  if (typeof restoreComposerDraftForView === 'function') restoreComposerDraftForView();
   if (window.metisNavigation) window.metisNavigation.recordSession(null);
+  return true;
 }
 
 // The POST resolves when the turn completes; while it is in flight the
@@ -3150,9 +3266,13 @@ document.addEventListener('paste', (e) => {
 });
 
 async function sendMessage(busyBehavior) {
+  if (typeof isWorkspaceSelectionPending === 'function' && isWorkspaceSelectionPending()) {
+    showToast(uiText('Wait for the workspace to finish opening.', '请等待工作区切换完成。'));
+    return;
+  }
   const input = document.getElementById('inputField');
   const text = input.value.trim();
-  if (!text && !attachments.length) return;
+  if (!text && !attachments.length) return resumeCurrentTurn();
   // Rename changes only the session label. It remains a local command while
   // a turn (or an ask) is active, including when the composer defaults to
   // queue/steer. Never forward its slash text to the model.
@@ -3240,6 +3360,23 @@ function queuedTurnIcon(name, className) {
   return '<img class="queued-icon' + (className ? ' ' + escAttr(className) : '') + '" src="/icons/lucide/' + escAttr(name) + '.svg" alt="" aria-hidden="true">';
 }
 
+const queuedTurnDisclosures = new Map();
+
+function queuedTurnDisclosureOwner() {
+  return String(queuedSessionId || currentSessionId || '');
+}
+
+function toggleQueuedTurnsDisclosure(event) {
+  if (event) event.stopPropagation();
+  if (queuedTurns.length < 2 || queuedTurnPendingItem) return;
+  const owner = queuedTurnDisclosureOwner();
+  queuedTurnDisclosures.set(owner, !queuedTurnDisclosures.get(owner));
+  queuedTurnMenuIndex = -1;
+  renderQueuedTurns();
+  const header = document.getElementById('queuedTurnsToggle');
+  if (header) header.focus();
+}
+
 function queuedTurnPreview(item) {
   const text = String(item && item.text || '').trim().replace(/\s+/g, ' ');
   const imageCount = Array.isArray(item && item.images) ? item.images.length : 0;
@@ -3255,40 +3392,80 @@ function queuedTurnCanSteer(item) {
     && item && (!Array.isArray(item.images) || item.images.length === 0));
 }
 
+function queuedTurnComposerBlockReason(index) {
+  if (!Number.isInteger(index) || index < 0 || index >= queuedTurns.length || !queuedTurns[index]) {
+    return uiText('This queued message is no longer available', '这条排队消息已不可用');
+  }
+  if (!document.getElementById('inputField')) return uiText('The composer is not available', '输入框暂不可用');
+  const owner = queuedSessionId || runningSessionId || currentSessionId;
+  if (!currentSessionId || owner !== currentSessionId) {
+    return uiText('Return to this message’s session to edit it', '请回到这条消息所属的会话再编辑');
+  }
+  if (queuedTurnPendingItem || (typeof drainingQueuedTurns !== 'undefined' && drainingQueuedTurns)) {
+    return uiText('Wait for the queued message action to finish', '请等待排队消息操作完成');
+  }
+  if (typeof pendingAsk !== 'undefined' && pendingAsk) {
+    return uiText('Answer the current question before editing a queued message', '请先回复当前问题，再编辑排队消息');
+  }
+  if ((typeof pendingSessionId !== 'undefined' && pendingSessionId) ||
+      (typeof isWorkspaceSelectionPending === 'function' && isWorkspaceSelectionPending())) {
+    return uiText('Wait for the session or workspace to finish opening', '请等待会话或工作区切换完成');
+  }
+  return '';
+}
+
 function renderQueuedTurns() {
   if (typeof saveSessionQueue === 'function') saveSessionQueue();
   const wrap = document.getElementById('queuedTurns');
   if (!wrap) return;
+  const owner = queuedTurnDisclosureOwner();
   const visibleForSession = !queuedSessionId || !currentSessionId || queuedSessionId === currentSessionId;
   if (!queuedTurns.length || !visibleForSession) {
+    if (!queuedTurns.length) queuedTurnDisclosures.delete(owner);
     wrap.style.display = 'none';
     wrap.innerHTML = '';
     return;
   }
+  const previousList = document.getElementById('queuedTurnsList');
+  const scrollTop = previousList ? previousList.scrollTop : 0;
+  const expanded = queuedTurns.length === 1 || !!queuedTurnPendingItem || !!queuedTurnDisclosures.get(owner);
+  if (!expanded) queuedTurnMenuIndex = -1;
   wrap.style.display = 'flex';
-  wrap.setAttribute('aria-label', uiText(queuedTurns.length + ' queued message' + (queuedTurns.length === 1 ? '' : 's'), queuedTurns.length + ' 条排队消息'));
-  wrap.innerHTML = queuedTurns.map((item, i) => {
+  const countLabel = uiText(queuedTurns.length + ' queued message' + (queuedTurns.length === 1 ? '' : 's'), queuedTurns.length + ' 条排队消息');
+  wrap.setAttribute('aria-label', countLabel);
+  let menuHTML = '';
+  const rows = expanded ? queuedTurns.map((item, i) => {
     const preview = queuedTurnPreview(item);
     const menuOpen = queuedTurnMenuIndex === i;
     const pending = queuedTurnPendingItem === item;
     const canSteer = queuedTurnCanSteer(item) && !pending;
+    const composerBlockReason = queuedTurnComposerBlockReason(i);
+    const composerTitle = composerBlockReason || uiText('Move this message back to the composer to edit it', '将这条消息移回输入框编辑');
     const steerTitle = item.images && item.images.length
       ? uiText('Image messages stay queued for the next turn', '图片消息会保留到下一轮发送')
       : (!turnRunning ? uiText('No turn is running', '当前没有正在运行的任务') : uiText('Send this to the running turn', '立即发送给当前任务'));
-    return '<article class="queued-card' + (pending ? ' is-pending' : '') + (menuOpen ? ' is-menu-open' : '') + '" data-queued-index="' + i + '">' +
-      '<span class="queued-card-mark">' + queuedTurnIcon('list-start') + '</span>' +
-      '<span class="queued-card-copy" title="' + escAttr(preview) + '">' + escHtml(preview) + '</span>' +
-      '<button type="button" class="queued-steer" onclick="steerQueuedTurn(event,' + i + ')" title="' + escAttr(steerTitle) + '" aria-label="' + escAttr(uiText('Steer the current turn with this message', '用这条消息调整当前任务方向')) + '"' + (canSteer ? '' : ' disabled') + '>' +
-        queuedTurnIcon('corner-down-left') + '<span>' + escHtml(uiText('Steer now', '调整方向')) + '</span></button>' +
-      '<button type="button" class="queued-icon-button queued-remove" onclick="removeQueuedTurn(' + i + ')" title="' + escAttr(uiText('Delete queued message', '删除排队消息')) + '" aria-label="' + escAttr(uiText('Delete queued message', '删除排队消息')) + '"' + (pending ? ' disabled' : '') + '>' + queuedTurnIcon('trash-2') + '</button>' +
-      '<button type="button" class="queued-icon-button queued-more' + (menuOpen ? ' is-open' : '') + '" onclick="toggleQueuedTurnMenu(event,' + i + ')" title="' + escAttr(uiText('More queued message actions', '更多排队消息操作')) + '" aria-label="' + escAttr(uiText('More queued message actions', '更多排队消息操作')) + '" aria-haspopup="menu" aria-expanded="' + (menuOpen ? 'true' : 'false') + '"' + (pending ? ' disabled' : '') + '>' + queuedTurnIcon('ellipsis') + '</button>' +
-      (menuOpen ? '<div class="queued-menu" role="menu" aria-label="' + escAttr(uiText('Queued message actions', '排队消息操作')) + '">' +
-        '<button type="button" role="menuitem" onclick="editQueuedTurn(event,' + i + ')">' + queuedTurnIcon('pen-line') + '<span>' + escHtml(uiText('Edit message', '编辑消息')) + '</span></button>' +
+    if (menuOpen) {
+      menuHTML = '<div class="queued-menu" role="menu" aria-label="' + escAttr(uiText('Queued message actions', '排队消息操作')) + '">' +
+        '<button type="button" role="menuitem" onclick="editQueuedTurn(event,' + i + ')" title="' + escAttr(composerTitle) + '"' + (composerBlockReason ? ' disabled' : '') + '>' + queuedTurnIcon('pen-line') + '<span>' + escHtml(uiText('Edit message', '编辑消息')) + '</span></button>' +
+        '<button type="button" role="menuitem" onclick="steerQueuedTurn(event,' + i + ')" title="' + escAttr(steerTitle) + '"' + (canSteer ? '' : ' disabled') + '>' + queuedTurnIcon('corner-down-left') + '<span>' + escHtml(uiText('Send to the current turn now', '立即发送给当前任务')) + '</span></button>' +
         '<button type="button" role="menuitem" onclick="openQueuedTurnInSideChat(event,' + i + ')">' + queuedTurnIcon('message-circle-plus') + '<span>' + escHtml(uiText('Open in side chat', '在侧边聊天中打开')) + '</span></button>' +
         '<button type="button" role="menuitem" onclick="clearQueuedTurns(event)">' + queuedTurnIcon('list-end') + '<span>' + escHtml(uiText('Close queue', '关闭排队')) + '</span></button>' +
-      '</div>' : '') +
-    '</article>';
-  }).join('');
+      '</div>';
+    }
+    return '<li class="queued-card' + (pending ? ' is-pending' : '') + '" data-queued-index="' + i + '">' +
+      '<span class="queued-card-copy" title="' + escAttr(preview) + '">' + escHtml(preview) + '</span>' +
+      '<button type="button" class="queued-steer" onclick="editQueuedTurn(event,' + i + ')" title="' + escAttr(composerTitle) + '" aria-label="' + escAttr(uiText('Move this queued message back to the composer to edit it', '将这条排队消息移回输入框编辑')) + '"' + (composerBlockReason ? ' disabled' : '') + '>' +
+        queuedTurnIcon('pen-line') + '<span class="visually-hidden">' + escHtml(uiText('Adjust direction', '调整方向')) + '</span></button>' +
+      '<button type="button" class="queued-icon-button queued-remove" onclick="removeQueuedTurn(' + i + ')" title="' + escAttr(uiText('Delete queued message', '删除排队消息')) + '" aria-label="' + escAttr(uiText('Delete queued message', '删除排队消息')) + '"' + (pending ? ' disabled' : '') + '>' + queuedTurnIcon('trash-2') + '</button>' +
+      '<button type="button" class="queued-icon-button queued-more' + (menuOpen ? ' is-open' : '') + '" onclick="toggleQueuedTurnMenu(event,' + i + ')" title="' + escAttr(uiText('More queued message actions', '更多排队消息操作')) + '" aria-label="' + escAttr(uiText('More queued message actions', '更多排队消息操作')) + '" aria-haspopup="menu" aria-expanded="' + (menuOpen ? 'true' : 'false') + '"' + (pending ? ' disabled' : '') + '>' + queuedTurnIcon('ellipsis') + '</button>' +
+    '</li>';
+  }).join('') : '';
+  wrap.innerHTML = '<section class="queued-dock">' +
+    (queuedTurns.length > 1 ? '<button type="button" class="queued-header" id="queuedTurnsToggle" onclick="toggleQueuedTurnsDisclosure(event)" aria-expanded="' + expanded + '" aria-controls="queuedTurnsList"' + (queuedTurnPendingItem ? ' disabled' : '') + '>' +
+      queuedTurnIcon('list-start') + '<span class="queued-header-copy">' + escHtml(countLabel) + '</span><svg class="queued-header-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></button>' : '') +
+    '<ul class="queued-list" id="queuedTurnsList"' + (expanded ? '' : ' hidden') + '>' + rows + '</ul></section>' + menuHTML;
+  const list = document.getElementById('queuedTurnsList');
+  if (list) list.scrollTop = scrollTop;
   if (queuedTurnMenuIndex >= 0) positionQueuedTurnMenu(queuedTurnMenuIndex);
 }
 
@@ -3310,14 +3487,17 @@ function toggleQueuedTurnMenu(event, index) {
 function positionQueuedTurnMenu(index) {
   if (typeof window === 'undefined') return;
   const card = document.querySelector('.queued-card[data-queued-index="' + index + '"]');
-  const menu = card && card.querySelector('.queued-menu');
+  const menu = document.querySelector('#queuedTurns .queued-menu');
   if (!card || !menu || typeof card.getBoundingClientRect !== 'function') return;
+  const button = card.querySelector('.queued-more');
+  if (!button) return;
   menu.classList.remove('opens-up');
-  const cardRect = card.getBoundingClientRect();
+  const anchor = button.getBoundingClientRect();
   const menuRect = menu.getBoundingClientRect();
-  const wouldClipBelow = cardRect.bottom + menuRect.height > window.innerHeight - 12;
-  const fitsAbove = cardRect.top - menuRect.height >= 12;
-  menu.classList.toggle('opens-up', wouldClipBelow && fitsAbove);
+  const opensUp = anchor.bottom + 6 + menuRect.height > window.innerHeight - 12 && anchor.top - 6 - menuRect.height >= 12;
+  menu.style.left = Math.max(12, Math.min(anchor.right - menuRect.width, window.innerWidth - menuRect.width - 12)) + 'px';
+  menu.style.top = Math.max(12, Math.min(opensUp ? anchor.top - menuRect.height - 6 : anchor.bottom + 6, window.innerHeight - menuRect.height - 12)) + 'px';
+  menu.classList.toggle('opens-up', opensUp);
 }
 
 function closeQueuedTurnMenu(restoreFocus) {
@@ -3332,13 +3512,15 @@ function closeQueuedTurnMenu(restoreFocus) {
 }
 
 function replaceComposerWithQueuedTurn(index) {
+  if (queuedTurnComposerBlockReason(index)) return false;
   const item = queuedTurns[index];
   const input = document.getElementById('inputField');
-  if (!item || !input) return false;
-  const draft = { text: input.value, images: attachments.slice() };
-  const hasDraft = !!(String(draft.text || '').trim() || draft.images.length);
+  if (String(input.value || '').trim() || attachments.length) {
+    showToast(uiText('Send or clear the current draft before moving this queued message back. Your draft and queue are unchanged.', '请先发送或清空输入框中的草稿，再移回这条排队消息。草稿和队列均已保留。'));
+    input.focus();
+    return false;
+  }
   queuedTurns.splice(index, 1);
-  if (hasDraft) queuedTurns.splice(index, 0, draft);
   if (!queuedTurns.length) queuedSessionId = null;
   input.value = item.text || '';
   attachments = Array.isArray(item.images) ? item.images.slice() : [];
@@ -3454,8 +3636,13 @@ document.addEventListener('keydown', event => {
   closeQueuedTurnMenu(true);
 });
 
+document.addEventListener('scroll', event => {
+  if (queuedTurnMenuIndex >= 0 && event.target.id === 'queuedTurnsList') positionQueuedTurnMenu(queuedTurnMenuIndex);
+}, true);
+
 async function drainQueuedTurns() {
   if (isViewedTurnRunning() || drainingQueuedTurns || pendingAsk || !queuedTurns.length) return;
+  if (isSessionQueuePaused()) return;
   if (queuedSessionId && currentSessionId !== queuedSessionId) return;
   const owner = currentSessionId;
   drainingQueuedTurns = true;
@@ -3471,7 +3658,7 @@ async function drainQueuedTurns() {
     if (currentSessionId === owner) {
       drainingQueuedTurns = false;
       if (!queuedTurns.length) queuedSessionId = null;
-      else if (succeeded) setTimeout(drainQueuedTurns, 0);
+      else if (succeeded && !isSessionQueuePaused(owner)) setTimeout(drainQueuedTurns, 0);
     }
     if (!succeeded) showToast('Queued messages paused after an incomplete or failed turn');
   }
@@ -3484,6 +3671,8 @@ async function syncViewedSessionHistory(sessionId, shouldApply = () => true) {
     if (!res.ok) return false;
     const data = await res.json();
     if (currentSessionId !== sessionId || !shouldApply()) return false;
+    if (data.session && data.session.id === sessionId && typeof mergeServerSessionMetadata === 'function') mergeServerSessionMetadata(data.session);
+    applyResumeSnapshot(data, sessionId);
     messages = [];
     streamedTextThisTurn = false;
     renderHistoryMessages(data.messages);
@@ -3495,11 +3684,13 @@ async function syncViewedSessionHistory(sessionId, shouldApply = () => true) {
 }
 
 async function runTurnItem(item) {
+  if (typeof isWorkspaceSelectionPending === 'function' && isWorkspaceSelectionPending()) return false;
+  if (typeof selectedWorkspaceCanRun === 'function' && !selectedWorkspaceCanRun()) return false;
   // Older Desktop versions could queue /rename and /title as user text.
   // Keep those saved queue items local after an upgrade too. An attachment
   // cannot be part of a rename: retain that item for editing, pause this
   // queue, and leave later queued messages untouched.
-  if (/^\/(?:rename|title)(?:\s|$)/i.test(String(item.text || '').trim())) {
+  if (!item.resume && /^\/(?:rename|title)(?:\s|$)/i.test(String(item.text || '').trim())) {
     if (Array.isArray(item.images) && item.images.length) {
       if (drainingQueuedTurns && queuedSessionId === currentSessionId) {
         queuedTurns.unshift(item);
@@ -3511,16 +3702,21 @@ async function runTurnItem(item) {
     await executeComposerCommand(item.text, currentSessionId);
     return true;
   }
-  clearTodoPlan();
+  if (item.resume && !canResumeCurrentTurn()) return false;
+  if (!item.skipClearTodoPlan && !item.resume) clearTodoPlan();
   const text = item.text || '';
   const images = item.images || [];
   const turnSessionId = currentSessionId;
+  // Bind this request before any asynchronous work; later navigation must not
+  // redirect a blank session into the newly selected workspace.
+  const turnWorkspaceId = typeof activeWorkspaceId === 'string' ? activeWorkspaceId : '';
   const viewGenerationAtSubmit = resumeSessionGeneration;
   const continuationGenerationAtSubmit = turnSessionId ? (backgroundContinuationGenerations.get(turnSessionId) || 0) : backgroundContinuationGeneration;
   const continuationUnchanged = () => continuationGenerationAtSubmit === (turnSessionId ? (backgroundContinuationGenerations.get(turnSessionId) || 0) : backgroundContinuationGeneration);
-  const foregroundRequest = { sessionId: turnSessionId, needsHistorySync: false, controller: typeof AbortController === 'function' ? new AbortController() : null };
+  const foregroundRequest = { sessionId: turnSessionId, workspaceId: turnWorkspaceId, viewGeneration: viewGenerationAtSubmit, needsHistorySync: false, controller: typeof AbortController === 'function' ? new AbortController() : null };
   if (typeof rememberForegroundRequest === 'function') rememberForegroundRequest(foregroundRequest);
   pendingForegroundRequest = foregroundRequest;
+  if (typeof resumeStatesBySession !== 'undefined' && turnSessionId) resumeStatesBySession.delete(String(turnSessionId));
   let resolvedTurnSessionId = turnSessionId;
   let turnSucceeded = false;
   let turnOutcome = 'completed';
@@ -3528,7 +3724,7 @@ async function runTurnItem(item) {
     ? currentSessionId === resolvedTurnSessionId
     : turnSessionId
       ? currentSessionId === turnSessionId
-      : currentSessionId === null && resumeSessionGeneration === viewGenerationAtSubmit;
+      : currentSessionId === null && resumeSessionGeneration === foregroundRequest.viewGeneration;
 
   // Hide welcome
   const welcome = document.getElementById('welcomeScreen');
@@ -3536,7 +3732,7 @@ async function runTurnItem(item) {
 
   // Add user message (image attachments render as placeholder thumbnails)
   resumeAutoScroll();
-  addMessage('user', text || '(image attached)');
+  if (!item.skipAddMessage && !item.resume) addMessage('user', text || '(image attached)');
   beginUserTurn();
   setTurnRunning(true, turnSessionId);
   document.getElementById('sendBtn').disabled = true;
@@ -3545,16 +3741,19 @@ async function runTurnItem(item) {
     const res = await fetch('/api/turns', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({sessionId: turnSessionId, input: text, images: images}),
+      body: JSON.stringify(item.resume
+        ? { sessionId: turnSessionId, resume: true, resumeToken: item.resumeToken }
+        : {sessionId: turnSessionId, workspaceId: turnWorkspaceId, input: text, images: images}),
       signal: foregroundRequest.controller && foregroundRequest.controller.signal
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `turn: ${res.status}`);
-    if (viewingTurn() && continuationUnchanged() && runningTurnIncompleteReason) throw new Error('Turn incomplete: ' + runningTurnIncompleteReason);
+    if (!data.stopped && viewingTurn() && continuationUnchanged() && runningTurnIncompleteReason) throw new Error('Turn incomplete: ' + runningTurnIncompleteReason);
     resolvedTurnSessionId = data.sessionId || turnSessionId;
     foregroundRequest.sessionId = resolvedTurnSessionId;
     if (!runningSessionId && resolvedTurnSessionId) runningSessionId = resolvedTurnSessionId;
-    if (currentSessionId === turnSessionId && (turnSessionId || resumeSessionGeneration === viewGenerationAtSubmit)) {
+    if (currentSessionId === turnSessionId && (turnSessionId || resumeSessionGeneration === foregroundRequest.viewGeneration)) {
+      if (!turnSessionId && typeof forgetWorkspaceComposerDraft === 'function') forgetWorkspaceComposerDraft(turnWorkspaceId);
       currentSessionId = resolvedTurnSessionId;
       closeMismatchedSubAgentDetails();
       if (!turnSessionId && window.metisNavigation) window.metisNavigation.recordSession(resolvedTurnSessionId, { replace: true });
@@ -3580,7 +3779,7 @@ async function runTurnItem(item) {
       if (viewingTurn()) showToast('Turn stopped');
     }
     await loadSessions();
-    turnSucceeded = true;
+    turnSucceeded = !data.stopped;
   } catch (e) {
     turnOutcome = e && e.name === 'AbortError' ? 'stopped' : 'error';
     if (e && e.name === 'AbortError') { if (viewingTurn()) showToast('Turn stopped'); }
@@ -3597,9 +3796,16 @@ async function runTurnItem(item) {
       else setTurnRunning(false);
       if (viewingTurn()) runningTurnNeedsHistorySync = false;
     }
+    if (turnSucceeded && item.resume) pausedQueueSessions.delete(String(resolvedTurnSessionId || ''));
+    // Refresh only the request's original view. A delayed A completion must
+    // never poll through B's navigation predicate or claim B's controls.
+    if (viewingTurn() && continuationUnchanged() && typeof pollStatus === 'function') {
+      await pollStatus(() => viewingTurn() && continuationUnchanged() &&
+        resumeSessionGeneration === foregroundRequest.viewGeneration);
+    }
     updateSendBtn();
     loadSessionStatsbar();
-    if (viewingTurn() && turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
+    if (viewingTurn() && turnSucceeded && queuedTurns.length && !drainingQueuedTurns && !isSessionQueuePaused(resolvedTurnSessionId)) {
       if (!queuedSessionId || currentSessionId === queuedSessionId) setTimeout(drainQueuedTurns, 0);
       else showToast('Queued messages are waiting in the completed session');
     } else if (viewingTurn() && !turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
@@ -4958,6 +5164,9 @@ function confirmFullAccessMode(trigger) {
 }
 
 async function setPermissionMode(value, trigger) {
+  const viewGeneration = typeof resumeSessionGeneration === 'number' ? resumeSessionGeneration : 0;
+  const viewSessionId = typeof currentSessionId !== 'undefined' ? currentSessionId : null;
+  const viewWorkspaceId = typeof activeWorkspaceId === 'string' ? activeWorkspaceId : '';
   const mode = normalizedPermissionMode(value);
   if (!mode) {
     showToast(uiText('Unknown permission mode.', '\u672a\u77e5\u7684\u6743\u9650\u6a21\u5f0f\u3002'));
@@ -4966,13 +5175,19 @@ async function setPermissionMode(value, trigger) {
   if (mode === 'fullAccess' && approvalMode !== 'fullAccess') {
     const accepted = await confirmFullAccessMode(trigger);
     if (!accepted) return null;
+    if (viewGeneration !== (typeof resumeSessionGeneration === 'number' ? resumeSessionGeneration : 0) ||
+        viewSessionId !== (typeof currentSessionId !== 'undefined' ? currentSessionId : null) ||
+        viewWorkspaceId !== (typeof activeWorkspaceId === 'string' ? activeWorkspaceId : '')) return false;
   }
+  const target = typeof ensureComposerSessionSettingsTarget === 'function' ? await ensureComposerSessionSettingsTarget() : undefined;
+  if (target === null || target && !target.isCurrent()) return false;
   try {
     const res = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ changes: [{ key: 'permission.mode', value: mode }] })
     });
     const data = await res.json().catch(() => ({}));
+    if (target && !target.isCurrent()) return false;
     if (!res.ok) throw new Error(data.error || 'mode: ' + res.status);
     syncApprovalChip(mode);
     const setting = settingByKey('permission.mode');
@@ -5184,7 +5399,17 @@ function updateEmptyLayout() {
 
 function updateSendBtn() {
   const val = document.getElementById('inputField').value.trim();
-  document.getElementById('sendBtn').disabled = !val && !attachments.length;
+  const selectingWorkspace = typeof isWorkspaceSelectionPending === 'function' && isWorkspaceSelectionPending();
+  const resuming = canResumeCurrentTurn();
+  const button = document.getElementById('sendBtn');
+  const label = resuming ? uiText('Resume current task', '恢复当前任务') : uiText('Send message', '发送消息');
+  button.classList.toggle('resume-btn', resuming);
+  button.innerHTML = resuming
+    ? '<svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M6 3.8a.8.8 0 0 1 1.22-.68l9.1 5.7a1.4 1.4 0 0 1 0 2.36l-9.1 5.7A.8.8 0 0 1 6 16.2z"/></svg>'
+    : '&#8593;';
+  button.title = label;
+  button.setAttribute('aria-label', label);
+  button.disabled = selectingWorkspace || !!(typeof pendingSessionId !== 'undefined' && pendingSessionId) || !val && !attachments.length && !resuming;
 }
 
 // --- Model ---
@@ -5227,6 +5452,8 @@ async function toggleModelMenu() {
 async function switchModel(provider, model) {
   document.getElementById('modelMenu').style.display = 'none';
   modelMenuOpen = false;
+  const target = typeof ensureComposerSessionSettingsTarget === 'function' ? await ensureComposerSessionSettingsTarget() : undefined;
+  if (target === null || target && !target.isCurrent()) return;
   try {
     const res = await fetch('/api/models', {
       method: 'POST',
@@ -5234,6 +5461,7 @@ async function switchModel(provider, model) {
       body: JSON.stringify({ provider: provider, model: model })
     });
     const d = await res.json();
+    if (target && !target.isCurrent()) return;
     if (!res.ok) throw new Error(d.error || 'model: ' + res.status);
     const name = document.getElementById('modelName');
     if (name) name.textContent = (d.model || model).split('/').pop();
