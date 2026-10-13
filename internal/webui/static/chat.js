@@ -5581,6 +5581,8 @@ document.addEventListener('keydown', event => {
 let settingsCache = null;
 let providersCache = null;
 const providerDiscoveryCache = new Map();
+const providerContextBudgetStates = new Map();
+let providerContextBudgetGeneration = 0;
 let presetsCache = null;
 let pluginsCache = null;
 let pluginCatalogCache = { ecosystems: [], marketplaces: [], plugins: [], needsSync: false };
@@ -6074,10 +6076,12 @@ function paintProviders() {
       <button type="button" onclick="validateProvider('${escOnclick(p.id)}')">${uiText('Validate', '验证')}</button>
       ${probeButton}
       ${modelsButton}
+      <button type="button" onclick="openProviderContextBudget('${escOnclick(p.id)}', '${escOnclick(p.model || '')}')"${p.model ? '' : ' disabled'}>${uiText('Context budget', '上下文预算')}</button>
       ${editButton}${p.custom ? `<button type="button" class="danger" onclick="deleteProvider('${escOnclick(p.id)}')"${p.default ? ' disabled title="' + uiText('Select another default first', '请先选择其他默认项') + '"' : ''}>${uiText('Delete', '删除')}</button>` : ''}
     </div>
     <div id="providerResult-${escAttr(p.id)}" class="provider-result" role="status" hidden></div>
     <div id="providerDiscovery-${escAttr(p.id)}" class="provider-discovery" hidden></div>
+    <div id="providerBudget-${escAttr(p.id)}" class="provider-discovery" hidden></div>
   </div>`;
   }).join('') || '<div class="provider-empty">' + uiText('No providers configured', '未配置提供商') + '</div>';
   const search = document.querySelector('.settings-search');
@@ -6253,7 +6257,18 @@ function renderProviderModelCandidates(panel, query) {
   const matched = needle ? models.filter(m => m.id.toLowerCase().includes(needle) || String(m.name || '').toLowerCase().includes(needle)) : models;
   const list = panel.querySelector('.provider-discovery-list');
   if (!list) return;
-  list.innerHTML = matched.slice(0, 100).map(m => `<button type="button" class="provider-model-choice" data-model-id="${escAttr(m.id)}" onclick="selectDiscoveredProviderModel(this)"><strong>${escHtml(m.id)}</strong>${m.name && m.name !== m.id ? `<span>${escHtml(m.name)}</span>` : ''}</button>`).join('')
+  const capabilities = model => {
+    const clientProfile = model.windowKind === 'client_profile';
+    const values = [[clientProfile ? uiText('Client suggested window', '客户端建议窗口') : model.windowKind === 'input' ? uiText('Input budget', '输入预算') : uiText('Default window', '默认窗口'), model.contextWindow],
+      [clientProfile ? uiText('Client catalog maximum', '客户端目录最大值') : uiText('Budget ceiling', '预算允许上限'), model.maxContextWindow],
+      [uiText('Full model capacity', '模型完整容量'), model.modelWindow],
+      [uiText('Maximum input', '最大输入'), model.maxInputTokens],
+      [uiText('Maximum output', '最大输出'), model.maxOutputTokens]];
+    const labels = values.filter(([, value]) => typeof value === 'number' && Number.isFinite(value) && value > 0)
+      .map(([label, value]) => label + ' ' + Math.round(value).toLocaleString() + ' tokens');
+    return labels.length ? `<span>${escHtml(labels.join(' · '))}</span>` : '';
+  };
+  list.innerHTML = matched.slice(0, 100).map(m => `<div><button type="button" class="provider-model-choice" data-model-id="${escAttr(m.id)}" onclick="selectDiscoveredProviderModel(this)"><strong>${escHtml(m.id)}</strong>${m.name && m.name !== m.id ? `<span>${escHtml(m.name)}</span>` : ''}${capabilities(m)}</button>${panel.dataset.origin === 'card' ? `<div class="provider-actions"><button type="button" data-model-id="${escAttr(m.id)}" onclick="openDiscoveredProviderContextBudget(this)">${uiText('Context budget', '上下文预算')}</button></div>` : ''}</div>`).join('')
     || `<div class="provider-empty">${uiText('No matching models', '没有匹配的模型')}</div>`;
   if (matched.length > 100) list.insertAdjacentHTML('beforeend', `<div class="provider-empty">${uiText('Showing the first 100 matches. Refine the search to see more.', '仅显示前 100 个结果，请继续缩小搜索范围。')}</div>`);
 }
@@ -6281,6 +6296,148 @@ async function selectDiscoveredProviderModel(button) {
   } catch (e) {
     setProviderResult(id, uiText('Could not save model: ', '保存模型失败：') + providerErrorText(e.message), 'error');
     button.disabled = false;
+  }
+}
+
+function openDiscoveredProviderContextBudget(button) {
+  const panel = button && button.closest('.provider-discovery');
+  if (panel && panel.dataset.origin === 'card') openProviderContextBudget(panel.dataset.providerId, button.dataset.modelId);
+}
+
+function providerContextBudgetIsCurrent(state) {
+  return providerContextBudgetStates.get(state.providerId) === state &&
+    document.getElementById('providerBudget-' + state.providerId) === state.panel;
+}
+
+function providerContextBudgetResponseMatches(data, state, expectedRouteKey) {
+  if (!data || data.providerId !== state.providerId || data.model !== state.model || !data.routeKey ||
+      (expectedRouteKey && data.routeKey !== expectedRouteKey)) return false;
+  const cap = data.capabilities || {};
+  // Legacy/fallback providers may lack nested ownership. If any binding is
+  // published, its complete tuple must agree with the server-owned envelope.
+  return !(cap.routeKey || cap.providerId || cap.model) ||
+    (cap.routeKey === data.routeKey && cap.providerId === data.providerId && cap.model === data.model);
+}
+
+function providerContextBudgetRequestedWindow(data) {
+  const saved = Number(data.requestedWindow) || 0;
+  if (saved > 0 || data.configured === true) return saved;
+  const cap = data.capabilities || {};
+  // An explicit saved zero overrides the old provider-level window. Without
+  // that per-model record, opening this editor must preserve the legacy value.
+  return cap.budgetSource === 'legacy_provider' ? Number(cap.requestedWindow) || 0 : 0;
+}
+
+function renderProviderContextBudget(state) {
+  if (!providerContextBudgetIsCurrent(state)) return;
+  const panel = state.panel, data = state.data || {}, cap = data.capabilities || {};
+  const tokens = value => typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value).toLocaleString() + ' tokens' : '';
+  const row = (label, value) => tokens(value) ? `<div><dt>${escHtml(label)}</dt><dd>${escHtml(tokens(value))}</dd></div>` : '';
+  const windowLabel = cap.windowKind === 'input' ? uiText('Active input budget', '当前输入预算') : uiText('Active window', '当前窗口');
+  const capacityRows = (row(windowLabel, cap.window) || `<div><dt>${escHtml(windowLabel)}</dt><dd>${uiText('Unconfirmed', '未确认')}</dd></div>`)
+    + row(uiText('Endpoint default window', '端点默认窗口'), cap.defaultWindow)
+    + row(uiText('Client suggested window', '客户端建议窗口'), cap.profileDefaultWindow)
+    + row(uiText('Client catalog maximum', '客户端目录最大值'), cap.profileMaxWindow)
+    + row(uiText('Full model capacity', '模型完整容量'), cap.modelWindow)
+    + row(uiText('Budget ceiling', '预算允许上限'), cap.maxWindow)
+    + row(uiText('Maximum input', '最大输入'), cap.maxInputTokens)
+    + row(uiText('Maximum output', '最大输出'), cap.maxOutputTokens);
+  const requested = providerContextBudgetRequestedWindow(data);
+  const manual = requested > 0;
+  const inputID = 'providerContextWindow-' + state.generation;
+  panel.hidden = false;
+  panel.innerHTML = `<div class="provider-discovery-head"><strong>${uiText('Context budget', '上下文预算')} · ${escHtml(state.model)}</strong><span>${uiText('Saved only for this exact model and connection route; the provider’s selected model stays unchanged.', '仅保存到这个精确模型与接入路线，不会变更提供商的所选模型。')}</span></div>
+    ${capacityRows ? `<dl class="context-meter-details">${capacityRows}</dl>` : ''}
+    <div class="provider-meta">${uiText('Data source', '数据来源')}：${escHtml(contextCapacitySourceLabel(cap.source || cap.limitSource))}${cap.limitSource && cap.limitSource !== cap.source ? ' · ' + uiText('Budget ceiling source', '预算约束来源') + '：' + escHtml(contextCapacitySourceLabel(cap.limitSource)) : ''}${cap.modelSource ? ' · ' + uiText('Model capacity source', '模型容量来源') + '：' + escHtml(contextCapacitySourceLabel(cap.modelSource)) : ''}</div>
+    <div class="settings-card-row"><label>${uiText('Working budget', '工作预算')} <select data-budget-mode onchange="changeProviderContextBudgetMode(this)"><option value="automatic"${manual ? '' : ' selected'}>${uiText('Automatic', '自动')}</option><option value="manual"${manual ? ' selected' : ''}>${uiText('Manual window', '手工窗口')}</option></select></label><label for="${inputID}"${manual ? '' : ' hidden'} data-budget-window-label>${uiText('Tokens', 'Token 数')} <input id="${inputID}" data-budget-window class="settings-number" type="number" min="1" step="1" value="${escAttr(String(requested || Number(cap.window) || ''))}"${manual ? '' : ' disabled'}></label></div>
+    <div class="provider-meta">${uiText('Automatic follows discovered capabilities. A manual request is limited by available capacity evidence; catalog specifications do not prove this service accepts that window.', '自动模式跟随已发现的能力。手工窗口受现有容量证据约束；模型目录规格和填写数值都不代表此服务已验证支持。')}</div>
+    ${Number(cap.window) > 0 ? '' : `<div class="provider-meta">${uiText('The automatic window is unknown for this connection. Set an explicit budget or complete the model metadata before relying on a capacity.', '此接入路线的自动窗口尚未确认。可手工配置预算或补全模型元数据；请先确认服务限制。')}</div>`}
+    ${requested > 0 && Number(cap.window) > 0 && requested !== Number(cap.window) ? `<div class="provider-meta">${uiText('Requested', '请求窗口')} ${escHtml(tokens(requested))} · ${uiText('Applied', '实际窗口')} ${escHtml(tokens(cap.window))}</div>` : ''}
+    <div class="provider-result" data-budget-result role="status" hidden></div>
+    <div class="provider-actions"><button type="button" onclick="closeProviderContextBudget(this)">${uiText('Close', '关闭')}</button><button type="button" class="primary" onclick="saveProviderContextBudget(this)">${uiText('Save budget', '保存预算')}</button></div>`;
+}
+
+function changeProviderContextBudgetMode(select) {
+  const panel = select && select.closest('.provider-discovery');
+  if (!panel) return;
+  const manual = select.value === 'manual';
+  const input = panel.querySelector('[data-budget-window]');
+  const label = panel.querySelector('[data-budget-window-label]');
+  if (label) label.hidden = !manual;
+  if (input) { input.disabled = !manual; if (manual) input.focus(); }
+}
+
+function closeProviderContextBudget(button) {
+  const panel = button && button.closest('.provider-discovery');
+  if (!panel) return;
+  providerContextBudgetStates.delete(panel.dataset.providerId);
+  panel.hidden = true;
+}
+
+async function openProviderContextBudget(providerId, model) {
+  providerId = String(providerId || ''); model = String(model || '');
+  const panel = document.getElementById('providerBudget-' + providerId);
+  if (!panel || !model) return;
+  const state = { providerId, model, panel, generation: ++providerContextBudgetGeneration, data: null, saving: false };
+  providerContextBudgetStates.set(providerId, state);
+  panel.dataset.providerId = providerId;
+  panel.classList.remove('error');
+  panel.hidden = false;
+  panel.textContent = uiText('Loading context capabilities…', '正在读取上下文能力…');
+  try {
+    const res = await fetch('/api/providers/' + encodeURIComponent(providerId) + '/context-budget?model=' + encodeURIComponent(model));
+    const data = await res.json();
+    if (!providerContextBudgetIsCurrent(state)) return;
+    if (!res.ok) throw new Error(data.error || 'context budget: ' + res.status);
+    if (!providerContextBudgetResponseMatches(data, state)) throw new Error(uiText('Context capability owner changed. Open the settings again.', '上下文能力所属配置已变化，请重新打开设置。'));
+    state.data = data;
+    renderProviderContextBudget(state);
+  } catch (e) {
+    if (!providerContextBudgetIsCurrent(state)) return;
+    panel.classList.add('error');
+    panel.textContent = uiText('Could not load context budget: ', '读取上下文预算失败：') + providerErrorText(e.message);
+  }
+}
+
+async function saveProviderContextBudget(button) {
+  const panel = button && button.closest('.provider-discovery');
+  const state = panel && providerContextBudgetStates.get(panel.dataset.providerId);
+  if (!state || !state.data || !providerContextBudgetIsCurrent(state) || state.saving) return;
+  const mode = panel.querySelector('[data-budget-mode]');
+  const input = panel.querySelector('[data-budget-window]');
+  const result = panel.querySelector('[data-budget-result]');
+  const value = mode && mode.value === 'manual' ? Number(input && input.value) : 0;
+  const feedback = (message, kind) => { if (result) { result.hidden = false; result.textContent = message; result.className = 'provider-result ' + kind; result.setAttribute('role', kind === 'error' ? 'alert' : 'status'); } };
+  if (!Number.isSafeInteger(value) || value < 0 || (mode && mode.value === 'manual' && value === 0)) {
+    feedback(uiText('Enter a positive whole number of tokens.', '请填写正整数 Token 数。'), 'error');
+    return;
+  }
+  const routeKey = state.data.routeKey;
+  state.saving = true;
+  panel.querySelectorAll('button, select, input').forEach(control => { control.disabled = true; });
+  feedback(uiText('Saving context budget…', '正在保存上下文预算…'), 'pending');
+  try {
+    // The server-generated scope hash prevents a changed route from inheriting
+    // this editor's request. Never send a URL, credential, model mutation or turn.
+    const res = await fetch('/api/providers/' + encodeURIComponent(state.providerId) + '/context-budget', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: state.model, window: value, expectedRouteKey: routeKey }) });
+    const data = await res.json();
+    if (!providerContextBudgetIsCurrent(state)) return;
+    if (!res.ok) throw new Error(data.error || 'save context budget: ' + res.status);
+    if (!providerContextBudgetResponseMatches(data, state, routeKey)) throw new Error(uiText('The connection route changed. Reopen these settings before saving again.', '接入路线已变化，请重新打开设置后再保存。'));
+    state.data = data;
+    renderProviderContextBudget(state);
+    const saved = panel.querySelector('[data-budget-result]');
+    if (saved) { saved.hidden = false; saved.className = 'provider-result success'; saved.textContent = data.applied === true ? uiText('Budget saved and applied.', '预算已保存并生效。') : uiText('Budget saved. It applies when this model is next bound to a task.', '预算已保存，下次任务绑定此模型时生效。'); }
+    const active = typeof lastStatusSnapshot !== 'undefined' ? lastStatusSnapshot : null;
+    if (active && active.contextProviderId === state.providerId && active.contextModel === state.model && active.contextRouteKey === routeKey && typeof pollStatus === 'function') await pollStatus();
+  } catch (e) {
+    if (providerContextBudgetIsCurrent(state)) feedback(uiText('Could not save context budget: ', '保存上下文预算失败：') + providerErrorText(e.message), 'error');
+  } finally {
+    state.saving = false;
+    if (providerContextBudgetIsCurrent(state)) {
+      panel.querySelectorAll('button, select, input').forEach(control => { control.disabled = false; });
+      changeProviderContextBudgetMode(panel.querySelector('[data-budget-mode]'));
+    }
   }
 }
 

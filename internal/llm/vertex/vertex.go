@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/anthropic"
 	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
@@ -59,7 +60,8 @@ type Vertex struct {
 	tokenSource *cloud.GCPTokenSource
 
 	// ContextWindow override, same shape as the other providers.
-	ContextWindow int
+	ContextWindow       int
+	ContextBudgetPolicy *llm.ContextBudgetPolicy
 }
 
 // NewVertex builds a Vertex AI provider from a service-account file
@@ -108,7 +110,12 @@ func (v *Vertex) SupportsVision() bool { return anthropic.SupportsVisionModel(v.
 func (v *Vertex) VisionCapability() provider.VisionCapability {
 	return anthropic.VisionCapabilityForModel(v.Model)
 }
-func (v *Vertex) MaxContextTokens() int { return v.ContextWindow }
+func (v *Vertex) MaxContextTokens() int {
+	if v.ContextBudgetPolicy == nil {
+		return v.ContextWindow
+	}
+	return v.ContextCapabilities().Window
+}
 
 // Vertex uses the shared Anthropic request encoder. Plaintext thinking only
 // round-trips when its original Anthropic signature is present.

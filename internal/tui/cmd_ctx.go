@@ -33,14 +33,46 @@ func cmdCtx(r *REPL, args string) string {
 	// Anthropic gateway); loop.Model is authoritative.
 	b.WriteString(fmt.Sprintf("  provider model:  %s\n", loop.Model))
 
-	cap := 0
-	if loop.Provider != nil {
-		cap = loop.Provider.MaxContextTokens()
-	}
+	// Read the capability version installed on the Loop, not a provider cache
+	// that may have refreshed since the compactor's request binding was built.
+	capabilities, threshold, trigger := loop.ContextDetailsSnapshot()
+	cap := capabilities.Window
 	if cap > 0 {
-		b.WriteString(fmt.Sprintf("  context window:  %s tokens\n", fmtThousands(cap)))
+		b.WriteString(fmt.Sprintf("  context window:  %s tokens (current working budget)\n", fmtThousands(cap)))
 	} else {
 		b.WriteString("  context window:  unknown (provider didn't publish)\n")
+	}
+	capacity := func(label string, value int) {
+		if value > 0 {
+			b.WriteString(fmt.Sprintf("  %-17s%s tokens\n", label+":", fmtThousands(value)))
+		}
+	}
+	capacity("endpoint default", capabilities.DefaultWindow)
+	capacity("client suggestion", capabilities.ProfileDefaultWindow)
+	capacity("client catalog max", capabilities.ProfileMaxWindow)
+	capacity("model capacity", capabilities.ModelWindow)
+	capacity("model max input", capabilities.ModelMaxInputTokens)
+	capacity("model max output", capabilities.ModelMaxOutputTokens)
+	capacity("budget ceiling", capabilities.MaxWindow)
+	capacity("max input", capabilities.MaxInputTokens)
+	capacity("max output", capabilities.MaxOutputTokens)
+	if capabilities.Source != "" {
+		b.WriteString(fmt.Sprintf("  data source:     %s\n", capabilities.Source))
+	}
+	if capabilities.ModelSource != "" {
+		b.WriteString(fmt.Sprintf("  model source:    %s\n", capabilities.ModelSource))
+	}
+	if capabilities.LimitSource != "" && capabilities.LimitSource != capabilities.Source {
+		b.WriteString(fmt.Sprintf("  route source:    %s\n", capabilities.LimitSource))
+	}
+	if capabilities.BudgetSource != "" {
+		b.WriteString(fmt.Sprintf("  budget source:   %s\n", capabilities.BudgetSource))
+	}
+	if capabilities.RequestedWindow > 0 && capabilities.RequestedWindow != cap {
+		capacity("requested window", capabilities.RequestedWindow)
+	}
+	if capabilities.WindowKind == "input" {
+		b.WriteString("  window kind:     input budget (total model capacity unknown)\n")
 	}
 
 	c := loop.Compactor
@@ -50,12 +82,11 @@ func cmdCtx(r *REPL, args string) string {
 	}
 
 	b.WriteString(fmt.Sprintf("  threshold:       %.2f (%d%%)\n",
-		c.Threshold, int(c.Threshold*100)))
+		threshold, int(threshold*100)))
 
 	// Use the compactor's public boundary calculation rather than copying its
 	// input-cap reservation logic here. That keeps this diagnostic identical to
 	// ShouldCompact, including compatibility switches and future policy changes.
-	trigger := c.TriggerTokens()
 	minimum := c.MinimumTokens
 	if trigger > 0 && minimum > trigger {
 		minimum = trigger

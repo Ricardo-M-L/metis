@@ -367,6 +367,9 @@ type Loop struct {
 	// are sent. The mode itself comes from the ENABLE_TOOL_SEARCH env
 	// var; this field is just the budget input.
 	ContextWindow int
+	// contextCapabilities is the metadata version installed with ContextWindow
+	// and Compactor under mu. Readers never query a newer provider version.
+	contextCapabilities llm.ContextCapabilities
 
 	// JobNotify is the receive end of the jobs.Registry notification
 	// channel. The Run loop drains it at every iteration boundary and
@@ -1107,18 +1110,18 @@ func (l *Loop) rebindProviderRuntime(provider llm.Provider, model string, maxOut
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	window := 0
-	if provider != nil {
-		window = provider.MaxContextTokens()
-	}
+	capabilities := providerContextCapabilities(provider)
+	window := capabilities.Window
 	if old := l.Compactor; old != nil && provider != nil {
 		outputBudget := old.MaxOutputTokens
 		if replaceOutput {
 			outputBudget = max(maxOutputTokens, 0)
 		}
 		next := NewCompactor(old.Config, model, window, provider)
+		next.WindowKind = capabilities.WindowKind
+		next.MaxInputTokens = capabilities.MaxInputTokens
 		next.MaxOutputTokens = outputBudget
-		next.ApplyWindowTier(window - outputBudget)
+		next.ApplyWindowTier(next.effectiveInputCap())
 		l.Compactor = next
 	} else if provider == nil {
 		l.Compactor = nil
@@ -1126,6 +1129,7 @@ func (l *Loop) rebindProviderRuntime(provider llm.Provider, model string, maxOut
 	l.Provider = provider
 	l.Model = model
 	l.ContextWindow = window
+	l.contextCapabilities = capabilities
 	if replacePrompt {
 		l.System = system
 		l.SystemSections = append([]llm.SystemSection(nil), sections...)
@@ -1171,17 +1175,8 @@ func (l *Loop) ProviderModelSnapshot() (llm.Provider, string, int) {
 // EstimateContextTokens so render paths retain its non-blocking TryRLock
 // behavior while a long compaction owns the history lock.
 func (l *Loop) ContextStatusSnapshot() (window int, threshold float64, trigger int) {
-	if l == nil {
-		return 0, 0, 0
-	}
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	window = l.ContextWindow
-	if l.Compactor != nil {
-		threshold = l.Compactor.Config.Threshold
-		trigger = l.Compactor.TriggerTokens()
-	}
-	return window, threshold, trigger
+	capabilities, threshold, trigger := l.ContextDetailsSnapshot()
+	return capabilities.Window, threshold, trigger
 }
 
 // FastEnabled returns the live quick-output preference. The setting can be
@@ -1671,6 +1666,16 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	}()
 
 	defer finish() // release native input before persistence/user-hook finalizers
+	// Metadata discovery can finish after construction. Refresh before any
+	// schema or compaction decision; a failed discovery retains the old cap.
+	if err := l.refreshCapabilitiesForRequest(ctx); errors.Is(err, ErrContextCapabilitiesBudget) || errors.Is(err, llm.ErrContextBudgetPolicy) || ctx.Err() != nil {
+		stopReason = "error"
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		emit(ctx, out, Event{Kind: EventError, Err: err})
+		return err
+	}
 	specs := l.toolSpecs()
 	l.contract.verifyUnavailable = !l.verifierDispatchAvailable()
 	verificationAttempts := 0
@@ -1818,6 +1823,14 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		// Tool/skill/plugin availability is live runtime state. Refresh the
 		// schema every iteration so post-compaction requests cannot inherit a
 		// stale Run-start catalog after lazy MCP discovery or plugin changes.
+		if err := l.refreshCapabilitiesForRequest(ctx); errors.Is(err, ErrContextCapabilitiesBudget) || errors.Is(err, llm.ErrContextBudgetPolicy) || ctx.Err() != nil {
+			stopReason = "error"
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			emit(ctx, out, Event{Kind: EventError, Err: err})
+			return err
+		}
 		specs = l.toolSpecs()
 		pressureTokens := l.EstimateRequestContextTokens(specs)
 		l.maybeCompactWithPressure(ctx, out, pressureTokens)

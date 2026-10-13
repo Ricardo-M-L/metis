@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,17 +48,32 @@ func TestCLIRunUserInputTraceRecordsRawPrompt(t *testing.T) {
 				}
 			}
 			requests := make(chan string, 4)
+			var metadataRequests, generationRequests atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodHead {
 					return // Runtime's local connectivity probe is not a model call.
 				}
+				if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+					metadataRequests.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					// An ID-only catalog is valid discovery metadata, not a
+					// generation. Both rich and ordinary listing probes use it.
+					fmt.Fprint(w, `{"data":[{"id":"trace-fixture-model","object":"model"}]}`)
+					return
+				}
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
+					t.Errorf("unexpected fixture request: %s %s", r.Method, r.URL.Path)
+					http.Error(w, "unexpected fixture request", http.StatusNotFound)
+					return
+				}
+				generation := generationRequests.Add(1)
 				body, err := io.ReadAll(r.Body)
 				if err != nil {
 					t.Error(err)
 				}
 				requests <- string(body)
 				answer := "local answer"
-				if schemaRetry && len(requests) > 1 {
+				if schemaRetry && generation > 1 {
 					answer = `{"ok":true}`
 				}
 				encoded, err := json.Marshal(answer)
@@ -113,8 +129,11 @@ api_key_env = "METIS_TEST_TRACE_KEY"
 			if schemaRetry {
 				wantRequests = 2
 			}
-			if len(requests) != wantRequests {
-				t.Fatalf("local provider requests = %d, want %d", len(requests), wantRequests)
+			if generationRequests.Load() != int32(wantRequests) || len(requests) != wantRequests {
+				t.Fatalf("local generation POSTs = %d, captured bodies = %d, want %d", generationRequests.Load(), len(requests), wantRequests)
+			}
+			if metadataRequests.Load() != 2 {
+				t.Fatalf("rich/ordinary ID-only metadata GETs = %d, want 2", metadataRequests.Load())
 			}
 			if request := <-requests; !strings.Contains(request, "GENERATED_DIRECTORY_HINT") {
 				t.Fatal("fixture did not exercise provider-only directory hints")

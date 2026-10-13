@@ -26,6 +26,16 @@ type checkpointProvider struct {
 	calls   atomic.Int32
 	blocked chan struct{}
 	release chan struct{}
+	// A fixture's request and compaction windows must describe the same
+	// provider; request-boundary metadata synchronization enforces that binding.
+	contextWindow int
+}
+
+func (p *checkpointProvider) MaxContextTokens() int {
+	if p.contextWindow > 0 {
+		return p.contextWindow
+	}
+	return p.headlessBoundaryProvider.MaxContextTokens()
 }
 
 func (p *checkpointProvider) Stream(ctx context.Context, req llm.Request) (llm.StreamReader, error) {
@@ -433,6 +443,8 @@ func TestHeadlessCheckpointAutoCompactionWriteFailureIsFatal(t *testing.T) {
 	}}
 	cfg := agent.DefaultCompactionConfig()
 	cfg.MaxSummarizeInputTokens = 0
+	provider.contextWindow = 2000
+	loop.ContextWindow = provider.MaxContextTokens()
 	loop.Compactor = agent.NewCompactor(cfg, "model", 2000, summarizer)
 	loop.Compactor.Threshold = 0.25
 	cancel, done := startCheckpointLoop(t, loop)

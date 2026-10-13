@@ -7,6 +7,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep automatic context budgets within independently known model and serving
+  limits, with client recommendations, input limits and provenance shown separately.
+- Bind saved context budgets to the exact provider route, account and model;
+  refresh them before the next request without interrupting an active generation.
+- Discover Codex subscription and native Gemini limits, and resolve GLM capacities
+  through verified Zhipu/Z.AI model records instead of proxy compatibility defaults.
+
+### Added
+
+- Configure per-model automatic or manual context budgets in Desktop settings,
+  shared with CLI diagnostics and automatic compaction.
+
 ## [0.4.88] - 2026-10-12
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

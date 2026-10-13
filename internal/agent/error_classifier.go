@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 )
 
@@ -137,6 +138,11 @@ func ClassifyError(err error) ErrorClass {
 		strings.Contains(msg, "user abort") ||
 		strings.Contains(msg, "operation cancelled by user") {
 		return ErrCancelled
+	}
+	// A saved budget or advertised generation allowance must be repaired by
+	// the caller. Compacting history or retrying cannot fix these constraints.
+	if errors.Is(err, ErrContextCapabilitiesBudget) || errors.Is(err, llm.ErrContextBudgetPolicy) || errors.Is(err, llm.ErrContextOutputBudget) {
+		return ErrInvalidRequest
 	}
 
 	// Tool/function argument failures are payload errors, even when a

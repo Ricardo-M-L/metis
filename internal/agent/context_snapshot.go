@@ -48,6 +48,9 @@ type contextRequestAnchor struct {
 	routingRevision uint64
 	requestOverhead int
 	maxContext      int
+	windowKind      string
+	maxInput        int
+	maxOutput       int
 }
 
 func identifyContextProvider(provider llm.Provider) contextProviderIdentity {
@@ -83,6 +86,19 @@ func (l *Loop) contextRequestAnchorLocked(provider llm.Provider, req llm.Request
 	// tool schemas can all change between two turns; inheriting the previous
 	// request's value makes the provider usage anchor internally inconsistent.
 	l.requestOverheadTokens.Store(int64(overhead))
+	maxContext := l.ContextWindow
+	// The active working budget may be smaller than a verified physical
+	// window. A valid reply can cross that budget and require compaction on
+	// the next request; it must not be mistaken for impossible wire usage.
+	if l.contextCapabilities.MaxWindow > 0 {
+		maxContext = l.contextCapabilities.MaxWindow
+	}
+	if maxContext <= 0 {
+		// Standalone embedders may inspect responses before runtime assembly or
+		// the first Run boundary. Preserve their legacy impossible-usage guard;
+		// an installed window always wins over a newer provider-cache version.
+		maxContext = provider.MaxContextTokens()
+	}
 	return contextRequestAnchor{
 		valid:           true,
 		provider:        provider,
@@ -92,7 +108,10 @@ func (l *Loop) contextRequestAnchorLocked(provider llm.Provider, req llm.Request
 		historyRevision: l.historyRevision,
 		routingRevision: l.routingRevision,
 		requestOverhead: overhead,
-		maxContext:      provider.MaxContextTokens(),
+		maxContext:      maxContext,
+		windowKind:      l.contextCapabilities.WindowKind,
+		maxInput:        l.contextCapabilities.MaxInputTokens,
+		maxOutput:       l.contextCapabilities.MaxOutputTokens,
 	}
 }
 
@@ -280,7 +299,7 @@ func (l *Loop) storeActiveContextSnapshotLocked(usage *usageTotals, anchor conte
 		// Reject only a clear omission; normal tokenizer drift must keep the
 		// provider's authoritative raw count for the UI tooltip.
 		usageClearlyUnderreports(tokens, estimatedAnchorTokens) ||
-		(anchor.maxContext > 0 && tokens > anchor.maxContext) ||
+		!contextUsageFitsAnchor(usage, promptTokens, tokens, anchor) ||
 		l.historyRevision != anchor.historyRevision ||
 		l.routingRevision != anchor.routingRevision ||
 		len(l.Messages) != anchor.messageCount+1 ||
@@ -300,6 +319,22 @@ func (l *Loop) storeActiveContextSnapshotLocked(usage *usageTotals, anchor conte
 		requestModel:    anchor.requestModel,
 	}
 	l.estTokens.Store(int64(tokens))
+}
+
+func contextUsageFitsAnchor(usage *usageTotals, prompt, active int, anchor contextRequestAnchor) bool {
+	if anchor.maxInput > 0 && prompt > anchor.maxInput {
+		return false
+	}
+	if anchor.maxOutput > 0 && usage != nil && usage.out > anchor.maxOutput {
+		return false
+	}
+	if anchor.maxContext <= 0 {
+		return true
+	}
+	if anchor.windowKind == llm.ContextWindowInput {
+		return prompt <= anchor.maxContext
+	}
+	return active <= anchor.maxContext
 }
 
 // activeContextBaseLocked returns the active snapshot adjusted for messages

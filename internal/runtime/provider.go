@@ -92,14 +92,71 @@ func finalizeProviderBuild(provider llm.Provider, model string, maxOutputTokens 
 	if provider == nil {
 		return nil, fmt.Errorf("provider %q: constructor returned nil", model)
 	}
+	if wireModel := provider.ModelID(); wireModel != "" {
+		model = wireModel
+	}
+	// The concrete constructor has already filled its transport default. Use
+	// the same reservation as the wire encoder, including native OpenAI's
+	// 4096 default when max_tokens was omitted.
+	switch p := provider.(type) {
+	case *anthropic.Anthropic:
+		maxOutputTokens = p.MaxTokens
+	case *openai.OpenAI:
+		maxOutputTokens = p.MaxTokens
+	case *openai.Responses:
+		maxOutputTokens = p.MaxTokens
+	case *gemini.Gemini:
+		maxOutputTokens = p.MaxTokens
+	}
 	if maxOutputTokens <= 0 {
 		maxOutputTokens = transport.DefaultMaxOutputTokens
 	}
-	if window := provider.MaxContextTokens(); window > 0 && maxOutputTokens >= window {
+	window, windowKind := 0, ""
+	if metadata, ok := provider.(llm.ContextCapabilitiesProvider); ok {
+		capabilities := metadata.ContextCapabilities()
+		window, windowKind = capabilities.Window, capabilities.WindowKind
+		if capabilities.MaxOutputTokens > 0 && maxOutputTokens > capabilities.MaxOutputTokens {
+			return nil, fmt.Errorf("provider %q: max_tokens (%d) exceeds advertised output limit (%d)", model, maxOutputTokens, capabilities.MaxOutputTokens)
+		}
+	} else {
+		window = provider.MaxContextTokens()
+	}
+	if window > 0 && windowKind != llm.ContextWindowInput && maxOutputTokens >= window {
 		return nil, fmt.Errorf("provider %q: max_tokens (%d) must be smaller than context_window (%d)",
 			model, maxOutputTokens, window)
 	}
 	return &ProviderBuild{Provider: provider, Model: model, MaxOutputTokens: maxOutputTokens}, nil
+}
+
+// A provider-wide legacy value belongs to its configured default wire model.
+// Explicit --model selection must not borrow it for another model. Empty
+// config defaults use the concrete constructor's verified fallback id.
+func legacyContextWindowForModel(window int, configuredModel, selectedModel, constructorDefault string) int {
+	if configuredModel == "" {
+		configuredModel = constructorDefault
+	}
+	if selectedModel == "" {
+		selectedModel = constructorDefault
+	}
+	if configuredModel == "" || selectedModel != configuredModel {
+		return 0
+	}
+	return window
+}
+
+func defaultWireModelForTransport(transportName string) string {
+	switch transportName {
+	case "anthropic_messages", "anthropic":
+		return "claude-opus-4-7"
+	case "openai_chat", "openai", "openai_responses":
+		return "gpt-4o-mini"
+	case "gemini_native", "gemini":
+		return "gemini-2.5-pro"
+	default:
+		// Cloud deployment/model ids are explicitly supplied; never infer one
+		// from a public catalog name or another transport's default model.
+		return ""
+	}
 }
 
 // visionOverrideProvider preserves the core Provider contract while replacing
@@ -144,6 +201,13 @@ func (p visionOverrideHistoryProvider) ContextIncludesAssistantBlock(block llm.C
 
 func withVisionOverride(provider llm.Provider, supportsVision bool) llm.Provider {
 	base := visionOverrideProvider{Provider: provider, supportsVision: supportsVision}
+	if metadata, ok := provider.(llm.ContextCapabilitiesProvider); ok {
+		contextBase := visionOverrideContextProvider{visionOverrideProvider: base, contextProvider: metadata}
+		if policy, ok := provider.(llm.ContextHistoryPolicy); ok {
+			return visionOverrideContextHistoryProvider{visionOverrideContextProvider: contextBase, historyPolicy: policy}
+		}
+		return contextBase
+	}
 	if policy, ok := provider.(llm.ContextHistoryPolicy); ok {
 		return visionOverrideHistoryProvider{
 			visionOverrideProvider: base,
@@ -323,6 +387,13 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 			if !isAnthropicOAuthOrigin(cfg.Provider.Anthropic.BaseURL) {
 				return nil, errors.New("refusing to send Anthropic OAuth credentials to a non-Anthropic base_url; use an API key for custom gateways")
 			}
+			storedCredential, oauthErr := auth.GetOAuth("anthropic")
+			if oauthErr != nil {
+				return nil, fmt.Errorf("check Anthropic OAuth credential: %w", oauthErr)
+			}
+			if storedCredential == nil {
+				return nil, errors.New("Anthropic OAuth credential is missing; run `metis login anthropic`")
+			}
 			prov = anthropic.NewOAuth(
 				cfg.Provider.Anthropic.BaseURL,
 				model,
@@ -337,17 +408,23 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 					if credential == nil || strings.TrimSpace(credential.AccessToken) == "" {
 						return "", errors.New("Anthropic OAuth credential is missing; run `metis login anthropic`")
 					}
+					if credential.AccountID != storedCredential.AccountID {
+						return "", fmt.Errorf("%w: OAuth account changed; rebuild the provider", llm.ErrContextBudgetPolicy)
+					}
 					return credential.AccessToken, nil
 				},
 			)
 		}
-		prov.ContextWindow = cfg.Provider.Anthropic.ContextWindow
+		prov.ContextWindow = legacyContextWindowForModel(cfg.Provider.Anthropic.ContextWindow, cfg.Provider.Anthropic.Model, prov.Model, "claude-opus-4-7")
 		prov.CatalogProvider = strings.ToLower(strings.TrimSpace(cfg.Provider.Anthropic.CatalogProvider))
 		if prov.CatalogProvider == "" && isAnthropicOrigin(cfg.Provider.Anthropic.BaseURL) {
 			prov.CatalogProvider = "anthropic"
 		}
 		prov.AntiDistillation = cfg.Provider.Anthropic.AntiDistillation
 		prov.ClientSideDecoys = cfg.Provider.Anthropic.ClientSideDecoys
+		if err := bindProviderContext(prov, name, "anthropic_messages", strings.TrimSpace(cfg.Provider.Anthropic.CatalogProvider) != ""); err != nil {
+			return nil, err
+		}
 		// If the user enabled anti_distillation but is talking to a
 		// non-Anthropic gateway, the opt-in is a no-op (the gateway's
 		// backend doesn't implement the server-side countermeasure).
@@ -397,13 +474,19 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 				if credential == nil {
 					return openai.ResponsesOAuthCredential{}, errors.New("OpenAI Codex OAuth credential is missing; run `metis login openai-codex`")
 				}
+				if credential.AccountID != storedCredential.AccountID {
+					return openai.ResponsesOAuthCredential{}, fmt.Errorf("%w: OAuth account changed; rebuild the provider", llm.ErrContextBudgetPolicy)
+				}
 				return openai.ResponsesOAuthCredential{
 					AccessToken: credential.AccessToken,
 					AccountID:   credential.AccountID,
 				}, nil
 			},
 		)
-		prov.ContextWindow = cfg.Provider.OpenAICodex.ContextWindow
+		prov.ContextWindow = legacyContextWindowForModel(cfg.Provider.OpenAICodex.ContextWindow, strings.TrimSpace(cfg.Provider.OpenAICodex.Model), prov.Model, "gpt-5.5")
+		if err := bindProviderContext(prov, name, "openai_codex_responses", false); err != nil {
+			return nil, err
+		}
 		if allowPreconnect {
 			Preconnect(prov.BaseURL)
 		}
@@ -420,7 +503,7 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 		if model == "" {
 			model = cfg.Provider.OpenAI.Model
 		}
-		if strings.EqualFold(cfg.Provider.OpenAI.WireProtocol, "responses") {
+		if strings.EqualFold(strings.TrimSpace(cfg.Provider.OpenAI.WireProtocol), "responses") {
 			prov := openai.NewResponses(
 				key,
 				cfg.Provider.OpenAI.BaseURL,
@@ -437,7 +520,14 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 			}
 			prov.PromptCacheKey = strings.TrimSpace(cfg.Provider.OpenAI.PromptCacheKey)
 			prov.HostedTools = append([]string(nil), cfg.Provider.OpenAI.HostedTools...)
-			prov.ContextWindow = cfg.Provider.OpenAI.ContextWindow
+			prov.ContextWindow = legacyContextWindowForModel(cfg.Provider.OpenAI.ContextWindow, cfg.Provider.OpenAI.Model, prov.Model, "gpt-4o-mini")
+			prov.CatalogProvider = strings.ToLower(strings.TrimSpace(cfg.Provider.OpenAI.CatalogProvider))
+			if prov.CatalogProvider == "" && isOpenAIOrigin(cfg.Provider.OpenAI.BaseURL) {
+				prov.CatalogProvider = "openai"
+			}
+			if err := bindProviderContext(prov, name, "openai_responses", strings.TrimSpace(cfg.Provider.OpenAI.CatalogProvider) != ""); err != nil {
+				return nil, err
+			}
 			if allowPreconnect {
 				Preconnect(cfg.Provider.OpenAI.BaseURL)
 			}
@@ -451,10 +541,13 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 			time.Duration(cfg.Provider.OpenAI.TimeoutSecs)*time.Second,
 			cfg.Provider.OpenAI.Temperature,
 		)
-		prov.ContextWindow = cfg.Provider.OpenAI.ContextWindow
+		prov.ContextWindow = legacyContextWindowForModel(cfg.Provider.OpenAI.ContextWindow, cfg.Provider.OpenAI.Model, prov.Model, "gpt-4o-mini")
 		prov.CatalogProvider = strings.ToLower(strings.TrimSpace(cfg.Provider.OpenAI.CatalogProvider))
 		if prov.CatalogProvider == "" && isOpenAIOrigin(cfg.Provider.OpenAI.BaseURL) {
 			prov.CatalogProvider = "openai"
+		}
+		if err := bindProviderContext(prov, name, "openai_chat", strings.TrimSpace(cfg.Provider.OpenAI.CatalogProvider) != ""); err != nil {
+			return nil, err
 		}
 		if allowPreconnect {
 			Preconnect(cfg.Provider.OpenAI.BaseURL)
@@ -482,7 +575,10 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 			time.Duration(cfg.Provider.Gemini.TimeoutSecs)*time.Second,
 			cfg.Provider.Gemini.Temperature,
 		)
-		prov.ContextWindow = cfg.Provider.Gemini.ContextWindow
+		prov.ContextWindow = legacyContextWindowForModel(cfg.Provider.Gemini.ContextWindow, cfg.Provider.Gemini.Model, prov.Model, "gemini-2.5-pro")
+		if err := bindProviderContext(prov, "gemini", "gemini_native", false); err != nil {
+			return nil, err
+		}
 		if allowPreconnect {
 			Preconnect(cfg.Provider.Gemini.BaseURL)
 		}
@@ -525,13 +621,7 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 	if model == "" {
 		model = raw.Model
 	}
-	transportName := raw.Transport
-	if transportName == "" {
-		// Empty transport defaults to anthropic_messages — the most
-		// common case for "I'm pointing at an Anthropic-format gateway"
-		// (MiniMax, OpenRouter, yunwu, …).
-		transportName = "anthropic_messages"
-	}
+	transportName := normalizedCustomTransport(raw)
 
 	opts := transport.BuildOpts{
 		APIKey:          key,
@@ -540,7 +630,7 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 		CatalogProvider: strings.ToLower(strings.TrimSpace(raw.CatalogProvider)),
 		MaxTokens:       raw.MaxTokens,
 		Timeout:         raw.TimeoutSecs,
-		ContextWindow:   raw.ContextWindow,
+		ContextWindow:   legacyContextWindowForModel(raw.ContextWindow, raw.Model, model, defaultWireModelForTransport(transportName)),
 		Extra: map[string]string{
 			// Azure
 			"api_version": raw.APIVersion,
@@ -566,6 +656,12 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 		return nil, fmt.Errorf("provider %q: %w", id, err)
 	}
 	provider := res.Provider
+	if responses, ok := provider.(*openai.Responses); ok {
+		responses.CatalogProvider = opts.CatalogProvider
+	}
+	if err := bindProviderContext(provider, id, transportName, strings.TrimSpace(raw.CatalogProvider) != ""); err != nil {
+		return nil, err
+	}
 	if raw.SupportsVision != nil {
 		// The native Gemini request encoder does not yet serialize Metis image
 		// blocks. Refuse a misleading positive override instead of passing the

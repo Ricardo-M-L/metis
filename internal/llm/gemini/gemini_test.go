@@ -300,7 +300,7 @@ func TestGemini_MaxContextTokens(t *testing.T) {
 		{"gemini-2.5-flash", 1_000_000},
 		{"gemini-1.5-pro", 1_000_000},
 		{"gemini-pro", 32_000},
-		{"unknown-model", 1_000_000},
+		{"unknown-model", 64_000},
 	}
 	for _, tc := range cases {
 		g := &Gemini{Model: tc.model}

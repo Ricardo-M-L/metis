@@ -294,7 +294,8 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	// mode has a budget to compare against. 0 here means the
 	// provider didn't publish a window; auto mode silently no-ops
 	// in that case.
-	loop.ContextWindow = opts.Provider.MaxContextTokens()
+	contextWindow := opts.Provider.MaxContextTokens()
+	loop.ContextWindow = contextWindow
 
 	// Wire jobs.Registry → Loop.JobNotify so the Run loop drains
 	// completed bash jobs and injects <job_notification> messages.
@@ -322,7 +323,7 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		compactCfg.MinimumTokens = cfg.Session.AutoCompactMinimumTokens
 	}
 	loop.Compactor = agent.NewCompactor(compactCfg, opts.Model,
-		opts.Provider.MaxContextTokens(), opts.Provider)
+		contextWindow, opts.Provider)
 	// max_tokens is per-provider; ShouldCompact subtracts this from the
 	// effective input cap so compaction fires before
 	// `input + max_tokens > context_window` triggers a 4xx server-side.
@@ -343,7 +344,7 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	// (DeepSeek-V2 16k, Ollama defaults) thrash on long sessions.
 	// Apply the tier AFTER MaxOutputTokens is set so the effective cap
 	// is correct.
-	loop.Compactor.ApplyWindowTier(opts.Provider.MaxContextTokens() - maxOutputTokens)
+	loop.Compactor.ApplyWindowTier(contextWindow - maxOutputTokens)
 
 	// Microcompact cache dir (2026-05-15 wire-up). The Compactor.Microcompact
 	// path was implemented + tested but never reachable in production
@@ -403,6 +404,9 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		loop.Detector = det
 	}
 
+	if _, ok := opts.Provider.(llm.ContextCapabilitiesProvider); ok {
+		loop.SyncContextCapabilities()
+	}
 	return loop
 }
 

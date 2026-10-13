@@ -28,6 +28,8 @@ package transport
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,18 +70,21 @@ func (t *dumpTransport) resolveSessID() string {
 
 // dumpEntry is the wire shape for each JSONL line.
 type dumpEntry struct {
-	Type      string          `json:"type"` // "request" | "response" | "error"
-	Timestamp string          `json:"timestamp"`
-	Provider  string          `json:"provider"`
-	ReqID     string          `json:"reqid,omitempty"`
-	Method    string          `json:"method,omitempty"`
-	URL       string          `json:"url,omitempty"`
-	Status    int             `json:"status,omitempty"`
-	Headers   map[string]any  `json:"headers,omitempty"`
-	Body      json.RawMessage `json:"body,omitempty"`
-	Error     string          `json:"error,omitempty"`
-	Stream    bool            `json:"stream,omitempty"`
-	ElapsedMS int64           `json:"elapsed_ms,omitempty"`
+	Type          string             `json:"type"` // "request" | "response" | "error"
+	Timestamp     string             `json:"timestamp"`
+	Provider      string             `json:"provider"`
+	ReqID         string             `json:"reqid,omitempty"`
+	RequestSHA256 string             `json:"request_sha256,omitempty"`
+	RequestBytes  int                `json:"request_bytes,omitempty"`
+	ContentDigest *dumpContentDigest `json:"request_content_digest,omitempty"`
+	Method        string             `json:"method,omitempty"`
+	URL           string             `json:"url,omitempty"`
+	Status        int                `json:"status,omitempty"`
+	Headers       map[string]any     `json:"headers,omitempty"`
+	Body          json.RawMessage    `json:"body,omitempty"`
+	Error         string             `json:"error,omitempty"`
+	Stream        bool               `json:"stream,omitempty"`
+	ElapsedMS     int64              `json:"elapsed_ms,omitempty"`
 }
 
 // RoundTrip — capture body before send (cheap), forward, capture body
@@ -102,12 +107,17 @@ func (t *dumpTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// stdlib idiom: r.Body must be re-readable for the actual
 	// transport that follows.
 	var reqBody []byte
+	var requestSHA256 string
 	if req.Body != nil {
 		buf, err := io.ReadAll(req.Body)
 		if err == nil {
 			reqBody = buf
 			req.Body = io.NopCloser(bytes.NewReader(buf))
 			req.ContentLength = int64(len(buf))
+			// Correlate the original dispatched payload without persisting its
+			// secrets. The body below still passes through exact-value redaction.
+			digest := sha256.Sum256(buf)
+			requestSHA256 = hex.EncodeToString(digest[:])
 		}
 	}
 
@@ -115,14 +125,17 @@ func (t *dumpTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// goroutine — the model call is on the critical path.
 	dumpWG.Add(1)
 	go appendDump(sessID, dumpEntry{
-		Type:      "request",
-		Timestamp: tsStart.UTC().Format(time.RFC3339Nano),
-		Provider:  t.provider,
-		ReqID:     reqID,
-		Method:    req.Method,
-		URL:       safeURL(req),
-		Headers:   redactHeaders(req.Header, exactValues...),
-		Body:      jsonOrRaw(reqBody, exactValues...),
+		Type:          "request",
+		Timestamp:     tsStart.UTC().Format(time.RFC3339Nano),
+		Provider:      t.provider,
+		ReqID:         reqID,
+		RequestSHA256: requestSHA256,
+		RequestBytes:  len(reqBody),
+		ContentDigest: requestContentDigest(reqBody, exactValues...),
+		Method:        req.Method,
+		URL:           safeURL(req),
+		Headers:       redactHeaders(req.Header, exactValues...),
+		Body:          jsonOrRaw(reqBody, exactValues...),
 	})
 
 	// 3. dispatch.
@@ -191,6 +204,129 @@ func (t *dumpTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	return resp, err
+}
+
+// Content evidence is captured before body redaction. Hashes and byte counts
+// let diagnostics compare the dispatched text even when a credential happens
+// to occur inside a non-secret prompt. No plaintext is added to this metadata.
+type dumpTextDigest struct {
+	Index      int    `json:"index"`
+	Type       string `json:"type"`
+	TextBytes  *int   `json:"text_bytes,omitempty"`
+	TextSHA256 string `json:"text_sha256,omitempty"`
+}
+
+type dumpMessageDigest struct {
+	Index  int              `json:"index"`
+	Role   string           `json:"role"`
+	Blocks []dumpTextDigest `json:"blocks"`
+}
+
+type dumpProbeDigest struct {
+	SHA256      string `json:"sha256"`
+	Occurrences int    `json:"occurrences"`
+}
+
+type dumpContentDigest struct {
+	Schema       int                 `json:"schema"`
+	SystemBlocks []dumpTextDigest    `json:"system_blocks"`
+	Messages     []dumpMessageDigest `json:"messages"`
+	Probes       []dumpProbeDigest   `json:"probes,omitempty"`
+}
+
+func dumpTextHash(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
+
+func dumpContentBlocks(raw json.RawMessage, exactValues ...string) []dumpTextDigest {
+	blocks := make([]dumpTextDigest, 0)
+	if len(raw) == 0 || string(raw) == "null" {
+		return blocks
+	}
+	add := func(index int, kind string, text *string) {
+		block := dumpTextDigest{Index: index, Type: security.RedactValues(kind, exactValues...)}
+		if text != nil {
+			size := len(*text)
+			block.TextBytes, block.TextSHA256 = &size, dumpTextHash(*text)
+		}
+		blocks = append(blocks, block)
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		add(0, "text", &text)
+		return blocks
+	}
+	var content []struct {
+		Type string  `json:"type"`
+		Text *string `json:"text"`
+	}
+	if json.Unmarshal(raw, &content) != nil {
+		return blocks
+	}
+	for index, block := range content {
+		add(index, block.Type, block.Text)
+	}
+	return blocks
+}
+
+func requestContentDigest(raw []byte, exactValues ...string) *dumpContentDigest {
+	var body struct {
+		System   json.RawMessage `json:"system"`
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(raw, &body) != nil || (body.Messages == nil && body.System == nil) {
+		return nil
+	}
+	evidence := &dumpContentDigest{Schema: 1, SystemBlocks: dumpContentBlocks(body.System, exactValues...), Messages: make([]dumpMessageDigest, 0, len(body.Messages))}
+	for index, message := range body.Messages {
+		evidence.Messages = append(evidence.Messages, dumpMessageDigest{Index: index,
+			Role: security.RedactValues(message.Role, exactValues...), Blocks: dumpContentBlocks(message.Content, exactValues...)})
+	}
+	// Optional, bounded probes correlate nonce occurrences across all original
+	// JSON string values, including non-text blocks. The probe itself never
+	// enters the log or the outgoing HTTP request.
+	probeJSON := os.Getenv("METIS_DUMP_TEXT_PROBES")
+	if len(probeJSON) == 0 || len(probeJSON) > 16<<10 {
+		return evidence
+	}
+	var probes []string
+	if json.Unmarshal([]byte(probeJSON), &probes) != nil || len(probes) > 32 {
+		return evidence
+	}
+	var decoded any
+	if json.Unmarshal(raw, &decoded) != nil {
+		return evidence
+	}
+	seen := make(map[string]bool)
+	for _, probe := range probes {
+		if len(probe) == 0 || len(probe) > 128 || seen[probe] {
+			continue
+		}
+		seen[probe] = true
+		count := 0
+		var visit func(any)
+		visit = func(value any) {
+			switch value := value.(type) {
+			case string:
+				count += strings.Count(value, probe)
+			case []any:
+				for _, item := range value {
+					visit(item)
+				}
+			case map[string]any:
+				for _, item := range value {
+					visit(item)
+				}
+			}
+		}
+		visit(decoded)
+		evidence.Probes = append(evidence.Probes, dumpProbeDigest{SHA256: dumpTextHash(probe), Occurrences: count})
+	}
+	return evidence
 }
 
 // teeCloser reads from r (the Tee), and Close()-s the upstream c +

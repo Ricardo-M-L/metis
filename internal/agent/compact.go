@@ -298,8 +298,14 @@ type Compactor struct {
 	Config
 	Model            string
 	MaxContextTokens int
-	MaxOutputTokens  int
-	Provider         llm.Provider
+	// Input-only metadata does not prove a shared input/output total. Such a
+	// working budget must not reserve the output allowance a second time.
+	WindowKind string
+	// MaxInputTokens is an independently advertised input ceiling. It does
+	// not imply a total context window or change the generation allowance.
+	MaxInputTokens  int
+	MaxOutputTokens int
+	Provider        llm.Provider
 
 	// consecutiveFailures counts back-to-back Compact() failures (either
 	// summarizer error or no-progress: cut adjustment swallowed the
@@ -389,12 +395,18 @@ func (c *Compactor) effectiveInputCap() int {
 		return 0
 	}
 	reserved := c.MaxOutputTokens
+	if c.WindowKind == llm.ContextWindowInput {
+		reserved = 0
+	}
 	if reserved > MaxReservedForSummary && os.Getenv("METIS_COMPACT_RESERVE_FULL_MAX_TOKENS") != "1" {
 		reserved = MaxReservedForSummary
 	}
 	cap := c.MaxContextTokens - reserved
 	if cap <= 0 {
 		return 0
+	}
+	if c.MaxInputTokens > 0 {
+		cap = min(cap, c.MaxInputTokens)
 	}
 	return cap
 }
@@ -2387,22 +2399,26 @@ func (c *Compactor) summaryWireLimits() (inputCap, outputCap int) {
 	if outputCap <= 0 {
 		outputCap = defaultMaxSummaryTokens
 	}
-	if c.MaxContextTokens <= 0 {
-		return inputCap, outputCap
+	if c.MaxContextTokens > 0 {
+		if quarter := c.MaxContextTokens / 4; outputCap > quarter {
+			outputCap = quarter
+		}
+		safety := min(c.MaxContextTokens/20, maxSummarySafetyTokens)
+		outputReserve := outputCap
+		if c.WindowKind == llm.ContextWindowInput {
+			outputReserve = 0
+		}
+		windowInputCap := max(c.MaxContextTokens-outputReserve-safety, 1)
+		if inputCap <= 0 || inputCap > windowInputCap {
+			inputCap = windowInputCap
+		}
 	}
-	if quarter := c.MaxContextTokens / 4; outputCap > quarter {
-		outputCap = quarter
-	}
-	safety := c.MaxContextTokens / 20
-	if safety > maxSummarySafetyTokens {
-		safety = maxSummarySafetyTokens
-	}
-	windowInputCap := c.MaxContextTokens - outputCap - safety
-	if windowInputCap < 1 {
-		windowInputCap = 1
-	}
-	if inputCap <= 0 || inputCap > windowInputCap {
-		inputCap = windowInputCap
+	if c.MaxInputTokens > 0 {
+		safety := min(c.MaxInputTokens/20, maxSummarySafetyTokens)
+		advertisedInputCap := max(c.MaxInputTokens-safety, 1)
+		if inputCap <= 0 || inputCap > advertisedInputCap {
+			inputCap = advertisedInputCap
+		}
 	}
 	return inputCap, outputCap
 }

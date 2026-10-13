@@ -157,3 +157,62 @@ func TestCmdCtx_NoCompactorPrintsDisabled(t *testing.T) {
 		t.Errorf("/ctx with no compactor should print 'compactor: ... disabled'; got:\n%s", out)
 	}
 }
+
+type ctxCapabilityProvider struct {
+	ctxTestProvider
+	capabilities llm.ContextCapabilities
+	cacheReads   int
+	refreshes    int
+}
+
+func (p *ctxCapabilityProvider) MaxContextTokens() int { p.cacheReads++; return p.capabilities.Window }
+func (p *ctxCapabilityProvider) ContextCapabilities() llm.ContextCapabilities {
+	p.cacheReads++
+	return p.capabilities
+}
+func (p *ctxCapabilityProvider) RefreshContextCapabilities(context.Context) error {
+	p.refreshes++
+	return nil
+}
+
+func TestCmdCtxReportsInstalledBudgetWithoutReadingNewProviderCache(t *testing.T) {
+	provider := &ctxCapabilityProvider{ctxTestProvider: ctxTestProvider{id: "gpt-6-astra"}, capabilities: llm.ContextCapabilities{
+		Window: 800_000, ProfileDefaultWindow: 272_000, ProfileMaxWindow: 872_000,
+		ModelWindow: 1_050_000, MaxWindow: 900_000, MaxInputTokens: 772_000, MaxOutputTokens: 128_000,
+		ModelSource: "catalog_issuer", Source: "configured", LimitSource: "endpoint_models", BudgetSource: "per_model", RequestedWindow: 800_000,
+	}}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
+	loop.SyncContextCapabilities()
+	// A provider refresh may precede installation at the next request boundary.
+	// Inspection must show the exact window currently bound to this Loop.
+	provider.capabilities.Window = 200_000
+	reads := provider.cacheReads
+	out := cmdCtx(&REPL{Loop: loop}, "")
+	if provider.cacheReads != reads || provider.refreshes != 0 {
+		t.Fatal("/ctx must not inspect a hot provider cache or perform discovery")
+	}
+	for _, want := range []string{"800,000 tokens (current working budget)", "client suggestion:", "272,000 tokens", "client catalog max:", "872,000 tokens", "model capacity:", "1,050,000 tokens", "budget ceiling:", "900,000 tokens", "max input:", "772,000 tokens", "budget source:   per_model", "model source:    catalog_issuer", "route source:    endpoint_models"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in installed diagnostic:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "200,000 tokens") || strings.Contains(out, "endpoint default:") {
+		t.Fatalf("inspection must not invent an endpoint default or use an unbound capacity:\n%s", out)
+	}
+}
+
+func TestCmdCtxExplainsClampedAndInputOnlyBudgets(t *testing.T) {
+	provider := &ctxCapabilityProvider{ctxTestProvider: ctxTestProvider{id: "input-only"}, capabilities: llm.ContextCapabilities{
+		Window: 500_000, RequestedWindow: 1_000_000, WindowKind: "input", MaxInputTokens: 500_000,
+		Source: "configured_clamped", BudgetSource: "per_model",
+	}}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), permission.New(permission.ModeAcceptEdits), nil, "sys", 5)
+	loop.SyncContextCapabilities()
+	out := cmdCtx(&REPL{Loop: loop}, "")
+	if !strings.Contains(out, "requested window:") || !strings.Contains(out, "1,000,000 tokens") || !strings.Contains(out, "input budget (total model capacity unknown)") {
+		t.Fatalf("missing clamped/input-only explanation:\n%s", out)
+	}
+	if strings.Contains(out, "model capacity:") || strings.Contains(out, "budget ceiling:") {
+		t.Fatalf("unknown complete or route capacity must remain unknown:\n%s", out)
+	}
+}

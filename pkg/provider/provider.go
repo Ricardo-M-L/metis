@@ -198,7 +198,7 @@ type SystemSection struct {
 }
 
 // StreamEvent is one chunk emitted while streaming a response.
-// Type is one of: "text_delta", "thinking_delta", "thinking_signature",
+// Type is one of: "message_start", "message_delta", "usage", "text_delta", "thinking_delta", "thinking_signature",
 // "redacted_thinking", "tool_use_start", "tool_input_delta",
 // "tool_use_stop", "message_stop", "error".
 //
@@ -207,18 +207,27 @@ type SystemSection struct {
 // upstream wire format reports a total that includes it; providers without
 // prompt caching leave both cache fields at 0. Consumers that compute
 // context-window load add the three buckets exactly once.
+// Usage counters are non-negative absolute snapshots for this request, not increments.
+// The Has* flags distinguish a reported zero from an omitted field. A reported
+// field replaces its prior value, including downward corrections. For legacy
+// providers that omit the flags, positive counters still count as reported;
+// zero counters leave the prior snapshot unchanged.
 type StreamEvent struct {
-	Type                     string
-	TextDelta                string
-	ToolUseID                string
-	ToolName                 string
-	InputDelta               string // partial JSON for tool input
-	StopReason               string
-	InputTokens              int
-	OutputTokens             int
-	CacheCreationInputTokens int
-	CacheReadInputTokens     int
-	Err                      error
+	Type                        string
+	TextDelta                   string
+	ToolUseID                   string
+	ToolName                    string
+	InputDelta                  string // partial JSON for tool input
+	StopReason                  string
+	InputTokens                 int
+	OutputTokens                int
+	CacheCreationInputTokens    int
+	CacheReadInputTokens        int
+	HasInputTokens              bool
+	HasOutputTokens             bool
+	HasCacheCreationInputTokens bool
+	HasCacheReadInputTokens     bool
+	Err                         error
 	// ProviderHint propagates opaque provider-specific blobs from a
 	// streaming response back to ContentBlock.ProviderHint via the
 	// stream consumer (see internal/agent/loop.go::consumeStream).

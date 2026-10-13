@@ -16,10 +16,28 @@ type Status struct {
 }
 
 type ContextPressure struct {
-	Used             int     `json:"used"`
-	Window           int     `json:"window"`
-	CompactThreshold float64 `json:"compactThreshold"`
-	CompactAtTokens  int     `json:"compactAtTokens"`
+	Used                 int     `json:"used"`
+	Window               int     `json:"window"`
+	WindowKind           string  `json:"windowKind,omitempty"`
+	ModelWindow          int     `json:"modelWindow,omitempty"`
+	ModelMaxInputTokens  int     `json:"modelMaxInputTokens,omitempty"`
+	ModelMaxOutputTokens int     `json:"modelMaxOutputTokens,omitempty"`
+	ModelSource          string  `json:"modelSource,omitempty"`
+	RequestedWindow      int     `json:"requestedWindow,omitempty"`
+	LimitSource          string  `json:"limitSource,omitempty"`
+	BudgetSource         string  `json:"budgetSource,omitempty"`
+	ProviderID           string  `json:"providerId,omitempty"`
+	Model                string  `json:"model,omitempty"`
+	RouteKey             string  `json:"routeKey,omitempty"`
+	DefaultWindow        int     `json:"defaultWindow,omitempty"`
+	ProfileDefaultWindow int     `json:"profileDefaultWindow,omitempty"`
+	ProfileMaxWindow     int     `json:"profileMaxWindow,omitempty"`
+	MaxWindow            int     `json:"maxWindow,omitempty"`
+	MaxInputTokens       int     `json:"maxInputTokens,omitempty"`
+	MaxOutputTokens      int     `json:"maxOutputTokens,omitempty"`
+	Source               string  `json:"source,omitempty"`
+	CompactThreshold     float64 `json:"compactThreshold"`
+	CompactAtTokens      int     `json:"compactAtTokens"`
 }
 
 type Subagent struct {

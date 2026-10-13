@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -15,14 +16,21 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm/modelinfo"
 	"github.com/Ricardo-M-L/metis/internal/llm/openai"
 )
 
 const maxProviderModelListingBytes = 2 << 20
 
 type discoveredProviderModel struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	ContextWindow    int    `json:"contextWindow,omitempty"`
+	MaxContextWindow int    `json:"maxContextWindow,omitempty"`
+	MaxInputTokens   int    `json:"maxInputTokens,omitempty"`
+	MaxOutputTokens  int    `json:"maxOutputTokens,omitempty"`
+	WindowKind       string `json:"windowKind,omitempty"`
+	Source           string `json:"source,omitempty"`
 }
 
 type providerModelsRequest struct {
@@ -70,7 +78,7 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 		}
 		models := make([]discoveredProviderModel, 0, len(openai.CodexModels()))
 		for _, model := range openai.CodexModels() {
-			models = append(models, discoveredProviderModel{ID: model.ID, Name: model.Name})
+			models = append(models, discoveredProviderModel{ID: model.ID, Name: model.Name, ContextWindow: model.ContextWindow, Source: "catalog_route"})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"models": models, "source": "local_catalog", "provider": body.ID})
 		return
@@ -116,12 +124,84 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
-	models, err := queryProviderModels(ctx, target, authKind, view.Transport, key)
+	var models []discoveredProviderModel
+	if authKind == "gemini" {
+		// Native Gemini's listing uses name-based IDs and generation-method
+		// filtering; retain that API's discovery contract.
+		models, err = queryProviderModels(ctx, target, authKind, view.Transport, key)
+	} else {
+		baseURL := strings.TrimSpace(view.BaseURL)
+		if baseURL == "" {
+			baseURL = strings.TrimSuffix(target, "/models")
+			if authKind == "anthropic" {
+				baseURL = strings.TrimSuffix(baseURL, "/v1")
+			}
+		}
+		providerID, cacheDir := view.ID, filepath.Join(config.Home(), "cache", "provider-models")
+		if providerID == "" {
+			// An anonymous draft has no persistent route identity yet.
+			providerID, cacheDir = "draft", ""
+		}
+		binding := modelinfo.Binding{ProviderID: providerID, Transport: view.Transport, BaseURL: baseURL, AuthKind: modelinfo.AuthBearer}
+		if view.ID == "anthropic" && authKind == "anthropic" {
+			binding.AuthKind = modelinfo.AuthAPIKey
+		} else if authKind == "anthropic" {
+			binding.AuthKind = modelinfo.AuthAPIKeyBearer
+		}
+		var client *modelinfo.Client
+		client, err = modelinfo.New(cacheDir, modelinfo.WithTimeout(12*time.Second))
+		if err == nil {
+			var discovered []modelinfo.Model
+			discovered, err = client.Refresh(ctx, binding, key)
+			if err == nil {
+				models = discoveredProviderModels(discovered)
+			}
+		}
+	}
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": models, "source": "provider", "provider": body.ID})
+}
+
+func discoveredProviderModels(models []modelinfo.Model) []discoveredProviderModel {
+	// Keep ordinary issuer-association peers in the endpoint cache, but do not
+	// offer a second masked selection for a uniquely associated client profile.
+	// A shared name or issuer alone cannot hide an independently advertised ID.
+	byID := make(map[string]modelinfo.Model, len(models))
+	profiles := make(map[string]modelinfo.Model)
+	references := make(map[string]int)
+	for _, model := range models {
+		byID[model.ID] = model
+		if model.WindowKind == modelinfo.WindowKindClientProfile && model.OwnedBy != "" &&
+			model.OwnerSource == modelinfo.SourceEndpointModels && model.OwnerModelID != "" && model.OwnerModelID != model.ID {
+			profiles[model.OwnerModelID] = model
+			references[model.OwnerModelID]++
+		}
+	}
+	shadowed := make(map[string]bool)
+	for peerID, profile := range profiles {
+		peer, exists := byID[peerID]
+		if references[peerID] == 1 && exists && peer.Source == modelinfo.SourceEndpointModels &&
+			peer.DisplayName == profile.ID && peer.OwnedBy == profile.OwnedBy && peer.OwnerModelID == peer.ID {
+			shadowed[peerID] = true
+		}
+	}
+	result := make([]discoveredProviderModel, 0, len(models))
+	for _, model := range models {
+		if shadowed[model.ID] && model.Source == modelinfo.SourceEndpointModels {
+			continue
+		}
+		name := model.Name
+		if name == "" {
+			name = model.ID
+		}
+		result = append(result, discoveredProviderModel{ID: model.ID, Name: name,
+			ContextWindow: model.ContextWindow, MaxContextWindow: model.MaxContextWindow,
+			MaxInputTokens: model.MaxInputTokens, MaxOutputTokens: model.MaxOutputTokens, WindowKind: model.WindowKind, Source: model.Source})
+	}
+	return result
 }
 
 func configuredProviderCredential(cfg *config.Config, id string) bool {
@@ -196,6 +276,13 @@ func queryProviderModels(ctx context.Context, target, authKind, transport, key s
 }
 
 func parseProviderModels(data []byte, transport string) ([]discoveredProviderModel, error) {
+	if !strings.EqualFold(transport, "gemini_native") && !strings.EqualFold(transport, "gemini") {
+		models, err := modelinfo.Parse(data, modelinfo.SourceEndpointModels)
+		if err != nil {
+			return nil, err
+		}
+		return discoveredProviderModels(models), nil
+	}
 	var listing map[string]json.RawMessage
 	if err := json.Unmarshal(data, &listing); err != nil || listing == nil {
 		return nil, errors.New("provider did not return a JSON model list")

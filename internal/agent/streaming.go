@@ -4,18 +4,46 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/argsunwrap"
 )
 
-// usageTotals holds the input / output token tallies a streaming response
-// emits across multiple message_delta events. Kept package-private; the
+// usageTotals holds the latest absolute token snapshot for a streaming
+// response. Kept package-private; the
 // final tally is forwarded to callers as an Event{Kind: EventTokens}.
 type usageTotals struct {
 	in, out                int
 	cacheCreate, cacheRead int
+}
+
+func (u *usageTotals) applyStreamEvent(event llm.StreamEvent) error {
+	fields := []struct {
+		name     string
+		value    int
+		present  bool
+		previous *int
+	}{
+		{"input", event.InputTokens, event.HasInputTokens, &u.in},
+		{"output", event.OutputTokens, event.HasOutputTokens, &u.out},
+		{"cache creation", event.CacheCreationInputTokens, event.HasCacheCreationInputTokens, &u.cacheCreate},
+		{"cache read", event.CacheReadInputTokens, event.HasCacheReadInputTokens, &u.cacheRead},
+	}
+	// Validate the entire snapshot before installing any part of it. A malformed
+	// update must not erase valid usage already reported by this request.
+	for _, field := range fields {
+		if field.present && field.value < 0 {
+			return fmt.Errorf("provider stream reported negative %s tokens: %d", field.name, field.value)
+		}
+	}
+	for _, field := range fields {
+		if field.present || field.value > 0 {
+			*field.previous = field.value
+		}
+	}
+	return nil
 }
 
 // consumeStream reads StreamEvents from the LLM stream, emits text and tool
@@ -180,6 +208,12 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 	for {
 		ev, err := s.Recv()
 		eof := errors.Is(err, io.EOF)
+		// Counters describe the latest absolute snapshot for this physical
+		// request. Update independently of event type, including usage-only
+		// events and a final value returned together with an error.
+		if usageErr := usage.applyStreamEvent(ev); usageErr != nil {
+			return partialBlocks(), stopReas, &usage, usageErr
+		}
 		// StreamReader follows the same contract as other Go iterators: a
 		// provider may return its final value together with io.EOF. Process that
 		// value before honoring EOF so a terminal message_stop does not lose its
@@ -191,16 +225,6 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			return partialBlocks(), stopReas, &usage, err
 		}
 		switch ev.Type {
-		case "message_start":
-			usage.in = ev.InputTokens
-			// Cache fields land at message_start on Anthropic native; some
-			// gateways only emit them in message_delta. Capture either way.
-			if ev.CacheCreationInputTokens > 0 {
-				usage.cacheCreate = ev.CacheCreationInputTokens
-			}
-			if ev.CacheReadInputTokens > 0 {
-				usage.cacheRead = ev.CacheReadInputTokens
-			}
 		case "text_delta":
 			// Reasoning ends as soon as the assistant starts emitting
 			// text — flush it as a block now so the order in `blocks`
@@ -309,41 +333,9 @@ func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<-
 			if ev.StopReason != "" {
 				stopReas = ev.StopReason
 			}
-			usage.out = ev.OutputTokens
-			// Some Anthropic-compatible gateways (MiniMax, ...) only
-			// report input_tokens here, not at message_start. Take the
-			// value if it shows up and we haven't seen one already, so
-			// the bottom-right token counter doesn't get stuck at the
-			// output-only number.
-			if usage.in == 0 && ev.InputTokens > 0 {
-				usage.in = ev.InputTokens
-			}
-			if ev.CacheCreationInputTokens > 0 {
-				usage.cacheCreate = ev.CacheCreationInputTokens
-			}
-			if ev.CacheReadInputTokens > 0 {
-				usage.cacheRead = ev.CacheReadInputTokens
-			}
 		case "message_stop":
-			// Bedrock's synthetic stream and some Anthropic-compatible readers put
-			// all final metadata on message_stop rather than message_start /
-			// message_delta. Treat non-zero terminal counters as authoritative,
-			// while preserving earlier counters when a provider emits a metadata-
-			// free message_stop.
 			if ev.StopReason != "" {
 				stopReas = ev.StopReason
-			}
-			if ev.InputTokens > 0 {
-				usage.in = ev.InputTokens
-			}
-			if ev.OutputTokens > 0 {
-				usage.out = ev.OutputTokens
-			}
-			if ev.CacheCreationInputTokens > 0 {
-				usage.cacheCreate = ev.CacheCreationInputTokens
-			}
-			if ev.CacheReadInputTokens > 0 {
-				usage.cacheRead = ev.CacheReadInputTokens
 			}
 			flushThinking()
 			flushText()

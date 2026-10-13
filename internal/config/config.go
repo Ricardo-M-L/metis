@@ -231,9 +231,8 @@ type ProviderGemini struct {
 	BaseURL   string `toml:"base_url"`
 	Model     string `toml:"model"`
 	MaxTokens int    `toml:"max_tokens"`
-	// ContextWindow overrides the model-prefix lookup used for
-	// auto-compaction. Set when the served model's name doesn't match
-	// a known prefix or its window differs from the upstream default.
+	// ContextWindow is a legacy working budget for the configured Model only.
+	// Exact route/model budgets take precedence; zero enables discovery.
 	ContextWindow int     `toml:"context_window"`
 	TimeoutSecs   int     `toml:"timeout_seconds"`
 	Temperature   float64 `toml:"temperature"`
@@ -249,11 +248,8 @@ type ProviderAnthropic struct {
 	// detection or provider-agnostic fallback.
 	CatalogProvider string `toml:"catalog_provider"`
 	MaxTokens       int    `toml:"max_tokens"`
-	// ContextWindow overrides the model-prefix lookup used for
-	// auto-compaction. Required for Anthropic-compatible third-party
-	// gateways (MiniMax, OpenRouter, ...) where the served model
-	// doesn't match `claude-*` and the real window may be smaller
-	// than 200k.
+	// ContextWindow is a legacy working budget for the configured Model only.
+	// Exact route/model budgets take precedence; zero enables discovery.
 	ContextWindow int     `toml:"context_window"`
 	TimeoutSecs   int     `toml:"timeout_seconds"`
 	AnthropicBeta string  `toml:"anthropic_beta"`
@@ -317,7 +313,7 @@ type ProviderOpenAI struct {
 	// context limits.
 	CatalogProvider string `toml:"catalog_provider"`
 	MaxTokens       int    `toml:"max_tokens"`
-	// ContextWindow overrides the model-prefix lookup. See ProviderAnthropic.
+	// ContextWindow is a legacy working budget. See ProviderAnthropic.
 	ContextWindow int     `toml:"context_window"`
 	TimeoutSecs   int     `toml:"timeout_seconds"`
 	Temperature   float64 `toml:"temperature"`
@@ -342,8 +338,8 @@ type ProviderOpenAI struct {
 type ProviderOpenAICodex struct {
 	Model     string `toml:"model"`
 	MaxTokens int    `toml:"max_tokens"`
-	// ContextWindow overrides the model-specific Codex catalog limit. Zero
-	// keeps automatic 128k/272k selection when the active model changes.
+	// ContextWindow is a legacy working budget for the configured Model only.
+	// Zero discovers full model capacity separately from client recommendations.
 	ContextWindow int     `toml:"context_window"`
 	TimeoutSecs   int     `toml:"timeout_seconds"`
 	Temperature   float64 `toml:"temperature"`
@@ -383,10 +379,9 @@ type ProviderRaw struct {
 	// model ids often do not exist in the public models.dev catalog.
 	SupportsVision *bool `toml:"supports_vision"`
 
-	// ContextWindow override. Required for cloud-auth providers
-	// (Azure / Vertex / Bedrock) where the metis side can't infer
-	// from the model name (Azure uses deployment names; Bedrock model
-	// ids look like "anthropic.claude-…-v1:0").
+	// ContextWindow is a legacy working budget for the configured Model only.
+	// Exact route/model budgets take precedence. Cloud routes without capacity
+	// discovery need an operator budget; it does not prove model capacity.
 	ContextWindow int `toml:"context_window"`
 
 	// Cloud-auth profile fields. Only consumed by the matching

@@ -698,6 +698,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/providers/probe", s.handleProviderProbe)
 	mux.HandleFunc("/api/providers/models", s.handleProviderModels)
 	mux.HandleFunc("/api/providers/model", s.handleProviderModelSelect)
+	mux.HandleFunc("/api/providers/", s.handleProviderContextBudget)
 	mux.HandleFunc("/api/effort", s.handleEffort)
 	mux.HandleFunc("/api/presets", s.handlePresets)
 	mux.HandleFunc("/api/presets/default", s.handlePresetDefault)
@@ -2658,11 +2659,23 @@ func (s *Server) invalidateWorkerContext(sessionID string) {
 }
 
 type contextStatusSnapshot struct {
-	used             int
-	window           int
-	compactThreshold float64
-	compactAtTokens  int
-	sessionID        string
+	windowKind                                             string
+	modelWindow, modelMaxInputTokens, modelMaxOutputTokens int
+	modelSource, limitSource, budgetSource                 string
+	requestedWindow                                        int
+	providerID, model, routeKey                            string
+	used                                                   int
+	window                                                 int
+	defaultWindow                                          int
+	profileDefaultWindow                                   int
+	profileMaxWindow                                       int
+	maxWindow                                              int
+	maxInputTokens                                         int
+	maxOutputTokens                                        int
+	source                                                 string
+	compactThreshold                                       float64
+	compactAtTokens                                        int
+	sessionID                                              string
 }
 
 // readContextStatus observes Loop values without holding the provenance lock.
@@ -3775,7 +3788,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	workerContext := (*desktopipc.ContextPressure)(nil)
 	if selectedContextSessionID != "" {
 		if status, ok := s.workerSnapshot(selectedContextSessionID); ok && status.Context != nil &&
-			status.Context.Window > 0 && status.Context.Used >= 0 {
+			status.Context.Window >= 0 && status.Context.Used >= 0 {
 			workerContext = status.Context
 		}
 	}
@@ -3784,14 +3797,26 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if workerContext != nil {
 		contextStatus = contextStatusSnapshot{
 			used: workerContext.Used, window: workerContext.Window,
+			defaultWindow: workerContext.DefaultWindow, maxWindow: workerContext.MaxWindow,
+			profileDefaultWindow: workerContext.ProfileDefaultWindow, profileMaxWindow: workerContext.ProfileMaxWindow,
+			maxInputTokens: workerContext.MaxInputTokens, maxOutputTokens: workerContext.MaxOutputTokens, source: workerContext.Source,
+			windowKind: workerContext.WindowKind, modelWindow: workerContext.ModelWindow, modelMaxInputTokens: workerContext.ModelMaxInputTokens, modelMaxOutputTokens: workerContext.ModelMaxOutputTokens, modelSource: workerContext.ModelSource,
+			requestedWindow: workerContext.RequestedWindow, limitSource: workerContext.LimitSource, budgetSource: workerContext.BudgetSource, providerID: workerContext.ProviderID, model: workerContext.Model, routeKey: workerContext.RouteKey,
 			compactThreshold: workerContext.CompactThreshold, compactAtTokens: workerContext.CompactAtTokens,
 			sessionID: selectedContextSessionID,
 		}
 	} else if s.loop != nil {
 		contextStatus = s.readContextStatus(func() contextStatusSnapshot {
+			s.loop.SyncContextCapabilities()
 			used := s.loop.EstimateContextTokens()
-			window, threshold, trigger := s.loop.ContextStatusSnapshot()
-			return contextStatusSnapshot{used: used, window: window, compactThreshold: threshold, compactAtTokens: trigger}
+			caps, threshold, trigger := s.loop.ContextDetailsSnapshot()
+			return contextStatusSnapshot{used: used, window: caps.Window,
+				defaultWindow: caps.DefaultWindow, maxWindow: caps.MaxWindow,
+				profileDefaultWindow: caps.ProfileDefaultWindow, profileMaxWindow: caps.ProfileMaxWindow,
+				maxInputTokens: caps.MaxInputTokens, maxOutputTokens: caps.MaxOutputTokens, source: caps.Source,
+				windowKind: caps.WindowKind, modelWindow: caps.ModelWindow, modelMaxInputTokens: caps.ModelMaxInputTokens, modelMaxOutputTokens: caps.ModelMaxOutputTokens, modelSource: caps.ModelSource,
+				requestedWindow: caps.RequestedWindow, limitSource: caps.LimitSource, budgetSource: caps.BudgetSource, providerID: caps.ProviderID, model: caps.Model, routeKey: caps.RouteKey,
+				compactThreshold: threshold, compactAtTokens: trigger}
 		})
 	}
 	if s.loop != nil && s.loop.Registry != nil {
@@ -3844,6 +3869,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"agents":            agentDetails, "jobs": jobDetails,
 		"toolCount": len(toolNames), "tools": toolNames,
 		"contextUsed": contextStatus.used, "contextWindow": contextStatus.window, "compactThreshold": contextStatus.compactThreshold,
+		"contextDefaultWindow": contextStatus.defaultWindow, "contextMaxWindow": contextStatus.maxWindow,
+		"contextProfileDefaultWindow": contextStatus.profileDefaultWindow, "contextProfileMaxWindow": contextStatus.profileMaxWindow,
+		"contextMaxInputTokens": contextStatus.maxInputTokens, "contextMaxOutputTokens": contextStatus.maxOutputTokens, "contextSource": contextStatus.source,
+		"contextWindowKind": contextStatus.windowKind, "contextModelWindow": contextStatus.modelWindow, "contextModelMaxInputTokens": contextStatus.modelMaxInputTokens, "contextModelMaxOutputTokens": contextStatus.modelMaxOutputTokens, "contextModelSource": contextStatus.modelSource,
+		"contextRequestedWindow": contextStatus.requestedWindow, "contextLimitSource": contextStatus.limitSource, "contextBudgetSource": contextStatus.budgetSource, "contextProviderId": contextStatus.providerID, "contextModel": contextStatus.model, "contextRouteKey": contextStatus.routeKey,
 		"compactAtTokens": contextStatus.compactAtTokens,
 		"turnRunning":     turnRunning, "runningSessionId": runningSessionID, "isolatedTurnSessions": workerSessions,
 		"isolatedTurnsEnabled": s.isolatedRunner != nil,

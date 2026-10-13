@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/security"
@@ -65,8 +66,11 @@ type Gemini struct {
 	MaxTokens   int
 	Temperature float64
 	// ContextWindow, when > 0, overrides the model-prefix lookup.
-	ContextWindow int
-	httpClient    *http.Client
+	ContextWindow       int
+	ContextDiscovery    *ContextDiscovery
+	ContextBudgetSource string
+	ContextBudgetPolicy *llm.ContextBudgetPolicy
+	httpClient          *http.Client
 }
 
 func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, temperature float64) *Gemini {
@@ -88,12 +92,13 @@ func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, te
 		return http.ErrUseLastResponse
 	}
 	return &Gemini{
-		APIKey:      apiKey,
-		BaseURL:     strings.TrimRight(baseURL, "/"),
-		Model:       model,
-		MaxTokens:   maxTokens,
-		Temperature: temperature,
-		httpClient:  httpClient,
+		APIKey:           apiKey,
+		BaseURL:          strings.TrimRight(baseURL, "/"),
+		Model:            model,
+		MaxTokens:        maxTokens,
+		Temperature:      temperature,
+		ContextDiscovery: NewContextDiscovery(ContextDiscoveryOptions{BaseURL: strings.TrimRight(baseURL, "/"), Model: model, APIKey: apiKey}),
+		httpClient:       httpClient,
 	}
 }
 
@@ -115,9 +120,12 @@ func (g *Gemini) SupportsVision() bool { return false }
 // pro / flash; older models cap at 32k or 128k. Pick by model prefix
 // so the compactor uses the right denominator.
 func (g *Gemini) MaxContextTokens() int {
-	if g.ContextWindow > 0 {
-		return g.ContextWindow
-	}
+	return g.ContextCapabilities().Window
+}
+
+// Until native model metadata is available, these are estimates rather than
+// measured serving limits. Discovery keeps independent input/output ceilings.
+func (g *Gemini) fallbackContextWindow() int {
 	switch {
 	case strings.HasPrefix(g.Model, "gemini-2.5"), strings.HasPrefix(g.Model, "gemini-2.0"),
 		strings.HasPrefix(g.Model, "gemini-1.5"):
@@ -125,7 +133,7 @@ func (g *Gemini) MaxContextTokens() int {
 	case strings.HasPrefix(g.Model, "gemini-pro"):
 		return 32000
 	default:
-		return 1000000
+		return 64000 // conservative work budget, not an asserted model capacity
 	}
 }
 
@@ -418,6 +426,9 @@ func (g *Gemini) Complete(ctx context.Context, req Request) (*Response, error) {
 	if g.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable or configure in ~/.metis/config.toml")
 	}
+	if err := g.validateContextOutputBudget(req); err != nil {
+		return nil, err
+	}
 	body := toGemini(req, g.MaxTokens)
 	buf, err := json.Marshal(body)
 	if err != nil {
@@ -454,6 +465,9 @@ func (g *Gemini) Complete(ctx context.Context, req Request) (*Response, error) {
 func (g *Gemini) Stream(ctx context.Context, req Request) (StreamReader, error) {
 	if g.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable or configure in ~/.metis/config.toml")
+	}
+	if err := g.validateContextOutputBudget(req); err != nil {
+		return nil, err
 	}
 	body := toGemini(req, g.MaxTokens)
 	buf, err := json.Marshal(body)

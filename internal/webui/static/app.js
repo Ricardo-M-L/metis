@@ -89,7 +89,8 @@ const DESKTOP_I18N = {
   en: {
     newSession: 'New session', workspaces: 'Workspaces', searchSessions: 'Search sessions…', settings: 'Settings', checkUpdates: 'Check for updates',
     searchSessionsLabel: 'Search sessions', collapseSidebar: 'Collapse sidebar', expandSidebar: 'Expand sidebar',
-    context: 'Context', contextDetails: 'Context details', contextOpenDetails: 'Click to view details', contextUsed: 'Used', contextWindow: 'Window', autoCompactAt: 'Auto-compact at', subAgents: 'sub-agents', backgroundTasks: 'background tasks',
+    context: 'Context', contextDetails: 'Context details', contextOpenDetails: 'Click to view details', contextUsed: 'Used', contextWindow: 'Active window', contextDefaultWindow: 'Endpoint default window', contextMaxWindow: 'Maximum supported', contextMaxInput: 'Maximum input', contextMaxOutput: 'Maximum output', contextSource: 'Data source', contextSourceEndpoint: 'Endpoint', contextSourceCatalog: 'Model catalog', contextSourceConfigured: 'Explicit configuration', contextSourceFallback: 'Conservative fallback', contextSourceUnknown: 'Unconfirmed', autoCompactAt: 'Auto-compact at', subAgents: 'sub-agents', backgroundTasks: 'background tasks',
+    contextProfileDefaultWindow: 'Client suggested window', contextProfileMaxWindow: 'Client catalog maximum', contextRouteMaxWindow: 'Budget ceiling', contextModelWindow: 'Full model capacity', contextModelMaxInput: 'Model maximum input', contextModelMaxOutput: 'Model maximum output', contextModelSource: 'Model capacity source', contextBudgetSource: 'Working budget', contextBudgetAutomatic: 'Automatic', contextBudgetPerModel: 'Saved for this route and model', contextBudgetLegacy: 'Legacy provider configuration', contextRequestedWindow: 'Requested window', contextInputBudget: 'Active input budget', contextSourceSubscriptionProfile: 'Subscription client profile', contextSourceSubscriptionEstimate: 'Built-in subscription estimate', contextSourceModelInput: 'Model input ceiling', contextSourceEstimate: 'Estimated budget', contextSourceConfiguredClamped: 'Explicit configuration (limited)', contextLimitSource: 'Budget ceiling source',
     chat: 'Chat', trajectory: 'Trajectory', welcome: 'From idea to done', preview: 'METIS Desktop', sessionLog: 'Session log',
     composerPlaceholder: 'Describe what you want to build', jumpLatest: 'Jump to latest', details: 'Details', detailsPlaceholder: 'Select a tool row to inspect details',
     backToApp: 'Back to app', searchSettings: 'Search settings…', personal: 'Personal', general: 'General', appearance: 'Appearance',
@@ -100,7 +101,8 @@ const DESKTOP_I18N = {
   'zh-CN': {
     newSession: '新会话', workspaces: '工作区', searchSessions: '搜索会话…', settings: '设置', checkUpdates: '检查更新',
     searchSessionsLabel: '搜索会话', collapseSidebar: '收起侧栏', expandSidebar: '展开侧栏',
-    context: '上下文', contextDetails: '上下文详情', contextOpenDetails: '点击查看详情', contextUsed: '已使用', contextWindow: '窗口', autoCompactAt: '自动压缩阈值', subAgents: '子代理', backgroundTasks: '后台任务',
+    context: '上下文', contextDetails: '上下文详情', contextOpenDetails: '点击查看详情', contextUsed: '已使用', contextWindow: '当前窗口', contextDefaultWindow: '端点默认窗口', contextMaxWindow: '最大支持', contextMaxInput: '最大输入', contextMaxOutput: '最大输出', contextSource: '数据来源', contextSourceEndpoint: '接入端点', contextSourceCatalog: '模型目录', contextSourceConfigured: '显式配置', contextSourceFallback: '保守回退', contextSourceUnknown: '未确认', autoCompactAt: '自动压缩阈值', subAgents: '子代理', backgroundTasks: '后台任务',
+    contextProfileDefaultWindow: '客户端建议窗口', contextProfileMaxWindow: '客户端目录最大值', contextRouteMaxWindow: '预算允许上限', contextModelWindow: '模型完整容量', contextModelMaxInput: '模型最大输入', contextModelMaxOutput: '模型最大输出', contextModelSource: '模型容量来源', contextBudgetSource: '工作预算', contextBudgetAutomatic: '自动', contextBudgetPerModel: '按接入路线和模型保存', contextBudgetLegacy: '旧版提供商配置', contextRequestedWindow: '请求窗口', contextInputBudget: '当前输入预算', contextSourceSubscriptionProfile: '订阅接口客户端资料', contextSourceSubscriptionEstimate: '内置订阅表估计', contextSourceModelInput: '模型输入上限', contextSourceEstimate: '估计预算', contextSourceConfiguredClamped: '显式配置（已约束）', contextLimitSource: '预算约束来源',
     chat: '对话', trajectory: '轨迹', welcome: '从想法，到完成', preview: 'METIS Desktop', sessionLog: '会话日志',
     composerPlaceholder: '描述你想要构建的内容', jumpLatest: '回到最新', details: '详情', detailsPlaceholder: '点击消息流中的工具行查看详情',
     backToApp: '返回应用', searchSettings: '搜索设置…', personal: '个人', general: '通用', appearance: '外观',
@@ -484,6 +486,21 @@ document.addEventListener('keydown', event => {
   document.getElementById('contextMeter')?.focus();
 });
 
+function contextCapacitySourceLabel(value, dict) {
+  dict = dict || DESKTOP_I18N[document.documentElement.lang === 'en' ? 'en' : 'zh-CN'];
+  const source = String(value || '');
+  if (source === 'codex_subscription_models') return dict.contextSourceSubscriptionProfile;
+  if (source === 'subscription_model_estimate') return dict.contextSourceSubscriptionEstimate;
+  if (source === 'gemini_model_input') return dict.contextSourceModelInput;
+  if (source === 'estimated') return dict.contextSourceEstimate;
+  if (source === 'configured_clamped') return dict.contextSourceConfiguredClamped;
+  if (source === 'codex_model_catalog' || source.startsWith('catalog')) return dict.contextSourceCatalog;
+  if (source === 'endpoint' || source.startsWith('endpoint_')) return dict.contextSourceEndpoint;
+  if (source === 'configured') return dict.contextSourceConfigured;
+  if (source.endsWith('fallback')) return dict.contextSourceFallback;
+  return dict.contextSourceUnknown;
+}
+
 function renderContextMeter(d, dict) {
   const meter = document.getElementById('contextMeter');
   const popover = document.getElementById('contextMeterPopover');
@@ -522,11 +539,35 @@ function renderContextMeter(d, dict) {
   const compactRow = compactAt > 0
     ? `<div><dt>${escHtml(dict.autoCompactAt)}</dt><dd>${compactAtTokens > 0 ? exactTokens(compactAtTokens) + ' · ' : ''}${Math.round(compactAt * 100)}%</dd></div>`
     : '';
+  const capacityRow = (label, value) => typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? `<div><dt>${escHtml(label)}</dt><dd>${exactTokens(value)}</dd></div>` : '';
+  const source = String(d.contextSource || d.contextLimitSource || '');
+  const sourceLabel = contextCapacitySourceLabel(source, dict);
+  const budgetSource = String(d.contextBudgetSource || '');
+  const budgetLabel = budgetSource === 'per_model' ? dict.contextBudgetPerModel
+    : budgetSource === 'legacy_provider' ? dict.contextBudgetLegacy
+      : budgetSource === 'automatic' ? dict.contextBudgetAutomatic : dict.contextSourceUnknown;
+  // Client profiles describe suggested operating windows, not endpoint or
+  // model hard capacity. Show each provenance independently when advertised.
+  const capabilityRows = capacityRow(dict.contextDefaultWindow, d.contextDefaultWindow)
+    + capacityRow(dict.contextProfileDefaultWindow, d.contextProfileDefaultWindow)
+    + capacityRow(dict.contextProfileMaxWindow, d.contextProfileMaxWindow)
+    + capacityRow(dict.contextModelWindow, d.contextModelWindow)
+    + capacityRow(dict.contextModelMaxInput, d.contextModelMaxInputTokens)
+    + capacityRow(dict.contextModelMaxOutput, d.contextModelMaxOutputTokens)
+    + capacityRow(dict.contextRouteMaxWindow, d.contextMaxWindow)
+    + capacityRow(dict.contextMaxInput, d.contextMaxInputTokens)
+    + capacityRow(dict.contextMaxOutput, d.contextMaxOutputTokens)
+    + (Number(d.contextRequestedWindow) > 0 && Number(d.contextRequestedWindow) !== limit ? capacityRow(dict.contextRequestedWindow, d.contextRequestedWindow) : '')
+    + (budgetSource ? `<div><dt>${escHtml(dict.contextBudgetSource)}</dt><dd>${escHtml(budgetLabel)}</dd></div>` : '')
+    + `<div><dt>${escHtml(dict.contextSource)}</dt><dd>${escHtml(sourceLabel)}</dd></div>`
+    + (d.contextLimitSource && d.contextLimitSource !== source ? `<div><dt>${escHtml(dict.contextLimitSource)}</dt><dd>${escHtml(contextCapacitySourceLabel(d.contextLimitSource, dict))}</dd></div>` : '')
+    + (d.contextModelSource ? `<div><dt>${escHtml(dict.contextModelSource)}</dt><dd>${escHtml(contextCapacitySourceLabel(d.contextModelSource, dict))}</dd></div>` : '');
   popover.setAttribute('aria-label', dict.contextDetails);
   popover.innerHTML = `<div class="context-meter-popover-title">${escHtml(dict.contextDetails)} <strong>${escHtml(percentLabel)}</strong></div>
     <div class="context-meter-progress" aria-hidden="true"><span style="width:${percent}%"></span></div>
     <dl class="context-meter-details"><div><dt>${escHtml(dict.contextUsed)}</dt><dd>${exactTokens(used)}</dd></div>
-    <div><dt>${escHtml(dict.contextWindow)}</dt><dd>${exactTokens(limit)}</dd></div>${compactRow}</dl>`;
+    <div><dt>${escHtml(d.contextWindowKind === 'input' ? dict.contextInputBudget : dict.contextWindow)}</dt><dd>${exactTokens(limit)}</dd></div>${capabilityRows}${compactRow}</dl>`;
   syncComposerRuntimeDock();
 }
 

@@ -29,6 +29,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/anthropic"
 	"github.com/Ricardo-M-L/metis/internal/llm/cloud"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
@@ -60,7 +61,8 @@ type Bedrock struct {
 	creds      cloud.AWSCreds
 	httpClient *http.Client
 
-	ContextWindow int
+	ContextWindow       int
+	ContextBudgetPolicy *llm.ContextBudgetPolicy
 }
 
 // NewBedrock builds a Bedrock provider. accessKey + secretKey are
@@ -121,7 +123,12 @@ func (b *Bedrock) SupportsVision() bool { return anthropic.SupportsVisionModel(b
 func (b *Bedrock) VisionCapability() provider.VisionCapability {
 	return anthropic.VisionCapabilityForModel(b.Model)
 }
-func (b *Bedrock) MaxContextTokens() int { return b.ContextWindow }
+func (b *Bedrock) MaxContextTokens() int {
+	if b.ContextBudgetPolicy == nil {
+		return b.ContextWindow
+	}
+	return b.ContextCapabilities().Window
+}
 
 // Bedrock uses the shared Anthropic request encoder. Plaintext thinking only
 // round-trips when its original Anthropic signature is present.

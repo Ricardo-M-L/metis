@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/argsunwrap"
 	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
 	"github.com/Ricardo-M-L/metis/internal/llm/sse"
@@ -136,9 +137,13 @@ type Anthropic struct {
 	OAuthTokenSource func(context.Context) (string, error)
 	// CatalogProvider is the models.dev provider id for this concrete route.
 	// It is separate from Name(), which identifies the Anthropic wire format.
-	CatalogProvider string
-	MaxTokens       int
-	Beta            string
+	CatalogProvider       string
+	CatalogProviderStrict bool
+	ContextResolver       *llm.ContextResolver
+	ContextBudgetSource   string
+	ContextBudgetPolicy   *llm.ContextBudgetPolicy
+	MaxTokens             int
+	Beta                  string
 	// ContextWindow, when > 0, overrides the model-prefix lookup in
 	// MaxContextTokens(). Lets users on Anthropic-compatible third-party
 	// gateways (MiniMax, OpenRouter, ...) declare the real window so
@@ -327,25 +332,10 @@ func visionCapabilityForRouteWithCatalog(catalogProvider, model string, cli *cat
 }
 
 func (a *Anthropic) MaxContextTokens() int {
-	// Tier 1 — explicit user override (~/.metis/config.toml).
-	if a.ContextWindow > 0 {
-		return a.ContextWindow
-	}
-	// Tier 2 — exact catalog-provider + model lookup from the
-	// background-warmed models.dev cache. Without a provider identity, only an
-	// unambiguous model-only result is accepted.
-	if cli := catalog.Default(); cli != nil {
-		var w int
-		var ok bool
-		if a.CatalogProvider != "" {
-			w, ok = cli.LookupContextWindow(a.CatalogProvider, a.Model)
-		} else {
-			w, ok = cli.LookupContextWindowByModelID(a.Model)
-		}
-		if ok {
-			return w
-		}
-	}
+	return a.ContextCapabilities().Window
+}
+
+func (a *Anthropic) fallbackContextWindow() int {
 	// Tier 3 — `-Nk` / `-Nm` suffix. Must run BEFORE the prefix table:
 	// `moonshot-v1-128k` would otherwise be captured by the generic
 	// `kimi/moonshot → 200000` prefix and silently lose its 128k cap.
@@ -1426,6 +1416,48 @@ type streamBlock struct {
 	Prefill string
 }
 
+// anthropicStreamUsage preserves each field's presence because compatible
+// gateways can correct absolute usage downward or explicitly reset it to zero.
+type anthropicStreamUsage struct {
+	InputTokens              *int `json:"input_tokens"`
+	OutputTokens             *int `json:"output_tokens"`
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+}
+
+func (u anthropicStreamUsage) validate() error {
+	for _, field := range []struct {
+		name  string
+		value *int
+	}{
+		{"input", u.InputTokens},
+		{"output", u.OutputTokens},
+		{"cache creation", u.CacheCreationInputTokens},
+		{"cache read", u.CacheReadInputTokens},
+	} {
+		if field.value != nil && *field.value < 0 {
+			return fmt.Errorf("anthropic SSE reported negative %s tokens: %d", field.name, *field.value)
+		}
+	}
+	return nil
+}
+
+func (u anthropicStreamUsage) apply(event StreamEvent) StreamEvent {
+	if u.InputTokens != nil {
+		event.InputTokens, event.HasInputTokens = *u.InputTokens, true
+	}
+	if u.OutputTokens != nil {
+		event.OutputTokens, event.HasOutputTokens = *u.OutputTokens, true
+	}
+	if u.CacheCreationInputTokens != nil {
+		event.CacheCreationInputTokens, event.HasCacheCreationInputTokens = *u.CacheCreationInputTokens, true
+	}
+	if u.CacheReadInputTokens != nil {
+		event.CacheReadInputTokens, event.HasCacheReadInputTokens = *u.CacheReadInputTokens, true
+	}
+	return event
+}
+
 func newAnthropicStream(body io.ReadCloser, exactValues ...string) *anthropicStream {
 	return &anthropicStream{
 		body:          body,
@@ -1468,41 +1500,31 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 		}
 
 		var env struct {
-			Type         string          `json:"type"`
-			Index        int             `json:"index"`
-			Delta        json.RawMessage `json:"delta"`
-			ContentBlock json.RawMessage `json:"content_block"`
-			Message      json.RawMessage `json:"message"`
-			Usage        struct {
-				InputTokens              int `json:"input_tokens"`
-				OutputTokens             int `json:"output_tokens"`
-				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-			} `json:"usage"`
+			Type         string               `json:"type"`
+			Index        int                  `json:"index"`
+			Delta        json.RawMessage      `json:"delta"`
+			ContentBlock json.RawMessage      `json:"content_block"`
+			Message      json.RawMessage      `json:"message"`
+			Usage        anthropicStreamUsage `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(frame.Data), &env); err != nil {
 			continue
+		}
+		if err := env.Usage.validate(); err != nil {
+			return StreamEvent{Type: "error", Err: err}, err
 		}
 
 		switch env.Type {
 		case "message_start":
 			// usage info available; emit empty event with token counts
 			var msg struct {
-				Usage struct {
-					InputTokens              int `json:"input_tokens"`
-					OutputTokens             int `json:"output_tokens"`
-					CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-					CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-				} `json:"usage"`
+				Usage anthropicStreamUsage `json:"usage"`
 			}
 			_ = json.Unmarshal(env.Message, &msg)
-			return StreamEvent{
-				Type:                     "message_start",
-				InputTokens:              msg.Usage.InputTokens,
-				OutputTokens:             msg.Usage.OutputTokens,
-				CacheCreationInputTokens: msg.Usage.CacheCreationInputTokens,
-				CacheReadInputTokens:     msg.Usage.CacheReadInputTokens,
-			}, nil
+			if err := msg.Usage.validate(); err != nil {
+				return StreamEvent{Type: "error", Err: err}, err
+			}
+			return msg.Usage.apply(StreamEvent{Type: "message_start"}), nil
 		case "content_block_start":
 			var cb struct {
 				Type      string         `json:"type"`
@@ -1618,25 +1640,16 @@ func (s *anthropicStream) Recv() (StreamEvent, error) {
 				StopReason string `json:"stop_reason"`
 			}
 			_ = json.Unmarshal(env.Delta, &d)
-			// Forward both input + output tokens. Anthropic native usually
-			// reports input_tokens at message_start and only output_tokens
-			// at message_delta, but Anthropic-compatible gateways are
-			// inconsistent — MiniMax in particular reports the input
-			// count here, not at the start. Carrying both means the
-			// downstream tracker doesn't end up with `in == 0` on those
-			// providers and the bottom-right counter actually moves.
-			return StreamEvent{
-				Type:                     "message_delta",
-				StopReason:               d.StopReason,
-				InputTokens:              env.Usage.InputTokens,
-				OutputTokens:             env.Usage.OutputTokens,
-				CacheCreationInputTokens: env.Usage.CacheCreationInputTokens,
-				CacheReadInputTokens:     env.Usage.CacheReadInputTokens,
-			}, nil
+			// Forward only the fields actually reported. Compatible gateways may
+			// supply their final input/cache split here after a provisional start.
+			return env.Usage.apply(StreamEvent{Type: "message_delta", StopReason: d.StopReason}), nil
+		case "usage":
+			return env.Usage.apply(StreamEvent{Type: "usage"}), nil
 		case "message_stop":
-			return s.terminate()
+			event, terminalErr := s.terminate()
+			return env.Usage.apply(event), terminalErr
 		case "error":
-			return StreamEvent{Type: "error", Err: errors.New(security.RedactValues(frame.Data, s.exactValues...))}, nil
+			return env.Usage.apply(StreamEvent{Type: "error", Err: errors.New(security.RedactValues(frame.Data, s.exactValues...))}), nil
 		}
 		// Unknown event type — keep reading.
 	}

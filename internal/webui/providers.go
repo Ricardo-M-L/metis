@@ -105,9 +105,13 @@ func configuredProviderViews(cfg *config.Config) []providerView {
 		}
 		return rtpkg.ProviderHasCredentials(cfg, id), kind
 	}
+	openAITransport := "openai_chat"
+	if strings.EqualFold(strings.TrimSpace(cfg.Provider.OpenAI.WireProtocol), "responses") {
+		openAITransport = "openai_responses"
+	}
 	views := []providerView{
 		{ID: "anthropic", Transport: "anthropic_messages", BaseURL: cfg.Provider.Anthropic.BaseURL, Model: cfg.Provider.Anthropic.Model},
-		{ID: "openai", Transport: "openai_chat", BaseURL: cfg.Provider.OpenAI.BaseURL, Model: cfg.Provider.OpenAI.Model},
+		{ID: "openai", Transport: openAITransport, BaseURL: cfg.Provider.OpenAI.BaseURL, Model: cfg.Provider.OpenAI.Model},
 		{ID: "openai-codex", Transport: "openai_codex_responses", BaseURL: openAICodexBaseURL, Model: cfg.Provider.OpenAICodex.Model, SetupCommand: "metis login openai-codex"},
 		{ID: "gemini", Transport: "gemini_native", BaseURL: cfg.Provider.Gemini.BaseURL, Model: cfg.Provider.Gemini.Model},
 	}
@@ -121,8 +125,12 @@ func configuredProviderViews(cfg *config.Config) []providerView {
 	sort.Strings(customIDs)
 	for _, id := range customIDs {
 		raw := cfg.Provider.Custom[id]
+		transport := raw.Transport
+		if strings.TrimSpace(transport) == "" {
+			transport = "anthropic_messages"
+		}
 		views = append(views, providerView{
-			ID: id, Transport: raw.Transport, BaseURL: raw.BaseURL, Model: raw.Model, Custom: true,
+			ID: id, Transport: transport, BaseURL: raw.BaseURL, Model: raw.Model, Custom: true,
 		})
 	}
 	defaultProvider := auth.CanonicalProviderID(cfg.Provider.Default)

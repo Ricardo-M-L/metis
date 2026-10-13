@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/openai"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/pkg/provider"
@@ -66,7 +67,8 @@ type Azure struct {
 	// ContextWindow override. Azure deployments inherit their model's
 	// window but the deployment id doesn't tell us which model — caller
 	// must set this when using compaction.
-	ContextWindow int
+	ContextWindow       int
+	ContextBudgetPolicy *llm.ContextBudgetPolicy
 }
 
 // NewAzure builds an Azure OpenAI provider. resource = the Azure
@@ -122,7 +124,12 @@ func (a *Azure) VisionCapability() provider.VisionCapability {
 // MaxContextTokens returns the configured override or 0 (caller falls
 // back to the model-prefix lookup, which is unlikely to match Azure
 // deployment names — set context_window in config.toml for accuracy).
-func (a *Azure) MaxContextTokens() int { return a.ContextWindow }
+func (a *Azure) MaxContextTokens() int {
+	if a.ContextBudgetPolicy == nil {
+		return a.ContextWindow
+	}
+	return a.ContextCapabilities().Window
+}
 
 // chatURL renders the deployment-routed endpoint with the api-version
 // query param Azure requires on every call.

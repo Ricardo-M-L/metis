@@ -10,6 +10,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/anthropic"
 	"github.com/Ricardo-M-L/metis/internal/llm/openai"
 )
@@ -148,8 +149,8 @@ func TestBuildProviderOpenAICodex(t *testing.T) {
 	if p.Name() != "openai-codex" || p.BaseURL != "https://chatgpt.com/backend-api/codex" {
 		t.Fatalf("Codex identity/base: name=%q base=%q", p.Name(), p.BaseURL)
 	}
-	if p.ContextWindow != 200000 || p.OAuthTokenSource == nil {
-		t.Fatalf("Codex config not applied: context=%d source=%v", p.ContextWindow, p.OAuthTokenSource != nil)
+	if p.ContextWindow != 0 || p.ContextBudgetSource != llm.ContextBudgetAutomatic || p.OAuthTokenSource == nil {
+		t.Fatalf("Codex model override borrowed the default model's legacy budget: context=%d budgetSource=%q oauthSource=%v", p.ContextWindow, p.ContextBudgetSource, p.OAuthTokenSource != nil)
 	}
 	credential, err := p.OAuthTokenSource(context.Background())
 	if err != nil {
@@ -157,6 +158,19 @@ func TestBuildProviderOpenAICodex(t *testing.T) {
 	}
 	if credential.AccessToken != "codex-token" || credential.AccountID != "account-123" {
 		t.Fatalf("resolved credential = %#v", credential)
+	}
+	// The old value still belongs to the configured default model, including
+	// explicitly selecting that same wire id. An override must never erase it.
+	for _, override := range []string{"", cfg.Provider.OpenAICodex.Model} {
+		defaultBuild, err := BuildProviderWithoutPreconnect(cfg, "openai-codex", override)
+		if err != nil {
+			t.Fatalf("BuildProvider default %q: %v", override, err)
+		}
+		defaultProvider := defaultBuild.Provider.(*openai.Responses)
+		capabilities := defaultProvider.ContextCapabilities()
+		if defaultProvider.ContextWindow != cfg.Provider.OpenAICodex.ContextWindow || capabilities.RequestedWindow != cfg.Provider.OpenAICodex.ContextWindow || capabilities.BudgetSource != llm.ContextBudgetLegacyProvider {
+			t.Fatalf("configured default lost its legacy budget: provider=%d capabilities=%+v", defaultProvider.ContextWindow, capabilities)
+		}
 	}
 }
 

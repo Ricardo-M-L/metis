@@ -5,12 +5,87 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/auth"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/llm/modelinfo"
 )
+
+func TestProviderModelDiscoveryRetainsNewSlugCapabilitiesAndRouteCache(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/v1/models" || r.URL.Query().Get("client_version") != "pi" || r.Header.Get("Authorization") != "Bearer capability-secret" {
+			t.Errorf("model capabilities did not use the rich authenticated catalog")
+		}
+		_, _ = w.Write([]byte(`{"models":[{"slug":"never-seen-before","display_name":"New Model","context_window":272000,"max_context_window":872000,"max_input_tokens":144000,"max_tokens":128000}]}`))
+	}))
+	defer upstream.Close()
+	if err := config.SaveUserCustomProvider(config.CustomProviderSpec{ID: "gateway", Transport: "openai_chat", BaseURL: upstream.URL + "/v1", Model: "old-model"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.ActivateAPIKeyBound("gateway", "capability-secret", "openai_chat", upstream.URL+"/v1"); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := testServer(t)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/providers/models", strings.NewReader(`{"id":"gateway"}`)))
+	var response struct {
+		Models []struct {
+			ID, Name, Source                                                 string
+			ContextWindow, MaxContextWindow, MaxInputTokens, MaxOutputTokens int
+		}
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if rr.Code != http.StatusOK || requests != 1 || len(response.Models) != 1 {
+		t.Fatalf("discovery=%d requests=%d body=%s", rr.Code, requests, rr.Body.String())
+	}
+	m := response.Models[0]
+	if m.ID != "never-seen-before" || m.Name != "New Model" || m.ContextWindow != 272000 || m.MaxContextWindow != 872000 || m.MaxInputTokens != 144000 || m.MaxOutputTokens != 128000 || m.Source != modelinfo.SourceEndpointPI {
+		t.Fatalf("discovery dropped or conflated capacity metadata: %+v", m)
+	}
+	if bytes.Contains(rr.Body.Bytes(), []byte("capability-secret")) {
+		t.Fatal("credential echoed")
+	}
+	c, err := modelinfo.New(filepath.Join(config.Home(), "cache", "provider-models"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := modelinfo.Binding{ProviderID: "gateway", Transport: "openai_chat", BaseURL: upstream.URL + "/v1"}
+	cached, ok := c.Get(b, m.ID)
+	if !ok || cached.ContextWindow != 272000 || cached.MaxContextWindow != 872000 || cached.MaxInputTokens != 144000 || cached.MaxOutputTokens != 128000 {
+		t.Fatalf("runtime cache=%+v ok=%v", cached, ok)
+	}
+	b.BaseURL += "/different"
+	if _, ok := c.Get(b, m.ID); ok {
+		t.Fatal("capacity cache crossed endpoint binding")
+	}
+}
+
+func TestProviderModelDiscoveryInputCeilingDoesNotInventDefaultWindow(t *testing.T) {
+	models, err := parseProviderModels([]byte(`{"data":[{"id":"input-only-new","max_input_tokens":500000}]}`), "openai_chat")
+	if err != nil || len(models) != 1 || models[0].MaxInputTokens != 500000 || models[0].ContextWindow != 0 || models[0].MaxContextWindow != 0 || models[0].MaxOutputTokens != 0 {
+		t.Fatalf("input ceiling was promoted to a context window: %+v err=%v", models, err)
+	}
+}
+
+func TestDiscoveredProviderModelsKeepClientProfileSemantics(t *testing.T) {
+	models := discoveredProviderModels([]modelinfo.Model{{ID: "new-profile-model", ContextWindow: 272000, MaxContextWindow: 872000, MaxOutputTokens: 128000, WindowKind: "client_profile", Source: modelinfo.SourceEndpointPI}})
+	if len(models) != 1 || models[0].WindowKind != "client_profile" || models[0].ContextWindow != 272000 || models[0].MaxContextWindow != 872000 {
+		t.Fatalf("client profile was promoted to model capacity: %+v", models)
+	}
+	wire, err := json.Marshal(models)
+	if err != nil || !bytes.Contains(wire, []byte(`"windowKind":"client_profile"`)) {
+		t.Fatalf("profile semantics absent from model selection response: %s err=%v", wire, err)
+	}
+}
 
 func TestProviderModelDiscoveryUsesSavedEndpointWithoutEchoingCredential(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())
@@ -21,7 +96,7 @@ func TestProviderModelDiscoveryUsesSavedEndpointWithoutEchoingCredential(t *test
 			t.Errorf("unexpected discovery request: method=%s path=%s authenticated=%t", r.Method, r.URL.Path, r.Header.Get("Authorization") == "Bearer "+secret)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":[{"id":"model-b","name":"Model B"},{"id":"model-a"},{"id":"model-b"},{"name":"missing-id"}]}`))
+		_, _ = w.Write([]byte(`{"data":[{"id":"model-b","name":"Model B"},{"id":"model-a"},{"id":"model-b","name":"Model B"}]}`))
 	}))
 	defer upstream.Close()
 	if err := config.SaveUserCustomProvider(config.CustomProviderSpec{ID: "gateway", Transport: "openai_responses", BaseURL: upstream.URL + "/v1", Model: "old-model"}); err != nil {
@@ -43,7 +118,7 @@ func TestProviderModelDiscoveryUsesSavedEndpointWithoutEchoingCredential(t *test
 	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Source != "provider" || len(got.Models) != 2 || got.Models[0].ID != "model-b" || got.Models[1].ID != "model-a" {
+	if got.Source != "provider" || len(got.Models) != 2 || got.Models[0].ID != "model-a" || got.Models[1].ID != "model-b" {
 		t.Fatalf("discovered models = %+v", got)
 	}
 }
@@ -74,6 +149,79 @@ func TestProviderModelDiscoveryDraftNeverForwardsOldKeyToChangedEndpoint(t *test
 	cfg, _, err := config.Load()
 	if err != nil || cfg.Provider.Custom["gateway"].Model != "old-model" {
 		t.Fatalf("draft discovery changed config: %+v %v", cfg, err)
+	}
+}
+
+func TestProviderModelDiscoveryCustomAnthropicUsesGatewayCatalogAuthentication(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/proxy/v1/models" || r.URL.Query().Get("client_version") != "pi" || r.Header.Get("Authorization") != "Bearer gateway-key" || r.Header.Get("x-api-key") != "gateway-key" {
+			t.Errorf("custom Anthropic model discovery used an incompatible route or auth header")
+		}
+		_, _ = w.Write([]byte(`{"models":[{"slug":"new-model","context_window":272000}]}`))
+	}))
+	defer upstream.Close()
+	if err := config.SaveUserCustomProvider(config.CustomProviderSpec{ID: "gateway", Transport: "anthropic_messages", BaseURL: upstream.URL + "/proxy", Model: "new-model"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.ActivateAPIKeyBound("gateway", "gateway-key", "anthropic_messages", upstream.URL+"/proxy"); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := testServer(t)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/providers/models", strings.NewReader(`{"id":"gateway"}`)))
+	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(`"contextWindow":272000`)) {
+		t.Fatalf("discovery=%d: %s", rr.Code, rr.Body.String())
+	}
+	client, err := modelinfo.New(filepath.Join(config.Home(), "cache", "provider-models"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := modelinfo.Binding{ProviderID: "gateway", Transport: "anthropic_messages", BaseURL: upstream.URL + "/proxy"}
+	if _, ok := client.Get(binding, "new-model"); !ok {
+		t.Fatal("discovery cache identity differs from the configured runtime endpoint")
+	}
+	binding.Transport = "openai_chat"
+	if _, ok := client.Get(binding, "new-model"); ok {
+		t.Fatal("capabilities crossed a transport binding")
+	}
+}
+
+func TestProviderModelDiscoveryViewKeepsRuntimeDefaultTransport(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	cfg := &config.Config{Provider: config.ProviderSet{Custom: map[string]config.ProviderRaw{
+		"default-wire": {BaseURL: "http://127.0.0.1:1", Model: "new"},
+	}}}
+	for _, view := range configuredProviderViews(cfg) {
+		if view.ID == "default-wire" {
+			if view.Transport != "anthropic_messages" {
+				t.Fatalf("UI route differs from runtime default: %+v", view)
+			}
+			return
+		}
+	}
+	t.Fatal("default route missing")
+}
+
+func TestProviderModelDiscoveryNativeOpenAIViewUsesConfiguredWireProtocol(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	for _, tc := range []struct{ wire, want string }{
+		{"", "openai_chat"}, {"chat", "openai_chat"}, {"responses", "openai_responses"},
+	} {
+		cfg := &config.Config{Provider: config.ProviderSet{OpenAI: config.ProviderOpenAI{WireProtocol: tc.wire}, Custom: map[string]config.ProviderRaw{}}}
+		found := false
+		for _, view := range configuredProviderViews(cfg) {
+			if view.ID == "openai" {
+				found = true
+				if view.Transport != tc.want {
+					t.Fatalf("wire=%q transport=%q want=%q", tc.wire, view.Transport, tc.want)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("native OpenAI route absent")
+		}
 	}
 }
 

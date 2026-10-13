@@ -43,7 +43,7 @@ const c = {
   fetch:async (url,options)=>{
     calls.push({url,body:JSON.parse(options.body)});
     return url.endsWith('/models')
-      ? {ok:true,json:async()=>({models:[{id:'model-a',name:'Model A'},{id:'model-b',name:'Model B'}],source:'provider'})}
+      ? {ok:true,json:async()=>({models:[{id:'model-a',name:'Model A',contextWindow:272000,maxContextWindow:872000,maxInputTokens:144000,maxOutputTokens:128000,source:'endpoint_pi'},{id:'model-b',name:'Model B',maxInputTokens:500000},{id:'profile-model',name:'Client profile',contextWindow:272000,maxContextWindow:872000,maxOutputTokens:128000,windowKind:'client_profile',source:'endpoint_pi'}],source:'provider'})}
       : {ok:true,json:async()=>({model:'model-b'})};
   },
   loadProviders:async()=>{},
@@ -69,6 +69,20 @@ vm.runInContext(extract('async function fetchProviderModels(id, origin, trigger)
   assert.equal(trigger.disabled,false);
   assert.equal(panel.hidden,false);
   assert.match(panelList.innerHTML,/model-a/);
+  assert.match(panelList.innerHTML,/默认窗口 272,000 tokens/);
+  assert.match(panelList.innerHTML,/预算允许上限 872,000 tokens/);
+  assert.match(panelList.innerHTML,/最大输入 144,000 tokens/);
+  assert.match(panelList.innerHTML,/最大输出 128,000 tokens/);
+  assert.equal(c.providerDiscoveryCache.get('card:fixture')[0].source,'endpoint_pi');
+  const modelButtons=Array.from(panelList.innerHTML.matchAll(/<button[^>]*class="provider-model-choice"[^>]*>([\s\S]*?)<\/button>/g),match=>match[1]);
+  const inputOnlyButton=modelButtons[1];
+  assert.match(inputOnlyButton,/最大输入 500,000 tokens/);
+  assert.doesNotMatch(inputOnlyButton,/默认窗口|最大支持|最大输出/);
+  const profileButton=modelButtons[2];
+  assert.match(profileButton,/客户端建议窗口 272,000 tokens/);
+  assert.match(profileButton,/客户端目录最大值 872,000 tokens/);
+  assert.doesNotMatch(profileButton,/默认窗口|预算允许上限/,'a client profile is not the model hard capacity');
+  assert.equal(c.providerDiscoveryCache.get('card:fixture')[2].windowKind,'client_profile');
   assert.equal(calls[0].url,'/api/providers/models');
   assert.equal(calls[0].body.id,'fixture');
   await c.selectDiscoveredProviderModel({dataset:{modelId:'model-b'},disabled:false,closest:()=>panel});

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/security"
@@ -41,6 +42,16 @@ type Responses struct {
 	APIKey  string
 	BaseURL string
 	Model   string
+	// CatalogProvider identifies this route's metadata independently of the
+	// Responses wire protocol. Explicit catalog mappings use strict matching.
+	CatalogProvider       string
+	CatalogProviderStrict bool
+	ContextResolver       *llm.ContextResolver
+	// CodexContextResolver uses only subscription OAuth discovery. It must
+	// never reuse the API-key route's generic resolver or authentication.
+	CodexContextResolver *CodexContextResolver
+	ContextBudgetSource  string
+	ContextBudgetPolicy  *llm.ContextBudgetPolicy
 	// OAuthTokenSource resolves a fresh bearer token and ChatGPT account id
 	// for OpenAI Codex subscription requests. It is invoked for every outbound
 	// HTTP attempt so a long-running provider observes credential refreshes
@@ -234,9 +245,10 @@ func (r *Responses) ContextIncludesAssistantBlock(block provider.ContentBlock) b
 }
 
 func (r *Responses) MaxContextTokens() int {
-	if r.ContextWindow > 0 {
-		return r.ContextWindow
-	}
+	return r.ContextCapabilities().Window
+}
+
+func (r *Responses) fallbackContextWindow() int {
 	if r.Name() == "openai-codex" {
 		if window, ok := CodexModelContextWindow(r.Model); ok {
 			return window
@@ -1170,6 +1182,9 @@ func hasFunctionCall(output []responsesStreamOutput) bool {
 // reader. The body stays open until Close().
 func (r *Responses) Stream(ctx context.Context, req provider.Request) (provider.StreamReader, error) {
 	if err := r.validateAuth(); err != nil {
+		return nil, err
+	}
+	if err := r.validateCodexContextOutputBudget(req); err != nil {
 		return nil, err
 	}
 	policy, err := transport.RecoveryPolicyForContext(ctx)

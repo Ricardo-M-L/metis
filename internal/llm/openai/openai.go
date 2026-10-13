@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/catalog"
 	"github.com/Ricardo-M-L/metis/internal/llm/sse"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
@@ -115,9 +116,13 @@ type OpenAI struct {
 	Model   string
 	// CatalogProvider is the models.dev provider id for this concrete route.
 	// It is distinct from Name(), which reports the wire transport.
-	CatalogProvider string
-	MaxTokens       int
-	Temperature     float64
+	CatalogProvider       string
+	CatalogProviderStrict bool
+	ContextResolver       *llm.ContextResolver
+	ContextBudgetSource   string
+	ContextBudgetPolicy   *llm.ContextBudgetPolicy
+	MaxTokens             int
+	Temperature           float64
 	// ContextWindow, when > 0, overrides the model-prefix lookup in
 	// MaxContextTokens(). Useful for OpenAI-compatible gateways
 	// (Together, Groq, Ollama) where the served model is a fine-tune
@@ -475,26 +480,10 @@ func fallbackVisionCapability(m string) provider.VisionCapability {
 }
 
 func (o *OpenAI) MaxContextTokens() int {
-	// Tier 1 — explicit user override.
-	if o.ContextWindow > 0 {
-		return o.ContextWindow
-	}
+	return o.ContextCapabilities().Window
+}
 
-	// Tier 2 — models.dev catalog. nil-safe (Default() returns nil
-	// when HOME is unset, e.g. CI minimal env) and miss-safe (returns
-	// false until the background fetch completes).
-	if cli := catalog.Default(); cli != nil {
-		var w int
-		var ok bool
-		if o.CatalogProvider != "" {
-			w, ok = cli.LookupContextWindow(o.CatalogProvider, o.Model)
-		} else {
-			w, ok = cli.LookupContextWindowByModelID(o.Model)
-		}
-		if ok {
-			return w
-		}
-	}
+func (o *OpenAI) fallbackContextWindow() int {
 
 	// Tier 3 — `-Nk` / `-Nm` suffix. Runs BEFORE the prefix table so
 	// a vendor variant like "moonshot-v1-32k" gets its declared 32K

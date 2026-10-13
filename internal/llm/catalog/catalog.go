@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -110,74 +111,128 @@ type Limit struct {
 // dataset. Keyed by provider id.
 type Catalog map[string]Provider
 
-// Client fetches and caches the catalog. Safe for concurrent use; one
-// in-flight fetch is shared via singleflight semantics (sync.Once per
-// fetch attempt).
+// Client fetches and caches the catalog. Safe for concurrent use; concurrent
+// refresh callers share an in-flight request and capability lookups read the
+// previous snapshot while that request is running.
 type Client struct {
 	URL       string
 	CachePath string
 	TTL       time.Duration
 	HTTP      *http.Client
 
-	mu      sync.RWMutex
-	cached  Catalog
-	loadedT time.Time
+	mu        sync.RWMutex
+	cached    Catalog
+	loadedT   time.Time
+	snapshotT time.Time
+	source    string
+	fetching  *catalogFetch
 }
 
-// NewClient builds a Client with sensible defaults. Override fields
-// directly for tests.
+type catalogFetch struct {
+	done chan struct{}
+	cat  Catalog
+	err  error
+}
+
+// NewClient builds a Client and loads an existing disk snapshot before
+// returning. Even an expired snapshot is useful to synchronous capability
+// lookups during cold start; its original modification time controls TTL,
+// so reading an old file does not make its metadata fresh again. No network
+// request is made by the constructor. Override fields directly for tests.
 func NewClient(home string) *Client {
 	url := os.Getenv("METIS_MODELS_URL")
 	if url == "" {
 		url = DefaultURL
 	}
-	return &Client{
+	c := &Client{
 		URL:       url,
 		CachePath: filepath.Join(home, "cache", "models.json"),
 		TTL:       DefaultTTL,
 		HTTP:      &http.Client{Timeout: 10 * time.Second},
 	}
+	if cat, modified, err := c.loadDiskSnapshot(); err == nil {
+		c.cached, c.snapshotT = cat, modified
+		c.loadedT, c.source = time.Now(), "disk_cache"
+	}
+	return c
 }
 
 // Get returns the catalog, fetching from network if the cache is stale
 // or missing. Network failures fall back to whatever's on disk; only
 // a completely empty cache + dead network surfaces as an error.
 func (c *Client) Get(ctx context.Context) (Catalog, error) {
+	cat, err := c.fetch(ctx, false)
+	if err == nil {
+		return cat, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	c.mu.RLock()
-	if c.cached != nil && time.Since(c.loadedT) < c.TTL {
-		out := c.cached
-		c.mu.RUnlock()
-		return out, nil
-	}
+	cat = c.cached
 	c.mu.RUnlock()
+	if cat != nil {
+		return cat, nil
+	}
+	// CachePath can be supplied after construction, and another process may
+	// have produced a disk snapshot while this process was offline.
+	if cat, modified, diskErr := c.loadDiskSnapshot(); diskErr == nil {
+		c.mu.Lock()
+		if c.cached == nil {
+			c.cached, c.snapshotT = cat, modified
+			c.loadedT, c.source = time.Now(), "disk_cache"
+		} else {
+			cat = c.cached
+		}
+		c.mu.Unlock()
+		return cat, nil
+	}
+	return nil, fmt.Errorf("catalog: network unreachable and no cached copy at %s: %w", c.CachePath, err)
+}
 
+func (c *Client) freshLocked() bool {
+	return c.cached != nil && (c.source == "static" ||
+		(!c.snapshotT.IsZero() && c.TTL > 0 && time.Since(c.snapshotT) < c.TTL))
+}
+
+// fetch shares one request among callers without holding the metadata lock
+// during HTTP or disk I/O. The initiating caller's context owns that request;
+// a waiting caller can cancel its own wait without cancelling the initiator.
+func (c *Client) fetch(ctx context.Context, force bool) (Catalog, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	// Re-check after acquiring write lock — another goroutine may have
-	// loaded while we were waiting.
-	if c.cached != nil && time.Since(c.loadedT) < c.TTL {
-		return c.cached, nil
-	}
-
-	// Try network first when cache is stale; fall back to whatever's on
-	// disk if network fails. Order matters: a network success refreshes
-	// the on-disk snapshot too, so subsequent offline starts are fast.
-	if cat, err := c.fetchAndPersist(ctx); err == nil {
-		c.cached = cat
-		c.loadedT = time.Now()
+	if !force && c.freshLocked() {
+		cat := c.cached
+		c.mu.Unlock()
 		return cat, nil
 	}
-
-	if cat, err := c.loadFromDisk(); err == nil {
-		c.cached = cat
-		c.loadedT = time.Now()
-		return cat, nil
-	} else if c.cached != nil {
-		// Stale in-memory copy is better than nothing.
-		return c.cached, nil
-	} else {
-		return nil, fmt.Errorf("catalog: network unreachable and no cached copy at %s", c.CachePath)
+	if active := c.fetching; active != nil {
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-active.done:
+			return active.cat, active.err
+		}
 	}
+	active := &catalogFetch{done: make(chan struct{})}
+	c.fetching = active
+	c.mu.Unlock()
+
+	cat, err := c.fetchAndPersist(ctx)
+	c.mu.Lock()
+	if err == nil {
+		c.cached = cat
+		c.loadedT, c.snapshotT = time.Now(), time.Now()
+		c.source = "network"
+	}
+	active.cat, active.err = cat, err
+	c.fetching = nil
+	close(active.done)
+	c.mu.Unlock()
+	return cat, err
 }
 
 // Provider looks up one provider by id. Returns ok=false if the id
@@ -211,18 +266,14 @@ func (c *Client) Model(ctx context.Context, providerID, modelID string) (Model, 
 // Refresh forces a network fetch regardless of TTL. Useful for `metis
 // models --refresh` and post-install warm-up.
 func (c *Client) Refresh(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	cat, err := c.fetchAndPersist(ctx)
-	if err != nil {
-		return err
-	}
-	c.cached = cat
-	c.loadedT = time.Now()
-	return nil
+	_, err := c.fetch(ctx, true)
+	return err
 }
 
 func (c *Client) fetchAndPersist(ctx context.Context) (Catalog, error) {
+	if c.HTTP == nil {
+		return nil, fmt.Errorf("catalog: HTTP client is not configured")
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", c.URL, nil)
 	if err != nil {
 		return nil, err
@@ -241,6 +292,9 @@ func (c *Client) fetchAndPersist(ctx context.Context) (Catalog, error) {
 	if err := dec.Decode(&cat); err != nil {
 		return nil, fmt.Errorf("catalog: decode %s: %w", c.URL, err)
 	}
+	if cat == nil {
+		return nil, fmt.Errorf("catalog: empty snapshot from %s", c.URL)
+	}
 	// Persist to disk best-effort; failures don't block returning the
 	// fresh copy. The next process start re-fetches if disk write
 	// failed (cache TTL window is short anyway).
@@ -256,23 +310,52 @@ func (c *Client) persist(cat Catalog) error {
 	if err != nil {
 		return err
 	}
-	tmp := c.CachePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	file, err := os.CreateTemp(filepath.Dir(c.CachePath), "models-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := file.Name()
+	defer os.Remove(tmp)
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, c.CachePath)
 }
 
 func (c *Client) loadFromDisk() (Catalog, error) {
-	data, err := os.ReadFile(c.CachePath)
+	cat, _, err := c.loadDiskSnapshot()
+	return cat, err
+}
+
+func (c *Client) loadDiskSnapshot() (Catalog, time.Time, error) {
+	file, err := os.Open(c.CachePath)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, time.Time{}, fmt.Errorf("catalog: cached snapshot is not a regular file")
 	}
 	cat := Catalog{}
-	if err := json.Unmarshal(data, &cat); err != nil {
-		return nil, fmt.Errorf("catalog: decode cached %s: %w", c.CachePath, err)
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&cat); err != nil {
+		return nil, time.Time{}, fmt.Errorf("catalog: decode cached %s: %w", c.CachePath, err)
 	}
-	return cat, nil
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, time.Time{}, fmt.Errorf("catalog: trailing data in cached snapshot at %s", c.CachePath)
+	}
+	if cat == nil {
+		return nil, time.Time{}, fmt.Errorf("catalog: empty cached snapshot at %s", c.CachePath)
+	}
+	return cat, info.ModTime(), nil
 }
 
 // LookupVisionByRoute returns the models.dev fact for one exact
@@ -382,6 +465,108 @@ func (c *Client) LookupContextWindow(providerID, modelID string) (int, bool) {
 	return m.Limit.Context, true
 }
 
+// ContextMatch identifies both the matched limit and the resolution path.
+// A catalog fact describes its published route; it cannot establish what an
+// undocumented proxy actually permits. Endpoint metadata and explicit user
+// configuration should take priority over these compatibility lookups.
+type ContextMatch struct {
+	Window     int
+	Source     string // "catalog_route" or "catalog_model"
+	ProviderID string // populated only for an exact route match
+	Stale      bool   // snapshot age exceeds TTL, including offline fallback
+}
+
+// LimitsMatch keeps total context, maximum input, and maximum output separate.
+// Unknown or ambiguous input/output values stay zero rather than being inferred
+// by subtracting another published limit.
+type LimitsMatch struct {
+	Limit      Limit
+	Source     string
+	ProviderID string
+	Stale      bool
+}
+
+// LookupRouteOrUnambiguousContext resolves an exact provider/model first.
+// Known catalog providers are authoritative: a missing model or limit never
+// borrows a sibling route's capacity. If providerID is a friendly custom
+// route name absent from the catalog, strictRoute=false allows model-only
+// resolution only when every exact model-ID entry has the same positive
+// window. No aliases, family prefixes or largest-window guesses are used.
+// An explicit catalog_provider should set strictRoute=true, so a typo cannot
+// silently select unrelated metadata. This method never performs I/O.
+func (c *Client) LookupRouteOrUnambiguousContext(providerID, modelID string, strictRoute bool) (ContextMatch, bool) {
+	match, found := c.LookupRouteOrUnambiguousLimits(providerID, modelID, strictRoute)
+	if !found {
+		return ContextMatch{}, false
+	}
+	return ContextMatch{Window: match.Limit.Context, Source: match.Source, ProviderID: match.ProviderID, Stale: match.Stale}, true
+}
+
+// LookupRouteOrUnambiguousLimits uses the same exact-route and unanimous
+// model-ID resolution as LookupRouteOrUnambiguousContext. The total context
+// must be positive and unambiguous to accept a match. Input and output are
+// independently retained only when every matching route publishes the same
+// positive value; omitted or conflicting fields remain unknown (zero).
+// Published fields are never derived from one another. Known routes remain
+// authoritative, and explicit catalog mappings never borrow another route.
+// This method reads only the current snapshot and never performs I/O.
+func (c *Client) LookupRouteOrUnambiguousLimits(providerID, modelID string, strictRoute bool) (LimitsMatch, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cached == nil || modelID == "" {
+		return LimitsMatch{}, false
+	}
+	if p, known := c.cached[providerID]; known {
+		m, found := p.Models[modelID]
+		if !found || m.Limit.Context <= 0 {
+			return LimitsMatch{}, false
+		}
+		limit := m.Limit
+		if limit.Input <= 0 {
+			limit.Input = 0
+		}
+		if limit.Output <= 0 {
+			limit.Output = 0
+		}
+		return LimitsMatch{Limit: limit, Source: "catalog_route", ProviderID: providerID, Stale: !c.freshLocked()}, true
+	}
+	if strictRoute {
+		return LimitsMatch{}, false
+	}
+	limit := Limit{}
+	for _, p := range c.cached {
+		m, found := p.Models[modelID]
+		if !found {
+			continue
+		}
+		// A route that publishes the model but omits its limit cannot
+		// participate in a claim that all routes agree on that limit.
+		if m.Limit.Context <= 0 || (limit.Context > 0 && limit.Context != m.Limit.Context) {
+			return LimitsMatch{}, false
+		}
+		if limit.Context == 0 {
+			limit = m.Limit
+			if limit.Input <= 0 {
+				limit.Input = 0
+			}
+			if limit.Output <= 0 {
+				limit.Output = 0
+			}
+			continue
+		}
+		if m.Limit.Input <= 0 || m.Limit.Input != limit.Input {
+			limit.Input = 0
+		}
+		if m.Limit.Output <= 0 || m.Limit.Output != limit.Output {
+			limit.Output = 0
+		}
+	}
+	if limit.Context <= 0 {
+		return LimitsMatch{}, false
+	}
+	return LimitsMatch{Limit: limit, Source: "catalog_model", Stale: !c.freshLocked()}, true
+}
+
 // LookupContextWindowByModelID is the provider-agnostic compatibility
 // fallback. It succeeds only when every catalog route that publishes the
 // model agrees on the same positive limit. Conflicting routes are ambiguous
@@ -438,6 +623,9 @@ type Stat struct {
 	CacheModTime  time.Time // mtime; zero if missing
 	InMemory      bool      // true once Default()'s warm-up populated c.cached
 	LoadedAt      time.Time // when the in-memory copy was loaded; zero if still empty
+	SnapshotAt    time.Time // disk modification time or successful network fetch time
+	Source        string    // "disk_cache", "network", "static", or empty when cold
+	Stale         bool      // missing snapshot or snapshot age exceeds TTL
 	ProviderCount int       // providers in the loaded snapshot
 	ModelCount    int       // total model entries across all providers
 }
@@ -446,21 +634,24 @@ type Stat struct {
 // call from any goroutine, never makes a network request.
 func (c *Client) Stat() Stat {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	out := Stat{
-		CachePath: c.CachePath,
-		LoadedAt:  c.loadedT,
-		InMemory:  c.cached != nil,
-	}
-	if fi, err := os.Stat(c.CachePath); err == nil {
-		out.CacheBytes = fi.Size()
-		out.CacheModTime = fi.ModTime()
+		CachePath:  c.CachePath,
+		LoadedAt:   c.loadedT,
+		InMemory:   c.cached != nil,
+		SnapshotAt: c.snapshotT,
+		Source:     c.source,
+		Stale:      !c.freshLocked(),
 	}
 	if c.cached != nil {
 		out.ProviderCount = len(c.cached)
 		for _, p := range c.cached {
 			out.ModelCount += len(p.Models)
 		}
+	}
+	c.mu.RUnlock()
+	if fi, err := os.Stat(out.CachePath); err == nil {
+		out.CacheBytes = fi.Size()
+		out.CacheModTime = fi.ModTime()
 	}
 	return out
 }
@@ -498,21 +689,20 @@ func (c *Client) LookupModel(modelID string) []ModelLocation {
 // defaultClient + defaultOnce wire a package-level singleton so the
 // provider.MaxContextTokens fast path can call catalog without each
 // provider package threading a *Client through its constructor. The
-// background warm-up fires on first Default() call; if it succeeds
-// LookupContextWindowByModelID starts answering with real numbers
-// within a few hundred ms of process start. If it fails (offline,
-// DNS hiccup), the lookup stays empty and providers fall through to
-// their hardcoded prefix tables — that's why hardcoded stays as the
-// belt to catalog's braces.
+// first call loads disk metadata synchronously, then refreshes expired or
+// missing metadata in the background. Offline starts retain cached facts;
+// only a missing/invalid disk snapshot remains empty for local fallbacks.
 var (
 	defaultClient *Client
 	defaultOnce   sync.Once
 )
 
-// Default returns the process-wide catalog client, kicking off a
-// background fetch on first call. Reuses the standard cache location
-// (~/.metis/cache/models.json). Returns nil if HOME is unset (CI
-// path) or METIS_CATALOG_DISABLE=1 is set in env (test path).
+// Default returns the process-wide catalog client with existing disk facts
+// already available, kicking off a bounded background refresh on first call.
+// METIS_HOME selects the same cache home as config and the models command;
+// otherwise the standard location is ~/.metis/cache/models.json. Returns nil
+// if neither a configured home nor the user's home can be resolved, or if
+// METIS_CATALOG_DISABLE=1 is set (test path).
 // Callers must nil-check.
 func Default() *Client {
 	defaultOnce.Do(func() {
@@ -524,15 +714,19 @@ func Default() *Client {
 		if os.Getenv("METIS_CATALOG_DISABLE") == "1" {
 			return
 		}
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return
+		home := os.Getenv("METIS_HOME")
+		if home == "" {
+			userHome, err := os.UserHomeDir()
+			if err != nil {
+				return
+			}
+			home = filepath.Join(userHome, ".metis")
 		}
-		defaultClient = NewClient(filepath.Join(home, ".metis"))
+		defaultClient = NewClient(home)
 		// Background warm-up. 8-second context cap so a hanging
 		// upstream doesn't leak a goroutine for hours; the eventual
-		// fetch failure is silent — callers see ok=false and fall
-		// through to the prefix table, which is fine.
+		// fetch failure is silent — callers retain the disk snapshot,
+		// or use local fallback facts if no snapshot could be loaded.
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
@@ -546,7 +740,8 @@ func Default() *Client {
 // lookups. It performs no network or disk I/O and is primarily useful to
 // callers/tests that already possess catalog facts.
 func NewStaticClient(models Catalog) *Client {
-	return &Client{cached: models}
+	now := time.Now()
+	return &Client{cached: models, loadedT: now, snapshotT: now, source: "static"}
 }
 
 // TransportHint maps the catalog's `npm` field to one of metis's
