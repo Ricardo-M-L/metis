@@ -41,7 +41,9 @@ func TestPrettifyCwd_ReturnsAbsolutePath(t *testing.T) {
 }
 
 func TestRenderWelcomeBannerCard_ContainsModelAndCwd(t *testing.T) {
-	m := &Model{model: "claude-opus-4-7", width: 120}
+	cwd := prettifyCwd(currentCwd())
+	// Keep the cwd on one line regardless of the checkout path length.
+	m := &Model{model: "claude-opus-4-7", width: 120 + len(cwd)}
 	got := m.renderWelcomeBannerCard()
 	if !strings.Contains(got, "metis") {
 		t.Errorf("expected 'metis' in welcome card; got: %q", got)
@@ -49,7 +51,7 @@ func TestRenderWelcomeBannerCard_ContainsModelAndCwd(t *testing.T) {
 	if !strings.Contains(got, "claude-opus-4-7") {
 		t.Errorf("expected model in welcome card; got: %q", got)
 	}
-	if !strings.Contains(got, prettifyCwd(currentCwd())) {
+	if !strings.Contains(got, cwd) {
 		t.Errorf("expected cwd in welcome card; got: %q", got)
 	}
 }

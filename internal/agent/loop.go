@@ -96,6 +96,12 @@ type Loop struct {
 	ResponseFormat *llm.ResponseFormat
 	MaxIters       int
 	GraceCalls     int
+	// ContinueOnIterationLimit makes MaxIters a segment length within the same
+	// Run instead of a terminal cap. Runtime enables this for ordinary main
+	// CLI/Desktop turns; raw NewLoop, child loops and explicit caps retain the
+	// bounded second-wind, grace and final-summary rescue behavior by default.
+	// Configure before Run starts.
+	ContinueOnIterationLimit bool
 
 	// rescueNoTools forces the NEXT buildRequest to omit the tool list,
 	// guaranteeing a text-only iteration. Set by the final-summary rescue
@@ -1685,6 +1691,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	finalSummaryRescued := false
 	compactedAtCap := false // at most one forced-compaction "second wind" per turn
 	diminishingRescued := false
+	progressArmed := false                      // advisory progress tracking is independent of hard-budget nudges
 	nudgeFired := make([]bool, len(iterNudges)) // see iter_nudge.go
 	progress := newProgressDetector()           // see progress_detector.go
 	stuckDet := &stuckDetector{}                // see stuck_detector.go — Phase C-mini
@@ -1698,7 +1705,8 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			runErr = errors.Join(runErr, fmt.Errorf("finite background job cleanup: %w", cleanupErr))
 		}
 	}()
-	runIter := 0 // MaxIters is per Run, not cumulative session history
+	runIter := 0     // cumulative for this Run, including every continuation segment
+	segmentIter := 0 // MaxIters applies to this segment, not the usage/audit cursor
 
 	// 2026-05-23: cumulative output tokens this Run() so the iter
 	// nudge formatter can include "you've also used N output tokens"
@@ -1732,6 +1740,10 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
 		}
+		if err := ctx.Err(); err != nil {
+			stopReason = "error"
+			return err
+		}
 		// Per-turn wall-clock cap (see deadline computation above).
 		// Checked at the top of each iter so an in-flight Bash /
 		// LLM call still finishes before we abort — same shape as
@@ -1757,6 +1769,16 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: "budget_usd"})
 			return nil
 		}
+		// A soft segment ends only at this complete, durable boundary. All
+		// ordinary Run guards above remain authoritative, and the next request
+		// still passes through automatic context-pressure compaction below.
+		// This also covers complete tool batches that re-enter through an
+		// earlier continue instead of the ordinary post-tool cap branch.
+		if l.ContinueOnIterationLimit && l.MaxIters > 0 && segmentIter >= l.MaxIters {
+			l.injectIterationContinuation(ctx, out, segmentIter, runIter, runOutputTokens)
+			segmentIter = 0
+		}
+
 		// One-shot 90%-budget warning. Injected HERE — the same
 		// pre-request boundary the iter nudge uses — and not in the
 		// post-stream usage block, because there the assistant message
@@ -1776,6 +1798,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		globalIter := l.iterIdx
 		l.mu.Unlock()
 		runIter++
+		segmentIter++
 		l.Hooks.EmitTurnStart(ctx, tc, globalIter)
 
 		// Drain any background-bash job notifications since the last
@@ -1798,6 +1821,14 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		// mid-status (see todo_reminder.go).
 		l.injectTodoReminder(ctx, out)
 
+		// Arm the soft path's existing diminishing-returns advisory once,
+		// near 75% of the first segment. It must not depend on the hard-budget
+		// nudge (suppressed in this mode), or reset at later segment seams.
+		if l.ContinueOnIterationLimit && !progressArmed && l.MaxIters > 0 && float64(runIter) >= float64(l.MaxIters)*0.75 {
+			progress.Reset()
+			progressArmed = true
+		}
+
 		// Soft iter-budget nudges at 50% / 75% / 90% — see
 		// iter_nudge.go. Fire at most one per threshold per turn so
 		// the model gets a heads-up before the hard cap kicks in.
@@ -1805,13 +1836,14 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		// model real cost context ("you've also used 12K output
 		// tokens"), matching claude-code's tokenBudget continuation
 		// message style.
-		if idx, body := shouldFireNudgeWithTokens(runIter, l.MaxIters, runOutputTokens, nudgeFired); body != "" {
+		if idx, body := shouldFireNudgeWithTokens(segmentIter, l.MaxIters, runOutputTokens, nudgeFired); !l.ContinueOnIterationLimit && body != "" {
 			nudgeFired[idx] = true
 			// Diminishing-return streaks only count after the 75% warning.
 			// Previously early cache hits accumulated silently and caused an
 			// immediate abort as soon as this threshold was crossed.
 			if idx == 1 {
 				progress.Reset()
+				progressArmed = true
 			}
 			l.appendInjectedMessage(ctx, out, "budget", body)
 			emit(ctx, out, Event{
@@ -2688,10 +2720,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		// tool loop. The old branch returned before appending `results`,
 		// so orphan repair replaced a successfully completed Read with
 		// "tool_use never completed" and the user got no final answer.
-		// After three low-output iterations *past* 75%, preserve the real
+		// After three low-output iterations past the progress advisory's
+		// initial 75% threshold, preserve the real
 		// results and inject one bounded recovery reminder instead.
 		progress.RecordIter(toolUses, results)
-		if !diminishingRescued && progress.IsDiminishing() && len(nudgeFired) >= 2 && nudgeFired[1] {
+		if !diminishingRescued && progress.IsDiminishing() && progressArmed {
 			diminishingRescued = true
 			results = append(results, llm.ContentBlock{Type: "text", Text: diminishingReturnsRescueMessage})
 			progress.Reset()
@@ -2864,11 +2897,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		//   2. Grace call (one extra iter for "I'm almost done").
 		//   3. Final-summary rescue (one tool-less iter that forces text).
 		//   4. Real abort.
-		if runIter >= l.MaxIters {
+		if !l.ContinueOnIterationLimit && segmentIter >= l.MaxIters {
 			if !compactedAtCap && l.compactorAvailable(false) {
 				compactedAtCap = true
 				if l.compactForSecondWind(ctx, out) {
-					runIter = 0
+					segmentIter = 0
 					emit(ctx, out, Event{
 						Kind: EventInfo,
 						Info: fmt.Sprintf("(iteration budget reached at %d — context compacted, continuing this turn with a fresh budget)", l.MaxIters),
@@ -2930,7 +2963,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 // fresh budget instead of hard-stopping mid-work (claude-code's token-budget
 // compaction / DSH's unbounded while(true) both prefer continue-over-stop).
 // Returns true when the history actually shrank and the caller should reset
-// its run counter and keep looping. False = compactor unavailable, the
+// its segment counter and keep looping. False = compactor unavailable, the
 // circuit breaker tripped, or the history was already too small to shrink —
 // in which case the caller falls through to the bounded grace→rescue→stop
 // path. CompactNow keeps provider work, hooks and persistence outside l.mu.

@@ -7,6 +7,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.90] - 2026-10-15
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Fixed
+
+- Continue ordinary long-running CLI and Desktop tasks in the same execution
+  at iteration checkpoints instead of terminating at the default 100 iterations.
+  Preserve completed tool results, cumulative usage, cancellation, time and cost
+  limits, and repeated/stuck-tool safeguards across every checkpoint.
+- Keep explicit CLI/profile iteration budgets and child-agent limits bounded.
+- Distinguish incomplete task outcomes from provider API errors in CLI, and
+  retain structured stop reasons from Desktop workers without masking real
+  process/protocol failures or marking partial work completed.
+- Show localized continuation and incomplete-task feedback in Desktop.
+
 ## [0.4.89] - 2026-10-15
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

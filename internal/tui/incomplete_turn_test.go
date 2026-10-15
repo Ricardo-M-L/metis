@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"strings"
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
@@ -53,7 +52,9 @@ func TestRunTurnAsyncReportsIncompleteTerminal(t *testing.T) {
 	done := make(chan error, 1)
 
 	runTurnAsync(turnCtx, cancel, loop, "", events, done)
-	if err := <-done; err == nil || !strings.Contains(err.Error(), "max_tokens") {
-		t.Fatalf("done error = %v, want max_tokens incomplete", err)
+	err := <-done
+	var incompleteErr *agent.IncompleteRunError
+	if !errors.As(err, &incompleteErr) || incompleteErr.Reason != "max_tokens" {
+		t.Fatalf("done error = %v, want typed max_tokens incomplete", err)
 	}
 }

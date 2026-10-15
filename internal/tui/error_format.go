@@ -23,6 +23,23 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/memory"
 )
 
+// Session checkpoints may fail with private paths or storage details. Keep the
+// cause available to errors.Is/As without exposing it in a transcript row.
+type sessionCheckpointError struct{ cause error }
+
+func (*sessionCheckpointError) Error() string {
+	return "Session save error: could not save session transcript"
+}
+
+func (e *sessionCheckpointError) Unwrap() error { return e.cause }
+
+func wrapSessionCheckpointError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &sessionCheckpointError{cause: err}
+}
+
 // Keep local Recall persistence failures distinct from provider failures in
 // both streamed events and finalization, which may report the same error.
 // Use the typed error's safe message, never its private underlying cause.
@@ -31,11 +48,43 @@ func formatTurnError(err error) (formatted, hint string) {
 	if errors.As(err, &persistenceErr) {
 		return "Memory save error: " + persistenceErr.Error(), "The completed answer is retained. Check local memory storage and permissions before retrying the save."
 	}
+	var checkpointErr *sessionCheckpointError
+	if errors.As(err, &checkpointErr) {
+		return checkpointErr.Error(), "The conversation is still in memory. Restore local storage before continuing."
+	}
 	if err == nil {
 		return "", ""
 	}
+	var incompleteErr *agent.IncompleteRunError
+	if errors.As(err, &incompleteErr) {
+		reason := ""
+		if incompleteErr != nil {
+			reason = incompleteErr.Reason
+		}
+		formatted = "Task incomplete"
+		if reason != "" {
+			formatted += ": " + reason
+		}
+		return formatted, incompleteTurnRecoveryHint(reason)
+	}
 	msg, hint := formatProviderError(err.Error())
 	return "API Error: " + msg, hint
+}
+
+func incompleteTurnRecoveryHint(reason string) string {
+	if agent.IsContentFilterStopReason(reason) {
+		return "Revise the request before sending a follow-up."
+	}
+	switch reason {
+	case "budget_usd":
+		return "Review the remaining budget before sending a follow-up."
+	case "environment_blocked":
+		return "Resolve the environment issue, then send a follow-up to continue."
+	case "diminishing_returns", "loop_detected", "stuck_after_reset":
+		return "Send a follow-up with a different approach to continue from the current conversation."
+	default:
+		return "Send a follow-up to continue from the current conversation."
+	}
 }
 
 // formatProviderError compresses a provider error message into a

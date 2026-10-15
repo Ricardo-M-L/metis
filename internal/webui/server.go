@@ -919,6 +919,11 @@ func (s *Server) writeHubEvent(w http.ResponseWriter, he hubEvent) {
 	case agent.EventLoopDone:
 		payload["stopReason"] = he.ev.StopReason
 		payload["incomplete"] = agent.IsIncompleteStopReason(he.ev.StopReason)
+	case agent.EventInfo:
+		payload["info"] = he.ev.Info
+		payload["source"] = he.ev.Source
+	case agent.EventContextInjected:
+		payload["source"] = he.ev.Source
 	case agent.EventContextWarn, agent.EventCompactionStart:
 		payload["info"] = he.ev.Info
 	case agent.EventContextCompacted:
@@ -1016,6 +1021,7 @@ var eventKindNames = map[agent.EventKind]string{
 	agent.EventDreamingProgress:   "dreaming_progress",
 	agent.EventDreamingEnd:        "dreaming_end",
 	agent.EventCompactionEnd:      "compaction_end",
+	agent.EventContextInjected:    "context_injected",
 }
 
 func eventKindName(kind agent.EventKind) string {
@@ -1938,7 +1944,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if runErr != nil {
-		writeError(w, status, runErr.Error())
+		writeTurnError(w, status, runErr)
 		return
 	}
 	if mayContinue {
@@ -2043,6 +2049,9 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 	// before publishing completion so footer refresh and reopened sessions see
 	// the provider's actual token/cache totals, including failed/cancelled runs.
 	s.reconcilePersistedTraceUsage(sessionID)
+	if !errors.Is(err, context.Canceled) && !result.Stopped {
+		err = isolatedTurnOutcomeError(err, result.Done)
+	}
 	s.finishWorkerSnapshot(sessionID, err != nil, errors.Is(err, context.Canceled) || result.Stopped)
 	if errors.Is(err, context.Canceled) || result.Stopped {
 		if persistErr := s.store.FinishDesktopTurn(sessionID, "stopped", result.Checkpointed); persistErr != nil {
@@ -2055,8 +2064,13 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 	}
 	if err != nil {
 		_ = s.store.FinishDesktopTurn(sessionID, "failed", false)
-		s.hub.publish(sessionID, agent.Event{Kind: agent.EventError, Err: err})
-		writeError(w, http.StatusBadGateway, err.Error())
+		var incomplete *agent.IncompleteRunError
+		if errors.As(err, &incomplete) && result.Done != nil {
+			s.hub.publish(sessionID, *result.Done)
+		} else {
+			s.hub.publish(sessionID, agent.Event{Kind: agent.EventError, Err: err})
+		}
+		writeTurnError(w, http.StatusBadGateway, err)
 		return
 	}
 	if persistErr := s.store.FinishDesktopTurn(sessionID, "completed", result.Checkpointed); persistErr != nil {
@@ -2198,7 +2212,7 @@ func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, me
 		runErr = turnCtx.Err()
 	}
 	if runErr == nil && incompleteReason != "" {
-		runErr = fmt.Errorf("task incomplete: %s", incompleteReason)
+		runErr = &agent.IncompleteRunError{Reason: incompleteReason}
 	}
 	// agent.emit deliberately notifies the trace hook even when a cancelled
 	// context wins its channel-send select. Recover that provider-authoritative
@@ -4651,7 +4665,7 @@ func (s *Server) listSettings(w http.ResponseWriter) {
 			Value: strconv.FormatFloat(cfg.Session.AutoCompactThreshold, 'g', -1, 64), RestartRequired: true},
 		{Key: "session.auto_compact_minimum_tokens", Label: "Compact minimum tokens", Description: "Absolute auto-compaction floor", Type: "number",
 			Value: strconv.Itoa(cfg.Session.AutoCompactMinimumTokens), RestartRequired: true},
-		{Key: "session.max_iterations", Label: "Max iterations", Description: "Maximum tool-loop iterations per turn", Type: "number",
+		{Key: "session.max_iterations", Label: "Iteration checkpoint interval", Description: "Tool-loop iterations between automatic continuation checkpoints", Type: "number",
 			Value: strconv.Itoa(cfg.Session.MaxIterations), RestartRequired: true},
 		{Key: "loop_detection.disabled", Label: "Loop detection disabled", Description: "Repeated-tool loop detection", Type: "bool",
 			Value: strconv.FormatBool(cfg.LoopDetection.Disabled), RestartRequired: true},
@@ -5528,4 +5542,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+// Unsuccessful local/provider terminals retain their typed reason alongside
+// the HTTP failure so clients can distinguish paused work from request errors.
+func writeTurnError(w http.ResponseWriter, status int, err error) {
+	var incomplete *agent.IncompleteRunError
+	if errors.As(err, &incomplete) {
+		writeJSON(w, status, map[string]any{"error": err.Error(), "incomplete": true, "stopReason": incomplete.Reason})
+		return
+	}
+	writeError(w, status, err.Error())
 }

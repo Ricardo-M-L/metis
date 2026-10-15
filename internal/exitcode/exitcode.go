@@ -84,6 +84,19 @@ func (e *IncompleteError) Error() string {
 	return "incomplete: " + e.Reason
 }
 
+// ContentFilterError identifies a provider's terminal refusal separately from
+// independent worker failures whose messages happen to mention safety.
+type ContentFilterError struct {
+	Reason string
+}
+
+func (e *ContentFilterError) Error() string {
+	if e == nil {
+		return "content_filter: <nil>"
+	}
+	return "content_filter: provider stopped generation (" + e.Reason + ")"
+}
+
 // Classify maps an error to one of the codes above. Best-effort —
 // nothing here is authoritative; callers who already KNOW the class
 // should just use the constant directly.
@@ -96,6 +109,23 @@ func Classify(err error) int {
 		return OK
 	}
 
+	// A terminal outcome and a later checkpoint/IPC failure are independent
+	// branches. Keep the real failure's typed classification, but exclude the
+	// terminal branch's descriptive text from heuristic matching.
+	summary := summarizeTerminalBranches(err)
+	if summary.joined {
+		if !summary.failure && summary.terminal != OK {
+			return summary.terminal
+		}
+		code := classifyFailure(err, summary.text)
+		if summary.terminal != OK && code == ContentFilter {
+			// Only explicit terminal types may suppress independent failures.
+			// "save safety database failed" is not a provider refusal.
+			return General
+		}
+		return code
+	}
+
 	// Typed IncompleteError takes precedence — the agent layer
 	// constructs this directly when a loop abort path was hit, so we
 	// must respect it before any string heuristics that might also
@@ -104,6 +134,73 @@ func Classify(err error) int {
 	if errors.As(err, &ie) {
 		return Incomplete
 	}
+	var filtered *ContentFilterError
+	if errors.As(err, &filtered) {
+		return ContentFilter
+	}
+	return classifyFailure(err, err.Error())
+}
+
+type terminalBranchSummary struct {
+	text     string
+	terminal int
+	failure  bool
+	joined   bool
+}
+
+func summarizeTerminalBranches(err error) terminalBranchSummary {
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		summary := terminalBranchSummary{joined: true}
+		text := err.Error()
+		var failures []string
+		for _, child := range multi.Unwrap() {
+			if child == nil {
+				continue
+			}
+			part := summarizeTerminalBranches(child)
+			summary.failure = summary.failure || part.failure
+			if part.terminal > summary.terminal {
+				summary.terminal = part.terminal
+			}
+			if part.failure {
+				failures = append(failures, part.text)
+			}
+			// Standard joins and fmt wrappers include the complete child text.
+			// If a custom wrapper doesn't, use only known failure branch text.
+			if strings.Contains(text, child.Error()) {
+				text = strings.Replace(text, child.Error(), part.text, 1)
+			} else {
+				text = ""
+			}
+		}
+		if text == "" {
+			text = strings.Join(failures, "\n")
+		}
+		summary.text = text
+		return summary
+	}
+	if single, ok := err.(interface{ Unwrap() error }); ok && single.Unwrap() != nil {
+		child := single.Unwrap()
+		summary := summarizeTerminalBranches(child)
+		if summary.joined {
+			if summary.failure && strings.Contains(err.Error(), child.Error()) {
+				summary.text = strings.Replace(err.Error(), child.Error(), summary.text, 1)
+			}
+			return summary
+		}
+	}
+	var incomplete *IncompleteError
+	if errors.As(err, &incomplete) {
+		return terminalBranchSummary{terminal: Incomplete}
+	}
+	var filtered *ContentFilterError
+	if errors.As(err, &filtered) {
+		return terminalBranchSummary{terminal: ContentFilter}
+	}
+	return terminalBranchSummary{text: err.Error(), failure: true}
+}
+
+func classifyFailure(err error, message string) int {
 
 	// Cancellation propagated from signal.NotifyContext.
 	if errors.Is(err, context.Canceled) {
@@ -151,7 +248,7 @@ func Classify(err error) int {
 	// Heuristic string layer (SDK errors / wrapped HTTP errors). Order
 	// matters: keep Network ahead of ContentFilter so "connection
 	// refused" doesn't false-trip on the bare "refused" token.
-	low := strings.ToLower(err.Error())
+	low := strings.ToLower(message)
 	switch {
 	case containsAny(low, "usage:", "unknown flag", "unknown command", "flag provided but not defined",
 		"is required", "argument required", "expected argument"):

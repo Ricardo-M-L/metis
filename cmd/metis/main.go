@@ -409,7 +409,7 @@ Flags (chat / run):
       --dangerously-bypass-approvals-and-sandbox
                         Run without approval prompts or process sandboxing
       --no-markdown     Disable markdown rendering of assistant output
-      --max-iter <n>    Iteration cap per turn (default 100; overrides [session] max_iterations in config.toml)
+      --max-iter <n>    Explicit finite iteration budget (default: continue at [session] max_iterations checkpoints)
       --max-budget-usd <x>  Stop the session once cumulative LLM spend reaches x USD (0 = unlimited; sub-agents draw from the same pool)
       --output-schema <file>  (run) Constrain the final reply to a JSON Schema — validated locally, 2 correction retries, then exit 11
       --preflight-only  (run) Validate runtime and trusted verification; print capabilities without running the model
@@ -1087,7 +1087,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.BoolVar(&out.streamlined, "streamlined", false, "distillation-resistant output: drop thinking, collapse tool calls into cumulative summaries (per-call override of [ui] streamlined_output)")
 	f.BoolVar(&out.desktopWorker, "desktop-worker", false, "internal Desktop worker event transport")
 	f.BoolVar(&out.desktopResumeTurn, "desktop-resume-turn", false, "internal Desktop continuation of a stopped turn")
-	f.IntVar(&out.maxIter, "max-iter", 0, "max tool iterations per turn")
+	f.IntVar(&out.maxIter, "max-iter", 0, "finite iteration budget; omit to continue at configured checkpoints")
 	f.Float64Var(&out.maxBudgetUSD, "max-budget-usd", 0, "stop the session once cumulative LLM spend reaches this many USD (0 = unlimited)")
 	f.StringVar(&out.system, "system", "", "override system prompt")
 	f.StringVar(&out.resumeID, "resume", "", "resume session id")
@@ -1877,11 +1877,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		Provider: prov, Registry: reg, Gate: gate,
 		System: system, SystemSections: systemSections,
 		Model: model, MaxOutputTokens: pbuild.MaxOutputTokens, MaxIter: maxIter,
-		MemoryManager:         memoryMgr,
-		MemoryManagerProvided: true,
-		Jobs:                  jobsPool,
-		Monitors:              monitorReg,
-		MaxBudgetUSD:          flags.maxBudgetUSD,
+		ContinueOnIterationLimit: flags.maxIter == 0,
+		MemoryManager:            memoryMgr,
+		MemoryManagerProvided:    true,
+		Jobs:                     jobsPool,
+		Monitors:                 monitorReg,
+		MaxBudgetUSD:             flags.maxBudgetUSD,
 	})
 	applyDesktopWorkerMemoryPolicy(loop, os.Getenv)
 
@@ -3098,7 +3099,7 @@ func shouldUseRunCache(requested bool, outputSchema string) bool {
 
 func runTerminalError(reason, detail string) error {
 	if agent.IsContentFilterStopReason(reason) {
-		return fmt.Errorf("content_filter: provider stopped generation (%s)", reason)
+		return &exitcode.ContentFilterError{Reason: reason}
 	}
 	return &exitcode.IncompleteError{Reason: reason, Detail: detail}
 }
