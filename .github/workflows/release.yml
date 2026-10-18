@@ -413,6 +413,24 @@ jobs:
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare same-source embedded CLI for Desktop
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          # Historical tags retain their original packaging contract.
+          if [ -f scripts/prepare-desktop-cli.py ]; then
+            python -B -m unittest discover -s scripts -p 'test_prepare_desktop_cli.py'
+            if [ "${PLATFORM%%/*}" != darwin ]; then
+              python scripts/prepare-desktop-cli.py --platform "$PLATFORM"
+            fi
+          fi
+
       - name: Check and build frontend
         working-directory: metis-desktop/frontend
         run: |
@@ -475,8 +493,18 @@ jobs:
               python3 -B -m unittest discover -s ../scripts -p 'test_bundle_computer_use.py'
               python3 ../scripts/bundle-computer-use.py --app "$app" --artifact-dir "$PWD/computer-use-release"
             fi
-            codesign --force --deep --sign - "$app"
+            if [ -f ../scripts/prepare-desktop-cli.py ]; then
+              python3 ../scripts/prepare-desktop-cli.py --platform "$PLATFORM" --app "$app"
+            fi
+            # CLI is already signed and hashed; signing only the outer app
+            # preserves its manifest while deep verification checks both.
+            codesign --force --sign - "$app"
             codesign --verify --deep --strict "$app"
+            if [ -f ../scripts/prepare-desktop-cli.py ]; then
+              python3 ../scripts/prepare-desktop-cli.py --platform "$PLATFORM" --app "$app" --verify-only --execute-version
+              env -u METIS_BIN -u METIS_CLI_PATH -u METIS_DESKTOP_CLI PATH=/usr/bin:/bin \
+                "$app/Contents/MacOS/metis-desktop" --runtime-check
+            fi
             # v0.4.42's updater only recognizes metis-desktop.app inside the
             # updater ZIP. Keep one bridge generation while the source-built
             # and user-facing DMG bundle is METIS.app. The new updater accepts
@@ -491,6 +519,10 @@ jobs:
             ditto -c -k --sequesterRsrc --keepParent "$app" "release-dist/$asset"
             unzip -tq "release-dist/$asset"
           else
+            if [ -f ../scripts/prepare-desktop-cli.py ]; then
+              env -u METIS_BIN -u METIS_CLI_PATH -u METIS_DESKTOP_CLI PATH=/usr/bin:/bin \
+                ./build/bin/metis-desktop --runtime-check
+            fi
             asset="metis-desktop-${ASSET}.tar.gz"
             tar -C build/bin -czf "release-dist/$asset" metis-desktop
             test "$(tar -tzf "release-dist/$asset")" = "metis-desktop"
@@ -506,6 +538,17 @@ jobs:
           ASSET: ${{ matrix.asset }}
         run: |
           wails build -clean -s -trimpath -platform $env:PLATFORM
+          if (Test-Path ../scripts/prepare-desktop-cli.py) {
+            Remove-Item Env:METIS_BIN -ErrorAction SilentlyContinue
+            Remove-Item Env:METIS_CLI_PATH -ErrorAction SilentlyContinue
+            Remove-Item Env:METIS_DESKTOP_CLI -ErrorAction SilentlyContinue
+            $originalPath = $env:PATH
+            try {
+              $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+              & ./build/bin/metis-desktop.exe --runtime-check
+              if ($LASTEXITCODE -ne 0) { throw "Desktop cannot run its own bundled CLI" }
+            } finally { $env:PATH = $originalPath }
+          }
           New-Item -ItemType Directory -Force release-dist | Out-Null
           $asset = "metis-desktop-$env:ASSET.zip"
           Compress-Archive -LiteralPath build/bin/metis-desktop.exe -DestinationPath "release-dist/$asset"

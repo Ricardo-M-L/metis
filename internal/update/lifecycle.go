@@ -78,8 +78,14 @@ func RegisterRunningVersion(destPath, runningVersion string) (func(), error) {
 }
 
 func registerRunningVersion(destPath, runningVersion, runningExecutable string) (func(), error) {
+	if err := checkDesktopManagedPath(destPath); err != nil {
+		return func() {}, nil
+	}
 	_, layout, ok := managedLayout(destPath)
 	if !ok {
+		return func() {}, nil
+	}
+	if err := checkDesktopManagedPath(layout.launcher); err != nil {
 		return func() {}, nil
 	}
 	version, err := normalizeVersion(runningVersion)
@@ -164,9 +170,15 @@ func runningRelease(path, nonce string) func() {
 // release. It shares the same global lock as Apply so it cannot prune a version
 // while another process is staging or activating an update.
 func CleanupManaged(ctx context.Context, destPath string) error {
+	if err := checkDesktopManagedPath(destPath); err != nil {
+		return err
+	}
 	_, layout, ok := managedLayout(destPath)
 	if !ok {
 		return nil
+	}
+	if err := checkDesktopManagedPath(layout.launcher); err != nil {
+		return err
 	}
 	release, err := acquireInstallLock(ctx, layout)
 	if err != nil {

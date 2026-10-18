@@ -43,7 +43,10 @@ func cmdDesktop(ctx context.Context, args []string) error {
 		return launchNativeDesktop(cwd)
 	}
 
-	flags := &cliFlags{autoMemoryStartup: autoMemoryStartupDesktop}
+	flags := &cliFlags{
+		autoMemoryStartup:      autoMemoryStartupDesktop,
+		desktopSettingsStartup: true,
+	}
 	prefs := webui.DesktopLaunchPreferences{
 		DefaultPreset:         "standard",
 		RootTurnParallelism:   webui.DefaultDesktopRootTurnParallelism,
@@ -156,6 +159,31 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	fmt.Fprintf(os.Stderr, "Open http://%s in your browser\n", addr)
 
 	return srv.Run(serverCtx)
+}
+
+// desktopAuthRequiredBuild preserves the selected provider/model without
+// constructing a client or inventing credentials. The existing settings model
+// selection rebuilds this provider after the user saves credentials.
+func desktopAuthRequiredBuild(cfg *config.Config, providerName, model string, authErr error) *rtpkg.ProviderBuild {
+	if model == "" {
+		switch providerName {
+		case "anthropic":
+			model = cfg.Provider.Anthropic.Model
+		case "openai":
+			model = cfg.Provider.OpenAI.Model
+		case "gemini", "google":
+			model = cfg.Provider.Gemini.Model
+		default:
+			model = cfg.Provider.Custom[providerName].Model
+		}
+	}
+	return &rtpkg.ProviderBuild{
+		Provider: &acpAuthRequiredProvider{
+			name: providerName, model: model,
+			err: fmt.Errorf("%w; configure a provider in Desktop Settings before sending a message", authErr),
+		},
+		Model: model,
+	}
 }
 
 func desktopWorkerParallelism(getenv func(string) string, saved int) int {

@@ -396,9 +396,18 @@ func ApplyIfNeeded(ctx context.Context, token, destPath string, r *release) (boo
 }
 
 func apply(ctx context.Context, token, destPath string, r *release, skipCurrent bool) (bool, error) {
+	// Check the final write entry point as well as CLI preflight: callers of
+	// Apply/ApplyIfNeeded must not create locks or update state in a Desktop
+	// app bundle or its immutable runtime cache, even with a supplied release.
+	if err := checkDesktopManagedPath(destPath); err != nil {
+		return false, err
+	}
 	_, layout, ok := managedLayoutForApply(destPath)
 	if !ok {
 		return false, fmt.Errorf("refusing to treat managed version target %q as launcher", destPath)
+	}
+	if err := checkDesktopManagedPath(layout.launcher); err != nil {
+		return false, err
 	}
 	releaseLock, err := acquireInstallLock(ctx, layout)
 	if err != nil {

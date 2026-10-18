@@ -59,7 +59,7 @@ if git -C "$repo_root" ls-files --error-unmatch "$credentials_rel" >/dev/null 2>
 	fail "$credentials_rel is tracked by Git; refusing to package"
 fi
 
-for command_name in wails codesign security ditto hdiutil shasum unzip xcrun spctl python3; do
+for command_name in go lipo wails codesign security ditto hdiutil shasum unzip xcrun spctl python3; do
 	command -v "$command_name" >/dev/null 2>&1 || fail "missing required command: $command_name"
 done
 xcrun --find notarytool >/dev/null 2>&1 || fail "missing required Xcode tool: notarytool"
@@ -96,6 +96,10 @@ printf '%s\n' "Building METIS Desktop for darwin/universal..."
 	wails build -clean -s -trimpath -skipbindings -platform darwin/universal
 )
 [ -d "$app_path" ] || fail "Wails did not create $app_path"
+# Build the matching CLI from this checkout; sign it before its manifest is
+# hashed. The outer signer below must not re-sign nested code afterward.
+python3 "$repo_root/scripts/prepare-desktop-cli.py" --platform darwin/universal \
+	--app "$app_path" --sign-identity "$identity"
 # Exact signed helper archives remain opaque resources: the outer app signer
 # must not rewrite their bytes. The compiled catalog, never a supplied manifest,
 # is the authority for both native targets. An empty catalog blocks production.
@@ -115,8 +119,10 @@ if find "$app_path" -type f \
 fi
 
 printf '%s\n' "Signing with the local Developer ID Application identity..."
-codesign --force --deep --options runtime --timestamp --sign "$identity" "$app_path"
+codesign --force --options runtime --timestamp --sign "$identity" "$app_path"
 codesign --verify --deep --strict --verbose=2 "$app_path"
+python3 "$repo_root/scripts/prepare-desktop-cli.py" --platform darwin/universal \
+	--app "$app_path" --verify-only --execute-version
 codesign -dv --verbose=4 "$app_path" 2>&1 | grep -q '^Authority=Developer ID Application:' || \
 	fail "application is not signed by a Developer ID Application identity"
 

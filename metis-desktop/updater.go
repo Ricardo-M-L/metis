@@ -69,12 +69,13 @@ func reportDesktopUpdateProgress(report desktopUpdateReporter, progress DesktopU
 }
 
 type desktopUpdater struct {
-	webBase  string
-	repo     string
-	client   *http.Client
-	goos     string
-	goarch   string
-	validate func(path, version string) error
+	webBase        string
+	repo           string
+	client         *http.Client
+	goos           string
+	goarch         string
+	validate       func(path, version string) error
+	beforeActivate func(context.Context, string) error
 }
 
 func defaultDesktopUpdater() desktopUpdater {
@@ -86,7 +87,7 @@ func defaultDesktopUpdater() desktopUpdater {
 		goarch:  runtime.GOARCH,
 	}
 	u.validate = func(path, version string) error {
-		return validateDesktopCandidate(path, version, u.goos)
+		return validateDesktopCandidateForPlatform(path, version, u.goos, u.goarch)
 	}
 	return u
 }
@@ -218,11 +219,22 @@ func (u desktopUpdater) install(ctx context.Context, current, appPath string, re
 	}
 	validator := u.validate
 	if validator == nil {
-		validator = func(path, version string) error { return validateDesktopCandidate(path, version, u.goos) }
+		validator = func(path, version string) error {
+			return validateDesktopCandidateForPlatform(path, version, u.goos, u.goarch)
+		}
 	}
 	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "verifying", Message: "Verifying the application…", Percent: 91})
 	if err := validator(candidate, status.LatestVersion); err != nil {
 		return status, fmt.Errorf("verify Desktop update: %w", err)
+	}
+	if u.beforeActivate != nil {
+		reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "draining", Message: "Finishing the running backend…", Percent: 94})
+		if err := u.beforeActivate(ctx, appPath); err != nil {
+			return status, fmt.Errorf("stop Desktop backend before activation: %w", err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return status, fmt.Errorf("Desktop update cancelled before activation: %w", err)
 	}
 	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "installing", Message: "Installing the verified application…", Percent: 97})
 	if err := activateDesktopCandidate(candidate, appPath, u.goos); err != nil {
@@ -583,6 +595,10 @@ func validateDesktopDestination(path, goos string) (string, error) {
 }
 
 func validateDesktopCandidate(path, version, goos string) error {
+	return validateDesktopCandidateForPlatform(path, version, goos, runtime.GOARCH)
+}
+
+func validateDesktopCandidateForPlatform(path, version, goos, goarch string) error {
 	switch goos {
 	case "darwin":
 		info, err := os.Lstat(path)
@@ -596,6 +612,12 @@ func validateDesktopCandidate(path, version, goos string) error {
 		plist, err := os.ReadFile(filepath.Join(path, "Contents", "Info.plist"))
 		if err != nil || !strings.Contains(string(plist), version) {
 			return fmt.Errorf("downloaded macOS bundle does not report version %s", version)
+		}
+		// The CLI is part of this release and must be checked as data before
+		// the signed bundle can replace the installed application. Executing
+		// an untrusted candidate for a --version probe would be too early.
+		if _, err := verifyMacDesktopRuntime(path, version, goarch); err != nil {
+			return fmt.Errorf("downloaded macOS bundled runtime is invalid: %w", err)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -844,15 +866,34 @@ if [ -n "$metis_bin" ]; then
 fi
 exec "$opener" -n -a "$app_path" --args --workspace "$workspace"
 `
-		return exec.Command(
+		cmd := exec.Command(
 			"/bin/sh", "-c", script, "metis-desktop-restart",
 			strconv.Itoa(parentPID), appPath, workspace, metisBin, opener,
-		), nil
+		)
+		cmd.Env = desktopRestartEnvironment(os.Environ())
+		return cmd, nil
 	case "linux":
-		return exec.Command(appPath, args...), nil
+		cmd := exec.Command(appPath, args...)
+		cmd.Env = desktopRestartEnvironment(os.Environ())
+		return cmd, nil
 	default:
 		return nil, errors.New("automatic Desktop restart is not supported on this platform yet")
 	}
+}
+
+// Native runtime identity describes the process being replaced. The new
+// Desktop must establish its own bundle identity, while a user's explicit
+// external METIS_BIN override remains available to the new resolver.
+func desktopRestartEnvironment(environ []string) []string {
+	filtered := make([]string, 0, len(environ))
+	for _, value := range environ {
+		name, _, _ := strings.Cut(value, "=")
+		if strings.EqualFold(name, "METIS_DESKTOP_BUNDLED_RUNTIME") || strings.EqualFold(name, "METIS_DESKTOP_APP") {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered
 }
 
 func normalizeDesktopVersion(value string) string {

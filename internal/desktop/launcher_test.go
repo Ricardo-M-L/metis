@@ -82,6 +82,69 @@ func TestOpenAppBuildsPlatformCommandsWithCLIOverride(t *testing.T) {
 	}
 }
 
+func TestOpenAppUsesRuntimeInsideMacBundle(t *testing.T) {
+	l, runs, _ := testLauncher("darwin")
+	app := filepath.Join(t.TempDir(), "App with spaces", "METIS.app")
+	cli := filepath.Join(app, "Contents", "Resources", "bin", "metis")
+	manifest := filepath.Join(filepath.Dir(cli), "metis-runtime.json")
+	l.stat = func(path string) (os.FileInfo, error) {
+		switch path {
+		case cli:
+			return fakeFileInfo{name: "metis", mode: 0o755}, nil
+		case manifest:
+			return fakeFileInfo{name: "metis-runtime.json", mode: 0o644}, nil
+		default:
+			return nil, os.ErrNotExist
+		}
+	}
+	if err := l.openApp(app, "/tmp/project with spaces"); err != nil {
+		t.Fatal(err)
+	}
+	want := []commandCall{{name: "open", args: []string{
+		"-n", "-a", app, "--args", "--workspace", "/tmp/project with spaces",
+	}}}
+	if !reflect.DeepEqual(*runs, want) {
+		t.Fatalf("bundled app commands = %#v, want %#v", *runs, want)
+	}
+}
+
+func TestBundledRuntimeMarkerOnlyAppliesToItsDesktop(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux", "windows"} {
+		t.Run(goos, func(t *testing.T) {
+			l, _, _ := testLauncher(goos)
+			l.bundledRuntime = true
+			l.appOverride = filepath.Join(t.TempDir(), "current Desktop")
+			if !l.appProvidesRuntime(l.appOverride) {
+				t.Fatal("current bundled Desktop should resolve its own runtime")
+			}
+			if l.appProvidesRuntime(filepath.Join(t.TempDir(), "different Desktop")) {
+				t.Fatal("bundled runtime marker leaked to a different Desktop")
+			}
+			l.appOverride = ""
+			if l.appProvidesRuntime("/custom/desktop") {
+				t.Fatal("marker without its originating app must not discard a legacy CLI")
+			}
+		})
+	}
+}
+
+func TestPartialMacRuntimeCannotBeHiddenByExternalCLI(t *testing.T) {
+	for _, missing := range []string{"metis", "metis-runtime.json"} {
+		t.Run(missing, func(t *testing.T) {
+			l, _, _ := testLauncher("darwin")
+			l.stat = func(path string) (os.FileInfo, error) {
+				if filepath.Base(path) == missing {
+					return nil, os.ErrNotExist
+				}
+				return fakeFileInfo{name: filepath.Base(path), mode: 0o755}, nil
+			}
+			if !l.appProvidesRuntime("/Applications/METIS.app") {
+				t.Fatal("incomplete package must reach its native validator instead of silently using an external CLI")
+			}
+		})
+	}
+}
+
 func TestResolveLauncherCLIPathPrefersStableManagedLauncher(t *testing.T) {
 	root := t.TempDir()
 	stable := filepath.Join(root, "bin", "metis")

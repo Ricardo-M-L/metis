@@ -18,6 +18,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Ship a matching CLI inside Metis Desktop, with a signed macOS app resource
+  and embedded Linux/Windows runtimes, so Desktop does not require a separate
+  CLI installation. Update and roll back the application and its runtime together.
+
 - Configure per-model automatic or manual context budgets in Desktop settings,
   shared with CLI diagnostics and automatic compaction.
 

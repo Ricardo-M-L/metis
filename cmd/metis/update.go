@@ -52,7 +52,7 @@ func defaultAutoUpdateDependencies() autoUpdateDependencies {
 		install: tryAutoInstall,
 		cleanupManaged: func(ctx context.Context) {
 			self, err := update.SelfPath()
-			if err != nil {
+			if err != nil || update.CheckSelfPathSafe(self) != nil {
 				return
 			}
 			cleanupCtx, cancel := context.WithTimeout(ctx, autoUpdateHousekeepingTimeout)
@@ -154,7 +154,6 @@ func waitForAutoUpdate(ctx context.Context, interval time.Duration) bool {
 // updates on the same path, including Windows. The running process is left
 // untouched and observes the new version only after restart.
 func tryAutoInstall(ctx context.Context, tag string) (autoUpdateInstallResult, error) {
-	token := update.Token()
 	self, err := update.SelfPath()
 	if err != nil {
 		return autoUpdateInstallResult{}, err
@@ -162,6 +161,7 @@ func tryAutoInstall(ctx context.Context, tag string) (autoUpdateInstallResult, e
 	if err := update.CheckSelfPathSafe(self); err != nil {
 		return autoUpdateInstallResult{}, err
 	}
+	token := update.Token()
 
 	installCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
@@ -234,6 +234,28 @@ Other env:
 		return err
 	}
 
+	// Desktop owns its packaged sidecar and private runtime cache. Reject an
+	// install before token lookup or release discovery, including --force;
+	// --check remains available because it cannot change the runtime.
+	var self string
+	if !*checkOnly {
+		var err error
+		self, err = update.SelfPath()
+		if err != nil {
+			return fmt.Errorf("resolve self path: %w", err)
+		}
+		if err := update.CheckSelfPathSafe(self); err != nil {
+			if errors.Is(err, update.ErrGoInstallManaged) {
+				return fmt.Errorf(`%w
+
+You appear to have installed metis with `+"`go install`"+`. To upgrade, run:
+
+  go install github.com/Ricardo-M-L/metis/cmd/metis@latest`, err)
+			}
+			return err
+		}
+	}
+
 	token := update.Token()
 	cur := strings.TrimPrefix(version.Version, "v")
 
@@ -247,7 +269,11 @@ Other env:
 		if update.IsNewer(cur, rel.TagName) {
 			fmt.Printf("update available: %s -> %s\n", cur, latest)
 			fmt.Printf("  release: %s\n", rel.HTMLURL)
-			fmt.Printf("  run `metis update` to install\n")
+			if self, err := update.SelfPath(); err == nil && errors.Is(update.CheckSelfPathSafe(self), update.ErrDesktopManaged) {
+				fmt.Printf("  update Metis Desktop to upgrade its bundled runtime\n")
+			} else {
+				fmt.Printf("  run `metis update` to install\n")
+			}
 			return nil
 		}
 		if update.IsNewer(rel.TagName, cur) {
@@ -264,21 +290,6 @@ Other env:
 		fmt.Printf("metis %s matches the currently available CLI stable release\n", cur)
 		fmt.Printf("(use --force to reinstall)\n")
 		return nil
-	}
-
-	self, err := update.SelfPath()
-	if err != nil {
-		return fmt.Errorf("resolve self path: %w", err)
-	}
-	if err := update.CheckSelfPathSafe(self); err != nil {
-		if errors.Is(err, update.ErrGoInstallManaged) {
-			return fmt.Errorf(`%w
-
-You appear to have installed metis with `+"`go install`"+`. To upgrade, run:
-
-  go install github.com/Ricardo-M-L/metis/cmd/metis@%s`, err, rel.TagName)
-		}
-		return err
 	}
 
 	fmt.Printf("downloading metis %s for %s ...\n", latest, update.Target())

@@ -1,7 +1,7 @@
 .PHONY: build install test clean run dev fmt vet tidy dist \
 		verify-version verify-dist \
 		bump-patch bump-minor bump-major sync-version print-version \
-		release-patch release-minor release-major
+		release-patch release-minor release-major desktop-runtime verify-desktop-runtime
 
 BIN_NAME := metis
 PKG := github.com/Ricardo-M-L/metis
@@ -130,3 +130,15 @@ dist: clean verify-version
 
 verify-dist: dist
 	@"$(VERIFY_DIST)" --repo "$(CURDIR)" $(if $(TAG),--tag "$(TAG)")
+
+# Linux/Windows: run before `wails build`; macOS: run after Wails and before
+# signing the outer app. All payloads use this checkout's VERSION and source.
+DESKTOP_PLATFORM ?= $(shell go env GOOS)/$(shell go env GOARCH)
+DESKTOP_APP ?= metis-desktop/build/bin/METIS.app
+DESKTOP_RUNTIME_ARGS := --platform "$(DESKTOP_PLATFORM)" $(if $(filter darwin/%,$(DESKTOP_PLATFORM)),--app "$(DESKTOP_APP)")
+
+desktop-runtime: verify-version
+	python3 scripts/prepare-desktop-cli.py $(DESKTOP_RUNTIME_ARGS) --commit "$(COMMIT)" --date "$(DATE)"
+
+verify-desktop-runtime:
+	python3 scripts/prepare-desktop-cli.py $(DESKTOP_RUNTIME_ARGS) --verify-only

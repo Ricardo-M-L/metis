@@ -31,6 +31,8 @@ type App struct {
 	sendMu   sync.Mutex
 
 	findMetis                         func() (string, error)
+	resolveRuntime                    func() (desktopRuntimeSelection, error)
+	runtimeResolver                   *desktopRuntimeResolver
 	runMetis                          func(ctx context.Context, binary string, args []string, dir string) (stdout, stderr string, err error)
 	chooseWorkspace                   func(context.Context, string) (string, error)
 	requestComputerUsePermission      func(string) (bool, error)
@@ -51,11 +53,17 @@ type App struct {
 	// webuiCmd is the in-process-browser backend child (metis desktop
 	// --web). The native window embeds it behind a tokenised frame URL; the
 	// child is reaped when the Wails context shuts down.
-	webuiCmd   *exec.Cmd
-	webuiDone  chan error
-	webuiPort  int
-	webuiToken string
-	webuiMu    sync.Mutex
+	webuiCmd                 *exec.Cmd
+	webuiDone                chan error
+	webuiPort                int
+	webuiToken               string
+	webuiMu                  sync.Mutex
+	webuiUpdating            bool
+	webuiUpdateNeedsRestart  bool
+	webuiUpdateDrainDeadline time.Time
+	nativeCLICalls           sync.WaitGroup
+	requestUpdateShutdown    func(context.Context, int, string) (bool, error)
+	updateDrainTimeout       time.Duration
 }
 
 func NewApp() *App {
@@ -75,8 +83,6 @@ func NewApp() *App {
 		computerUsePermissionStatus:       desktopComputerUsePermissionStatus,
 		openComputerUsePermissionSettings: openDesktopComputerUsePermissionSettings,
 		checkDesktopUpdate:                updater.Check,
-		installDesktopUpdate:              updater.Install,
-		installDesktopUpdateWithProgress:  updater.InstallWithProgress,
 		desktopPath:                       currentDesktopPath,
 		restartDesktop:                    restartDesktopProcess,
 		resolveUpdatedMetis:               resolveStableMetisBinary,
@@ -88,7 +94,14 @@ func NewApp() *App {
 		},
 		quit: wailsruntime.Quit,
 	}
-	app.findMetis = func() (string, error) { return findMetisBinary(app.metisBin) }
+	updater.beforeActivate = app.quiesceBackendForUpdate
+	app.installDesktopUpdate = updater.Install
+	app.installDesktopUpdateWithProgress = updater.InstallWithProgress
+	app.runtimeResolver = newDesktopRuntimeResolver(app.GetVersion())
+	app.findMetis = func() (string, error) {
+		selected, err := app.runtimeResolver.resolve(app.metisBin)
+		return selected.Path, err
+	}
 	return app
 }
 
@@ -233,6 +246,10 @@ func waitForWebUIProcess(done <-chan error, timeout time.Duration) bool {
 }
 
 func parseWorkspaceArg(args []string) string {
+	return parseWorkspaceArgWithDirectories(args, os.Getwd, os.UserHomeDir)
+}
+
+func parseWorkspaceArgWithDirectories(args []string, getwd, userHomeDir func() (string, error)) string {
 	for i := 1; i < len(args); i++ {
 		if args[i] == "--workspace" && i+1 < len(args) {
 			if abs, err := filepath.Abs(args[i+1]); err == nil {
@@ -245,11 +262,21 @@ func parseWorkspaceArg(args []string) string {
 			}
 		}
 	}
-	dir, _ := os.Getwd()
-	if abs, err := filepath.Abs(dir); err == nil {
-		return abs
+	dir, err := getwd()
+	if err == nil && strings.TrimSpace(dir) != "" {
+		if abs, absErr := filepath.Abs(dir); absErr == nil && filepath.Dir(abs) != abs {
+			return abs
+		}
 	}
-	return dir
+	// Finder and desktop launchers can use the filesystem root as cwd. It is
+	// not a user-selected workspace; use the user's home until they choose one.
+	dir, err = userHomeDir()
+	if err == nil && strings.TrimSpace(dir) != "" {
+		if abs, absErr := filepath.Abs(dir); absErr == nil && filepath.Dir(abs) != abs {
+			return abs
+		}
+	}
+	return ""
 }
 
 // StartWebUI launches the in-process browser UI backend (metis desktop
@@ -287,16 +314,22 @@ func (b *processLogBuffer) String() string {
 func (a *App) StartWebUI() (string, error) {
 	a.webuiMu.Lock()
 	defer a.webuiMu.Unlock()
+	if a.webuiUpdating {
+		return "", errors.New("Desktop is preparing an update; wait for it to restart")
+	}
+	if strings.TrimSpace(a.workDir) == "" {
+		return "", errors.New("Desktop workspace is unavailable; launch with --workspace or restore the user home directory")
+	}
 	if a.webuiCmd != nil && a.webuiPort > 0 {
 		return a.webUIURL(), nil
 	}
-	binary, err := a.findMetis()
+	selected, err := a.resolveMetisRuntime()
 	if err != nil {
 		return "", err
 	}
 	failures := make([]string, 0, webUIStartupAttempts)
 	for attempt := 1; attempt <= webUIStartupAttempts; attempt++ {
-		frameURL, attemptErr := a.startWebUIAttempt(binary)
+		frameURL, attemptErr := a.startWebUIAttemptWithRuntime(selected)
 		if attemptErr == nil {
 			return frameURL, nil
 		}
@@ -311,6 +344,11 @@ func (a *App) StartWebUI() (string, error) {
 }
 
 func (a *App) startWebUIAttempt(binary string) (string, error) {
+	return a.startWebUIAttemptWithRuntime(desktopRuntimeSelection{Path: binary})
+}
+
+func (a *App) startWebUIAttemptWithRuntime(selected desktopRuntimeSelection) (string, error) {
+	binary := selected.Path
 	port, err := freePort()
 	if err != nil {
 		return "", err
@@ -323,7 +361,8 @@ func (a *App) startWebUIAttempt(binary string) (string, error) {
 	cmd := exec.Command(binary, "desktop", "--web", "--port", strconv.Itoa(port))
 	cmd.Dir = a.workDir
 	hostExecutable, _ := os.Executable()
-	cmd.Env = append(computerUseBundleEnvironment(os.Environ(), hostExecutable), "METIS_DESKTOP_FRAME_TOKEN="+frameToken)
+	cmd.Env = desktopRuntimeChildEnvironment(computerUseBundleEnvironment(os.Environ(), hostExecutable), hostExecutable, selected.Bundled)
+	cmd.Env = append(cmd.Env, "METIS_DESKTOP_FRAME_TOKEN="+frameToken)
 	cmd.Stdout = logs
 	cmd.Stderr = logs
 	if err := cmd.Start(); err != nil {
@@ -611,10 +650,10 @@ func (a *App) InstallUpdateAndRestart() (DesktopUpdateStatus, error) {
 	return a.installUpdateAndRestart(a.publishDesktopUpdateProgress)
 }
 
-// installUpdateAndRestart updates the CLI first (the CLI serves the shared
-// Desktop UI), then installs the verified native bundle and starts the new
-// bundle with the same workspace. The caller is responsible for update
-// admission; report is intentionally optional for legacy callers.
+// installUpdateAndRestart installs a verified native release with its bundled
+// CLI and lets the new Desktop resolve that release's runtime. Explicit
+// external CLI overrides retain their independent update flow. The caller is
+// responsible for update admission; report is optional for legacy callers.
 func (a *App) installUpdateAndRestart(report desktopUpdateReporter) (DesktopUpdateStatus, error) {
 	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "checking", Message: "Checking for updates…", Percent: 3})
 	status, err := a.GetUpdateStatus()
@@ -627,33 +666,46 @@ func (a *App) installUpdateAndRestart(report desktopUpdateReporter) (DesktopUpda
 	if !status.CanUpdate {
 		return status, errors.New(status.Message)
 	}
-	binary, err := a.findMetis()
+	// Do not close the backend or replace the application unless the native
+	// restart handoff is available to restore a usable window afterward.
+	if a.restartDesktop == nil || a.scheduleRestart == nil || a.quit == nil {
+		return status, errors.New("Desktop restart is unavailable")
+	}
+	selected, err := a.resolveMetisRuntime()
 	if err != nil {
 		return status, err
 	}
+	binary := selected.Path
 	base := a.ctx
 	if base == nil {
 		base = context.Background()
 	}
-	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "cli", Message: "Updating the METIS CLI…", Percent: 7})
-	cliCtx, cliCancel := context.WithTimeout(base, 10*time.Minute)
-	stdout, stderr, err := a.runMetis(cliCtx, binary, []string{"update"}, a.workDir)
-	cliCancel()
-	if err != nil {
-		detail := strings.TrimSpace(stderr)
-		if detail == "" {
-			detail = strings.TrimSpace(stdout)
+	if !selected.Bundled {
+		reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "cli", Message: "Updating the METIS CLI…", Percent: 7})
+		cliCtx, cliCancel := context.WithTimeout(base, 10*time.Minute)
+		stdout, stderr, updateErr := a.runMetis(cliCtx, binary, []string{"update"}, a.workDir)
+		cliCancel()
+		if updateErr != nil {
+			detail := strings.TrimSpace(stderr)
+			if detail == "" {
+				detail = strings.TrimSpace(stdout)
+			}
+			if detail == "" {
+				detail = updateErr.Error()
+			}
+			return status, fmt.Errorf("update Metis CLI: %s", detail)
 		}
-		if detail == "" {
-			detail = err.Error()
+		if a.resolveUpdatedMetis != nil {
+			binary, err = a.resolveUpdatedMetis(binary)
+			if err != nil {
+				return status, fmt.Errorf("resolve updated Metis CLI: %w", err)
+			}
 		}
-		return status, fmt.Errorf("update Metis CLI: %s", detail)
-	}
-	if a.resolveUpdatedMetis != nil {
-		binary, err = a.resolveUpdatedMetis(binary)
-		if err != nil {
-			return status, fmt.Errorf("resolve updated Metis CLI: %w", err)
-		}
+	} else {
+		// A sidecar or extracted payload belongs to the old Desktop release.
+		// Passing it to the new application would pin that application to an
+		// obsolete runtime after the bundle is replaced or its cache rotates.
+		binary = ""
 	}
 	if a.desktopPath == nil || (a.installDesktopUpdate == nil && a.installDesktopUpdateWithProgress == nil) {
 		return status, errors.New("native Desktop updater is unavailable")
@@ -661,6 +713,14 @@ func (a *App) installUpdateAndRestart(report desktopUpdateReporter) (DesktopUpda
 	appPath, err := a.desktopPath()
 	if err != nil {
 		return status, err
+	}
+	recoverFailedUpdate := func(updateErr error) (DesktopUpdateStatus, error) {
+		restarting, recoveryErr := a.recoverDesktopAfterFailedUpdate(base, appPath, binary)
+		status.Restarting = restarting
+		if recoveryErr != nil {
+			return status, fmt.Errorf("%w; restore Desktop backend after failed update: %w", updateErr, recoveryErr)
+		}
+		return status, updateErr
 	}
 	installCtx, installCancel := context.WithTimeout(base, 10*time.Minute)
 	if a.installDesktopUpdateWithProgress != nil {
@@ -670,13 +730,10 @@ func (a *App) installUpdateAndRestart(report desktopUpdateReporter) (DesktopUpda
 	}
 	installCancel()
 	if err != nil {
-		return status, err
-	}
-	if a.restartDesktop == nil || a.scheduleRestart == nil || a.quit == nil {
-		return status, errors.New("Desktop restart is unavailable")
+		return recoverFailedUpdate(err)
 	}
 	if err := a.restartDesktop(appPath, a.workDir, binary); err != nil {
-		return status, fmt.Errorf("restart updated Desktop: %w", err)
+		return recoverFailedUpdate(fmt.Errorf("restart updated Desktop: %w", err))
 	}
 	status.Restarting = true
 	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "restarting", Message: "Restarting METIS…", Percent: 100, Done: true})
@@ -1051,6 +1108,14 @@ func (a *App) SendMessage(input, threadID, approvalMode string) MessageResponse 
 	if threadID != "" && !validSessionID(threadID) {
 		return MessageResponse{Error: "invalid session id"}
 	}
+	a.webuiMu.Lock()
+	if a.webuiUpdating {
+		a.webuiMu.Unlock()
+		return MessageResponse{ThreadID: threadID, Error: "Desktop is preparing an update; wait for it to restart"}
+	}
+	a.nativeCLICalls.Add(1)
+	a.webuiMu.Unlock()
+	defer a.nativeCLICalls.Done()
 	binary, err := a.findMetis()
 	if err != nil {
 		return MessageResponse{ThreadID: threadID, Error: err.Error()}
@@ -1180,6 +1245,11 @@ func validSessionID(id string) bool {
 }
 
 func findMetisBinary(preferred string) (string, error) {
+	selected, err := newDesktopRuntimeResolver((&App{}).GetVersion()).resolve(preferred)
+	return selected.Path, err
+}
+
+func findExternalMetisBinary(preferred string) (string, error) {
 	if preferred = strings.TrimSpace(preferred); preferred != "" {
 		if info, err := os.Stat(preferred); err == nil && executableMetisFile(preferred, info, runtime.GOOS) {
 			return preferred, nil
@@ -1225,6 +1295,14 @@ func executableMetisFile(path string, info os.FileInfo, goos string) bool {
 }
 
 func (a *App) runCLI(timeout time.Duration, args ...string) (string, string, error) {
+	a.webuiMu.Lock()
+	if a.webuiUpdating {
+		a.webuiMu.Unlock()
+		return "", "", errors.New("Desktop is preparing an update; wait for it to restart")
+	}
+	a.nativeCLICalls.Add(1)
+	a.webuiMu.Unlock()
+	defer a.nativeCLICalls.Done()
 	binary, err := a.findMetis()
 	if err != nil {
 		return "", "", err

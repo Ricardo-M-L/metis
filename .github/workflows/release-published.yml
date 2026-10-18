@@ -180,6 +180,10 @@ jobs:
     if: needs.inventory.outputs.channel == 'stable' && needs.inventory.outputs.unsigned_macos != 'true'
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          path: source
       - name: Download official macOS assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -216,6 +220,14 @@ jobs:
           test "$(defaults read "$PWD/$app/Contents/Info" CFBundleExecutable)" = "metis-desktop"
           test "$(defaults read "$PWD/$app/Contents/Info" CFBundleShortVersionString)" = "$version"
 
+          if [ -f source/scripts/prepare-desktop-cli.py ]; then
+            python3 source/scripts/prepare-desktop-cli.py --repo source --platform darwin/universal \
+              --app "$app" --verify-only --execute-version
+            lipo "$app/Contents/Resources/bin/metis" -verify_arch x86_64 arm64
+            codesign --verify --strict --verbose=2 "$app/Contents/Resources/bin/metis"
+            env -u METIS_BIN -u METIS_CLI_PATH -u METIS_DESKTOP_CLI PATH=/usr/bin:/bin \
+              "$app/Contents/MacOS/metis-desktop" --runtime-check
+          fi
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign -dv --verbose=4 "$app" 2>&1 | grep -q '^Authority=Developer ID Application:'
           xcrun stapler validate "$app"
@@ -232,6 +244,10 @@ jobs:
     if: needs.inventory.outputs.channel == 'stable' && needs.inventory.outputs.unsigned_macos == 'true'
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          path: source
       - name: Download registered ad-hoc macOS assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -264,6 +280,14 @@ jobs:
           test "$(defaults read "$PWD/$app/Contents/Info" CFBundleExecutable)" = "metis-desktop"
           test "$(defaults read "$PWD/$app/Contents/Info" CFBundleShortVersionString)" = "$version"
           lipo "$app/Contents/MacOS/metis-desktop" -verify_arch x86_64 arm64
+          if [ -f source/scripts/prepare-desktop-cli.py ]; then
+            python3 source/scripts/prepare-desktop-cli.py --repo source --platform darwin/universal \
+              --app "$app" --verify-only --execute-version
+            lipo "$app/Contents/Resources/bin/metis" -verify_arch x86_64 arm64
+            codesign --verify --strict --verbose=2 "$app/Contents/Resources/bin/metis"
+            env -u METIS_BIN -u METIS_CLI_PATH -u METIS_DESKTOP_CLI PATH=/usr/bin:/bin \
+              "$app/Contents/MacOS/metis-desktop" --runtime-check
+          fi
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign -dv --verbose=4 "$app" 2>&1 | grep -q '^Signature=adhoc$'
           codesign --verify --verbose=2 dist/metis-desktop-darwin-universal.dmg

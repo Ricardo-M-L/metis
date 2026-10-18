@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	metisupdate "github.com/Ricardo-M-L/metis/internal/update"
 )
@@ -14,15 +15,16 @@ import (
 const metisReleasesURL = "https://github.com/Ricardo-M-L/metis/releases"
 
 type launcher struct {
-	goos         string
-	goarch       string
-	home         string
-	cwd          string
-	appOverride  string
-	cliPath      string
-	stat         func(string) (os.FileInfo, error)
-	runCommand   func(string, ...string) error
-	startCommand func(string, ...string) error
+	goos           string
+	goarch         string
+	home           string
+	cwd            string
+	appOverride    string
+	cliPath        string
+	bundledRuntime bool
+	stat           func(string) (os.FileInfo, error)
+	runCommand     func(string, ...string) error
+	startCommand   func(string, ...string) error
 }
 
 func systemLauncher() launcher {
@@ -30,15 +32,16 @@ func systemLauncher() launcher {
 	cwd, _ := os.Getwd()
 	cliPath := resolveLauncherCLIPath(metisupdate.SelfPath, os.Executable)
 	return launcher{
-		goos:         runtime.GOOS,
-		goarch:       runtime.GOARCH,
-		home:         home,
-		cwd:          cwd,
-		appOverride:  os.Getenv("METIS_DESKTOP_APP"),
-		cliPath:      cliPath,
-		stat:         os.Stat,
-		runCommand:   runCommand,
-		startCommand: startCommand,
+		goos:           runtime.GOOS,
+		goarch:         runtime.GOARCH,
+		home:           home,
+		cwd:            cwd,
+		appOverride:    os.Getenv("METIS_DESKTOP_APP"),
+		cliPath:        cliPath,
+		bundledRuntime: os.Getenv("METIS_DESKTOP_BUNDLED_RUNTIME") == "1",
+		stat:           os.Stat,
+		runCommand:     runCommand,
+		startCommand:   startCommand,
 	}
 }
 
@@ -184,7 +187,7 @@ func (l launcher) findExistingAppPath() string {
 
 func (l launcher) openApp(appPath, workspace string) error {
 	appArgs := []string{"--workspace", workspace}
-	if l.cliPath != "" {
+	if l.cliPath != "" && !l.appProvidesRuntime(appPath) {
 		appArgs = append(appArgs, "--metis-bin", l.cliPath)
 	}
 	switch l.goos {
@@ -202,6 +205,30 @@ func (l launcher) openApp(appPath, workspace string) error {
 		return l.runCommand("cmd", commandArgs...)
 	}
 	return fmt.Errorf("unsupported platform: %s", l.goos)
+}
+
+// A packaged app owns its CLI version. Passing the caller's CLI would pin a
+// new window to an old bundle/cache after a Desktop update. Legacy apps still
+// receive the explicit launcher path and keep their existing upgrade behavior.
+func (l launcher) appProvidesRuntime(appPath string) bool {
+	if l.bundledRuntime && l.appOverride != "" {
+		current, currentErr := filepath.Abs(l.appOverride)
+		target, targetErr := filepath.Abs(appPath)
+		if currentErr == nil && targetErr == nil &&
+			(current == target || (l.goos == "windows" && strings.EqualFold(current, target))) {
+			return true
+		}
+	}
+	if l.goos != "darwin" || l.stat == nil || !strings.EqualFold(filepath.Ext(appPath), ".app") {
+		return false
+	}
+	binDir := filepath.Join(appPath, "Contents", "Resources", "bin")
+	_, cliErr := l.stat(filepath.Join(binDir, "metis"))
+	_, manifestErr := l.stat(filepath.Join(binDir, "metis-runtime.json"))
+	// The native resolver verifies the manifest, digest and version before any
+	// execution. Even a partial package must reach that validator: an external
+	// CLI would otherwise silently hide a missing or unreadable bundled file.
+	return !os.IsNotExist(cliErr) || !os.IsNotExist(manifestErr)
 }
 
 func runCommand(name string, args ...string) error {

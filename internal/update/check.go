@@ -253,6 +253,9 @@ func CheckSelfPathSafe(path string) error {
 	if path == "" {
 		return fmt.Errorf("could not resolve self path")
 	}
+	if err := checkDesktopManagedPath(path); err != nil {
+		return err
+	}
 	// Refuse to clobber a Go-managed install — different upgrade story.
 	gobin := os.Getenv("GOBIN")
 	if gobin == "" {

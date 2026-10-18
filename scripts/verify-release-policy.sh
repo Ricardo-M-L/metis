@@ -68,7 +68,7 @@ grep -Fq 'PRIVATE KEY-----' "$package_script" || \
 	fail "macOS application bundle private-key content gate is missing"
 grep -Fq 'security find-identity -v -p codesigning' "$package_script" || \
 	fail "macOS Developer ID Application signing gate is missing"
-grep -Fq "codesign --force --deep --options runtime --timestamp --sign \"\$identity\" \"\$app_path\"" \
+grep -Fq "codesign --force --options runtime --timestamp --sign \"\$identity\" \"\$app_path\"" \
 	"$package_script" || \
 	fail "macOS hardened-runtime timestamp signing gate is missing"
 grep -Fq "codesign --force --timestamp --sign \"\$identity\" \"\$dmg\"" \
@@ -178,6 +178,13 @@ grep -Fq 'if [ "$lookup_status" -ne 4 ]; then exit "$lookup_status"; fi' "$stage
 	fail "release staging treats non-absence lookup failures as missing releases"
 python3 "$release_contract" plan --tag v0.0.0 --registry "$cli_registry" >/dev/null || \
 	fail "invalid trusted CLI-only registry"
+grep -Fq 'prepare-desktop-cli.py' "$package_script" || fail "macOS does not bundle its same-source CLI"
+grep -Fq -- '--sign-identity "$identity"' "$package_script" || fail "bundled CLI does not share the app signing identity"
+grep -Fq 'prepare-desktop-cli.py' "$stage_workflow" || fail "Desktop CI does not prepare the bundled runtime"
+grep -Fq -- '--runtime-check' "$stage_workflow" || fail "Desktop CI lacks standalone runtime acceptance"
+grep -Fq -- '--verify-only --execute-version' "$verify_workflow" || fail "published Desktop does not verify bundled CLI"
+python3 -B -m unittest discover -s "$script_dir" -p 'test_prepare_desktop_cli.py' || \
+	fail "Desktop CLI bundle regression tests failed"
 python3 -B -m unittest discover -s "$script_dir" -p 'test_release_contract.py' || \
 	fail "release contract regression tests failed"
 python3 -B -m unittest discover -s "$script_dir" -p 'test_validate_computer_use_helper.py' || \

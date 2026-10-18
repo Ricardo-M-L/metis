@@ -900,6 +900,8 @@ type cliFlags struct {
 	worktree          string // --worktree=slug — spin up git worktree with explicit slug
 	worktreeOn        bool   // -W — spin up worktree with auto slug
 
+	desktopSettingsStartup bool // private: let Desktop settings open before API-key setup
+
 	// --debug / -d: write a verbose trace to ~/.metis/debug.log alongside
 	// METIS_DEBUG=1's stderr output. Doesn't change visible behavior; just
 	// captures more for post-mortem.
@@ -1380,19 +1382,34 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// wizard or browser.
 	providerBeforeAuth := provName
 	cfgBeforeAuth := cfg
+	var desktopProviderBuild *rtpkg.ProviderBuild
 	// The first-run wizard may create or update the user config while this
 	// function is running. Re-pin both the merged config and its staleness
 	// baseline so the brand-new provider profile is not immediately reported
 	// as an external mid-session edit.
 	cfg, provName, err = rtpkg.EnsureAPIKey(cfg, provName, rtpkg.AuthGateOptions{
-		NoWizard:       disableAuthWizard(flags.noAuthWizard, canonicalMode) || startupRequiresCredentialIsolation,
+		NoWizard:       flags.desktopSettingsStartup || disableAuthWizard(flags.noAuthWizard, canonicalMode) || startupRequiresCredentialIsolation,
 		IsTTY:          authGateIsTTY,
 		RunWizard:      authGateRunWizard,
 		Stderr:         os.Stderr,
 		ProjectTrusted: projectTrusted,
 	})
 	if err != nil {
-		return nil, err
+		if !flags.desktopSettingsStartup || !errors.Is(err, config.ErrMissingAPIKey) {
+			return nil, err
+		}
+		// Keep only the missing-credential case available to the settings UI.
+		// Local construction still validates endpoint and credential-store
+		// integrity: EnsureAPIKey's readiness check alone can hide a corrupt
+		// OAuth store behind the absent API-key error. Never preconnect here.
+		authErr := err
+		cfg, provName = cfgBeforeAuth, providerBeforeAuth
+		desktopProviderBuild, err = rtpkg.BuildProviderWithoutPreconnect(cfg, provName, model)
+		if errors.Is(err, config.ErrMissingAPIKey) {
+			desktopProviderBuild = desktopAuthRequiredBuild(cfg, provName, model, authErr)
+		} else if err != nil {
+			return nil, err
+		}
 	}
 	if err := config.ApplyProviderPolicyForWorkspace(cfg, projectTrusted); err != nil {
 		return nil, fmt.Errorf("apply provider trust policy after auth setup: %w", err)
@@ -1421,9 +1438,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 
 	// Build LLM provider client + resolve final model id. Bootstrap logic
 	// lives in internal/runtime so main.go stays composer-only.
-	pbuild, err := rtpkg.BuildProvider(cfg, provName, model)
-	if err != nil {
-		return nil, err
+	pbuild := desktopProviderBuild
+	if pbuild == nil {
+		pbuild, err = rtpkg.BuildProvider(cfg, provName, model)
+		if err != nil {
+			return nil, err
+		}
 	}
 	prov := pbuild.Provider
 	model = pbuild.Model
