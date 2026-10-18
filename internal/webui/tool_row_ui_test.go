@@ -322,6 +322,7 @@ context = {
   showToast: message => toasts.push(String(message)),
   turnStartMs: 0, streaming: false, toolDetails: {}, selectedToolId: null, detailTab: 'summary',
   currentSessionId: 'A', turnRunning: false, runningSessionId: null, pendingForegroundRequest: null,
+  runningTurnIncompleteReason: '',
   messages: [], fetch: async () => ({ok:false}),
   openedAgents: [],
   openSubAgentDetails: (id, trigger, owner) => context.openedAgents.push({id, trigger, owner}),

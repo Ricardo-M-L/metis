@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -52,8 +53,9 @@ func TestPlainREPL_EmptyFinalReturnsIncomplete(t *testing.T) {
 	r, _ := newPromptTestREPL("", slash.NewRegistry())
 	r.Loop.AppendUser("produce an answer")
 	err := r.runTurn(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "task incomplete: empty_final_answer") {
-		t.Fatalf("runTurn error = %v, want empty_final_answer", err)
+	var incompleteErr *agent.IncompleteRunError
+	if !errors.As(err, &incompleteErr) || incompleteErr.Reason != "empty_final_answer" {
+		t.Fatalf("runTurn error = %v, want typed empty_final_answer", err)
 	}
 }
 

@@ -15,12 +15,16 @@ package agent
 // tool_result outputs sum to less than progressLowBytesThreshold.
 // Errors and empty-stop iters count as low-progress too.
 //
-// The detector only fires AFTER the 75% iter nudge has already
-// gone out — before that we trust the model to find its rhythm.
+// The detector arms once near 75% of the first iteration segment.
+// Hard-cap loops pair that boundary with their 75% budget nudge;
+// soft-continuation loops arm it independently and retain progress across
+// later segments. Before that we trust the model to find its rhythm.
 // Three consecutive low-progress iters past 75% → inject one focused
 // recovery reminder. This detector must never hard-stop inside a tool
 // batch: doing so would discard completed results and suppress the final
-// assistant response. MaxIters remains the bounded terminal backstop.
+// assistant response. Explicit hard-cap loops retain MaxIters as their terminal
+// backstop; soft-continuation loops skip these budget nudges and keep the
+// independent loop/stuck detectors and caller, wall-clock and USD limits.
 
 import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -126,7 +130,7 @@ func (p *progressDetector) RecordIter(toolUses []llm.ContentBlock, results []llm
 
 // IsDiminishing returns true when the detector has seen
 // progressMaxLowIters consecutive low-progress iters. The Loop
-// should also gate on "already past 75% nudge" before acting —
+// should also gate on the one-time 75% progress-advisory threshold —
 // early-session low-progress (model still picking a strategy)
 // is not interesting.
 func (p *progressDetector) IsDiminishing() bool {

@@ -197,14 +197,16 @@ func TestCompletedTurnTailRetriesAtREPLBoundary(t *testing.T) {
 
 func TestREPLCompletedTurnReturnsSessionSaveFailure(t *testing.T) {
 	m, store := newSessionSwitchModel(t, permission.ModeAsk)
-	m.loop.Provider = &backgroundTestProvider{requests: make(chan llm.Request, 1)}
+	var restore func()
+	m.loop.Provider = tailStorageFailureProvider{fail: func() {
+		restore = temporarilyBlockSessionTail(t, store, "source")
+	}}
 	r, err := NewREPL(m.loop, nil, store, "source", false, false, m.gate, "test-model", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	r.out = &bytes.Buffer{}
 	r.Loop.AppendUser("Finish this task without discarding its transcript.")
-	restore := temporarilyBlockSessionTail(t, store, "source")
 	if err := r.runTurn(context.Background()); err == nil || !strings.Contains(err.Error(), "save session") {
 		t.Fatalf("completed turn error = %v, want session persistence error", err)
 	}
@@ -256,22 +258,36 @@ func TestTailRetryPreservesAlreadyWrittenPrefix(t *testing.T) {
 	}
 }
 
-type tailCanceledProvider struct{ fakeProvider }
+type tailStorageFailureProvider struct {
+	fakeProvider
+	fail   func()
+	cancel bool
+}
 
-func (tailCanceledProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
-	return nil, context.Canceled
+func (p tailStorageFailureProvider) Stream(context.Context, llm.Request) (llm.StreamReader, error) {
+	// Initial history must pass its producer checkpoint. Fail storage only
+	// after provider work starts so these tests still exercise final saves.
+	p.fail()
+	if p.cancel {
+		return nil, context.Canceled
+	}
+	return &backgroundTestStream{events: []llm.StreamEvent{
+		{Type: "text_delta", TextDelta: "COMPLETED_TRANSCRIPT_MUST_SURVIVE"},
+		{Type: "message_stop", StopReason: "end_turn"},
+	}}, nil
 }
 
 func TestREPLCancellationKeepsSessionSaveError(t *testing.T) {
 	m, store := newSessionSwitchModel(t, permission.ModeAsk)
-	m.loop.Provider = tailCanceledProvider{}
+	m.loop.Provider = tailStorageFailureProvider{cancel: true, fail: func() {
+		temporarilyBlockSessionTail(t, store, "source")
+	}}
 	r, err := NewREPL(m.loop, nil, store, "source", false, false, m.gate, "test-model", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	r.out = &bytes.Buffer{}
 	r.Loop.AppendUser("Keep even this interrupted prompt.")
-	temporarilyBlockSessionTail(t, store, "source")
 	err = r.runTurn(context.Background())
 	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "save session") {
 		t.Fatalf("Run error = %v, want both cancellation and session persistence failure", err)
@@ -283,11 +299,13 @@ func TestPromptSaveFailureWarnsBeforeRunningAndAllowsManualRecovery(t *testing.T
 		t.Run(entry, func(t *testing.T) {
 			m, provider := newBackgroundTestModel(t)
 			restore := temporarilyBlockSessionTail(t, m.session, "source")
+			prompt := "Run this scheduled task."
 			if entry == "submit" {
-				m.input.SetValue("Run this explicitly submitted task.")
+				prompt = "Run this explicitly submitted task."
+				m.input.SetValue(prompt)
 				m.handleSubmit()
 			} else {
-				m.beginTurn("Run this scheduled task.")
+				m.beginTurn(prompt)
 			}
 			found := false
 			for _, message := range m.messages {
@@ -296,17 +314,51 @@ func TestPromptSaveFailureWarnsBeforeRunningAndAllowsManualRecovery(t *testing.T
 			if !found {
 				t.Error("initial prompt persistence failure was not visible")
 			}
-			// The requested task still runs; only unattended continuation is
-			// revoked. Do not claim the request was blocked after sending it.
-			finishBackgroundTestTurn(t, m)
-			if len(provider.requests) != 1 || m.backgroundResumeAllowed {
+			// The producer must join with the storage failure before any model
+			// request. Consume the expected error without the success-only helper.
+			var runErr error
+		waitForBlockedTurn:
+			for {
+				select {
+				case event := <-m.eventCh:
+					m.handleAgentEvent(event)
+				case runErr = <-m.doneCh:
+					m.drainAgentEvents(len(m.eventCh))
+					m.finalizeTurn(runErr)
+					break waitForBlockedTurn
+				case <-m.ctx.Done():
+					t.Fatal("blocked turn did not finish")
+				}
+			}
+			var saveErr *sessionCheckpointError
+			if !errors.As(runErr, &saveErr) {
+				t.Fatalf("Run error = %v, want session checkpoint failure", runErr)
+			}
+			if len(provider.requests) != 0 || m.backgroundResumeAllowed {
 				t.Fatalf("run/continuation status = %d/%v", len(provider.requests), m.backgroundResumeAllowed)
 			}
+			history := m.loop.History()
+			if len(history) != 1 || history[0].Role != llm.RoleUser || len(history[0].Content) != 1 || history[0].Content[0].Text != prompt {
+				t.Fatalf("blocked turn lost or duplicated the original prompt: %#v", history)
+			}
 			restore()
-			m.beginTurn("Storage is restored; continue this task.")
+			const recovery = "Storage is restored; continue this task."
+			m.beginTurn(recovery)
 			finishBackgroundTestTurn(t, m)
-			if len(provider.requests) != 2 || !m.backgroundResumeAllowed {
+			if len(provider.requests) != 1 || !m.backgroundResumeAllowed {
 				t.Fatal("explicit recovery did not restore normal continuation")
+			}
+			request := <-provider.requests
+			counts := map[string]int{}
+			for _, message := range request.Messages {
+				for _, block := range message.Content {
+					if block.Type == "text" {
+						counts[block.Text]++
+					}
+				}
+			}
+			if counts[prompt] != 1 || counts[recovery] != 1 {
+				t.Fatalf("recovery request prompt counts = %v, want one original and one recovery", counts)
 			}
 			assertStoredTail(t, m.session, "source", m.loop.History())
 		})

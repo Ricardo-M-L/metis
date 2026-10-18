@@ -710,7 +710,7 @@ func (e Event) PresentationCopy() Event {
 // retain their payload under the generic context category.
 func NormalizeContextSource(source string) string {
 	switch source {
-	case "job", "peer", "dream", "monitor", "subagent", "todo", "recovery", "verification", "budget", "contract", "hook", "cron", "context":
+	case "job", "peer", "dream", "monitor", "subagent", "todo", "recovery", "verification", "budget", "contract", "hook", "cron", "iteration_continuation", "context":
 		return source
 	default:
 		return "context"

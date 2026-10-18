@@ -189,6 +189,16 @@ func NewREPL(loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string
 		stdin:         os.Stdin,
 		out:           os.Stdout,
 	}
+	loop.HistoryCheckpoint = func(history []llm.Message) error {
+		if r.Session == nil || r.SessionID == "" {
+			return nil
+		}
+		if r.historyCursor == nil {
+			fresh := session.NewHistoryCursor(nil)
+			r.historyCursor = &fresh
+		}
+		return wrapSessionCheckpointError(r.Session.CheckpointHistory(r.SessionID, history, r.historyCursor))
+	}
 	// Automatic, overflow and second-wind compaction can happen in the
 	// middle of Run, before the normal turn-end tail flush. Checkpoint both
 	// the raw pre-compact tail and the exact replacement synchronously so a
@@ -201,7 +211,7 @@ func NewREPL(loop *agent.Loop, sl *slash.Registry, st *session.Store, sid string
 			fresh := session.NewHistoryCursor(nil)
 			r.historyCursor = &fresh
 		}
-		return r.Session.CheckpointCompaction(r.SessionID, before, after, r.historyCursor)
+		return wrapSessionCheckpointError(r.Session.CheckpointCompaction(r.SessionID, before, after, r.historyCursor))
 	}
 	return r, nil
 }
@@ -897,7 +907,7 @@ func (r *REPL) runTurn(ctx context.Context) (returnErr error) {
 			fmt.Fprintln(r.out)
 			runErr := <-done
 			if runErr == nil && agent.IsIncompleteStopReason(ev.StopReason) {
-				return fmt.Errorf("task incomplete: %s", ev.StopReason)
+				return &agent.IncompleteRunError{Reason: ev.StopReason}
 			}
 			return runErr
 		case agent.EventError:
@@ -1022,7 +1032,7 @@ func (r *REPL) persistTail() error {
 		r.historyCursor = &cursor
 	}
 	if err := r.Session.AppendHistoryTail(r.SessionID, r.Loop.History(), r.historyCursor); err != nil {
-		return fmt.Errorf("save session %s transcript: %w", shortID(r.SessionID), err)
+		return wrapSessionCheckpointError(err)
 	}
 	return nil
 }

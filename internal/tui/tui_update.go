@@ -1037,7 +1037,7 @@ func (m *Model) finalizeTurn(err error) {
 		// Fix: route through formatProviderError too, AND dedupe
 		// against the last error row so we don't double-print the
 		// same failure under two formats.
-		formatted, _ := formatTurnError(err)
+		formatted, errHint := formatTurnError(err)
 		alreadyShown := false
 		for i := len(m.messages) - 1; i >= 0; i-- {
 			r := m.messages[i].Role
@@ -1056,6 +1056,9 @@ func (m *Model) finalizeTurn(err error) {
 		}
 		if !alreadyShown {
 			m.messages = append(m.messages, Message{Role: "error", Content: formatted, Timestamp: time.Now()})
+			if errHint != "" {
+				m.messages = append(m.messages, Message{Role: "error-hint", Content: errHint, Timestamp: time.Now()})
+			}
 		}
 	}
 	// Queued messages — claude-code parity. After the turn finishes,
@@ -1117,7 +1120,7 @@ func (m *Model) persistTail() error {
 		return nil
 	}
 	if err := m.session.AppendHistoryTail(m.sessionID, m.loop.History(), &m.historyCursor); err != nil {
-		return fmt.Errorf("save session %s transcript: %w", shortID(m.sessionID), err)
+		return wrapSessionCheckpointError(err)
 	}
 	return nil
 }
@@ -1208,7 +1211,7 @@ func runTurnAsync(
 	}
 	runErr := <-done
 	if runErr == nil && incompleteReason != "" {
-		runErr = fmt.Errorf("task incomplete: %s", incompleteReason)
+		runErr = &agent.IncompleteRunError{Reason: incompleteReason}
 	}
 	doneCh <- runErr
 }

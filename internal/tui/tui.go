@@ -920,6 +920,14 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 		toolArgsStreams: make(map[string]toolArgsStreamState),
 	}
 	mdl.historyCursor = session.NewHistoryCursor(loop.History())
+	// Only the Run producer calls this callback. Compaction and final tail
+	// persistence use the same cursor; Store serializes each cursor mutation.
+	loop.HistoryCheckpoint = func(history []llm.Message) error {
+		if mdl.session == nil || mdl.sessionID == "" {
+			return nil
+		}
+		return wrapSessionCheckpointError(mdl.session.CheckpointHistory(mdl.sessionID, history, &mdl.historyCursor))
+	}
 	// Commit compaction at the point it happens, not only when the turn ends.
 	// The callback captures the model rather than the initial sid/store so
 	// session switching keeps the checkpoint target and cursor current.
@@ -927,7 +935,7 @@ func NewModel(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService,
 		if mdl.session == nil || mdl.sessionID == "" {
 			return nil
 		}
-		return mdl.session.CheckpointCompaction(mdl.sessionID, before, after, &mdl.historyCursor)
+		return wrapSessionCheckpointError(mdl.session.CheckpointCompaction(mdl.sessionID, before, after, &mdl.historyCursor))
 	}
 	// Hydrate sessionTitle from the on-disk header so a resumed session
 	// (e.g. metis --resume <id> where the previous run had run /rename

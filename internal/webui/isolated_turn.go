@@ -14,6 +14,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/desktopipc"
+	"github.com/Ricardo-M-L/metis/internal/exitcode"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/processutil"
@@ -258,6 +259,13 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 	replyWorkers.Wait()
 	<-controls.done
 	result := IsolatedTurnResult{Text: output.text, Stopped: ctx.Err() != nil, Checkpointed: output.checkpointed && !forceTerminated && output.err == nil}
+	// A valid terminal frame carries the unsuccessful stop reason even when
+	// the worker exits nonzero. Retaining it is presentation metadata, never
+	// proof of success: every process/protocol failure below still returns an
+	// error, and malformed output must not lend authority to an earlier frame.
+	if output.err == nil {
+		result.Done = output.done
+	}
 	if ctx.Err() != nil {
 		return result, ctx.Err()
 	}
@@ -277,8 +285,36 @@ func (r *processIsolatedTurnRunner) Run(ctx context.Context, request IsolatedTur
 		}
 		return result, fmt.Errorf("isolated turn worker: %w", failure)
 	}
-	result.Done = output.done
 	return result, nil
+}
+
+// The worker's terminal frame alone cannot prove why its process failed. Only
+// the matching, documented exit code can classify a failed worker as a normal
+// incomplete task; protocol, persistence and unexpected process errors retain
+// their error semantics even if an earlier frame reported a local limit.
+func isolatedTurnOutcomeError(err error, done *agent.Event) error {
+	if done == nil || !agent.IsIncompleteStopReason(done.StopReason) {
+		return err
+	}
+	if err == nil {
+		return &agent.IncompleteRunError{Reason: done.StopReason}
+	}
+	var incomplete *agent.IncompleteRunError
+	if errors.As(err, &incomplete) {
+		return err
+	}
+	var exited *exec.ExitError
+	if !errors.As(err, &exited) {
+		return err
+	}
+	expected := exitcode.Incomplete
+	if agent.IsContentFilterStopReason(done.StopReason) {
+		expected = exitcode.ContentFilter
+	}
+	if exited.ExitCode() != expected {
+		return err
+	}
+	return errors.Join(&agent.IncompleteRunError{Reason: done.StopReason}, err)
 }
 
 type isolatedWorkerOutput struct {

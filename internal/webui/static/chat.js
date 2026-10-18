@@ -95,13 +95,19 @@ function connectEvents() {
   // Only transcript rendering is filtered by the currently viewed session.
   eventSource.addEventListener('info', e => {
     if (!acceptLiveEvent(e)) return;
-    try { handleBackgroundContinuation(JSON.parse(e.data)); } catch (_) {}
+    try {
+      const data = JSON.parse(e.data);
+      handleBackgroundContinuation(data);
+      if (data.source === 'iteration_continuation' && sameSession(data)) {
+        showToast(uiText('Progress checkpoint reached. Continuing the current task.', '已到达进度检查点，继续执行当前任务。'));
+      }
+    } catch (_) {}
   });
   onLive('loop_done', d => {
-    runningTurnIncompleteReason = d.incomplete ? (d.stopReason || 'incomplete') : '';
-    if (runningTurnIncompleteReason) showToast('Turn incomplete: ' + runningTurnIncompleteReason);
-    const state = ['stopped', 'cancelled', 'interrupted'].includes(String(d.stopReason || '').toLowerCase())
-      ? 'stopped' : (d.incomplete ? 'error' : 'completed');
+    const stopped = ['stopped', 'cancelled', 'interrupted'].includes(String(d.stopReason || '').toLowerCase());
+    runningTurnIncompleteReason = d.incomplete && !stopped ? (d.stopReason || 'incomplete') : '';
+    if (runningTurnIncompleteReason) showToast(incompleteTurnMessage(runningTurnIncompleteReason));
+    const state = stopped ? 'stopped' : (d.incomplete ? 'incomplete' : 'completed');
     finishUserTurn(state, d.stopReason || '');
   });
   onLive('agent_error', d => {
@@ -111,6 +117,24 @@ function connectEvents() {
   eventSource.addEventListener('error', () => {
     showReconnectBanner();
   });
+}
+
+function incompleteTurnMessage(reason) {
+  switch (String(reason || '').toLowerCase()) {
+    case 'budget_usd':
+      return uiText('Task paused: the local spending limit was reached. The task is incomplete.', '任务已暂停：达到本地费用上限，任务尚未完成。');
+    case 'turn_wall_clock':
+      return uiText('Task paused: the local time limit was reached. The task is incomplete.', '任务已暂停：达到本地时间上限，任务尚未完成。');
+    case 'max_iterations':
+      return uiText('Task paused: the iteration limit was reached. The task is incomplete.', '任务已暂停：达到迭代上限，任务尚未完成。');
+    case 'loop_detected':
+      return uiText('Task paused: repeated tool calls were detected. The task is incomplete.', '任务已暂停：检测到重复工具调用，任务尚未完成。');
+    case 'stuck_after_reset':
+    case 'diminishing_returns':
+      return uiText('Task paused: no further progress was detected. The task is incomplete.', '任务已暂停：未检测到进一步进展，任务尚未完成。');
+    default:
+      return uiText('Task incomplete', '任务尚未完成') + (reason && reason !== 'incomplete' ? ': ' + reason : '');
+  }
 }
 
 function handleBackgroundContinuation(d) {
@@ -282,7 +306,7 @@ function applyActivityPresentationGroup(group, policy = activityPresentationPoli
   if (group.dataset.userTouched !== 'true') {
     // A failed tool or a stopped turn must reveal its evidence by default.
     const showEvidence = group.dataset.hasError === 'true' ||
-      (turn && (turn.dataset.state === 'error' || turn.dataset.state === 'stopped'));
+      (turn && ['error', 'stopped', 'incomplete'].includes(turn.dataset.state));
     setActivityGroupOpen(group, !!showEvidence);
   }
   if (flat) scheduleActivityGroupFollow(group);
@@ -295,7 +319,7 @@ function applyActivityPresentationTurn(turn, policy = activityPresentationPolicy
   const hasFailure = groups.some(group => group.dataset.hasError === 'true');
   const hasAnswer = activityTurnHasFinalAnswer(turn, groups);
   turn.dataset.hasFinalAnswer = String(hasAnswer);
-  const showEvidence = state === 'running' || state === 'error' || state === 'stopped' || hasFailure || !hasAnswer;
+  const showEvidence = ['running', 'error', 'stopped', 'incomplete'].includes(state) || hasFailure || !hasAnswer;
   const manualOpen = turn.dataset.userTouched === 'true' && turn.dataset.userOpen !== undefined
     ? turn.dataset.userOpen === 'true' : null;
   const open = showEvidence || !policy.foldCompleted ||
@@ -374,6 +398,7 @@ function activityTurnStateLabel(state) {
     running: uiText('Running', '进行中'),
     completed: uiText('Completed', '已完成'),
     stopped: uiText('Stopped', '已停止'),
+    incomplete: uiText('Incomplete', '未完成'),
     error: uiText('Failed', '失败'),
   })[state] || '';
 }
@@ -426,7 +451,7 @@ function setActivityTurnOpen(turn, open) {
 function toggleActivityTurn(button) {
   const turn = button && button.closest('.activity-turn');
   if (turn) {
-    if (turn.dataset.state === 'running' || turn.dataset.state === 'error' || turn.dataset.state === 'stopped' ||
+    if (['running', 'error', 'stopped', 'incomplete'].includes(turn.dataset.state) ||
         !activityPresentationPolicy().foldCompleted) return;
     turn.dataset.userTouched = 'true';
     const open = !turn.classList.contains('open');
@@ -445,7 +470,10 @@ function updateActivityTurnLabel(turn) {
     : turn.dataset.state === 'running' && startedAt > 0 && Date.now() - startedAt >= 1000
       ? activityDurationLabel(Date.now() - startedAt)
       : turn.dataset.state === 'running' ? uiText('Working', '执行中') : uiText('Activity', '执行过程');
-  if (state) state.textContent = activityTurnStateLabel(turn.dataset.state);
+  if (state) {
+    state.textContent = activityTurnStateLabel(turn.dataset.state);
+    state.title = turn.dataset.state === 'incomplete' ? incompleteTurnMessage(turn.dataset.reason) : '';
+  }
 }
 
 function ensureActivityTurn() {
@@ -507,7 +535,7 @@ function finishActivityTurn(state = 'completed', reason = '') {
   const oldState = turn.dataset.state;
   const wasSettled = turn.dataset.settled === 'true';
   const hadAnswer = turn.dataset.hasFinalAnswer === 'true';
-  if (oldState !== 'error' && oldState !== 'stopped') {
+  if (oldState !== 'error' && oldState !== 'stopped' && (oldState !== 'incomplete' || state === 'error')) {
     turn.dataset.state = state;
   }
   if (turn.dataset.state !== 'running') settleUnfinishedActivityTools(turn, turn.dataset.state, reason);
@@ -1791,8 +1819,8 @@ function endStreamingMessage(refresh = true) {
 // continue through tool execution and another model request. Keep the
 // TurnStatus alive until loop_done (or the authoritative POST completion).
 function finishUserTurn() {
-  const state = arguments.length ? arguments[0] : (runningTurnIncompleteReason ? 'error' : 'completed');
-  const reason = arguments.length > 1 ? arguments[1] : '';
+  const state = arguments.length ? arguments[0] : (runningTurnIncompleteReason ? 'incomplete' : 'completed');
+  const reason = arguments.length > 1 ? arguments[1] : runningTurnIncompleteReason;
   endStreamingMessage();
   finishActivityGroup();
   finishActivityTurn(state, reason);
@@ -3660,7 +3688,7 @@ async function drainQueuedTurns() {
       if (!queuedTurns.length) queuedSessionId = null;
       else if (succeeded && !isSessionQueuePaused(owner)) setTimeout(drainQueuedTurns, 0);
     }
-    if (!succeeded) showToast('Queued messages paused after an incomplete or failed turn');
+    if (!succeeded) showToast(uiText('Queued messages paused after an incomplete or failed turn', '任务未完成或失败，排队消息已暂停。'));
   }
 }
 
@@ -3720,6 +3748,7 @@ async function runTurnItem(item) {
   let resolvedTurnSessionId = turnSessionId;
   let turnSucceeded = false;
   let turnOutcome = 'completed';
+  let turnReason = '';
   const viewingTurn = () => resolvedTurnSessionId
     ? currentSessionId === resolvedTurnSessionId
     : turnSessionId
@@ -3747,8 +3776,11 @@ async function runTurnItem(item) {
       signal: foregroundRequest.controller && foregroundRequest.controller.signal
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || `turn: ${res.status}`);
-    if (!data.stopped && viewingTurn() && continuationUnchanged() && runningTurnIncompleteReason) throw new Error('Turn incomplete: ' + runningTurnIncompleteReason);
+    // Local limits are unsuccessful outcomes, even when conveyed with an HTTP
+    // error status. Their typed terminal reason is not a request/API failure.
+    const incompleteReason = data.incomplete ? (data.stopReason || 'incomplete')
+      : res.ok && !data.stopped && viewingTurn() && continuationUnchanged() ? runningTurnIncompleteReason : '';
+    if (!res.ok && !data.incomplete) throw new Error(data.error || `turn: ${res.status}`);
     resolvedTurnSessionId = data.sessionId || turnSessionId;
     foregroundRequest.sessionId = resolvedTurnSessionId;
     if (!runningSessionId && resolvedTurnSessionId) runningSessionId = resolvedTurnSessionId;
@@ -3774,12 +3806,19 @@ async function runTurnItem(item) {
     if (viewingTurn() && continuationUnchanged() && !historySynced && !streamedTextThisTurn && data.text) {
       addMessage('assistant', data.text);
     }
-    if (data.stopped) {
+    if (incompleteReason) {
+      turnOutcome = 'incomplete';
+      turnReason = incompleteReason;
+      if (viewingTurn() && continuationUnchanged()) {
+        if (runningTurnIncompleteReason !== incompleteReason) showToast(incompleteTurnMessage(incompleteReason));
+        runningTurnIncompleteReason = incompleteReason;
+      }
+    } else if (data.stopped) {
       turnOutcome = 'stopped';
       if (viewingTurn()) showToast('Turn stopped');
     }
     await loadSessions();
-    turnSucceeded = !data.stopped;
+    turnSucceeded = !data.stopped && !incompleteReason;
   } catch (e) {
     turnOutcome = e && e.name === 'AbortError' ? 'stopped' : 'error';
     if (e && e.name === 'AbortError') { if (viewingTurn()) showToast('Turn stopped'); }
@@ -3791,7 +3830,7 @@ async function runTurnItem(item) {
     if (typeof finishForegroundRequest === 'function') finishForegroundRequest(foregroundRequest);
     if (pendingForegroundRequest === foregroundRequest) pendingForegroundRequest = null;
     if (continuationUnchanged()) {
-      if (viewingTurn()) finishUserTurn(turnOutcome);
+      if (viewingTurn()) finishUserTurn(turnOutcome, turnReason);
       if (typeof parallelTurnsEnabled === 'function' && parallelTurnsEnabled()) syncTrackedRunningState();
       else setTurnRunning(false);
       if (viewingTurn()) runningTurnNeedsHistorySync = false;
@@ -3809,7 +3848,7 @@ async function runTurnItem(item) {
       if (!queuedSessionId || currentSessionId === queuedSessionId) setTimeout(drainQueuedTurns, 0);
       else showToast('Queued messages are waiting in the completed session');
     } else if (viewingTurn() && !turnSucceeded && queuedTurns.length && !drainingQueuedTurns) {
-      showToast('Queued messages paused after an incomplete or failed turn');
+      showToast(uiText('Queued messages paused after an incomplete or failed turn', '任务未完成或失败，排队消息已暂停。'));
     }
   }
   return turnSucceeded;
@@ -5601,7 +5640,7 @@ function uiText(en, zh) {
 
 const SETTINGS_ZH = {
   'permission.mode': ['权限模式', '选择工具调用与文件修改何时需要确认'],
-  'session.max_iterations': ['最大迭代次数', '单个 turn 允许的最大代理循环次数'],
+  'session.max_iterations': ['迭代检查点间隔', '每经过这些代理循环轮次检查一次进展，并在同一任务中自动继续；到达检查点不代表任务完成，费用、时间与循环保护仍然有效'],
   'session.auto_compact_threshold': ['自动压缩阈值', '上下文窗口达到该比例时自动压缩'],
   'session.auto_compact_minimum_tokens': ['最小压缩 token', '触发自动压缩前需要的最小 token 数'],
   'loop_detection.disabled': ['禁用循环检测', '关闭重复工具调用与停滞检测'],

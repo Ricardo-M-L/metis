@@ -203,3 +203,49 @@ func TestIncompleteError_NilSafe(t *testing.T) {
 	var ie *IncompleteError
 	_ = ie.Error() // must not panic
 }
+
+// A worker can emit a valid incomplete terminal frame and subsequently fail
+// while saving its checkpoint or closing the IPC bridge. That independent
+// failure must not be hidden behind the earlier terminal outcome.
+func TestClassify_JoinedTerminalOutcomePreservesFailure(t *testing.T) {
+	incomplete := &IncompleteError{Reason: "max_iterations", Detail: "last activity mentioned 429 rate limit and timeout"}
+	filter := &ContentFilterError{Reason: "content_filter"}
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"incomplete_only", errors.Join(incomplete), Incomplete},
+		{"incomplete_wrapped", fmt.Errorf("run aborted: %w", incomplete), Incomplete},
+		{"joined_incomplete_only", errors.Join(incomplete, fmt.Errorf("another outcome: %w", incomplete)), Incomplete},
+		{"filter_only", errors.Join(filter), ContentFilter},
+		{"mixed_terminal_outcomes", errors.Join(filter, incomplete), Incomplete},
+		{"disk_full", errors.Join(incomplete, fmt.Errorf("save checkpoint: %w", syscall.ENOSPC)), IO},
+		{"broken_bridge", errors.Join(incomplete, fmt.Errorf("report checkpoint: %w", syscall.EPIPE)), IO},
+		{"permission", errors.Join(incomplete, fmt.Errorf("save checkpoint: %w", os.ErrPermission)), Permission},
+		{"opaque_storage_failure", errors.Join(incomplete, errors.New("save checkpoint: backend unavailable")), General},
+		{"opaque_storage_failure_first", errors.Join(errors.New("save checkpoint: backend unavailable"), incomplete), General},
+		{"canceled", errors.Join(incomplete, context.Canceled), SIGINT},
+		{"deadline", errors.Join(incomplete, context.DeadlineExceeded), Timeout},
+		{"network", errors.Join(incomplete, transport.ErrNetwork), Network},
+		{"oauth", errors.Join(incomplete, &testOAuthStatusError{status: 401}), Auth},
+		{"quota", errors.Join(incomplete, errors.New("HTTP 429 rate limit")), Quota},
+		{"filter_with_storage_failure", errors.Join(filter, errors.New("save checkpoint: backend unavailable")), General},
+		{"filter_with_disk_full", errors.Join(filter, syscall.ENOSPC), IO},
+		{"storage_mentions_safety", errors.Join(incomplete, errors.New("save safety database failed")), General},
+		{"filter_storage_mentions_safety", errors.Join(filter, errors.New("save safety database failed")), General},
+		{"wrapped_join", fmt.Errorf("worker failed: %w", errors.Join(incomplete, errors.New("save checkpoint: backend unavailable"))), General},
+		{"typed_network_wrapper", &net.OpError{Op: "read", Net: "tcp", Err: errors.Join(incomplete, errors.New("opaque failure"))}, Network},
+		{"quota_wrapper", fmt.Errorf("HTTP 429 rate limit: %w", errors.Join(incomplete, errors.New("opaque failure"))), Quota},
+		{"nested_join", errors.Join(incomplete, fmt.Errorf("cleanup failed: %w", errors.Join(filter, syscall.EPIPE))), IO},
+		{"multiple_wrap", fmt.Errorf("terminal: %w; storage: %w", incomplete, syscall.ENOSPC), IO},
+		{"ordinary_join_keeps_typed_priority", errors.Join(errors.New("HTTP 401 unauthorized"), os.ErrPermission), Permission},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Classify(tc.err); got != tc.want {
+				t.Fatalf("Classify(%v) = %d, want %d", tc.err, got, tc.want)
+			}
+		})
+	}
+}

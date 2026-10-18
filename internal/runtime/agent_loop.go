@@ -41,6 +41,10 @@ type AgentLoopOptions struct {
 	// Zero retains the config-based fallback for tests and older SDK callers.
 	MaxOutputTokens int
 	MaxIter         int
+	// ContinueOnIterationLimit makes MaxIter a checkpoint interval for a
+	// top-level interactive task. Explicit CLI/profile limits and child agents
+	// leave this false so their bounded execution contract is unchanged.
+	ContinueOnIterationLimit bool
 	// MemoryManager is optional. When nil, BuildAgentLoop constructs
 	// one at the canonical user/project repository — keeps
 	// existing call-sites working. main.go now constructs it earlier
@@ -181,6 +185,7 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 
 	loop := agent.NewLoop(opts.Provider, opts.Registry, opts.Gate,
 		hookReg, opts.System, maxIter)
+	loop.ContinueOnIterationLimit = opts.ContinueOnIterationLimit
 	loop.Model = opts.Model
 	// Plan instructions are live session state, not part of the stable boot
 	// prompt. Loop.buildRequest adds this body only while Loop.PlanMode is true

@@ -107,6 +107,21 @@ func TestIsolatedWorkerProtocolHelper(t *testing.T) {
 	case "failed-exit":
 		emit("", desktopipc.Event{Kind: agent.EventLoopDone, StopReason: "end_turn"})
 		os.Exit(47)
+	case "incomplete-exit":
+		emit("", desktopipc.Event{Kind: agent.EventLoopDone, StopReason: "max_iterations"})
+		os.Exit(11)
+	case "incomplete-fatal-exit":
+		emit("", desktopipc.Event{Kind: agent.EventLoopDone, StopReason: "max_iterations"})
+		os.Exit(47)
+	case "filter-exit":
+		emit("", desktopipc.Event{Kind: agent.EventLoopDone, StopReason: "content_filter"})
+		os.Exit(10)
+	case "incomplete-wrong-code":
+		emit("", desktopipc.Event{Kind: agent.EventLoopDone, StopReason: "max_iterations"})
+		os.Exit(10)
+	case "invalid-after-done":
+		emit("", desktopipc.Event{Kind: agent.EventLoopDone, StopReason: "max_iterations"})
+		_, _ = io.WriteString(os.Stdout, "not-json\n")
 	case "persist-delay":
 		emit("", desktopipc.Event{Kind: agent.EventLoopDone, StopReason: "end_turn"})
 		_ = os.Stdout.Close()
@@ -238,7 +253,7 @@ func TestProcessIsolatedTurnRunnerRelaysConcurrentInteractions(t *testing.T) {
 }
 
 func TestProcessIsolatedTurnRunnerRejectsInvalidProtocolAndEarlyEOF(t *testing.T) {
-	for _, scenario := range []string{"invalid", "wrong-direction", "unknown-kind", "missing-id", "duplicate-id", "eof", "eof-live"} {
+	for _, scenario := range []string{"invalid", "invalid-after-done", "wrong-direction", "unknown-kind", "missing-id", "duplicate-id", "eof", "eof-live"} {
 		t.Run(scenario, func(t *testing.T) {
 			runner := protocolTestRunner(t, scenario)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -356,7 +371,14 @@ func TestProcessIsolatedTurnRunnerDoesNotCompleteBeforeSuccessfulExit(t *testing
 	t.Run("nonzero exit after loop completion", func(t *testing.T) {
 		runner := protocolTestRunner(t, "failed-exit")
 		result, err := runner.Run(context.Background(), IsolatedTurnRequest{SessionID: "failed-exit", WorkDir: t.TempDir()})
-		if err == nil || result.Done != nil {
+		if err == nil || result.Done == nil || result.Done.StopReason != "end_turn" {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+	})
+	t.Run("preserve incomplete reason on nonzero exit", func(t *testing.T) {
+		runner := protocolTestRunner(t, "incomplete-exit")
+		result, err := runner.Run(context.Background(), IsolatedTurnRequest{SessionID: "incomplete-exit", WorkDir: t.TempDir()})
+		if err == nil || result.Done == nil || result.Done.StopReason != "max_iterations" {
 			t.Fatalf("result=%+v err=%v", result, err)
 		}
 	})
@@ -401,4 +423,33 @@ func TestProcessIsolatedTurnRunnerDoesNotCompleteBeforeSuccessfulExit(t *testing
 			t.Fatalf("successful result preceded persisted output: %v", err)
 		}
 	})
+}
+
+func TestIsolatedTurnOutcomeRequiresMatchingExitCode(t *testing.T) {
+	for _, scenario := range []struct {
+		name       string
+		incomplete bool
+	}{
+		{"incomplete-exit", true},
+		{"filter-exit", true},
+		{"incomplete-fatal-exit", false},
+		{"incomplete-wrong-code", false},
+		{"invalid-after-done", false},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			runner := protocolTestRunner(t, scenario.name)
+			result, err := runner.Run(context.Background(), IsolatedTurnRequest{SessionID: scenario.name, WorkDir: t.TempDir()})
+			if err == nil {
+				t.Fatal("expected unsuccessful worker exit/protocol failure")
+			}
+			classified := isolatedTurnOutcomeError(err, result.Done)
+			var incomplete *agent.IncompleteRunError
+			if got := errors.As(classified, &incomplete); got != scenario.incomplete {
+				t.Fatalf("incomplete=%v want=%v result=%+v err=%v", got, scenario.incomplete, result, classified)
+			}
+			if !errors.Is(classified, err) {
+				t.Fatal("classification lost the actual worker failure")
+			}
+		})
+	}
 }
