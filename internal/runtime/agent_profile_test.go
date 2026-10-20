@@ -9,6 +9,32 @@ import (
 	"testing"
 )
 
+func TestLoadProfileForWorkspaceUsesItsOverrideWithoutChangingCWD(t *testing.T) {
+	workspace := t.TempDir()
+	dir := filepath.Join(workspace, ".metis", "agents")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "event-writer.md"), []byte("---\nname: event-writer\ntools: [Read, Write]\n---\nProject-specific event worker.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := LoadAgentProfileForWorkspace("event-writer", workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Source != AgentProfileSourceProject || !strings.Contains(profile.SystemPrompt, "Project-specific event worker") || !slices.Equal(profile.Tools, []string{"Read", "Write"}) {
+		t.Fatalf("incorrect project override: %+v", profile)
+	}
+	after, err := os.Getwd()
+	if err != nil || before != after {
+		t.Fatalf("profile lookup changed cwd: %q -> %q (%v)", before, after, err)
+	}
+}
+
 func TestParseAgentProfile_FullFrontmatter(t *testing.T) {
 	src := `---
 name: reviewer

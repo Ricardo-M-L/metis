@@ -314,8 +314,13 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	final = append(final, postHookSuffix...)
 	final = stripProviderState(final)
 	rollbackBase := append(cloneMessages(before), postHookSuffix...)
+	var peerCheckpointErr error
+	final, peerCheckpointErr = l.retainAssignedPeerCheckpoint(ctx, before, final)
 	if historyCap, constrained, budgetErr := compactor.postCompactHistoryCap(requestOverhead); budgetErr != nil ||
-		(constrained && estimateTokens(final) >= historyCap) {
+		peerCheckpointErr != nil || (constrained && estimateTokens(final) >= historyCap) {
+		if peerCheckpointErr != nil {
+			budgetErr = peerCheckpointErr
+		}
 		if budgetErr == nil {
 			budgetErr = fmt.Errorf("compact: post-compact hook/suffix exceeds effective history budget (%d >= %d tokens; request overhead=%d)",
 				estimateTokens(final), historyCap, requestOverhead)

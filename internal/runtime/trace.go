@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 
@@ -58,12 +59,13 @@ type TraceAdapter struct {
 	// owner. A background child can outlive the parent turn or a session switch;
 	// consulting sessionID only when the burst is flushed would write
 	// that old child text into the new active session or merge it with parent text.
-	burstKind         string
-	burstSessionID    string
-	burstTurn         int
-	burstSubAgentOf   string
-	burstInvocationID string
-	burstBuf          strings.Builder
+	burstKind           string
+	burstSessionID      string
+	burstTurn           int
+	burstSubAgentOf     string
+	burstInvocationID   string
+	burstBuf            strings.Builder
+	learningFullResults bool
 }
 
 type traceOrigin struct {
@@ -118,11 +120,12 @@ const redactedThinkingPlaceholder = "Reasoning redacted by provider"
 // NewTraceAdapter wraps a TraceStore.
 func NewTraceAdapter(store *session.TraceStore) *TraceAdapter {
 	return &TraceAdapter{
-		store:             store,
-		invocationOrigin:  make(map[string]*traceInvocationState),
-		legacyChildOrigin: make(map[legacyTraceKey]traceOrigin),
-		activeTurns:       make(map[string]int),
-		turnUsage:         make(map[traceTurnKey]session.CostSnapshot),
+		learningFullResults: os.Getenv("METIS_LEARNING_TRACE_FULL_RESULTS") == "1",
+		store:               store,
+		invocationOrigin:    make(map[string]*traceInvocationState),
+		legacyChildOrigin:   make(map[legacyTraceKey]traceOrigin),
+		activeTurns:         make(map[string]int),
+		turnUsage:           make(map[traceTurnKey]session.CostSnapshot),
 	}
 }
 
@@ -672,7 +675,13 @@ func (a *TraceAdapter) appendLocked(origin traceOrigin, kind string, ev agent.Ev
 	text := security.RedactSubprocessText(x.Text)
 	// Keep complete human inputs and model-visible context envelopes. Other
 	// diagnostic rows retain the existing compact trace representation.
-	if kind != "user" && kind != "context" {
+	fullLearningResult := a.learningFullResults && kind == "tool_result" && (x.ToolName == "Skill" || x.ToolName == "Workflow")
+	if fullLearningResult && (len(x.Text) > 2*1024*1024 || len(text) > 2*1024*1024) {
+		// Preserve a complete error envelope rather than a partial result that
+		// could accidentally be interpreted as passing evidence.
+		text = "[learning evidence incomplete: tool result exceeds 2 MiB limit]"
+		x.IsError = true
+	} else if kind != "user" && kind != "context" && !fullLearningResult {
 		text = truncateTrace(text, 2000)
 	}
 	te := &session.TraceEvent{

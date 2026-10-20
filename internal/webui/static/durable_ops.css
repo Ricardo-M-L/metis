@@ -1,0 +1,33 @@
+#durableOpsPage { overflow: auto; color: var(--fg-body); background: var(--bg); }
+.durable-ops-page { max-width: 1180px; padding: 40px 36px 64px; margin: 0 auto; }
+.durable-ops-muted { font-size: 12px; line-height: 1.7; color: var(--fg-dim); overflow-wrap: anywhere; margin: 6px 0 12px; }
+.durable-ops-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 22px 0; }
+.durable-ops-tabs [aria-pressed='true'] { border-color: var(--fg-mid); background: var(--surface-2); color: var(--fg-strong); }
+.durable-ops-tabs span { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.durable-ops-list { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%,360px),1fr)); gap: 14px; }
+.durable-ops-card { min-width: 0; padding: 20px; border: 1px solid var(--border-faint); border-radius: 12px; background: var(--bg-inset); font-size: 12px; line-height: 1.7; }
+.durable-ops-card header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 16px; }
+.durable-ops-card h3 { font-size: 15px; font-weight: 600; color: var(--fg-strong); overflow-wrap: anywhere; }
+.durable-ops-status { flex-shrink: 0; border: 1px solid var(--border); border-radius: 6px; padding: 1px 7px; color: var(--fg-mid); }
+.durable-ops-card dl { display: grid; gap: 8px; }
+.durable-ops-card dl > div { display: grid; grid-template-columns: 104px minmax(0,1fr); gap: 12px; }
+.durable-ops-card dt { color: var(--fg-dim); }
+.durable-ops-card dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.durable-ops-card progress { width: 100%; height: 5px; margin-top: 14px; accent-color: var(--accent); }
+.durable-ops-card details { margin-top: 14px; border-top: 1px solid var(--border-faint); padding-top: 12px; }
+.durable-ops-card summary { color: var(--fg-mid); cursor: pointer; margin-bottom: 9px; }
+.durable-ops-card footer,.durable-ops-review footer { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.durable-ops-hint { margin-top: 12px; padding: 10px 12px; border-left: 2px solid var(--accent); background: var(--surface-2); color: var(--fg-mid); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.durable-ops-error { margin: 16px 0; padding: 14px; border: 1px solid var(--border); border-radius: 8px; color: var(--error); font-size: 13px; line-height: 1.7; }
+.durable-ops-error p { color: var(--fg-dim); margin-top: 7px; }
+.durable-ops-empty { padding: 50px 20px; text-align: center; grid-column: 1/-1; }
+.durable-ops-empty h2 { font-size: 17px; color: var(--fg-strong); }
+.durable-ops-empty p { color: var(--fg-dim); font-size: 13px; line-height: 1.8; margin-top: 12px; }
+.durable-ops-record + .durable-ops-record { border-top: 1px solid var(--border-faint); margin-top: 10px; padding-top: 10px; }
+.durable-ops-review { border: 1px solid var(--border); border-radius: 10px; background: var(--bg-inset); padding: 20px; margin-bottom: 20px; }
+.durable-ops-review h2 { font-size: 17px; margin-bottom: 10px; color: var(--fg-strong); }
+.durable-ops-review p,.durable-ops-review label { font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.durable-ops-review label { display: block; margin: 14px 0 6px; }
+.durable-ops-review textarea { width: 100%; box-sizing: border-box; resize: vertical; padding: 10px; color: var(--fg-body); border: 1px solid var(--border); border-radius: 7px; background: var(--bg); font: inherit; font-size: 13px; }
+#durableOpsPage :is(button,summary,textarea):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media(max-width:760px) { .durable-ops-page { padding: 25px 18px 45px; } .durable-ops-page .automations-heading { align-items:flex-start; } .durable-ops-card dl > div { grid-template-columns:84px minmax(0,1fr); gap:8px; } }

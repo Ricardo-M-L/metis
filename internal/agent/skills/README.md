@@ -87,13 +87,73 @@ wired to an enforced per-skill registry.
 
 - Outside plan mode, `Skill(action="get", ...)` records a view for a
   user-owned skill; `Skill(action="invoke", ...)` records a use.
-- Dream synthesis records create/patch provenance. It is not exposed as a
-  `metis skills synth` CLI subcommand.
+- Dream's `SkillSynth` stages hidden create/update proposals in the learning
+  version store. It cannot overwrite or archive an active skill. The legacy
+  `Synth.CreateSkill/UpdateSkill` APIs remain for trusted administrative callers
+  of unmanaged skills and refuse to bypass an existing learning state.
 - `curator.go` treats flat `.md`/`.markdown` files directly under the user
   skill root as eligible and archives stale candidates recoverably. Directory
-  installs, JSON files, symlinks, dotfiles, bundled/project skills, and pinned
+  installs, JSON files, symlinks, dotfiles, bundled/project skills, version-managed skills, and pinned
   skills are outside that pruning path. Flat-file eligibility is a provenance
   heuristic; the curator cannot distinguish a hand-authored flat file from a
   synthesized one, so users should pin files that must never age out.
 - `overlap.go` nominates near-duplicate clusters before the more expensive
   dream consolidation pass.
+
+## Evaluated versions
+
+`internal/learning` persists each artifact at `.learning/<name>/state.json`.
+The original flat user manifest is frozen as a trusted baseline and left on
+disk. Content SHA256 identifies immutable versions; one atomic active pointer
+controls the user catalog. Unpromoted versions remain hidden. The user loader
+checks the state revision before cached lookups, so a resident worker observes
+another process's promotion or rollback. Higher-priority project/plugin layers
+still take precedence.
+
+The initial skill source must be canonical `<name>.md`, with a matching name,
+enabled metadata and no `activate_on` filters. Versioning explicitly rejects
+existing JSON/tree/alternate sources and inline-shell manifests before writing
+state, preserving their active catalog behavior. These formats need a separate
+resource-aware evaluation contract before automatic changes are supported.
+
+The CLI provides `metis learning stage|list|evaluate|promote|rollback` and
+`--kind workflow` for workflow recipes. Evaluation runs both the baseline and
+candidate through the currently executing CLI against the configured provider.
+A private `METIS_HOME`, workspace and tool allowlist isolate each case. Skill
+candidates cannot use inline shell. The host, rather than the model, checks
+exact final text or a complete JSON value against a fixed suite; expected
+answers do not enter the model prompt.
+
+Every evaluation binds the suite, CLI binary, secret-free provider route and
+generation profile, provider/model and artifact
+digests to observed token classes, duration, final output, and paired tool
+invocation evidence. Missing usage, unsuccessful queries, wrong output,
+budget overruns and changed inputs fail the gate. Candidate quality must not
+regress; an optional `max_cost_ratio` limits total token growth. Tokens are
+observed usage, not a supplier invoice or a claim about actual USD charges.
+
+`evaluate --promote` activates only a passing comparison. Explicit promotion
+also rechecks the host suite and evaluator identity. The activation epoch
+prevents stale evidence from being reused after a promotion/rollback cycle.
+Rollback restores the frozen baseline or a previously activated version and
+retains results and transition history. Automatic Dream extraction proposes
+versions; host evaluation policies determine whether and when they advance.
+
+Private evaluator children set `METIS_LEARNING_EVALUATION=1` to omit memory
+retrieval and auxiliary distillation requests, preventing hidden model spend
+or cross-candidate memory. `METIS_LEARNING_TRACE_FULL_RESULTS=1` retains complete,
+redacted Skill/Workflow results up to 2 MiB for host evidence; oversize results
+are explicitly incomplete. Ordinary trace diagnostics retain their 2,000
+character limit. Evaluator temporary roots live under the calling
+`METIS_HOME/.learning-runs` and are deleted after each query.
+
+A host suite looks like:
+
+```json
+{
+  "name": "receipt-format-contract",
+  "cases": [{"id": "one", "prompt": "Format the supplied receipt.", "expected_json": {"amount": 323}}],
+  "max_tokens": 30000,
+  "max_duration_seconds": 120
+}
+```

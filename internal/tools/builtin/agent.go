@@ -698,6 +698,15 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		}
 		resumedSnapshot = snap
 	}
+	handoffStore, handoffScope := a.roster.HandoffBinding()
+	if resumedSnapshot != nil && resumedSnapshot.Handoff != nil {
+		binding := resumedSnapshot.Handoff
+		if handoffStore == nil || handoffScope != binding.Scope ||
+			resumedSnapshot.Header.TeammateName != binding.Recipient ||
+			(nameArg != "" && nameArg != binding.Recipient) {
+			return &tools.Result{Output: "resume_from refused: durable sub-agent transcript requires its original mailbox scope and teammate name", IsError: true}, nil
+		}
+	}
 
 	// G.0 cap — refuse before constructing the sub-loop so the API
 	// burn stays bounded. The cap reads from the Roster's Capacity
@@ -992,21 +1001,15 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		sub.PeerInbox = teammate.Mailbox
 	}
 
-	// G.4 — open a transcript writer if persistence is wired. Foreground
-	// & background paths both append to it via the event-forwarding
-	// loop (see persistNewMessages below). Close is deferred in the
-	// foreground path; the background goroutine handles its own close.
-	//
-	// persistedOnDisk tracks how many messages from sub.History() we've
-	// already written. The event loop bumps it on every EventTurnEnd
-	// so each new turn's tail gets appended exactly once. For fresh
-	// sub-agents this starts at 0 (header-only on disk); for resumed
-	// sub-agents it starts at len(snapshot.Messages) — the count of
-	// historic messages we just rewrote — so the new user prompt
-	// (which sub.AppendUser already added to sub.Messages) DOES get
-	// flushed when the first turn ends.
+	// Durable named children checkpoint on the producer before acknowledging
+	// their stable mailbox. Consumers only forward events in this mode. Legacy
+	// children retain advisory per-turn persistence for compatibility.
 	var transcript *agent.SubAgentTranscript
 	persistedOnDisk := 0
+	durableChild := handoffStore != nil && teammate != nil && !teammate.Anonymous
+	if durableChild && a.sessionDir == "" {
+		return &tools.Result{Output: "durable named sub-agent requires session persistence before it can receive handoffs", IsError: true}, nil
+	}
 	if a.sessionDir != "" && teammate != nil {
 		hdr := agent.NewSubAgentHeader(
 			teammate.AgentID,
@@ -1019,13 +1022,38 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			// `/agents resume` rebuilds the same posture.
 			string(subGate.Mode()),
 		)
-		t, err := agent.NewSubAgentTranscript(a.sessionDir, teammate.AgentID, hdr)
+		var t *agent.SubAgentTranscript
+		var err error
+		if durableChild && resumedSnapshot != nil {
+			t, err = agent.ResumeSubAgentTranscript(a.sessionDir, teammate.AgentID)
+			if err == nil {
+				// The earlier pre-admission snapshot can become stale while a
+				// producer in another process finishes. Reload under the acquired
+				// writer lease so a resume cannot reset away its final checkpoint.
+				latest, loadErr := agent.LoadSubAgentSnapshot(a.sessionDir, teammate.AgentID)
+				if loadErr != nil {
+					_ = t.Close()
+					err = loadErr
+				} else {
+					resumedSnapshot = latest
+					sub.Restore(latest.Messages)
+					sub.AppendUser(effectivePrompt)
+				}
+			}
+		} else if durableChild {
+			t, err = agent.NewDurableSubAgentTranscript(a.sessionDir, teammate.AgentID, hdr)
+		} else {
+			t, err = agent.NewSubAgentTranscript(a.sessionDir, teammate.AgentID, hdr)
+		}
+		if err != nil && durableChild {
+			return &tools.Result{Output: fmt.Sprintf("durable sub-agent transcript setup failed: %v", err), IsError: true}, nil
+		}
 		if err == nil {
 			transcript = t
 			// On resume, rewrite the recovered messages immediately so
 			// the file isn't a stub-with-header-only if the sub-agent
 			// errors before producing new output.
-			if resumedSnapshot != nil {
+			if resumedSnapshot != nil && !durableChild {
 				for _, m := range resumedSnapshot.Messages {
 					_ = transcript.AppendMessage(m)
 				}
@@ -1043,6 +1071,20 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			_ = transcript.Close()
 		}
 	}()
+	if durableChild {
+		if err := transcript.BindHandoff(handoffScope, teammate.Name); err != nil {
+			return &tools.Result{Output: fmt.Sprintf("durable sub-agent mailbox setup failed: %v", err), IsError: true}, nil
+		}
+		inbox, err := agent.NewDurablePeerInbox(handoffStore, handoffScope, teammate.Name)
+		if err != nil {
+			return &tools.Result{Output: fmt.Sprintf("durable sub-agent receiver setup failed: %v", err), IsError: true}, nil
+		}
+		sub.HistoryCheckpoint = transcript.Checkpoint
+		sub.DurablePeer = inbox
+		if err := sub.HistoryCheckpoint(sub.History()); err != nil {
+			return &tools.Result{Output: fmt.Sprintf("durable sub-agent initial checkpoint failed: %v", err), IsError: true}, nil
+		}
+	}
 
 	// Only an explicit numeric value overrides the configured fallback. Zero
 	// disables this child's cap, not a deadline inherited from its parent.
@@ -1699,7 +1741,7 @@ drainLoop:
 // the transcript and returns the new count. nil transcript → no-op.
 // On write failure we don't fail the run — persistence is advisory.
 func persistNewMessages(t *agent.SubAgentTranscript, sub *agent.Loop, idx int) int {
-	if t == nil {
+	if t == nil || sub.HistoryCheckpoint != nil {
 		return idx
 	}
 	hist := sub.History()

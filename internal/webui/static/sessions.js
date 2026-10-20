@@ -92,6 +92,7 @@ function applySelectedWorkspace(workspace, id) {
     else workspaces = workspaces.map(item => item.id === workspace.id ? workspace : item);
   }
   workspaces = workspaces.map(item => ({ ...item, active: item.id === activeWorkspaceId }));
+  if (typeof durableOpsWorkspaceChanged === 'function') durableOpsWorkspaceChanged(workspace && workspace.path || '');
   if (typeof refreshSelectedWorkspaceTitle === 'function') refreshSelectedWorkspaceTitle();
 }
 

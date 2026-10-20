@@ -7,11 +7,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Ricardo-M-L/metis/internal/learning"
 )
 
-// Store persists named workflows as JSON files under a directory
-// (typically ~/.metis/workflows). Named workflows let common multi-step
-// sequences (build→test→lint) be saved once and re-run by name.
+// Store reads the learning activation authority before legacy JSON baselines
+// (typically ~/.metis/workflows). Model proposals remain separate until a host
+// evaluation promotes them; legacy host-authored recipes remain supported.
 type Store struct {
 	dir string
 }
@@ -63,6 +65,24 @@ func (s *Store) Load(name string) (Workflow, error) {
 	if !validName(name) {
 		return Workflow{}, fmt.Errorf("invalid workflow name %q", name)
 	}
+	if learning.ValidateName(name) == nil {
+		state, err := s.LearningStore().Read(name)
+		if err == nil {
+			if state.Suspended {
+				return Workflow{}, fmt.Errorf("workflow %q suspended by host quality guard; host review and resume required", name)
+			}
+			if state.ActiveVersion == "" {
+				return Workflow{}, fmt.Errorf("workflow %q has only candidates; evaluate and promote before running", name)
+			}
+			v := state.Versions[state.ActiveVersion]
+			wf, err := ParseManifest(name, []byte(v.Content))
+			wf.VersionSHA256 = v.ID
+			return wf, err
+		}
+		if !os.IsNotExist(err) {
+			return Workflow{}, err
+		}
+	}
 	b, err := os.ReadFile(s.path(name))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -74,6 +94,7 @@ func (s *Store) Load(name string) (Workflow, error) {
 	if err := json.Unmarshal(b, &wf); err != nil {
 		return Workflow{}, fmt.Errorf("workflow %q is corrupt: %w", name, err)
 	}
+	wf.VersionSHA256 = learning.Digest(b)
 	return wf, nil
 }
 
@@ -92,6 +113,19 @@ func (s *Store) List() ([]string, error) {
 			continue
 		}
 		names = append(names, strings.TrimSuffix(e.Name(), ".json"))
+	}
+	states, err := s.LearningStore().List()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		seen[name] = true
+	}
+	for _, state := range states {
+		if state.ActiveVersion != "" && !seen[state.Name] {
+			names = append(names, state.Name)
+		}
 	}
 	sort.Strings(names)
 	return names, nil

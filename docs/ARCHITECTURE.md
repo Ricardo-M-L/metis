@@ -216,12 +216,20 @@ Two coordinator surfaces are distinct:
   and filters the current loop's tool palette to orchestration/read tools. Its
   `ProjectCoordinator` tool persists project runs, dependencies, worker claims,
   evidence, and failure recovery across sessions.
-- `metis coordinator create|list|status|add|run|claim|complete|fail|recover`
+- `metis coordinator create|list|status|add|run|claim|renew|configure|event|complete|fail|recover`
   is the durable CLI surface over the same workspace-bound graph. It starts
   with a research → synthesis → implementation → verification scaffold, lets a
   coordinator expand parallel work deliberately, and expires abandoned worker
   claims instead of leaving work permanently running. `dispatch|worker` remains
   available as the older mailbox transport for compatibility.
+
+Project workers renew fenced claims while running. Task state also owns
+deadlines, cumulative estimated spend, role profiles, delivery hashes and host
+acceptance records. Verification nodes execute CLI-configured checks outside the
+state-file lock, then revalidate ownership and delivery hashes before completing.
+External event IDs atomically create role-bound work and a verification node;
+event replay across processes does not create duplicate work. The event adapter
+does not provision workers or subscribe to external systems by itself.
 
 ### Cron and daemon processes
 

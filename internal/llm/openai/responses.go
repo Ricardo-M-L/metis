@@ -99,6 +99,11 @@ func (e *responsesRedactedError) Error() string { return e.message }
 func (e *responsesRedactedError) Unwrap() error { return e.classification }
 
 func responsesSafeClassification(err error) error {
+	if usage := transport.SafeUsageObserverClassification(err); usage != nil {
+		// Durable accounting failures must not become retryable through a
+		// surrounding network error or retain the callback's private cause.
+		return usage
+	}
 	var safe []error
 	var status *transport.HTTPStatusError
 	if errors.As(err, &status) {
@@ -129,10 +134,15 @@ func redactResponsesError(err error, exactValues ...string) error {
 	if err == nil {
 		return nil
 	}
-	safe := &responsesRedactedError{
-		message:        security.RedactValues(err.Error(), exactValues...),
-		classification: responsesSafeClassification(err),
+	classification := responsesSafeClassification(err)
+	var message string
+	var usage *transport.UsageObserverError
+	if errors.As(classification, &usage) {
+		message = usage.Error()
+	} else {
+		message = security.RedactValues(err.Error(), exactValues...)
 	}
+	safe := &responsesRedactedError{message: message, classification: classification}
 	// Retry exhaustion is itself a control-flow classification used by the
 	// agent loop. Rebuild it around the safe error rather than exposing its
 	// original, potentially credential-bearing cause.

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -84,6 +85,14 @@ type recoveryStream struct {
 func (s *recoveryStream) Close() error { defer s.release(); return s.StreamReader.Close() }
 
 func (l *Loop) consumeStreamWithRecovery(ctx context.Context, p llm.Provider, req llm.Request, stream llm.StreamReader, out chan<- Event, session *transport.RecoverySession) (assistant []llm.ContentBlock, stop string, usage *usageTotals, err error) {
+	return l.consumeStreamWithRecoveryUsage(ctx, p, req, stream, out, session, nil)
+}
+
+// Every stream attempt has separate billing metadata, even if its draft is
+// discarded. Persist it before admitting a retry. The returned usage remains
+// the last attempt's snapshot for active-context accounting, never the sum of
+// multiple copies of the same prompt.
+func (l *Loop) consumeStreamWithRecoveryUsage(ctx context.Context, p llm.Provider, req llm.Request, stream llm.StreamReader, out chan<- Event, session *transport.RecoverySession, accountUsage func(*usageTotals) error) (assistant []llm.ContentBlock, stop string, usage *usageTotals, err error) {
 	defer func() {
 		if err != nil && session != nil {
 			// Keep only human-readable prose for terminal-failure auditing.
@@ -101,11 +110,26 @@ func (l *Loop) consumeStreamWithRecovery(ctx context.Context, p llm.Provider, re
 	for {
 		assistant, stop, usage, err := l.consumeStream(ctx, stream, out)
 		_ = stream.Close()
+		if accountUsage != nil && usage != nil && (err == nil || *usage != (usageTotals{})) {
+			if ledgerErr := accountUsage(usage); ledgerErr != nil {
+				if err == nil {
+					// A completed response cannot authorize tools if its accounting
+					// boundary failed. Preserve the previous success-path behavior.
+					return nil, stop, usage, ledgerErr
+				}
+				// A failed durable write is terminal. Keep both causes without
+				// exposing a pure provider error for an outer task retry to hide it.
+				return assistant, stop, usage, errors.Join(err, ledgerErr)
+			}
+		}
 		if err == nil || session == nil {
 			return assistant, stop, usage, err
 		}
 		if ctx.Err() != nil {
 			return assistant, stop, usage, ctx.Err()
+		}
+		if l.Budget.Exceeded() {
+			return assistant, stop, usage, err
 		}
 		if !session.RecordFailure(err) {
 			return assistant, stop, usage, err
@@ -115,6 +139,11 @@ func (l *Loop) consumeStreamWithRecovery(ctx context.Context, p llm.Provider, re
 		emitRecoveryInfo(out, "Model stream interrupted; discarding the incomplete draft and retrying the same request. No tool from that draft was executed.")
 		if retryErr := session.WaitRetry(ctx); retryErr != nil {
 			return assistant, stop, usage, retryErr
+		}
+		// Parent and child loops share the tracker; another request may have
+		// exhausted it while this recovery session was backing off.
+		if l.Budget.Exceeded() {
+			return assistant, stop, usage, err
 		}
 		stream, err = openStreamWithRecovery(ctx, p, req, session)
 		if err != nil {

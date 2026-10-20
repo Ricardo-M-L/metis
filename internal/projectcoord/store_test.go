@@ -1,6 +1,7 @@
 package projectcoord
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -15,7 +16,7 @@ func TestRunPersistsGraphAndPromotesDependencies(t *testing.T) {
 	workspace := t.TempDir()
 	root := filepath.Join(t.TempDir(), "project-coordinator")
 	store := NewStore(root)
-	run, err := store.Create(CreateInput{Workspace: workspace, Goal: "Ship a durable coordinator"})
+	run, err := store.Create(CreateInput{Workspace: workspace, Goal: "Ship a durable coordinator", CheckCommands: []string{"exit 0"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +40,7 @@ func TestRunPersistsGraphAndPromotesDependencies(t *testing.T) {
 	if claimed.ID != "research" || claimed.Status != ItemRunning || claimed.Attempts != 1 {
 		t.Fatalf("claimed = %+v", claimed)
 	}
-	if _, err := reopened.Complete(workspace, run.ID, claimed.ID, "researcher", "Repository is a Go module; tests are available."); err != nil {
+	if _, err := reopened.Complete(context.Background(), workspace, run.ID, claimed.ID, CompletionInput{Worker: "researcher", Token: claimed.Lease.Token, Output: "Repository is a Go module; tests are available."}); err != nil {
 		t.Fatal(err)
 	}
 	progress, err := reopened.Get(workspace, run.ID)
@@ -58,7 +59,7 @@ func TestRunPersistsGraphAndPromotesDependencies(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := reopened.Complete(workspace, run.ID, item.ID, worker, "evidence from "+worker); err != nil {
+		if _, err := reopened.Complete(context.Background(), workspace, run.ID, item.ID, CompletionInput{Worker: worker, Token: item.Lease.Token, Output: "evidence from " + worker}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -98,7 +99,7 @@ func TestFailureIsDurableAndKnownEnvironmentRuleRecoversOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	failed, err := store.Fail(workspace, blockedRun.ID, item.ID, "worker-a", Failure{Code: "provider_rejected", Summary: "Provider rejected the request."}, "provider output")
+	failed, err := store.Fail(workspace, blockedRun.ID, item.ID, "worker-a", item.Lease.Token, Failure{Code: "provider_rejected", Summary: "Provider rejected the request."}, "provider output")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +129,7 @@ func TestFailureIsDurableAndKnownEnvironmentRuleRecoversOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	auto, err := store.Fail(workspace, knownRun.ID, knownItem.ID, "worker-b", Failure{
+	auto, err := store.Fail(workspace, knownRun.ID, knownItem.ID, "worker-b", knownItem.Lease.Token, Failure{
 		Code:    string(execution.FailureWorktreeRequiresGit),
 		Summary: "Git worktree isolation is unavailable because this workspace is not a Git repository.",
 	}, "the child requested worktree isolation")
@@ -220,7 +221,7 @@ func TestForcedRecoveryIsAvailableOnlyOnceAfterAttemptBudget(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.Fail(workspace, run.ID, item.ID, worker, Failure{Code: "provider_rejected", Summary: "Provider rejected this attempt."}, ""); err != nil {
+		if _, err := store.Fail(workspace, run.ID, item.ID, worker, item.Lease.Token, Failure{Code: "provider_rejected", Summary: "Provider rejected this attempt."}, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -254,7 +255,7 @@ func TestKnownProjectFailureAlsoUpdatesExecutionMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Fail(workspace, run.ID, item.ID, "worker", Failure{
+	if _, err := store.Fail(workspace, run.ID, item.ID, "worker", item.Lease.Token, Failure{
 		Code:            string(execution.FailureWorktreeRequiresGit),
 		Summary:         "Git worktree isolation is unavailable because this workspace is not a Git repository.",
 		SuggestedAction: "Use direct execution with the same working directory.",

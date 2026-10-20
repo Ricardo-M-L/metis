@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/execution"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/principal"
 	"github.com/Ricardo-M-L/metis/internal/projectcoord"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
@@ -25,6 +27,7 @@ type ProjectCoordinator struct {
 	store             *projectcoord.Store
 	defaultWorkspace  string
 	workspaceResolver func() string
+	principalResolver func(context.Context, string, string) (*principal.Binding, error)
 }
 
 // NewProjectCoordinator constructs the tool with an already configured,
@@ -46,9 +49,16 @@ func (p ProjectCoordinator) WithWorkspaceResolver(resolver func() string) Projec
 	return p
 }
 
+// WithPrincipalResolver lets the host resolve a persistent job without exposing
+// credential or CLI dependencies to this model-facing tool.
+func (p ProjectCoordinator) WithPrincipalResolver(resolver func(context.Context, string, string) (*principal.Binding, error)) ProjectCoordinator {
+	p.principalResolver = resolver
+	return p
+}
+
 func (ProjectCoordinator) Name() string { return "ProjectCoordinator" }
 func (ProjectCoordinator) Description() string {
-	return "Manage a durable project work graph across METIS sessions and workers. Create a project run, inspect its dependency-aware status, add focused work, claim one ready item for a worker, then record completion or a concrete failure/recovery. The graph retains execution-environment rules and stale-worker recovery."
+	return "Manage a durable project work graph across METIS sessions and workers. Claims return a lease token; renew it during long external work and pass it to complete/fail. Record concrete evidence, deliverables, failure and recovery. Verification requires host acceptance commands configured by the user through coordinator create/configure --check; model-written PASS text cannot replace those checks."
 }
 func (ProjectCoordinator) InputSchema() map[string]any {
 	return map[string]any{
@@ -57,7 +67,7 @@ func (ProjectCoordinator) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"action": map[string]any{
 				"type":        "string",
-				"enum":        []string{"create", "list", "status", "add_work", "claim_next", "complete", "fail", "recover"},
+				"enum":        []string{"create", "list", "status", "add_work", "claim_next", "renew", "complete", "fail", "recover"},
 				"description": "create a run, list/status it, add a graph node, claim ready work, or record a lifecycle transition",
 			},
 			"workspace": map[string]any{"type": "string", "description": "absolute project directory; omit to use the active workspace"},
@@ -68,11 +78,17 @@ func (ProjectCoordinator) InputSchema() map[string]any {
 				"type": "string", "enum": []string{"research", "synthesis", "implementation", "verification", "custom"},
 				"description": "phase for add_work (default custom)",
 			},
-			"subject":      map[string]any{"type": "string", "description": "short work title for add_work"},
-			"prompt":       map[string]any{"type": "string", "description": "focused worker instruction for add_work"},
-			"depends_on":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "work-item IDs that must complete first"},
-			"max_attempts": map[string]any{"type": "integer", "minimum": 1, "maximum": 10, "description": "attempt budget for add_work; default 2"},
-			"worker":       map[string]any{"type": "string", "description": "worker identity for claim/complete/fail"},
+			"subject":        map[string]any{"type": "string", "description": "short work title for add_work"},
+			"prompt":         map[string]any{"type": "string", "description": "focused worker instruction for add_work"},
+			"depends_on":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "work-item IDs that must complete first"},
+			"max_attempts":   map[string]any{"type": "integer", "minimum": 1, "maximum": 10, "description": "attempt budget for add_work; default 2"},
+			"agent_profile":  map[string]any{"type": "string", "description": "saved agent profile for add_work"},
+			"job_id":         map[string]any{"type": "string", "description": "persistent job to execute add_work; host freezes its role, permissions, route and lifetime budget"},
+			"deadline":       map[string]any{"type": "string", "description": "absolute RFC3339 deadline for create/add_work"},
+			"max_budget_usd": map[string]any{"type": "number", "minimum": 0, "description": "persistent estimated USD cap for create/add_work; zero is unlimited"},
+			"deliverables":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "required workspace-relative output files for add_work"},
+			"worker":         map[string]any{"type": "string", "description": "worker identity for claim/complete/fail"},
+			"lease_token":    map[string]any{"type": "string", "description": "claim token returned by claim_next; required for renew, complete and fail"},
 			"lease_seconds": map[string]any{"type": "integer", "minimum": 1, "maximum": 86400,
 				"description": "claim duration; expired claims are automatically requeued"},
 			"output":           map[string]any{"type": "string", "description": "durable worker result/evidence for complete or fail"},
@@ -103,8 +119,13 @@ func (p ProjectCoordinator) Execute(ctx context.Context, input map[string]any) (
 	}
 	switch action {
 	case "create":
+		deadline, err := projectDeadline(input)
+		if err != nil {
+			return nil, err
+		}
 		goal, _ := input["goal"].(string)
-		run, err := p.store.Create(projectcoord.CreateInput{Workspace: workspace, Goal: goal})
+		maxBudget, _ := input["max_budget_usd"].(float64)
+		run, err := p.store.Create(projectcoord.CreateInput{Workspace: workspace, Goal: goal, DeadlineAt: deadline, MaxBudgetUSD: maxBudget})
 		if err != nil {
 			return nil, err
 		}
@@ -130,17 +151,52 @@ func (p ProjectCoordinator) Execute(ctx context.Context, input map[string]any) (
 		}
 		return projectCoordinatorResult(map[string]any{"run": compactProjectRun(run)})
 	case "add_work":
+		deadline, err := projectDeadline(input)
+		if err != nil {
+			return nil, err
+		}
 		runID, err := requiredProjectString(input, "run_id")
 		if err != nil {
 			return nil, err
 		}
+		maxBudget, _ := input["max_budget_usd"].(float64)
+		profile := stringProjectValue(input, "agent_profile")
+		var binding *principal.Binding
+		if jobID := stringProjectValue(input, "job_id"); jobID != "" {
+			if p.principalResolver == nil {
+				return nil, fmt.Errorf("persistent job assignment is unavailable in this runtime")
+			}
+			binding, err = p.principalResolver(ctx, workspace, jobID)
+			if err != nil {
+				return nil, err
+			}
+			if binding == nil || binding.JobID != jobID {
+				return nil, fmt.Errorf("persistent job resolver returned a different job identity")
+			}
+			canonicalWorkspace, err := execution.CanonicalWorkspace(workspace)
+			if err != nil {
+				return nil, err
+			}
+			if err := principal.ValidateBinding(binding, canonicalWorkspace); err != nil {
+				return nil, err
+			}
+			if profile != "" && profile != binding.Definition.Profile.Name {
+				return nil, fmt.Errorf("agent_profile conflicts with the persistent job's frozen role")
+			}
+			profile = binding.Definition.Profile.Name
+		}
 		item, err := p.store.AddWorkItem(workspace, runID, projectcoord.WorkItemInput{
-			ID:          stringProjectValue(input, "item_id"),
-			Phase:       projectcoord.Phase(defaultProjectValue(input, "phase", string(projectcoord.PhaseCustom))),
-			Subject:     stringProjectValue(input, "subject"),
-			Prompt:      stringProjectValue(input, "prompt"),
-			DependsOn:   projectStringSlice(input["depends_on"]),
-			MaxAttempts: projectInt(input, "max_attempts", 0),
+			ID:               stringProjectValue(input, "item_id"),
+			Phase:            projectcoord.Phase(defaultProjectValue(input, "phase", string(projectcoord.PhaseCustom))),
+			Subject:          stringProjectValue(input, "subject"),
+			Prompt:           stringProjectValue(input, "prompt"),
+			DependsOn:        projectStringSlice(input["depends_on"]),
+			MaxAttempts:      projectInt(input, "max_attempts", 0),
+			AgentProfile:     profile,
+			PrincipalBinding: binding,
+			DeadlineAt:       deadline,
+			MaxBudgetUSD:     maxBudget,
+			Deliverables:     projectStringSlice(input["deliverables"]),
 		})
 		if err != nil {
 			return nil, err
@@ -167,12 +223,22 @@ func (p ProjectCoordinator) Execute(ctx context.Context, input map[string]any) (
 			return nil, err
 		}
 		return projectCoordinatorResult(map[string]any{"item": compactProjectItem(item), "worker_prompt": projectcoord.BuildWorkerPrompt(run, item)})
+	case "renew":
+		runID, itemID, err := projectRunAndItem(input)
+		if err != nil {
+			return nil, err
+		}
+		item, err := p.store.Renew(workspace, runID, itemID, stringProjectValue(input, "worker"), stringProjectValue(input, "lease_token"), time.Duration(projectInt(input, "lease_seconds", 15*60))*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		return projectCoordinatorResult(map[string]any{"item": compactProjectItem(item)})
 	case "complete":
 		runID, itemID, err := projectRunAndItem(input)
 		if err != nil {
 			return nil, err
 		}
-		item, err := p.store.Complete(workspace, runID, itemID, stringProjectValue(input, "worker"), stringProjectValue(input, "output"))
+		item, err := p.store.Complete(ctx, workspace, runID, itemID, projectcoord.CompletionInput{Worker: stringProjectValue(input, "worker"), Token: stringProjectValue(input, "lease_token"), Output: stringProjectValue(input, "output")})
 		if err != nil {
 			return nil, err
 		}
@@ -182,7 +248,7 @@ func (p ProjectCoordinator) Execute(ctx context.Context, input map[string]any) (
 		if err != nil {
 			return nil, err
 		}
-		item, err := p.store.Fail(workspace, runID, itemID, stringProjectValue(input, "worker"), projectcoord.Failure{
+		item, err := p.store.Fail(workspace, runID, itemID, stringProjectValue(input, "worker"), stringProjectValue(input, "lease_token"), projectcoord.Failure{
 			Code:            defaultProjectValue(input, "failure_code", projectcoord.FailureWorkerExecution),
 			Summary:         stringProjectValue(input, "failure_summary"),
 			SuggestedAction: stringProjectValue(input, "suggested_action"),
@@ -308,13 +374,17 @@ func projectStringSlice(value any) []string {
 // coordinator context.  Full evidence remains durable in the state file and
 // the direct prerequisite excerpt is supplied only when claim_next needs it.
 type projectRunView struct {
-	ID          string                 `json:"id"`
-	Workspace   string                 `json:"workspace"`
-	Goal        string                 `json:"goal"`
-	Status      projectcoord.RunStatus `json:"status"`
-	Environment projectEnvironmentView `json:"environment"`
-	Items       []projectWorkItemView  `json:"items"`
-	UpdatedAt   time.Time              `json:"updated_at"`
+	ID             string                 `json:"id"`
+	Workspace      string                 `json:"workspace"`
+	Goal           string                 `json:"goal"`
+	Status         projectcoord.RunStatus `json:"status"`
+	Environment    projectEnvironmentView `json:"environment"`
+	Items          []projectWorkItemView  `json:"items"`
+	UpdatedAt      time.Time              `json:"updated_at"`
+	DeadlineAt     time.Time              `json:"deadline_at,omitempty"`
+	MaxBudgetUSD   float64                `json:"max_budget_usd,omitempty"`
+	SpentUSD       float64                `json:"spent_usd,omitempty"`
+	HostCheckCount int                    `json:"host_check_count"`
 }
 
 type projectEnvironmentView struct {
@@ -324,16 +394,26 @@ type projectEnvironmentView struct {
 }
 
 type projectWorkItemView struct {
-	ID          string                  `json:"id"`
-	Phase       projectcoord.Phase      `json:"phase"`
-	Subject     string                  `json:"subject"`
-	Status      projectcoord.ItemStatus `json:"status"`
-	DependsOn   []string                `json:"depends_on,omitempty"`
-	Owner       string                  `json:"owner,omitempty"`
-	Attempts    int                     `json:"attempts"`
-	MaxAttempts int                     `json:"max_attempts"`
-	Output      string                  `json:"output_excerpt,omitempty"`
-	Failure     *projectcoord.Failure   `json:"failure,omitempty"`
+	ID           string                       `json:"id"`
+	Phase        projectcoord.Phase           `json:"phase"`
+	Subject      string                       `json:"subject"`
+	Status       projectcoord.ItemStatus      `json:"status"`
+	DependsOn    []string                     `json:"depends_on,omitempty"`
+	Owner        string                       `json:"owner,omitempty"`
+	Lease        *projectcoord.Lease          `json:"lease,omitempty"`
+	Attempts     int                          `json:"attempts"`
+	MaxAttempts  int                          `json:"max_attempts"`
+	Output       string                       `json:"output_excerpt,omitempty"`
+	Failure      *projectcoord.Failure        `json:"failure,omitempty"`
+	AgentProfile string                       `json:"agent_profile,omitempty"`
+	JobID        string                       `json:"job_id,omitempty"`
+	Handoff      *projectcoord.HandoffBinding `json:"handoff,omitempty"`
+	DeadlineAt   time.Time                    `json:"deadline_at,omitempty"`
+	MaxBudgetUSD float64                      `json:"max_budget_usd,omitempty"`
+	SpentUSD     float64                      `json:"spent_usd,omitempty"`
+	Deliverables []string                     `json:"deliverables,omitempty"`
+	Artifacts    []projectcoord.Artifact      `json:"artifacts,omitempty"`
+	Acceptance   *projectcoord.Acceptance     `json:"acceptance,omitempty"`
 }
 
 func compactProjectRun(run projectcoord.Run) projectRunView {
@@ -346,8 +426,12 @@ func compactProjectRun(run projectcoord.Run) projectRunView {
 			GitRepository:  run.Environment.IsGitRepository,
 			LinkedWorktree: run.Environment.IsLinkedWorktree,
 		},
-		UpdatedAt: run.UpdatedAt,
-		Items:     make([]projectWorkItemView, 0, len(run.Items)),
+		UpdatedAt:      run.UpdatedAt,
+		DeadlineAt:     run.DeadlineAt,
+		MaxBudgetUSD:   run.MaxBudgetUSD,
+		SpentUSD:       run.SpentUSD,
+		HostCheckCount: len(run.CheckCommands),
+		Items:          make([]projectWorkItemView, 0, len(run.Items)),
 	}
 	if run.Environment.LastFailure != nil {
 		view.Environment.RememberedRule = run.Environment.LastFailure.Summary
@@ -360,21 +444,45 @@ func compactProjectRun(run projectcoord.Run) projectRunView {
 
 func compactProjectItem(item projectcoord.WorkItem) projectWorkItemView {
 	view := projectWorkItemView{
-		ID:          item.ID,
-		Phase:       item.Phase,
-		Subject:     item.Subject,
-		Status:      item.Status,
-		DependsOn:   append([]string(nil), item.DependsOn...),
-		Owner:       item.Owner,
-		Attempts:    item.Attempts,
-		MaxAttempts: item.MaxAttempts,
-		Output:      projectExcerpt(item.Output, 6000),
+		ID:           item.ID,
+		Phase:        item.Phase,
+		Subject:      item.Subject,
+		Status:       item.Status,
+		DependsOn:    append([]string(nil), item.DependsOn...),
+		Owner:        item.Owner,
+		Lease:        item.Lease,
+		Attempts:     item.Attempts,
+		MaxAttempts:  item.MaxAttempts,
+		Output:       projectExcerpt(item.Output, 6000),
+		AgentProfile: item.AgentProfile,
+		DeadlineAt:   item.DeadlineAt,
+		MaxBudgetUSD: item.MaxBudgetUSD,
+		SpentUSD:     item.SpentUSD,
+		Deliverables: item.Deliverables,
+		Artifacts:    item.Artifacts,
+		Acceptance:   item.Acceptance,
+	}
+	view.Handoff = item.Handoff
+	if item.PrincipalBinding != nil {
+		view.JobID = item.PrincipalBinding.JobID
 	}
 	if item.Failure != nil {
 		failure := *item.Failure
 		view.Failure = &failure
 	}
 	return view
+}
+
+func projectDeadline(input map[string]any) (time.Time, error) {
+	value := stringProjectValue(input, "deadline")
+	if value == "" {
+		return time.Time{}, nil
+	}
+	deadline, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("deadline must be RFC3339: %w", err)
+	}
+	return deadline, nil
 }
 
 func projectExcerpt(value string, limit int) string {

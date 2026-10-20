@@ -51,9 +51,11 @@ type Loader struct {
 	// disables ActivateOn filtering — every skill is always-on.
 	Cwd string
 
-	mu    sync.RWMutex
-	cache []Skill
-	dirty bool
+	mu               sync.RWMutex
+	cache            []Skill
+	dirty            bool
+	learningDir      string
+	learningRevision string
 }
 
 // NewLoader builds the standard loader (bundled / optional / user /
@@ -102,7 +104,7 @@ func NewLoaderWithUniversal(userDir, projectDir, optionalDir, universalDir strin
 		layers = append(layers, dirLayer("universal", 8, universalDir, pubskill.TrustCommunity))
 	}
 	if userDir != "" {
-		layers = append(layers, dirLayer("user", 10, userDir, pubskill.TrustUser))
+		layers = append(layers, learningUserLayer(userDir))
 	}
 	if projectDir != "" {
 		layers = append(layers, dirLayer("project", 20, projectDir, pubskill.TrustProject))
@@ -113,10 +115,11 @@ func NewLoaderWithUniversal(userDir, projectDir, optionalDir, universalDir strin
 	sort.Slice(layers, func(i, j int) bool { return layers[i].Priority < layers[j].Priority })
 	cwd, _ := os.Getwd()
 	return &Loader{
-		Layers: layers,
-		Logger: func(string, ...any) {},
-		Cwd:    cwd,
-		dirty:  true,
+		Layers:      layers,
+		Logger:      func(string, ...any) {},
+		Cwd:         cwd,
+		dirty:       true,
+		learningDir: userDir,
 	}
 }
 
@@ -232,6 +235,15 @@ func pathPatternMatch(pattern, path string) bool {
 // resolved by priority (later layer wins). Cache is populated once per
 // Invalidate cycle.
 func (l *Loader) List() ([]Skill, error) {
+	if l.learningDir != "" {
+		stamp := learningStamp(l.learningDir)
+		l.mu.Lock()
+		if stamp != l.learningRevision {
+			l.learningRevision = stamp
+			l.dirty = true
+		}
+		l.mu.Unlock()
+	}
 	l.mu.RLock()
 	if !l.dirty && l.cache != nil {
 		out := append([]Skill(nil), l.cache...)

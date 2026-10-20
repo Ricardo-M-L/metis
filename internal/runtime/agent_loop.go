@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
-	"github.com/Ricardo-M-L/metis/internal/budget"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -201,7 +200,7 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	// Sub-agent builders share the parent's tracker pointer instead of
 	// calling this path (see builtin/agent.go).
 	if opts.MaxBudgetUSD > 0 {
-		loop.Budget = budget.NewTrackerLazy(opts.MaxBudgetUSD, modelRatesResolver(opts.Model))
+		loop.Budget = NewBudgetTracker(opts.MaxBudgetUSD, opts.Model)
 	}
 	if len(opts.SystemSections) > 0 {
 		loop.SystemSections = toLLMSections(opts.SystemSections)

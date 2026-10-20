@@ -9,9 +9,11 @@
 package execution
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -19,7 +21,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/jobs"
 )
+
+const environmentProbeTimeout = 5 * time.Second
 
 // FailureCode identifies an environment constraint. Values are stable because
 // they are persisted and may later be rendered in the Desktop trace.
@@ -90,6 +96,21 @@ func NewStore(dir string) *Store { return &Store{dir: strings.TrimSpace(dir)} }
 // `git init` between two turns, and an old non-Git observation must never
 // permanently suppress valid worktree isolation.
 func Probe(workspace string) (Profile, error) {
+	return ProbeContext(context.Background(), workspace)
+}
+
+// ProbeContext shares one deadline across the complete Git observation. A
+// cancelled or timed out observation is an error, never evidence that a known
+// repository became a non-Git workspace.
+func ProbeContext(ctx context.Context, workspace string) (Profile, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, environmentProbeTimeout)
+	defer cancel()
+	if err := probeCtx.Err(); err != nil {
+		return Profile{}, err
+	}
 	canonical, err := CanonicalWorkspace(workspace)
 	if err != nil {
 		return Profile{}, err
@@ -99,18 +120,37 @@ func Probe(workspace string) (Profile, error) {
 		Workspace:  canonical,
 		ObservedAt: time.Now().UTC(),
 	}
-	root, err := gitOutput(canonical, "rev-parse", "--show-toplevel")
+	root, err := gitOutputContext(probeCtx, canonical, "rev-parse", "--show-toplevel")
+	if incomplete := incompleteProbeError(probeCtx, err); incomplete != nil {
+		return Profile{}, incomplete
+	}
 	if err != nil {
 		return profile, nil
 	}
 	profile.IsGitRepository = true
 	profile.GitRoot = canonicalPath(root)
-	gitDir, gitDirErr := gitOutput(canonical, "rev-parse", "--path-format=absolute", "--absolute-git-dir")
-	commonDir, commonErr := gitOutput(canonical, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	gitDir, gitDirErr := gitOutputContext(probeCtx, canonical, "rev-parse", "--path-format=absolute", "--absolute-git-dir")
+	if incomplete := incompleteProbeError(probeCtx, gitDirErr); incomplete != nil {
+		return Profile{}, incomplete
+	}
+	commonDir, commonErr := gitOutputContext(probeCtx, canonical, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if incomplete := incompleteProbeError(probeCtx, commonErr); incomplete != nil {
+		return Profile{}, incomplete
+	}
 	if gitDirErr == nil && commonErr == nil {
 		profile.IsLinkedWorktree = canonicalPath(gitDir) != canonicalPath(commonDir)
 	}
 	return profile, nil
+}
+
+func incompleteProbeError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return fmt.Errorf("Git environment probe could not join its output: %w", err)
+	}
+	return nil
 }
 
 // CanonicalWorkspace validates an existing directory and produces the stable
@@ -252,10 +292,19 @@ func (s *Store) pathFor(canonical string) string {
 	return filepath.Join(s.dir, hex.EncodeToString(digest[:])+".json")
 }
 
-func gitOutput(dir string, args ...string) (string, error) {
-	command := exec.Command("git", append([]string{"-C", dir}, args...)...)
+func gitOutputContext(ctx context.Context, dir string, args ...string) (string, error) {
+	command := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	jobs.ApplyProcessGroup(command)
+	command.Cancel = func() error {
+		jobs.KillProcessGroup(command.Process)
+		return nil
+	}
+	// A wrapper can exit while a descendant retains stdout. Bound draining as
+	// well as execution and remove the owned group before returning.
+	command.WaitDelay = time.Second
 	command.Stderr = nil
 	output, err := command.Output()
+	jobs.KillProcessGroup(command.Process)
 	return strings.TrimSpace(string(output)), err
 }
 

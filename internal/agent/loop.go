@@ -61,7 +61,8 @@ type Loop struct {
 	// durations after the fact. nil = not recorded.
 	TimingSink func(tool string, elapsed time.Duration, isError bool)
 
-	System string
+	System            string
+	principalIdentity string // immutable host identity, independent of prompt rebinding
 	// RecoverTextToolCalls enables one safe compatibility retry when a model
 	// returns a whole XML-like tool call as plain assistant text. The retry never
 	// executes or parses the text arguments; it asks the provider to re-emit the
@@ -396,6 +397,9 @@ type Loop struct {
 	// since the last turn. nil for the top-level user loop (which
 	// has no Roster entry) and for headless tests.
 	PeerInbox <-chan PeerMessage
+	// DurablePeer receives persisted cross-process handoffs. A receiver may
+	// acknowledge only after HistoryCheckpoint has saved the exact envelope.
+	DurablePeer *DurablePeerInbox
 
 	// subAgentNotify is the internal channel used to receive completion
 	// signals from background sub-agents. Both ends are created in
@@ -827,6 +831,15 @@ func (l *Loop) checkpointHistory() error {
 	return nil
 }
 
+// SetPrincipalIdentity attaches host-owned identity to every provider request,
+// including after an asynchronous prompt/provider refresh.
+func (l *Loop) SetPrincipalIdentity(body string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.principalIdentity = body
+	l.invalidateActiveContextLocked()
+}
+
 // EstimateContextTokens returns the active provider context plus any local
 // messages appended since the last response and the latest request-overhead
 // delta. Providers that do not report usable prompt usage fall back to the
@@ -888,6 +901,12 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 	activeBase, hasActiveSnapshot := l.activeContextBaseLocked()
 	system := l.System
 	sections := append([]llm.SystemSection(nil), l.SystemSections...)
+	if l.principalIdentity != "" {
+		system += "\n\n" + l.principalIdentity
+		if len(sections) > 0 {
+			sections = append(sections, llm.SystemSection{Name: "principal_identity", Body: l.principalIdentity, Cache: true})
+		}
+	}
 	planMode := l.planMode
 	planPrompt := l.PlanSystemPrompt
 	planBodiesToRemove := make([]string, 0, 2)
@@ -1540,6 +1559,9 @@ func (l *Loop) IterIdx() int {
 //  8. Append assistant + tool_results, emit TurnEnd
 //  9. Loop-detect / max-iter / grace-call checks
 func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
+	if l.DurablePeer != nil {
+		ctx = WithAgentName(ctx, l.DurablePeer.Recipient)
+	}
 	finish := func() {}
 	if l.OnRunFinished != nil {
 		finish = sync.OnceFunc(l.OnRunFinished)
@@ -1682,7 +1704,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		emit(ctx, out, Event{Kind: EventError, Err: err})
 		return err
 	}
-	specs := l.toolSpecs()
+	specs := l.toolSpecsWithContext(ctx)
 	l.contract.verifyUnavailable = !l.verifierDispatchAvailable()
 	verificationAttempts := 0
 	graceUsed := 0
@@ -1807,7 +1829,10 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		// jobs finished (and whether to BashOutput-read the result),
 		// matching claude-code's <task_notification> envelope.
 		clearCompletedBackgroundJobs(awaitedBackgroundJobs, l.injectJobNotificationsForAwaited(ctx, out, awaitedBackgroundJobs))
-		l.injectPeerMessages(ctx, out)
+		if err := l.injectPeerMessages(ctx, out); err != nil {
+			emit(ctx, out, Event{Kind: EventError, Err: err})
+			return err
+		}
 		l.injectSubAgentNotifications(ctx, out)
 		l.injectDreamNotifications(ctx, out)
 		// Same pattern for Monitor pattern-matches — pulls every
@@ -1863,7 +1888,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
 		}
-		specs = l.toolSpecs()
+		specs = l.toolSpecsWithContext(ctx)
 		pressureTokens := l.EstimateRequestContextTokens(specs)
 		l.maybeCompactWithPressure(ctx, out, pressureTokens)
 		// Automatic compaction may recover from a summarizer failure, but a
@@ -1932,7 +1957,30 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				return err
 			}
 		}
-		assistant, stop, usage, err := l.consumeStreamWithRecovery(recoveryCtx, provider, req, stream, out, recoverySession)
+		accountUsage := func(reported *usageTotals) error {
+			runOutputTokens += reported.out
+			if l.CacheStats != nil {
+				l.CacheStats.Add(CacheStat{
+					Turn: runIter, Input: reported.in, Output: reported.out,
+					CacheCreate: reported.cacheCreate, CacheRead: reported.cacheRead,
+					Fingerprint: FingerprintRequest(req),
+				})
+			}
+			emit(ctx, out, Event{
+				Kind: EventTokens, InputTokens: reported.in, OutputTokens: reported.out,
+				CacheCreationInputTokens: reported.cacheCreate, CacheReadInputTokens: reported.cacheRead,
+			})
+			// The physical ledger is the sole writer for observed requests. A
+			// second legacy spend entry would become an uncorrectable floor after
+			// a final usage correction or authoritative receipt refund.
+			if !transport.HasUsageObserver(recoveryCtx) {
+				if err := l.Budget.AddUsage(reported.in, reported.out, reported.cacheRead, reported.cacheCreate); err != nil {
+					return fmt.Errorf("persist task spend: %w", err)
+				}
+			}
+			return nil
+		}
+		assistant, stop, usage, err := l.consumeStreamWithRecoveryUsage(recoveryCtx, provider, req, stream, out, recoverySession, accountUsage)
 		if err != nil {
 			if len(assistant) > 0 {
 				for i := range assistant {
@@ -1949,27 +1997,6 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			l.Hooks.EmitError(ctx, tc, err)
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
-		}
-		if usage != nil {
-			runOutputTokens += usage.out
-			if l.CacheStats != nil {
-				l.CacheStats.Add(CacheStat{
-					Turn:        runIter,
-					Input:       usage.in,
-					Output:      usage.out,
-					CacheCreate: usage.cacheCreate,
-					CacheRead:   usage.cacheRead,
-					Fingerprint: FingerprintRequest(req),
-				})
-			}
-			emit(ctx, out, Event{
-				Kind:                     EventTokens,
-				InputTokens:              usage.in,
-				OutputTokens:             usage.out,
-				CacheCreationInputTokens: usage.cacheCreate,
-				CacheReadInputTokens:     usage.cacheRead,
-			})
-			l.Budget.AddUsage(usage.in, usage.out, usage.cacheRead, usage.cacheCreate)
 		}
 		// A rescue request advertised no tools. If a provider nevertheless
 		// returns a tool_use block, never dispatch it: doing so would violate the
@@ -3140,6 +3167,12 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, conte
 					system += section.Body
 				}
 			}
+		}
+	}
+	if l.principalIdentity != "" {
+		system += "\n\n" + l.principalIdentity
+		if len(sections) > 0 {
+			sections = append(sections, llm.SystemSection{Name: "principal_identity", Body: l.principalIdentity, Cache: true})
 		}
 	}
 	// BypassNextCache: when /break-cache is invoked, the next request

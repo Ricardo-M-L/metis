@@ -60,6 +60,9 @@ func TestWorkflowTool_RunInlineStopsAndFlagsError(t *testing.T) {
 
 func TestWorkflowTool_SaveRunNamedList(t *testing.T) {
 	store := workflow.NewStore(t.TempDir())
+	if err := store.Save(workflow.Workflow{Name: "greet", Steps: []workflow.Step{{Name: "hi", Command: "echo host-baseline"}}}); err != nil {
+		t.Fatal(err)
+	}
 	w := NewWorkflow(permission.New(permission.ModeBypass), store)
 
 	save, err := w.Execute(context.Background(), map[string]any{
@@ -70,9 +73,12 @@ func TestWorkflowTool_SaveRunNamedList(t *testing.T) {
 	if err != nil || save.IsError {
 		t.Fatalf("save failed: %v / %s", err, save.Output)
 	}
+	if !strings.Contains(save.Output, "Staged workflow") {
+		t.Fatalf("save did not stage a candidate: %s", save.Output)
+	}
 
 	run, _ := w.Execute(context.Background(), map[string]any{"operation": "run_named", "name": "greet"})
-	if run.IsError || !strings.Contains(run.Output, "saved-and-run") {
+	if run.IsError || !strings.Contains(run.Output, "host-baseline") || strings.Contains(run.Output, "saved-and-run") {
 		t.Errorf("run_named: %s", run.Output)
 	}
 

@@ -12,12 +12,14 @@ package builtin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	skillsloader "github.com/Ricardo-M-L/metis/internal/agent/skills"
+	"github.com/Ricardo-M-L/metis/internal/learning"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -239,7 +241,7 @@ func (s Skill) getSkill(name string) (*tools.Result, error) {
 	return &tools.Result{Output: string(out)}, nil
 }
 
-func (s Skill) invokeSkill(ctx context.Context, name string) (*tools.Result, error) {
+func (s Skill) invokeSkill(ctx context.Context, name string) (result *tools.Result, resultErr error) {
 	if name == "" {
 		return &tools.Result{Output: "Skill invoke: name required", IsError: true}, nil
 	}
@@ -249,6 +251,21 @@ func (s Skill) invokeSkill(ctx context.Context, name string) (*tools.Result, err
 	}
 	if sk == nil {
 		return &tools.Result{Output: "skill not found: " + name, IsError: true}, nil
+	}
+	if sk.LearningVersionSHA256 != "" {
+		finish, err := learning.BeginInvocation(ctx, learning.Invocation{Kind: "skill", ArtifactRoot: s.userDir, Name: sk.Name, VersionSHA256: sk.LearningVersionSHA256, ActivationEpoch: sk.LearningActivationEpoch})
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if result != nil && resultErr == nil {
+				data, err := json.Marshal(result)
+				if err == nil {
+					err = finish(ctx, data)
+				}
+				resultErr = errors.Join(resultErr, err)
+			}
+		}()
 	}
 
 	// Best-effort uses-counter increment: only meaningful for skills the

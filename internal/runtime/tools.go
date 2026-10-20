@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/principal"
 	"github.com/Ricardo-M-L/metis/internal/projectcoord"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/session"
@@ -106,6 +108,10 @@ type ToolRegistryOptions struct {
 	// Desktop uses it to follow the active session header without rebuilding the
 	// whole tool registry on every session switch.
 	ProjectWorkspaceResolver func() string
+	// ProjectPrincipalResolver resolves an explicit job identity through the
+	// host's immutable role, workspace and admission policy. Embedders that
+	// omit it retain the existing profile-only project coordination surface.
+	ProjectPrincipalResolver func(context.Context, string, string) (*principal.Binding, error)
 }
 
 // BuildToolRegistry constructs the per-session tools.Registry, registers
@@ -155,6 +161,9 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 		projectTool := builtin.NewProjectCoordinator(opts.Gate, projectStore, workspace)
 		if opts.ProjectWorkspaceResolver != nil {
 			projectTool = projectTool.WithWorkspaceResolver(opts.ProjectWorkspaceResolver)
+		}
+		if opts.ProjectPrincipalResolver != nil {
+			projectTool = projectTool.WithPrincipalResolver(opts.ProjectPrincipalResolver)
 		}
 		reg.Register(projectTool)
 	}

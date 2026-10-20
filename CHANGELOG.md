@@ -7,6 +7,45 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- Requeue unfinished coordinator work on normal process cancellation within its
+  attempt budget, and release cross-process state locks immediately when their
+  holder exits, including after a crash.
+- Return exit code 11 from coordinator runs when a worker fails or the durable
+  project is blocked/cancelled, including when JSON output was requested.
+
+- Renew durable coordinator claims during worker execution and acceptance, cancel
+  workers that lose ownership, and fence completion/failure with per-claim tokens.
+- Reject empty or explicitly incomplete coordinator results and require actual
+  host checks before verification nodes can complete.
+
+### Added
+
+- Ship a matching CLI inside Metis Desktop, with a signed macOS app resource
+  and embedded Linux/Windows runtimes, so Desktop does not require a separate
+  CLI installation. Update and roll back the application and its runtime together.
+
+- Archive completed coordinator operations and settled job history while keeping
+  replay identities, unresolved holds and lifetime budgets intact; expose safe
+  storage capacity counters in the Desktop Jobs page.
+- Persist queued-job waiting reasons, add host-evidenced learning quality gates
+  with exact-version rollback, and evaluate opt-in Python code fixtures with
+  immutable host tests in an isolated environment.
+- Reconcile native OpenRouter bills and read-only CLIProxyGUI token receipts;
+  distinguish authoritative amounts from catalogue estimates and unknown cost.
+- Manage persistent jobs, handoff receipts, unsettled requests, uncertain writes
+  and learning versions from a workspace-bound Desktop Jobs page.
+
+- Receive authenticated local events with `coordinator serve`, automatically
+  execute ready work in supervised CLI workers, and continue the same durable
+  graph after restart. Bind event execution and verification to saved profiles.
+- Emit bounded worker supervision responses with `coordinator run --summary-json`.
+- Persist task deadlines, estimated USD budgets and attempt usage across restart
+  and retry, together with declared delivery hashes and host acceptance records.
+- Route deduplicated external events to saved agent profiles and add independent
+  verification work; expose `coordinator renew`, `configure` and `event` commands.
+
 ## [0.4.90] - 2026-10-15
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
@@ -39,10 +78,6 @@ without Apple notarization.
   through verified Zhipu/Z.AI model records instead of proxy compatibility defaults.
 
 ### Added
-
-- Ship a matching CLI inside Metis Desktop, with a signed macOS app resource
-  and embedded Linux/Windows runtimes, so Desktop does not require a separate
-  CLI installation. Update and roll back the application and its runtime together.
 
 - Configure per-model automatic or manual context budgets in Desktop settings,
   shared with CLI diagnostics and automatic compaction.

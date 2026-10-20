@@ -238,11 +238,26 @@ func collectHeadlessEvents(run func(events chan<- agent.Event) error) (string, e
 // runHeadlessOneShot is shared by the daemon and coordinator worker. A single
 // implementation keeps their cancellation/channel-close behavior identical
 // and establishes exactly one success durability boundary per task.
-func runHeadlessOneShot(ctx context.Context, r *runtime, prompt, source string) (string, error) {
+func runHeadlessOneShot(ctx context.Context, r *runtime, prompt, source string) (text string, resultErr error) {
 	if r == nil || r.loop == nil {
 		return "", fmt.Errorf("%s: runtime loop is unavailable", source)
 	}
+	checkpoint := newHeadlessCheckpoint(r.loop, r.store, r.sessionID)
+	defer func() {
+		// Preserve typed structured failures when persistence succeeded. Joining
+		// a single error would erase its JSON marshaling contract.
+		if persistErr := checkpoint.Save(); persistErr != nil {
+			if resultErr == nil {
+				resultErr = persistErr
+			} else {
+				resultErr = errors.Join(resultErr, persistErr)
+			}
+		}
+	}()
 	r.loop.AppendUser(prompt)
+	if err := checkpoint.Save(); err != nil {
+		return "", err
+	}
 	text, runErr := collectHeadlessEvents(func(events chan<- agent.Event) error {
 		return rtpkg.RunWithTraceTurn(ctx, r.sessionID, func(turnCtx context.Context) error {
 			return r.loop.Run(turnCtx, events)

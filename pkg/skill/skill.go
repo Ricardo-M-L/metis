@@ -97,6 +97,11 @@ type Skill struct {
 	// `metis skills info` so users can tell what's installed.
 	Version string `json:"version,omitempty" yaml:"version,omitempty"`
 
+	// Host-only activation identity, assigned by the versioned learning layer.
+	// A manifest cannot supply these fields or impersonate evaluated content.
+	LearningVersionSHA256   string `json:"-" yaml:"-"`
+	LearningActivationEpoch uint64 `json:"-" yaml:"-"`
+
 	// ContentHash is the SHA256 of the canonical skill payload (every
 	// field except ContentHash, Uses, Source). Marketplace fetches verify
 	// this against the hash advertised by the registry before saving —

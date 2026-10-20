@@ -55,6 +55,11 @@ func (e *anthropicRedactedError) Error() string { return e.message }
 func (e *anthropicRedactedError) Unwrap() error { return e.classification }
 
 func anthropicSafeClassification(err error) error {
+	if usage := transport.SafeUsageObserverClassification(err); usage != nil {
+		// Durable accounting failures must not become retryable through a
+		// surrounding network error or retain the callback's private cause.
+		return usage
+	}
 	var safe []error
 	if transport.IsNetworkError(err) {
 		safe = append(safe, transport.ErrNetwork)
@@ -77,10 +82,15 @@ func redactAnthropicError(err error, exactValues ...string) error {
 	if err == nil {
 		return nil
 	}
-	safe := &anthropicRedactedError{
-		message:        security.RedactValues(err.Error(), exactValues...),
-		classification: anthropicSafeClassification(err),
+	classification := anthropicSafeClassification(err)
+	var message string
+	var usage *transport.UsageObserverError
+	if errors.As(classification, &usage) {
+		message = usage.Error()
+	} else {
+		message = security.RedactValues(err.Error(), exactValues...)
 	}
+	safe := &anthropicRedactedError{message: message, classification: classification}
 	var exhausted *transport.RetryExhaustedError
 	if errors.As(err, &exhausted) {
 		return &transport.RetryExhaustedError{Err: safe, Attempts: exhausted.Attempts}

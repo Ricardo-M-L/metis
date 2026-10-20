@@ -50,6 +50,11 @@ type loggingTransport struct {
 // log line on completion (success or failure). Errors don't gate the
 // log — a connect failure is at least as interesting as a 200.
 func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	observedReq, usage, usageErr := beginRequestUsage(req, t.provider)
+	if usageErr != nil {
+		return nil, usageErr
+	}
+	req = observedReq
 	reqID := req.Header.Get(HeaderRequestID)
 	if reqID == "" {
 		reqID = newRequestID()
@@ -62,6 +67,22 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 
 	start := time.Now()
 	resp, err := t.inner.RoundTrip(req)
+	if usage != nil {
+		if err != nil {
+			if ledgerErr := usage.finish(UsageInterrupted); ledgerErr != nil {
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				return nil, ledgerErr
+			}
+		} else if ledgerErr := usage.attach(resp); ledgerErr != nil {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			_ = usage.finish(UsageInterrupted)
+			return nil, ledgerErr
+		}
+	}
 	elapsed := time.Since(start)
 
 	if isDebugEnabled() {

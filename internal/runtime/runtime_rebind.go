@@ -156,6 +156,10 @@ func RebindLoopRuntime(loop *agent.Loop, provider llm.Provider, model, system, p
 	RebindTrace(parentSessionID)
 }
 
+func NewBudgetTracker(maxUSD float64, model string) *budget.Tracker {
+	return budget.NewTrackerLazy(maxUSD, modelRatesResolver(model))
+}
+
 func modelRatesResolver(model string) func() (budget.Rates, bool) {
 	return func() (budget.Rates, bool) {
 		cli := catalog.Default()

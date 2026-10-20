@@ -86,10 +86,11 @@ func (l *Loop) toolSpecs() []llm.ToolSpec {
 	case LazyModeAlways:
 		return stripAndAppendToolSearchWithExposure(out, deferred, preserve)
 	case LazyModeAuto:
-		if l.ContextWindow <= 0 {
+		_, _, window := l.ProviderModelSnapshot()
+		if window <= 0 {
 			return out
 		}
-		return applyLazySchemaByTokensWithExposure(out, l.ContextWindow, pct, deferred, preserve)
+		return applyLazySchemaByTokensWithExposure(out, window, pct, deferred, preserve)
 	}
 	return out
 }
@@ -987,16 +988,30 @@ func (l *Loop) spillDir() string {
 func safeToolExecute(ctx context.Context, t tools.Tool, in map[string]any) (res *tools.Result, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			res = nil
-			err = fmt.Errorf("tool %q crashed (recovered panic): %v", t.Name(), r)
-			// Full stack only under METIS_DEBUG so the TUI alt-screen
-			// stays clean in normal runs (stderr leaks corrupt it).
-			if os.Getenv("METIS_DEBUG") != "" {
-				fmt.Fprintf(os.Stderr, "metis: recovered tool panic in %s: %v\n%s\n", t.Name(), r, debug.Stack())
-			}
+			// The executor is an optional extension point too. A faulty executor
+			// must preserve dispatch's process-wide crash containment. A durable
+			// pending record remains uncertain until it is explicitly resolved.
+			res, err = nil, fmt.Errorf("tool %q execution boundary crashed (recovered panic): %v", t.Name(), r)
 		}
 	}()
-	return t.Execute(ctx, in)
+	invoke := func(callCtx context.Context) (result *tools.Result, callErr error) {
+		defer func() {
+			if r := recover(); r != nil {
+				result = nil
+				callErr = fmt.Errorf("tool %q crashed (recovered panic): %v", t.Name(), r)
+				// Recover inside invoke so durable execution observes the failure
+				// and cannot mistake a panic after a remote write for success.
+				if os.Getenv("METIS_DEBUG") != "" {
+					fmt.Fprintf(os.Stderr, "metis: recovered tool panic in %s: %v\n%s\n", t.Name(), r, debug.Stack())
+				}
+			}
+		}()
+		return t.Execute(callCtx, in)
+	}
+	if executor := pubtool.OperationExecutorFromContext(ctx); executor != nil {
+		return executor.Execute(ctx, t, in, invoke)
+	}
+	return invoke(ctx)
 }
 
 // runExecute runs the post-permission portion of a single tool_use:

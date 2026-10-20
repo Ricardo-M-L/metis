@@ -40,6 +40,12 @@ func cmdCoordinator(ctx context.Context, args []string) error {
 		return cmdProjectCoordinatorAdd(args[1:])
 	case "claim":
 		return cmdProjectCoordinatorClaim(args[1:])
+	case "renew":
+		return cmdProjectCoordinatorRenew(args[1:])
+	case "configure":
+		return cmdProjectCoordinatorConfigure(args[1:])
+	case "event":
+		return cmdProjectCoordinatorEvent(args[1:])
 	case "complete":
 		return cmdProjectCoordinatorComplete(args[1:])
 	case "fail":
@@ -48,6 +54,14 @@ func cmdCoordinator(ctx context.Context, args []string) error {
 		return cmdProjectCoordinatorRecover(args[1:])
 	case "run":
 		return cmdProjectCoordinatorRun(ctx, args[1:])
+	case "serve":
+		return cmdProjectCoordinatorServe(ctx, args[1:])
+	case "service":
+		return cmdProjectCoordinatorService(ctx, args[1:])
+	case "operation":
+		return cmdProjectCoordinatorOperations(args[1:])
+	case "usage":
+		return cmdProjectCoordinatorUsage(ctx, args[1:])
 	}
 	if len(args) < 2 {
 		fmt.Print(coordinatorHelp)
@@ -144,8 +158,20 @@ Durable project workflow:
   metis coordinator status <runID> [--cwd DIR] [--json]
   metis coordinator add <runID> --subject "<title>" --prompt "<work>" [--phase implementation] [--depends-on id,id] [--cwd DIR]
   metis coordinator run <runID> [--cwd DIR] [--worker NAME] [--max-items N|--until-idle]
+  metis coordinator serve <runID> --agent PROFILE --token-file FILE [--verify-agent PROFILE] [--listen 127.0.0.1:9091] [--workers 1]
+  metis coordinator service install <runID> --id NAME --agent PROFILE --token-file FILE --listen 127.0.0.1:9091 [--cwd DIR]
+  metis coordinator service status NAME [--json]
+  metis coordinator service uninstall NAME [--json]
+  metis coordinator operation list <runID> [--cwd DIR] [--json]
+  metis coordinator operation resolve <runID> <operationID> --outcome applied|not_applied --note TEXT [--result-file FILE] [--cwd DIR]
+  metis coordinator usage list <runID> [--cwd DIR] [--json]
+  metis coordinator usage import <runID> --receipt-file FILE [--cwd DIR] [--json]
+  metis coordinator usage reconcile <runID> [--receipt-dir DIR] [--command FILE] [--cwd DIR] [--json]
   metis coordinator claim <runID> --worker NAME [--cwd DIR] [--prompt]
-  metis coordinator complete <runID> <itemID> [--worker NAME] [--output TEXT] [--cwd DIR]
+  metis coordinator renew <runID> <itemID> --worker NAME --lease-token TOKEN [--lease 15m]
+  metis coordinator configure <runID> --check COMMAND [--check COMMAND] [--cwd DIR]
+  metis coordinator event <runID> --source SOURCE --id EVENT --agent PROFILE --subject TITLE --prompt TEXT
+  metis coordinator complete <runID> <itemID> --worker NAME --lease-token TOKEN --output TEXT [--cwd DIR]
   metis coordinator fail <runID> <itemID> --summary "<reason>" [--code CODE] [--worker NAME] [--cwd DIR]
   metis coordinator recover <runID> <itemID> [--note TEXT] [--force] [--cwd DIR]
 

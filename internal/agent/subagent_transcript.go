@@ -24,12 +24,16 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	pubsess "github.com/Ricardo-M-L/metis/pkg/session"
@@ -69,6 +73,9 @@ func LoadSubAgentHeader(sessionDir, agentID string) (pubsess.Header, error) {
 // `/agents resume` + tests can find them deterministically.
 const SubAgentTranscriptDirname = "subagents"
 
+// ErrSubAgentTranscriptBusy means another process still owns the producer.
+var ErrSubAgentTranscriptBusy = errors.New("subagent transcript is already owned by another running producer")
+
 // SubAgentSnapshot is the resume payload — Header + decoded message
 // history. Returned by LoadSubAgentSnapshot; callers (Agent.Execute's
 // resume branch) seed a fresh Loop with these Messages.
@@ -76,6 +83,20 @@ type SubAgentSnapshot struct {
 	Header   pubsess.Header
 	Messages []llm.Message
 	Terminal *SubAgentTerminal
+	Handoff  *SubAgentHandoffBinding
+}
+
+// SubAgentHandoffBinding pins a durable mailbox to the transcript that owns
+// its acknowledgements. Resuming that transcript cannot change its address.
+type SubAgentHandoffBinding struct {
+	Scope     string `json:"scope"`
+	Recipient string `json:"recipient"`
+}
+
+type subagentHistoryCheckpoint struct {
+	Offset   int           `json:"offset"`
+	Reset    bool          `json:"reset,omitempty"`
+	Messages []llm.Message `json:"messages"`
 }
 
 // SubAgentTerminal records the last known lifecycle state independently of
@@ -95,21 +116,29 @@ type SubAgentTerminal struct {
 // internal/session.Entry. Kept private here so the file format
 // stays opaque to callers — they only see SubAgentSnapshot.
 type subagentEntry struct {
-	Type     string            `json:"type"` // "header" | "message" | "terminal"
-	Header   *pubsess.Header   `json:"header,omitempty"`
-	Message  *llm.Message      `json:"message,omitempty"`
-	Terminal *SubAgentTerminal `json:"terminal,omitempty"`
+	Type       string                     `json:"type"` // header, message, terminal, checkpoint, handoff
+	Header     *pubsess.Header            `json:"header,omitempty"`
+	Message    *llm.Message               `json:"message,omitempty"`
+	Terminal   *SubAgentTerminal          `json:"terminal,omitempty"`
+	Checkpoint *subagentHistoryCheckpoint `json:"checkpoint,omitempty"`
+	Handoff    *SubAgentHandoffBinding    `json:"handoff,omitempty"`
 }
 
-// SubAgentTranscript is the per-sub-agent writer. Owns an open file
-// handle so AppendMessage is one syscall + flush. The Agent tool
+// SubAgentTranscript serializes the per-sub-agent writer. Checkpoint owns the
+// durable producer boundary; advisory AppendMessage supports legacy consumers.
+// The Agent tool
 // constructs one per spawned sub-agent (foreground or background),
 // closes it on exit. nil-safe: a nil receiver means "persistence
 // disabled" — Append / Close are no-ops so the foreground unit-test
 // path doesn't need a writable filesystem.
 type SubAgentTranscript struct {
-	path string
-	f    *os.File
+	mu             sync.Mutex
+	path           string
+	f              *os.File
+	historyDigests [][sha256.Size]byte
+	handoff        *SubAgentHandoffBinding
+	writeErr       error
+	syncFile       func() error // injectable only by package tests; defaults to f.Sync
 }
 
 // NewSubAgentTranscript opens (or creates) a sub-agent's JSONL under
@@ -118,6 +147,17 @@ type SubAgentTranscript struct {
 // should treat that as "persistence disabled" and continue without
 // transcript (no fatal).
 func NewSubAgentTranscript(sessionDir, agentID string, hdr pubsess.Header) (*SubAgentTranscript, error) {
+	return newSubAgentTranscript(sessionDir, agentID, hdr, false)
+}
+
+// NewDurableSubAgentTranscript holds an OS-backed nonblocking writer lease
+// before creating history and refuses to replace an existing transcript.
+// Process exit releases the writer lease automatically.
+func NewDurableSubAgentTranscript(sessionDir, agentID string, hdr pubsess.Header) (*SubAgentTranscript, error) {
+	return newSubAgentTranscript(sessionDir, agentID, hdr, true)
+}
+
+func newSubAgentTranscript(sessionDir, agentID string, hdr pubsess.Header, durable bool) (*SubAgentTranscript, error) {
 	if sessionDir == "" || agentID == "" {
 		return nil, fmt.Errorf("subagent transcript: sessionDir + agentID both required")
 	}
@@ -126,16 +166,204 @@ func NewSubAgentTranscript(sessionDir, agentID string, hdr pubsess.Header) (*Sub
 		return nil, fmt.Errorf("subagent transcript mkdir: %w", err)
 	}
 	path := filepath.Join(dir, agentID+".jsonl")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	if durable {
+		flags = os.O_CREATE | os.O_RDWR
+	}
+	f, err := os.OpenFile(path, flags, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("subagent transcript open %s: %w", path, err)
+	}
+	if durable {
+		if err := trySubAgentTranscriptLock(f); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		info, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		if info.Size() != 0 {
+			_ = f.Close()
+			return nil, fmt.Errorf("durable subagent transcript already exists; resume it instead of replacing acknowledged history")
+		}
 	}
 	t := &SubAgentTranscript{path: path, f: f}
 	if err := t.writeEntry(subagentEntry{Type: "header", Header: &hdr}); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("sync subagent header: %w", err)
+	}
+	if err := syncSubAgentDirectory(dir); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := syncSubAgentDirectory(sessionDir); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
 	return t, nil
+}
+
+// ResumeSubAgentTranscript preserves acknowledged history in place. The last
+// incomplete JSONL record was never a checkpoint and is removed before append.
+func ResumeSubAgentTranscript(sessionDir, agentID string) (*SubAgentTranscript, error) {
+	path := filepath.Join(sessionDir, SubAgentTranscriptDirname, agentID+".jsonl")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open resumed subagent transcript: %w", err)
+	}
+	if err := trySubAgentTranscriptLock(f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	snap, err := LoadSubAgentSnapshot(sessionDir, agentID)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		if err := f.Truncate(int64(bytes.LastIndexByte(data, '\n') + 1)); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("trim incomplete subagent checkpoint: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+	}
+	digests, err := subAgentMessageDigests(snap.Messages)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &SubAgentTranscript{path: path, f: f, historyDigests: digests, handoff: snap.Handoff}, nil
+}
+
+func syncSubAgentDirectory(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open subagent directory for sync: %w", err)
+	}
+	defer f.Close()
+	if err := syncSubAgentDirectoryFile(f); err != nil {
+		return fmt.Errorf("sync subagent directory: %w", err)
+	}
+	return nil
+}
+
+// BindHandoff synchronously saves the mailbox before any receipt can be issued.
+func (t *SubAgentTranscript) BindHandoff(scope, recipient string) error {
+	if t == nil {
+		return fmt.Errorf("durable subagent transcript unavailable")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.f == nil {
+		return fmt.Errorf("subagent transcript is closed")
+	}
+	if scope == "" || recipient == "" {
+		return fmt.Errorf("durable subagent mailbox requires scope and recipient")
+	}
+	if t.handoff != nil {
+		if t.handoff.Scope != scope || t.handoff.Recipient != recipient {
+			return fmt.Errorf("durable subagent mailbox cannot change on resume")
+		}
+		return t.syncLocked()
+	}
+	binding := &SubAgentHandoffBinding{Scope: scope, Recipient: recipient}
+	if err := t.writeEntryLocked(subagentEntry{Type: "handoff", Handoff: binding}); err != nil {
+		return err
+	}
+	if err := t.syncLocked(); err != nil {
+		return err
+	}
+	t.handoff = binding
+	return nil
+}
+
+// Checkpoint saves the exact producer-owned history before it may acknowledge
+// delivery or start another provider call. Append-only suffixes use one record;
+// edits and compaction replace the replayed history with one reset record.
+func (t *SubAgentTranscript) Checkpoint(history []llm.Message) error {
+	if t == nil {
+		return fmt.Errorf("durable subagent transcript unavailable")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.f == nil {
+		return fmt.Errorf("subagent transcript is closed")
+	}
+	if t.writeErr != nil {
+		return t.writeErr
+	}
+	digests, err := subAgentMessageDigests(history)
+	if err != nil {
+		return err
+	}
+	offset, reset := len(t.historyDigests), len(t.historyDigests) > len(digests)
+	if !reset {
+		for i, digest := range t.historyDigests {
+			if digest != digests[i] {
+				reset = true
+				break
+			}
+		}
+	}
+	if reset {
+		offset = 0
+	}
+	if reset || offset < len(history) {
+		messages := append([]llm.Message{}, history[offset:]...)
+		entry := subagentEntry{Type: "checkpoint", Checkpoint: &subagentHistoryCheckpoint{Offset: offset, Reset: reset, Messages: messages}}
+		if err := t.writeEntryLocked(entry); err != nil {
+			return err
+		}
+	}
+	if err := t.syncLocked(); err != nil {
+		return err
+	}
+	t.historyDigests = digests
+	return nil
+}
+
+func subAgentMessageDigests(history []llm.Message) ([][sha256.Size]byte, error) {
+	digests := make([][sha256.Size]byte, len(history))
+	for i, m := range history {
+		encoded, err := json.Marshal(m)
+		if err != nil {
+			return nil, fmt.Errorf("marshal subagent checkpoint message: %w", err)
+		}
+		digests[i] = sha256.Sum256(encoded)
+	}
+	return digests, nil
+}
+
+func (t *SubAgentTranscript) syncLocked() error {
+	if t.f == nil {
+		return fmt.Errorf("subagent transcript is closed")
+	}
+	if t.writeErr != nil {
+		return t.writeErr
+	}
+	syncFile := t.f.Sync
+	if t.syncFile != nil {
+		syncFile = t.syncFile
+	}
+	if err := syncFile(); err != nil {
+		t.writeErr = fmt.Errorf("sync subagent checkpoint: %w", err)
+		return t.writeErr
+	}
+	return nil
 }
 
 // AppendMessage writes one llm.Message to the transcript. Safe to
@@ -143,7 +371,7 @@ func NewSubAgentTranscript(sessionDir, agentID string, hdr pubsess.Header) (*Sub
 // be treated as advisory by the caller — the in-memory run continues
 // regardless.
 func (t *SubAgentTranscript) AppendMessage(m llm.Message) error {
-	if t == nil || t.f == nil {
+	if t == nil {
 		return nil
 	}
 	return t.writeEntry(subagentEntry{Type: "message", Message: &m})
@@ -153,15 +381,28 @@ func (t *SubAgentTranscript) AppendMessage(m llm.Message) error {
 // resources have been joined. It makes the status and final output available
 // to Desktop after a process restart or roster eviction.
 func (t *SubAgentTranscript) AppendTerminal(terminal SubAgentTerminal) error {
-	if t == nil || t.f == nil {
+	if t == nil {
 		return nil
 	}
-	return t.writeEntry(subagentEntry{Type: "terminal", Terminal: &terminal})
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.f == nil {
+		return nil
+	}
+	if err := t.writeEntryLocked(subagentEntry{Type: "terminal", Terminal: &terminal}); err != nil {
+		return err
+	}
+	return t.syncLocked()
 }
 
-// Close flushes and closes the underlying file. Safe to call on nil.
+// Close closes the file and releases its producer lease. Safe to call on nil.
 func (t *SubAgentTranscript) Close() error {
-	if t == nil || t.f == nil {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.f == nil {
 		return nil
 	}
 	err := t.f.Close()
@@ -179,13 +420,29 @@ func (t *SubAgentTranscript) Path() string {
 }
 
 func (t *SubAgentTranscript) writeEntry(e subagentEntry) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.f == nil {
+		return nil
+	}
+	return t.writeEntryLocked(e)
+}
+
+func (t *SubAgentTranscript) writeEntryLocked(e subagentEntry) error {
+	if t.writeErr != nil {
+		return t.writeErr
+	}
 	b, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("marshal subagent entry: %w", err)
 	}
 	b = append(b, '\n')
-	if _, err := t.f.Write(b); err != nil {
-		return fmt.Errorf("write subagent entry: %w", err)
+	if n, err := t.f.Write(b); err != nil || n != len(b) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		t.writeErr = fmt.Errorf("write subagent entry: %w", err)
+		return t.writeErr
 	}
 	return nil
 }
@@ -213,6 +470,9 @@ func LoadSubAgentSnapshot(sessionDir, agentID string) (*SubAgentSnapshot, error)
 	}
 	var snap SubAgentSnapshot
 	headerSeen := false
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		data = data[:bytes.LastIndexByte(data, '\n')+1]
+	}
 	for i, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
 		if line == "" {
 			continue
@@ -244,6 +504,31 @@ func LoadSubAgentSnapshot(sessionDir, agentID string) (*SubAgentSnapshot, error)
 			}
 			terminal := *e.Terminal
 			snap.Terminal = &terminal
+		case "handoff":
+			if !headerSeen || e.Handoff == nil || e.Handoff.Scope == "" || e.Handoff.Recipient == "" {
+				return nil, fmt.Errorf("subagent transcript line %d: invalid handoff binding", i+1)
+			}
+			if snap.Handoff != nil && *snap.Handoff != *e.Handoff {
+				return nil, fmt.Errorf("subagent transcript line %d: handoff binding changed", i+1)
+			}
+			binding := *e.Handoff
+			snap.Handoff = &binding
+		case "checkpoint":
+			if !headerSeen || e.Checkpoint == nil || e.Checkpoint.Offset < 0 {
+				return nil, fmt.Errorf("subagent transcript line %d: invalid history checkpoint", i+1)
+			}
+			cp := e.Checkpoint
+			if cp.Reset {
+				if cp.Offset != 0 {
+					return nil, fmt.Errorf("subagent transcript line %d: reset checkpoint offset must be zero", i+1)
+				}
+				snap.Messages = nil
+			}
+			if cp.Offset != len(snap.Messages) {
+				return nil, fmt.Errorf("subagent transcript line %d: checkpoint offset %d differs from history length %d", i+1, cp.Offset, len(snap.Messages))
+			}
+			snap.Messages = append(snap.Messages, cp.Messages...)
+			snap.Terminal = nil
 		default:
 			return nil, fmt.Errorf("subagent transcript line %d: unknown entry type %q", i+1, e.Type)
 		}

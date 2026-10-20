@@ -31,6 +31,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/notify"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/projectcoord"
@@ -195,6 +196,14 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdAttach(ctx, args[1:])
 	case "coordinator":
 		return cmdCoordinator(ctx, args[1:])
+	case "job":
+		return cmdJob(ctx, args[1:])
+	case "handoff":
+		return cmdHandoff(ctx, args[1:])
+	case "learning":
+		return cmdLearning(ctx, args[1:])
+	case "operations":
+		return cmdOperations(ctx, args[1:])
 	case "cron":
 		return cmdCron(ctx, args[1:])
 	case "auth":
@@ -256,6 +265,7 @@ func findEarlySubcommand(args []string, lookahead int) (int, bool) {
 		"models": true, "sessions": true, "artifact": true, "artifacts": true, "files": true, "stats": true, "skills": true,
 		"acp": true, "daemon": true, "ps": true, "logs": true,
 		"kill": true, "attach": true, "coordinator": true, "cron": true,
+		"job": true, "handoff": true, "learning": true, "operations": true,
 		"auth": true, "login": true, "logout": true, "plugin": true, "plugins": true, "audit": true,
 		"desktop": true, "cu": true, "diag": true, "eval": true, "update": true, "version": true,
 		"dirs": true, "projects": true, "help": true,
@@ -389,6 +399,10 @@ Usage:
   metis daemon [--poll DURATION] Run the file-queue daemon
   metis ps|logs|kill|attach      Inspect and control managed processes
   metis coordinator <create|list|status|add|run|claim|complete|fail|recover|dispatch|worker>  Coordinate durable project work
+  metis job <create|list|status|run|pause|resume|retire|rotate>  Manage persistent agent roles
+  metis handoff <send|list|status>  Inspect durable peer delivery
+  metis learning <stage|list|evaluate|promote|rollback>  Evaluate and version agent skills
+  metis operations <snapshot|action> --cwd DIR  Inspect and manage persistent jobs and learning
   metis cron <list|add|rm|pause|resume|run|start|history|audit>  Manage scheduled prompts
   metis login [provider] [--method api-key|oauth]  Sign in to an LLM provider
   metis logout <provider> [provider...]             Remove stored provider credentials
@@ -661,6 +675,11 @@ func (r *runtime) prepareSessionRebindAt(sessionID, workDir string) (string, fun
 
 func (r *runtime) commitSessionRebindAt(sessionID, workDir string) {
 	r.sessionID = sessionID
+	if r.subAgentRoster != nil {
+		if store, _ := r.subAgentRoster.HandoffBinding(); store != nil {
+			r.subAgentRoster.BindHandoff(store, "session:"+sessionID)
+		}
+	}
 	rtpkg.SetCurrentSessionID(sessionID)
 	transport.SetSessionID(sessionID)
 	taskstore.SetCurrentTaskStore(sessionID)
@@ -874,31 +893,36 @@ const (
 )
 
 type cliFlags struct {
-	model             string
-	provider          string
-	modelSet          bool // true when --model/-m was present, even with an empty value
-	providerSet       bool // true when --provider/-p was present, even with an empty value
-	mode              string
-	noMarkdown        bool
-	noStream          bool // reserved compatibility flag; currently no runtime effect
-	streamlined       bool // --streamlined: distillation-resistant output (thinking stripped, tools summarized)
-	desktopWorker     bool // private native Desktop JSONL event/reply transport
-	desktopResumeTurn bool // private Desktop continuation without new user input
-	maxIter           int
-	maxBudgetUSD      float64 // --max-budget-usd: session USD spend cap (0 = unlimited)
-	system            string
-	systemSet         bool // true when --system was present, even with an empty value
-	resumeID          string
-	newSessionID      string // internal/native-client hook: choose ID for a fresh run
-	cont              bool   // -c / --continue: pick up the most recently modified session
-	useTUI            bool
-	noAuthWizard      bool   // skip the first-run wizard (CI / scripted use)
-	effort            string // "low" | "medium" | "high" — Anthropic thinking budget / OpenAI reasoning_effort
-	fast              bool   // collapse one turn: effort=low + halved max_tokens
-	addDirs           stringList
-	agentProfile      string // --agent=NAME — load .metis/agents/<name>.md
-	worktree          string // --worktree=slug — spin up git worktree with explicit slug
-	worktreeOn        bool   // -W — spin up worktree with auto slug
+	model                string
+	provider             string
+	modelSet             bool // true when --model/-m was present, even with an empty value
+	providerSet          bool // true when --provider/-p was present, even with an empty value
+	mode                 string
+	noMarkdown           bool
+	noStream             bool // reserved compatibility flag; currently no runtime effect
+	streamlined          bool // --streamlined: distillation-resistant output (thinking stripped, tools summarized)
+	desktopWorker        bool // private native Desktop JSONL event/reply transport
+	desktopResumeTurn    bool // private Desktop continuation without new user input
+	maxIter              int
+	maxBudgetUSD         float64 // --max-budget-usd: session USD spend cap (0 = unlimited)
+	system               string
+	systemSet            bool // true when --system was present, even with an empty value
+	resumeID             string
+	newSessionID         string // internal/native-client hook: choose ID for a fresh run
+	cont                 bool   // -c / --continue: pick up the most recently modified session
+	useTUI               bool
+	noAuthWizard         bool   // skip the first-run wizard (CI / scripted use)
+	effort               string // "low" | "medium" | "high" — Anthropic thinking budget / OpenAI reasoning_effort
+	fast                 bool   // collapse one turn: effort=low + halved max_tokens
+	addDirs              stringList
+	agentProfile         string              // --agent=NAME — load .metis/agents/<name>.md
+	agentProfileSnapshot *rtpkg.AgentProfile // internal: immutable principal role
+	jobID                string              // internal: stable principal identity
+	jobSessionDir        string              // internal: principal-owned session store
+	jobMemoryDir         string              // internal: principal-owned memory namespace
+	jobExecutionContext  context.Context     // internal: authority for all principal model calls
+	worktree             string              // --worktree=slug — spin up git worktree with explicit slug
+	worktreeOn           bool                // -W — spin up worktree with auto slug
 
 	desktopSettingsStartup bool // private: let Desktop settings open before API-key setup
 
@@ -1201,6 +1225,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if flags.cronSessionDir != "" {
 		cfg.Session.Dir = flags.cronSessionDir
 	}
+	if flags.jobSessionDir != "" {
+		cfg.Session.Dir = flags.jobSessionDir
+	}
 	projectTrusted := currentWorkspaceTrusted()
 	if err := config.ApplyProviderPolicyForWorkspace(cfg, projectTrusted); err != nil {
 		return nil, fmt.Errorf("apply provider trust policy: %w", err)
@@ -1260,9 +1287,14 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// Agent profile (--agent=NAME) loads early so its values participate
 	// in flag merging and tool-registry filtering downstream. CLI overrides
 	// always win — profile is "use this default unless I said otherwise".
-	agentProf, err := rtpkg.LoadAgentProfile(flags.agentProfile)
-	if err != nil {
-		return nil, err
+	var agentProf *rtpkg.AgentProfile
+	if flags.agentProfileSnapshot != nil {
+		agentProf = rtpkg.AgentProfileFromSnapshot(rtpkg.SnapshotAgentProfile(flags.agentProfileSnapshot))
+	} else {
+		agentProf, err = rtpkg.LoadAgentProfile(flags.agentProfile)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if agentProf != nil && agentProf.Source == rtpkg.AgentProfileSourceProject &&
 		!projectTrusted && profileRequestsFullAccess(agentProf) && !explicitlyRequestsFullAccess(flags) {
@@ -1446,6 +1478,9 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		}
 	}
 	prov := pbuild.Provider
+	if flags.jobExecutionContext != nil {
+		prov = llm.BindExecutionProvider(prov, flags.jobExecutionContext)
+	}
 	model = pbuild.Model
 
 	// Permission gate (allow/deny rules from config.toml).
@@ -1607,7 +1642,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		//   - --simple / --system override / explicit user prompt:
 		//     wrap `system` as one "base" section to preserve the
 		//     caller's intent (don't fragment a user-supplied prompt).
-		if systemSet || rtpkg.IsSimpleMode() {
+		if systemSet || rtpkg.IsSimpleMode() || promptKind == session.SystemPromptKindCustom {
 			systemSections = rtpkg.AssembleSystemPromptSections(system, assembleOpts)
 		} else {
 			systemSections = rtpkg.AssembleSystemPromptSectionsCtx(promptCtx, assembleOpts)
@@ -1675,7 +1710,19 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// Pre-fix this was constructed inside BuildAgentLoop and the Memory
 	// tool maintained its own ~/.metis/memories/*.md fork, never reaching
 	// BuildContext (the 2026-04-30 audit disconnect bug).
-	memoryMgr := rtpkg.BuildMemoryManager(cfg)
+	var memoryMgr *memory.MemoryManager
+	if flags.jobMemoryDir != "" {
+		workspace, cwdErr := os.Getwd()
+		if cwdErr != nil {
+			return nil, cwdErr
+		}
+		memoryMgr, err = memory.NewMemoryManagerForWorkspace(flags.jobMemoryDir, workspace)
+		if err != nil {
+			return nil, fmt.Errorf("initialize principal memory: %w", err)
+		}
+	} else {
+		memoryMgr = rtpkg.BuildMemoryManager(cfg)
+	}
 	// MinimalSystem is the trimmed prompt the Agent tool's sub-agents
 	// run with — base + env, no <project_context>, no addendum. The
 	// parent loop's full assembled `system` already saw those, so a
@@ -1714,21 +1761,23 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	subAgentRoster := agent.NewRoster(capNamed, capAnon)
 
 	reg := rtpkg.BuildToolRegistry(rtpkg.ToolRegistryOptions{
-		Cfg:             cfg,
-		Gate:            gate,
-		Provider:        prov,
-		Model:           model,
-		System:          system,
-		MinimalSystem:   minimalSystem,
-		ChannelRegistry: chReg,
-		DefaultPlatform: cfg.Channels.DefaultPlatform,
-		CronService:     cronSvc,
-		MemoryManager:   memoryMgr,
-		Sandbox:         sandboxMgr,
-		Jobs:            jobsPool,
-		Monitors:        monitorReg,
-		ConfigSnapshot:  snap,
-		Roster:          subAgentRoster,
+		Cfg:                      cfg,
+		Gate:                     gate,
+		Provider:                 prov,
+		Model:                    model,
+		System:                   system,
+		MinimalSystem:            minimalSystem,
+		ChannelRegistry:          chReg,
+		DefaultPlatform:          cfg.Channels.DefaultPlatform,
+		CronService:              cronSvc,
+		MemoryManager:            memoryMgr,
+		Sandbox:                  sandboxMgr,
+		Jobs:                     jobsPool,
+		Monitors:                 monitorReg,
+		ConfigSnapshot:           snap,
+		Roster:                   subAgentRoster,
+		ProjectCoordinatorStore:  projectCoordinatorStore(),
+		ProjectPrincipalResolver: resolveProjectPrincipalBinding,
 		ProjectWorkspaceResolver: func() string {
 			// A Desktop session switch does not mutate process-wide cwd: doing
 			// so would race active jobs and other windows. Resolve the current
@@ -1905,6 +1954,13 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		MaxBudgetUSD:             flags.maxBudgetUSD,
 	})
 	applyDesktopWorkerMemoryPolicy(loop, os.Getenv)
+	// A host evaluation compares frozen versions without cross-case memory or
+	// unmetered enrichment calls. Ordinary roles retain their memory runtime.
+	if os.Getenv("METIS_LEARNING_EVALUATION") == "1" {
+		loop.Memory = nil
+		loop.AutoRetrieveK = 0
+		loop.DistillEvery = 0
+	}
 
 	// METIS_SIMPLE / --simple → use the curated short tool descriptions
 	// matched 1:1 with the simple-mode system prompt: short prompt +
@@ -1953,7 +2009,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// Auto-memory v2: interactive chat and Desktop default on; one-shot and
 	// other headless startup paths remain opt-in. The extractor writes through
 	// the same canonical MemoryRepository used by request-time recall.
-	if shouldEnableAutoMemory(flags, os.LookupEnv) {
+	if os.Getenv("METIS_LEARNING_EVALUATION") != "1" && shouldEnableAutoMemory(flags, os.LookupEnv) {
 		if memoryMgr == nil {
 			fmt.Fprintln(os.Stderr, "metis: auto-memory disabled: memory repository is unavailable")
 		} else {
@@ -2109,6 +2165,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// TodoRead persist into the right per-session file. Done last so a
 	// resume failure above doesn't leave a stale id in the singleton.
 	rtpkg.SetCurrentSessionID(rt.sessionID)
+	if err := bindRuntimeHandoff(rt, flags.jobID); err != nil {
+		rt.Cleanup()
+		return nil, err
+	}
 	// Fresh-session IDs are allocated after the registry is built. Bind Agent's
 	// durable child transcripts and parent metadata before any tool invocation.
 	builtin.RebindProviderTools(reg, prov, model, system, rt.sessionID)
@@ -3137,10 +3197,9 @@ func waitForkInflight(maxWait time.Duration) {
 	}
 }
 
-// acpAuthRequiredProvider keeps the ACP control plane available before the
-// user configures credentials. Initialize remains a credential-free
-// capability handshake; the first prompt still fails with the exact auth
-// error setupRuntime produced, so starting ACP never weakens model access.
+// acpAuthRequiredProvider keeps credential-free control surfaces available
+// before the user configures credentials. ACP initialize and Desktop settings
+// can load; every model request still fails with the original auth error.
 type acpAuthRequiredProvider struct {
 	name  string
 	model string

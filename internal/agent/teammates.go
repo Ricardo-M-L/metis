@@ -38,6 +38,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/handoff"
 )
 
 // MsgType distinguishes peer messages by protocol role. Zero value
@@ -57,6 +59,8 @@ const (
 // `Type` defaults to MsgTypeContent (zero value) — existing senders that
 // don't set it are unaffected.
 type PeerMessage struct {
+	// ID identifies a durable envelope. Empty means the legacy live channel.
+	ID   string
 	From string
 	Body string
 	Sent time.Time
@@ -484,9 +488,57 @@ type Roster struct {
 	// still want to read. Append-only with size cap; oldest evicted
 	// when over RosterFinishedKeep. Stored separately from teammates
 	// so cap-counted Count() / Summary() report only live work.
-	recentlyFinished []*Teammate
-	capNamed         int
-	capAnon          int
+	recentlyFinished          []*Teammate
+	capNamed                  int
+	capAnon                   int
+	handoffStore              *handoff.Store
+	handoffScope              string
+	handoffRecipientValidator func(context.Context, string) error
+}
+
+// BindHandoff enables durable peer delivery for this session. A workspace
+// switch must rebind the scope along with the session; disk messages survive
+// roster resets and process exits. Explicit job addresses use scope "jobs".
+func (r *Roster) BindHandoff(store *handoff.Store, scope string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.handoffStore, r.handoffScope = store, scope
+}
+
+func (r *Roster) HandoffBinding() (*handoff.Store, string) {
+	if r == nil {
+		return nil, ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.handoffStore, r.handoffScope
+}
+
+// SetHandoffRecipientValidator lets the runtime resolve persistent principals
+// without coupling the agent package to the job repository. Validation runs
+// outside the roster mutex; paused jobs may receive mail, retired jobs may not.
+func (r *Roster) SetHandoffRecipientValidator(validate func(context.Context, string) error) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.handoffRecipientValidator = validate
+}
+func (r *Roster) ValidateHandoffRecipient(ctx context.Context, address string) error {
+	if r == nil {
+		return errors.New("roster unavailable")
+	}
+	r.mu.RLock()
+	validate := r.handoffRecipientValidator
+	r.mu.RUnlock()
+	if validate == nil {
+		return nil
+	}
+	return validate(ctx, address)
 }
 
 // RosterFinishedKeep is the max number of finished teammates the

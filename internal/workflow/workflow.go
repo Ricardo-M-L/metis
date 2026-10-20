@@ -17,6 +17,7 @@ package workflow
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -37,6 +38,8 @@ type Step struct {
 type Workflow struct {
 	Name  string `json:"name"`
 	Steps []Step `json:"steps"`
+	// VersionSHA256 binds a loaded recipe to its immutable learning version.
+	VersionSHA256 string `json:"-"`
 }
 
 // Status values for a StepResult.
@@ -62,8 +65,10 @@ type RunOptions struct {
 	PerStepTimeout            time.Duration // 0 → DefaultStepTimeout
 	MaxOutputBytes            int           // 0 → DefaultMaxOutputBytes; per-step output cap
 	Sandbox                   *sandbox.Manager
-	Network                   sandbox.NetworkPolicy // empty inherits Manager default (allow without one)
-	SkipDangerousCommandCheck bool                  // caller already authorized unrestricted command execution
+	Network                   sandbox.NetworkPolicy     // empty inherits Manager default (allow without one)
+	SkipDangerousCommandCheck bool                      // caller already authorized unrestricted command execution
+	Environment               []string                  // nil inherits the host; evaluations supply a private, minimal environment
+	EvaluationFixture         *EvaluationFixtureContext // optional host-owned code fixture; never enabled by a model recipe
 }
 
 const (
@@ -79,6 +84,22 @@ const (
 // failed step (non-zero exit, timeout, or spawn error) stops the run
 // when StopOnError; the remaining steps are returned with StatusSkipped.
 func Run(ctx context.Context, wf Workflow, opts RunOptions) []StepResult {
+	if opts.EvaluationFixture != nil {
+		err := ValidateEvaluationFixtureRecipe(wf, opts.EvaluationFixture)
+		if opts.Cwd != opts.EvaluationFixture.Workspace {
+			err = fmt.Errorf("fixture run changed the pinned workspace")
+		}
+		if err != nil {
+			results := make([]StepResult, len(wf.Steps))
+			for i, step := range wf.Steps {
+				results[i] = StepResult{Name: step.Name, Command: step.Command, Status: StatusSkipped}
+			}
+			if len(results) > 0 {
+				results[0].Status, results[0].ExitCode, results[0].Output = StatusFailed, -1, "[blocked] "+err.Error()
+			}
+			return results
+		}
+	}
 	// Preflight the complete workflow before spawning step one. Model callers
 	// can reach this lower-level runner without the Workflow tool's CanUse, and
 	// discovering a blocked later step after earlier mutations is too late.
@@ -124,15 +145,36 @@ func Run(ctx context.Context, wf Workflow, opts RunOptions) []StepResult {
 func runStep(ctx context.Context, s Step, opts RunOptions, timeout time.Duration, maxBytes int) StepResult {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if opts.EvaluationFixture != nil && strings.TrimSpace(s.Command) == "fixture-test" {
+		output, err := opts.EvaluationFixture.RunTests(cctx)
+		result := StepResult{Name: s.Name, Command: s.Command, Status: StatusOK, Output: output}
+		if err != nil {
+			result.Status, result.ExitCode, result.Output = StatusFailed, 1, err.Error()
+		}
+		return result
+	}
 
 	cmd := exec.CommandContext(cctx, "sh", "-c", s.Command)
+	if opts.Environment != nil {
+		cmd.Env = append([]string(nil), opts.Environment...)
+	}
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
-	if opts.Sandbox != nil {
+	if opts.EvaluationFixture != nil {
+		wrapped, err := sandbox.WrapEvaluation(cmd, opts.Cwd, opts.EvaluationFixture.TestsDir)
+		if err != nil {
+			return StepResult{Name: s.Name, Command: s.Command, ExitCode: -1, Status: StatusFailed, Output: "[fixture sandbox wrap failed: " + err.Error() + "]"}
+		}
+		cmd = wrapped
+	} else if opts.Sandbox != nil {
 		// Workflow steps are model-controlled shell commands, so they use the
 		// same credential filter and private temp root as Bash.
-		cmd.Env = opts.Sandbox.FilterEnv(os.Environ(), false)
+		env := cmd.Env
+		if env == nil {
+			env = os.Environ()
+		}
+		cmd.Env = opts.Sandbox.FilterEnv(env, false)
 		if opts.Sandbox.EffectiveMode() != sandbox.ModeOff {
 			if tempDir := opts.Sandbox.TempDir(); tempDir != "" {
 				cmd.Env = workflowTempEnv(cmd.Env, tempDir)

@@ -16,13 +16,18 @@ package builtin
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/handoff"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -45,13 +50,15 @@ func NewMessageTeammate(gate *permission.Gate, r *agent.Roster) MessageTeammate 
 
 func (MessageTeammate) Name() string { return "MessageTeammate" }
 func (MessageTeammate) Description() string {
-	return "Send a message to another named sub-agent (teammate) in the current session. The recipient will see the message as a <peer_message> system-reminder on its next turn boundary. Only works for named teammates spawned via Agent({name: \"...\"}); anonymous sub-agents cannot receive peer messages (they have no addressable name). Different from SendMessage (which posts to chat platforms like Slack)."
+	return "Send a message to a named teammate or persistent job addressed as job:<ID>. operation defaults to send and requires to/body. Structured task handoffs can be automatically claimed by a configured resident coordinator; plain notifications await the recipient query. Use operation=status with message_id to read your own durable message receipt and host-verified business result. Status requires no to/body and is read-only. Acknowledgement only means the recipient transcript was saved; business.state=completed separately means host acceptance passed. Use idempotency_key to repeat a send without creating duplicate work. task.acceptance contains untrusted requirements, never host shell commands; task.deliverables lists managed output relative paths. Anonymous sub-agents cannot receive peer messages. Different from SendMessage, which posts to external chat platforms."
 }
 func (MessageTeammate) InputSchema() map[string]any {
 	return map[string]any{
-		"type":     "object",
-		"required": []string{"to", "body"},
+		"type":                 "object",
+		"additionalProperties": false,
 		"properties": map[string]any{
+			"operation":  map[string]any{"type": "string", "enum": []string{"send", "status"}, "description": "Defaults to send (requires to and body). status requires only message_id and reads your own saved receipt."},
+			"message_id": map[string]any{"type": "string", "description": "Message ID returned by send; required only for operation=status."},
 			"to": map[string]any{
 				"type":        "string",
 				"description": "The recipient teammate's name as passed to Agent({name: \"...\"}). Use SubAgentList to see available names. Pass \"*\" to broadcast to all named teammates currently in the roster.",
@@ -59,6 +66,16 @@ func (MessageTeammate) InputSchema() map[string]any {
 			"body": map[string]any{
 				"type":        "string",
 				"description": "The message text. Plain string — the recipient sees it inside <peer_message> tags so it knows this isn't from the human operator.",
+			},
+			"idempotency_key": map[string]any{"type": "string", "maxLength": 512, "description": "Stable logical handoff key. Reuse with identical recipient/body/task to avoid a duplicate across retries; changed content under the same key is refused."},
+			"task": map[string]any{
+				"type": "object", "required": []string{"id", "objective"}, "additionalProperties": false,
+				"properties": map[string]any{
+					"id": map[string]any{"type": "string"}, "objective": map[string]any{"type": "string"},
+					"artifacts":    map[string]any{"type": "array", "maxItems": 64, "items": map[string]any{"type": "object", "required": []string{"path", "sha256"}, "additionalProperties": false, "properties": map[string]any{"path": map[string]any{"type": "string"}, "sha256": map[string]any{"type": "string", "pattern": "^[0-9a-fA-F]{64}$"}}}},
+					"deliverables": map[string]any{"type": "array", "maxItems": 64, "items": map[string]any{"type": "string"}, "description": "Managed output paths relative to the job workspace. These are outputs, distinct from input artifacts."},
+					"acceptance":   map[string]any{"type": "array", "maxItems": 64, "items": map[string]any{"type": "string"}},
+				},
 			},
 		},
 	}
@@ -68,12 +85,38 @@ func (MessageTeammate) InputSchema() map[string]any {
 // channel send guarded by Roster's RLock; multiple MessageTeammate
 // calls in the same dispatch batch (e.g. broadcasting to two peers)
 // can fan out without serialization.
+// IsReadOnly keeps receipt polling out of the writing-operation journal. A
+// recovered worker must observe the current receipt rather than replay a stale
+// query result from the previous claim's writing-operation occurrence.
+func (MessageTeammate) IsReadOnly(in map[string]any) bool {
+	operation, ok := in["operation"].(string)
+	if !ok || operation != "status" {
+		return false
+	}
+	for key := range in {
+		if key != "operation" && key != "message_id" {
+			return false
+		}
+	}
+	id, ok := in["message_id"].(string)
+	if !ok || !strings.HasPrefix(id, "msg-") || len(id) != 68 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(id, "msg-"))
+	return err == nil
+}
+
 func (MessageTeammate) Concurrency(map[string]any) tools.Concurrency {
 	return tools.ConcurrencySafe
 }
 
-func (m MessageTeammate) CanUse(_ context.Context, in map[string]any) (tools.Permission, string) {
-	d, src := m.gate.Check(context.Background(), "MessageTeammate", strFromAny(in["body"]))
+func (m MessageTeammate) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
+	input := strFromAny(in["body"])
+	if m.IsReadOnly(in) {
+		b, _ := json.Marshal(in)
+		input = string(b)
+	}
+	d, src := m.gate.Check(ctx, "MessageTeammate", input)
 	return mapDecision(d), src
 }
 
@@ -86,6 +129,20 @@ var ErrMailboxFull = errors.New("teammate mailbox full")
 func (m MessageTeammate) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	if m.roster == nil {
 		return &tools.Result{Output: "MessageTeammate unavailable: no Roster wired in this session", IsError: true}, nil
+	}
+	operation := "send"
+	if raw, ok := in["operation"]; ok {
+		text, ok := raw.(string)
+		if !ok || (text != "send" && text != "status") {
+			return &tools.Result{Output: "operation must be send or status", IsError: true}, nil
+		}
+		operation = text
+	}
+	if operation == "status" {
+		return m.executeStatus(ctx, in)
+	}
+	if _, ok := in["message_id"]; ok {
+		return &tools.Result{Output: "message_id is only valid with operation=status", IsError: true}, nil
 	}
 	to, _ := in["to"].(string)
 	body, _ := in["body"].(string)
@@ -103,6 +160,12 @@ func (m MessageTeammate) Execute(ctx context.Context, in map[string]any) (*tools
 	// Fixes the previous hardcoded `from := "main"` that made every
 	// peer-to-peer chain show "main → bob".
 	from := agent.AgentNameFromContext(ctx)
+	if store, scope := m.roster.HandoffBinding(); store != nil && scope != "" {
+		return m.executeDurable(ctx, in, store, scope, to, body, from)
+	}
+	if strings.HasPrefix(to, "job:") {
+		return &tools.Result{Output: "persistent job handoff unavailable: durable mailbox is not configured", IsError: true}, nil
+	}
 
 	// Broadcast: to=="*" delivers to every named teammate in the roster.
 	if to == "*" {
@@ -158,7 +221,7 @@ func (m MessageTeammate) Execute(ctx context.Context, in map[string]any) (*tools
 	select {
 	case t.Mailbox <- agent.PeerMessage{From: from, Body: body, Sent: time.Now()}:
 		return &tools.Result{
-			Output: fmt.Sprintf("message delivered to %s (agent_id=%s)", t.Name, t.AgentID),
+			Output: fmt.Sprintf("message queued in live mailbox for %s (agent_id=%s); recipient acknowledgement is unavailable in this legacy session", t.Name, t.AgentID),
 		}, nil
 	default:
 		// Mailbox is buffered (size 16); a full mailbox means the
@@ -199,10 +262,205 @@ func (m MessageTeammate) executeBroadcast(body, from string) (*tools.Result, err
 	}
 	var parts []string
 	if len(sent) > 0 {
-		parts = append(parts, fmt.Sprintf("delivered to: %s", strings.Join(sent, ", ")))
+		parts = append(parts, fmt.Sprintf("queued in live mailboxes (not acknowledged): %s", strings.Join(sent, ", ")))
 	}
 	if len(full) > 0 {
 		parts = append(parts, fmt.Sprintf("mailbox full (retry): %s", strings.Join(full, ", ")))
 	}
 	return &tools.Result{Output: "broadcast " + strings.Join(parts, "; ")}, nil
+}
+
+func (m MessageTeammate) executeDurable(ctx context.Context, in map[string]any, store *handoff.Store, scope, to, body, from string) (*tools.Result, error) {
+	key, _ := in["idempotency_key"].(string)
+	if key == "" {
+		key = tools.InvocationIDFromContext(ctx)
+	}
+	var task *handoff.Task
+	if raw, ok := in["task"]; ok && raw != nil {
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return &tools.Result{Output: "invalid task contract: " + err.Error(), IsError: true}, nil
+		}
+		task = &handoff.Task{}
+		dec := json.NewDecoder(strings.NewReader(string(b)))
+		dec.DisallowUnknownFields()
+		if err = dec.Decode(task); err != nil {
+			return &tools.Result{Output: "invalid task contract: " + err.Error(), IsError: true}, nil
+		}
+	}
+	recipients := []string{to}
+	if to == "*" {
+		recipients = nil
+		for _, t := range m.roster.ListNamed() {
+			recipients = append(recipients, t.Name)
+		}
+		if len(recipients) == 0 {
+			return &tools.Result{Output: "broadcast: no named teammates in roster"}, nil
+		}
+	}
+	rows := make([]map[string]any, 0, len(recipients))
+	var failures []string
+	for _, recipient := range recipients {
+		targetScope := scope
+		senderScope := scope
+		if strings.HasPrefix(from, "job:") {
+			senderScope = "jobs"
+		}
+		if strings.HasPrefix(recipient, "job:") {
+			if strings.TrimPrefix(recipient, "job:") == "" {
+				failures = append(failures, "job ID is required")
+				continue
+			}
+			targetScope = "jobs"
+			if err := m.roster.ValidateHandoffRecipient(ctx, recipient); err != nil {
+				failures = append(failures, err.Error())
+				continue
+			}
+		} else {
+			t, ok := m.roster.Lookup(recipient)
+			if !ok {
+				t, ok = m.roster.LookupByAgentID(recipient)
+			}
+			if ok {
+				if t.Anonymous || t.Mailbox == nil {
+					failures = append(failures, fmt.Sprintf("%q is an anonymous sub-agent and cannot receive peer messages", t.Name))
+					continue
+				}
+				recipient = t.Name
+			} else if strings.HasPrefix(recipient, "agt-") {
+				failures = append(failures, "unknown agent ID; use a stable named teammate or job:<ID>")
+				continue
+			}
+		}
+		r, duplicate, err := store.Send(ctx, handoff.SendRequest{Scope: targetScope, SenderScope: senderScope, From: from, To: recipient, Body: body, Task: task, IdempotencyKey: key})
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		status := "durably queued; awaiting recipient transcript acknowledgement"
+		if r.State == "acknowledged" {
+			status = "already saved and acknowledged by recipient; requested work may still be pending"
+		}
+		row := messageTeammateReceipt(r)
+		row["duplicate"] = duplicate
+		row["message"] = status
+		rows = append(rows, row)
+	}
+	var output any
+	if to != "*" && len(rows) == 1 && len(failures) == 0 {
+		output = rows[0]
+	} else {
+		output = map[string]any{"messages": rows, "errors": failures}
+	}
+	b, err := json.Marshal(output)
+	if err != nil {
+		return nil, err
+	}
+	return &tools.Result{Output: string(b), IsError: len(failures) > 0}, nil
+}
+
+func (m MessageTeammate) executeStatus(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	for k := range in {
+		if k != "operation" && k != "message_id" {
+			return &tools.Result{Output: "status accepts only operation and message_id", IsError: true}, nil
+		}
+	}
+	id, ok := in["message_id"].(string)
+	if !ok || strings.TrimSpace(id) == "" || strings.TrimSpace(id) != id {
+		return &tools.Result{Output: "message_id is required for status", IsError: true}, nil
+	}
+	store, scope := m.roster.HandoffBinding()
+	if store == nil || scope == "" {
+		return &tools.Result{Output: "durable handoff status is unavailable in this session", IsError: true}, nil
+	}
+	from := agent.AgentNameFromContext(ctx)
+	senderScope := scope
+	if strings.HasPrefix(from, "job:") {
+		senderScope = "jobs"
+	}
+	rec, err := store.Get(ctx, id)
+	if err != nil {
+		return &tools.Result{Output: "handoff receipt is unavailable for this sender", IsError: true}, nil
+	}
+	// The recipient is deliberately not an alternate authorization path: knowing
+	// a message ID, recipient name, or shared jobs scope never grants sender access.
+	owned := rec.From == from && rec.SenderScope == senderScope
+	// Legacy envelopes lack sender_scope. Only their own session namespace (or a
+	// durable, host-stamped job identity) can disambiguate the original sender.
+	if rec.SenderScope == "" && rec.From == from && rec.Scope == senderScope && (senderScope != "jobs" || strings.HasPrefix(from, "job:")) {
+		owned = true
+	}
+	if !owned {
+		return &tools.Result{Output: "handoff receipt is unavailable for this sender", IsError: true}, nil
+	}
+	b, err := json.Marshal(messageTeammateReceipt(rec))
+	if err != nil {
+		return nil, err
+	}
+	return &tools.Result{Output: string(b)}, nil
+}
+
+// messageTeammateReceipt is the model-visible boundary shared by status and
+// idempotent sends. It never serializes the Record, claim tokens, consumers,
+// workspace paths, host commands or their raw stdout/stderr.
+func messageTeammateReceipt(r handoff.Record) map[string]any {
+	message := "durably queued; awaiting recipient transcript acknowledgement"
+	if r.State == "acknowledged" {
+		message = "already saved and acknowledged by recipient; requested work may still be pending"
+	}
+	row := map[string]any{"id": r.ID, "scope": r.Scope, "sender_scope": r.SenderScope, "from": r.From, "to": r.To, "state": r.State, "acknowledged": r.State == "acknowledged", "checkpoint_sha256": r.CheckpointSHA256, "message": message, "business": nil}
+	if r.Admission != nil {
+		row["admission"] = r.Admission.SafeStatus()
+	}
+	b := r.Business
+	if b == nil {
+		return row
+	}
+	a := b.Assignment
+	business := map[string]any{"state": b.State, "source_revision": b.SourceRevision, "assignment": map[string]any{"job_id": a.JobID, "run_id": a.RunID, "work_item_id": a.WorkItemID, "verification_item_id": a.VerificationItemID, "config_sha256": a.ConfigSHA256}, "accepted_at": b.AcceptedAt, "updated_at": b.UpdatedAt}
+	if !b.StartedAt.IsZero() {
+		business["started_at"] = b.StartedAt
+	}
+	if !b.CompletedAt.IsZero() {
+		business["completed_at"] = b.CompletedAt
+	}
+	protected := []string{a.Workspace, r.Token, r.Consumer}
+	if b.Acceptance != nil {
+		for _, check := range b.Acceptance.Checks {
+			protected = append(protected, check.Command)
+		}
+	}
+	clean := func(v string) string { return messageTeammateSafeText(v, protected...) }
+	if b.Output != "" {
+		business["output"] = clean(b.Output)
+		business["output_sha256"] = b.OutputSHA256
+		business["output_redacted"] = clean(b.Output) != b.Output
+	}
+	if len(b.Artifacts) > 0 {
+		business["artifacts"] = b.Artifacts
+	}
+	if b.Acceptance != nil {
+		a := b.Acceptance
+		checks := make([]map[string]any, 0, len(a.Checks))
+		for i, c := range a.Checks {
+			checks = append(checks, map[string]any{"index": i, "exit_code": c.ExitCode, "output_sha256": c.OutputSHA256})
+		}
+		business["acceptance"] = map[string]any{"passed": a.Passed, "source": a.Source, "evidence_sha256": a.EvidenceSHA256, "summary": clean(a.Summary), "checks": checks}
+	}
+	if b.Failure != nil {
+		business["failure"] = map[string]any{"code": clean(b.Failure.Code), "summary": clean(b.Failure.Summary), "evidence_sha256": b.Failure.EvidenceSHA256}
+	}
+	row["business"] = business
+	if b.State == handoff.BusinessCompleted {
+		row["message"] = "requested work completed with independent host acceptance; inspect business for verified output and artifact hashes"
+	}
+	return row
+}
+
+var messageTeammatePrivatePathRE = regexp.MustCompile(`(?:[A-Za-z]:[\\/]|/)[^\s"'<>]+`)
+
+func messageTeammateSafeText(v string, protected ...string) string {
+	v = security.RedactValues(v, protected...)
+	v = security.RedactSubprocessText(v)
+	return messageTeammatePrivatePathRE.ReplaceAllString(v, "[PRIVATE_PATH]")
 }

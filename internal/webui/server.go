@@ -148,6 +148,7 @@ type Server struct {
 	clipboardFiles          func() ([]desktop.ClipboardFile, error)
 	computerUse             func(context.Context, string) (computeruse.Status, error)
 	automations             *automationManager
+	durableOps              *durableOperationsBridge
 	plugins                 *rtpkg.PluginRegistry
 	pluginMarket            *pluginmarket.Manager
 	artifactStore           *artifact.Store
@@ -463,6 +464,7 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		options.TotalAgentSlots = server.maxTotalAgentSlots
 		options.SubagentsPerRoot = server.maxSubagentsPerRoot
 		server.automations = newAutomationManager(options)
+		server.durableOps = newDurableOperationsBridge(options)
 	}
 	var initialSessionCommit func()
 	var initialSessionSwitchErr error
@@ -671,6 +673,8 @@ func (s *Server) handler() http.Handler {
 	})
 	mux.HandleFunc("/api/automations", s.handleAutomations)
 	mux.HandleFunc("/api/automations/", s.handleAutomations)
+	mux.HandleFunc("/api/operations", s.handleDurableOperations)
+	mux.HandleFunc("/api/operations/action", s.handleDurableOperations)
 	mux.HandleFunc("/api/sessions", s.handleSessions)
 	mux.HandleFunc("/api/sessions/activate", s.handleSessionActivate)
 	mux.HandleFunc("/api/sessions/", s.handleSession)

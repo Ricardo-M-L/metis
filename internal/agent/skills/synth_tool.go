@@ -36,7 +36,7 @@ func NewSkillSynthTool(synth *Synth) SkillSynthTool {
 
 func (SkillSynthTool) Name() string { return "SkillSynth" }
 func (SkillSynthTool) Description() string {
-	return "Create or update a user-level skill in ~/.metis/skills. ONLY available to the dreaming subagent — the main agent cannot call this tool. Use 'create_skill' for new skills (refuses to overwrite), 'update_skill' to revise an existing skill's body (frontmatter preserved)."
+	return "Propose a versioned user skill candidate. ONLY available to Dream. create_skill and update_skill stage hidden proposals; they do not modify the active skill. A host learning suite must evaluate baseline and candidate and promote the exact passing version before normal queries can use it."
 }
 func (SkillSynthTool) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
 
@@ -104,11 +104,7 @@ func (t SkillSynthTool) Execute(_ context.Context, in map[string]any) (*tools.Re
 	case "update_skill":
 		return t.handleUpdate(in)
 	case "archive_skill":
-		name, _ := in["name"].(string)
-		if err := t.synth.ArchiveSkill(name); err != nil {
-			return &tools.Result{Output: "archive_skill: " + err.Error(), IsError: true}, nil
-		}
-		return &tools.Result{Output: fmt.Sprintf("archived %q (recoverable via `metis skills curator restore %s`)", name, name)}, nil
+		return &tools.Result{Output: "Dream cannot archive an active skill while its replacement is an unvalidated candidate. Promote the replacement with a host learning suite, then use the explicit skills curator command to archive.", IsError: true}, nil
 	case "list_user_skills":
 		names := t.synth.ListUserSkills()
 		buf, _ := json.MarshalIndent(map[string]any{
@@ -138,11 +134,12 @@ func (t SkillSynthTool) handleCreate(in map[string]any) (*tools.Result, error) {
 		Tags:         asStrSlice(in["tags"]),
 		AllowedTools: asStrSlice(in["allowed_tools"]),
 	}
-	path, err := t.synth.CreateSkill(meta, body)
+	version, err := t.synth.StageCreateSkill(meta, body)
 	if err != nil {
 		return &tools.Result{Output: err.Error(), IsError: true}, nil
 	}
-	return &tools.Result{Output: fmt.Sprintf("created skill at %s", path)}, nil
+	out, _ := json.Marshal(map[string]any{"status": "candidate_staged", "name": meta.Name, "version": version.ID, "active_unchanged": true})
+	return &tools.Result{Output: string(out)}, nil
 }
 
 func (t SkillSynthTool) handleUpdate(in map[string]any) (*tools.Result, error) {
@@ -151,11 +148,12 @@ func (t SkillSynthTool) handleUpdate(in map[string]any) (*tools.Result, error) {
 	if strings.TrimSpace(body) == "" {
 		return &tools.Result{Output: "update_skill: body required", IsError: true}, nil
 	}
-	path, err := t.synth.UpdateSkill(name, body)
+	version, err := t.synth.StageUpdateSkill(name, body)
 	if err != nil {
 		return &tools.Result{Output: err.Error(), IsError: true}, nil
 	}
-	return &tools.Result{Output: fmt.Sprintf("updated skill at %s", path)}, nil
+	out, _ := json.Marshal(map[string]any{"status": "candidate_staged", "name": name, "version": version.ID, "active_unchanged": true})
+	return &tools.Result{Output: string(out)}, nil
 }
 
 func asStr(v any) string {

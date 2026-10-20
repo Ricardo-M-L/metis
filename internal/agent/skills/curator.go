@@ -36,6 +36,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Ricardo-M-L/metis/internal/learning"
 	"os"
 	"path/filepath"
 	"sort"
@@ -293,6 +294,16 @@ func (c *Curator) scan() ([]curatorSkill, map[string]bool, error) {
 		if !info.Mode().IsRegular() {
 			continue
 		}
+		// Version-managed skills have a logical active pointer. Moving their
+		// legacy baseline file cannot retire that pointer, so the flat-file
+		// curator must not report a successful archive for them.
+		if learning.ValidateName(base) == nil {
+			if _, err := learning.NewStore(c.root).Read(base); err == nil {
+				continue
+			} else if !os.IsNotExist(err) {
+				return nil, nil, err
+			}
+		}
 		out = append(out, curatorSkill{
 			name:    base,
 			modTime: info.ModTime(),
@@ -306,6 +317,13 @@ func (c *Curator) scan() ([]curatorSkill, map[string]bool, error) {
 // archived copy of the same name — the agent may have re-created and the
 // old archive is still wanted.
 func (c *Curator) archive(name string) error {
+	if learning.ValidateName(name) == nil {
+		if _, err := learning.NewStore(c.root).Read(name); err == nil {
+			return fmt.Errorf("skill %q is version managed; its active version is controlled by learning promotion and rollback", name)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
 	src, filename, ok := findSkillFile(c.root, name)
 	if !ok {
 		return fmt.Errorf("skills curator: %q not found in root", name)

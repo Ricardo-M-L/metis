@@ -24,9 +24,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/Ricardo-M-L/metis/internal/learning"
 	"gopkg.in/yaml.v3"
 )
 
@@ -107,6 +109,8 @@ func sanitizeName(raw string) (string, error) {
 	return n, nil
 }
 
+// CreateSkill is the legacy trusted administrative write API. Automatic Dream
+// uses StageCreateSkill instead and cannot activate this path through its tool.
 // CreateSkill writes a brand-new skill to ~/.metis/skills/<name>.md.
 // Refuses to overwrite — caller must use UpdateSkill to modify an
 // existing file. Returns the absolute path on success.
@@ -122,6 +126,11 @@ func (s *Synth) CreateSkill(meta SynthSkillMeta, body string) (string, error) {
 	}
 	if s.dir == "" {
 		return "", fmt.Errorf("synth: no target dir")
+	}
+	if _, err := learning.NewStore(s.dir).Read(name); err == nil {
+		return "", fmt.Errorf("skill %q is version managed; stage a candidate instead", name)
+	} else if !os.IsNotExist(err) {
+		return "", err
 	}
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return "", fmt.Errorf("synth: mkdir %s: %w", s.dir, err)
@@ -150,6 +159,8 @@ func (s *Synth) CreateSkill(meta SynthSkillMeta, body string) (string, error) {
 	return path, nil
 }
 
+// UpdateSkill is the legacy trusted administrative write API. Automatic Dream
+// uses StageUpdateSkill so edits are evaluated before activation.
 // UpdateSkill rewrites the body of an existing skill. The frontmatter
 // is preserved (the dreaming agent can't accidentally clobber the
 // user's hand-tuned description by feeding a smaller meta block).
@@ -162,6 +173,11 @@ func (s *Synth) CreateSkill(meta SynthSkillMeta, body string) (string, error) {
 func (s *Synth) UpdateSkill(name, body string) (string, error) {
 	clean, err := sanitizeName(name)
 	if err != nil {
+		return "", err
+	}
+	if _, err := learning.NewStore(s.dir).Read(clean); err == nil {
+		return "", fmt.Errorf("skill %q is version managed; stage and evaluate a candidate instead", clean)
+	} else if !os.IsNotExist(err) {
 		return "", err
 	}
 	path := filepath.Join(s.dir, clean+".md")
@@ -223,6 +239,19 @@ func (s *Synth) ListUserSkills() []string {
 		}
 		names = append(names, strings.TrimSuffix(n, ".md"))
 	}
+	if states, err := learning.NewStore(s.dir).List(); err == nil {
+		seen := map[string]bool{}
+		for _, name := range names {
+			seen[name] = true
+		}
+		for _, st := range states {
+			if !seen[st.Name] {
+				names = append(names, st.Name)
+				seen[st.Name] = true
+			}
+		}
+	}
+	sort.Strings(names)
 	return names
 }
 

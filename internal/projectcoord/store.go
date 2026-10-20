@@ -9,6 +9,7 @@
 package projectcoord
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,17 +24,21 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/execution"
+	"github.com/Ricardo-M-L/metis/internal/principal"
 )
 
 const (
-	stateVersion        = 1
-	defaultLease        = 15 * time.Minute
-	defaultMaxAttempts  = 2 // one original attempt plus one constrained recovery attempt
-	maxEvents           = 200
-	maxPersistedOutput  = 512 << 10
-	maxDependencyOutput = 24 << 10
-	lockWait            = 3 * time.Second
-	staleLockAfter      = time.Minute
+	stateVersion          = 5 // older writers must refuse archived operation references they cannot preserve
+	handoffStateVersion   = 4
+	principalStateVersion = 3
+	ledgerStateVersion    = 2
+	legacyStateVersion    = 1
+	defaultLease          = 15 * time.Minute
+	defaultMaxAttempts    = 2 // one original attempt plus one constrained recovery attempt
+	maxEvents             = 200
+	maxPersistedOutput    = 512 << 10
+	maxDependencyOutput   = 24 << 10
+	lockWait              = 3 * time.Second
 )
 
 var (
@@ -82,9 +87,18 @@ const (
 )
 
 const (
-	// FailureLeaseExpired is safe to recover because no worker reported a
-	// result; the claim simply expired after a restart or worker crash.
+	// FailureLeaseExpired can recover when no unsettled physical provider
+	// request or writing operation is left by the crashed worker.
 	FailureLeaseExpired = "worker_lease_expired"
+	// FailureProviderUsageUnresolved holds a work item until its earlier
+	// physical request settles and the coordinator explicitly recovers it.
+	FailureProviderUsageUnresolved = "provider_usage_unresolved"
+	// FailureWorkerInterrupted marks an unfinished claim during a service stop.
+	// It may be retried within the existing attempt budget.
+	FailureWorkerInterrupted = "worker_interrupted"
+	// FailureProviderStreamInterrupted is an explicit missing-completion marker
+	// from a provider stream, eligible for the same bounded task retry policy.
+	FailureProviderStreamInterrupted = "provider_stream_interrupted"
 	// FailureWorkerExecution is the durable record used when a worker process
 	// itself exits with an error.  It deliberately requires explicit recovery.
 	FailureWorkerExecution = "worker_execution_failed"
@@ -108,6 +122,7 @@ type Failure struct {
 // Lease identifies an active worker claim.  Claims expire so a killed CLI or
 // Desktop process cannot leave a project permanently stuck in "running".
 type Lease struct {
+	Token     string    `json:"token"`
 	Worker    string    `json:"worker"`
 	ClaimedAt time.Time `json:"claimed_at"`
 	ExpiresAt time.Time `json:"expires_at"`
@@ -128,13 +143,26 @@ type WorkItem struct {
 	// coordinator to retry once after the normal attempt budget only after a
 	// person/model has reviewed and changed the underlying condition; it must
 	// never create an unbounded retry loop.
-	ForcedRecoveries int       `json:"forced_recoveries,omitempty"`
-	Lease            *Lease    `json:"lease,omitempty"`
-	Output           string    `json:"output,omitempty"`
-	Failure          *Failure  `json:"failure,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
-	CompletedAt      time.Time `json:"completed_at,omitempty"`
+	ForcedRecoveries     int                `json:"forced_recoveries,omitempty"`
+	LastRecoveryRevision uint64             `json:"last_recovery_revision,omitempty"`
+	Lease                *Lease             `json:"lease,omitempty"`
+	Output               string             `json:"output,omitempty"`
+	Failure              *Failure           `json:"failure,omitempty"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
+	CompletedAt          time.Time          `json:"completed_at,omitempty"`
+	AgentProfile         string             `json:"agent_profile,omitempty"`
+	PrincipalBinding     *principal.Binding `json:"principal_binding,omitempty"`
+	Handoff              *HandoffBinding    `json:"handoff,omitempty"`
+	DeadlineAt           time.Time          `json:"deadline_at,omitempty"`
+	MaxBudgetUSD         float64            `json:"max_budget_usd,omitempty"`
+	SpentUSD             float64            `json:"spent_usd,omitempty"`
+	Deliverables         []string           `json:"deliverables,omitempty"`
+	Artifacts            []Artifact         `json:"artifacts,omitempty"`
+	Usage                []AttemptUsage     `json:"usage,omitempty"`
+	Acceptance           *Acceptance        `json:"acceptance,omitempty"`
+	EventSource          string             `json:"event_source,omitempty"`
+	EventID              string             `json:"event_id,omitempty"`
 }
 
 // Event is a bounded audit trail.  The full worker result remains on the
@@ -150,37 +178,55 @@ type Event struct {
 
 // Run is a durable project-level work graph.
 type Run struct {
-	Version     int               `json:"version"`
-	ID          string            `json:"id"`
-	Workspace   string            `json:"workspace"`
-	Goal        string            `json:"goal"`
-	Status      RunStatus         `json:"status"`
-	Environment execution.Profile `json:"environment"`
-	Items       []WorkItem        `json:"items"`
-	Events      []Event           `json:"events,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
-	CompletedAt time.Time         `json:"completed_at,omitempty"`
+	Version          int                  `json:"version"`
+	Revision         uint64               `json:"revision"`
+	ID               string               `json:"id"`
+	Workspace        string               `json:"workspace"`
+	Goal             string               `json:"goal"`
+	Status           RunStatus            `json:"status"`
+	Environment      execution.Profile    `json:"environment"`
+	Items            []WorkItem           `json:"items"`
+	Events           []Event              `json:"events,omitempty"`
+	CreatedAt        time.Time            `json:"created_at"`
+	UpdatedAt        time.Time            `json:"updated_at"`
+	CompletedAt      time.Time            `json:"completed_at,omitempty"`
+	DeadlineAt       time.Time            `json:"deadline_at,omitempty"`
+	MaxBudgetUSD     float64              `json:"max_budget_usd,omitempty"`
+	SpentUSD         float64              `json:"spent_usd,omitempty"`
+	CheckCommands    []string             `json:"check_commands,omitempty"`
+	Operations       []OperationRecord    `json:"operations,omitempty"`
+	UsageRequests    []UsageRequestRecord `json:"usage_requests,omitempty"`
+	OperationArchive *OperationArchive    `json:"operation_archive,omitempty"`
+	archiveLookup    func(*OperationArchive, string) (*OperationRecord, error)
 }
 
 // CreateInput describes a new project run.  If Items is empty METIS creates
 // a four-stage research → synthesis → implementation → verification scaffold.
 type CreateInput struct {
-	Workspace string
-	Goal      string
-	Items     []WorkItemInput
+	Workspace     string
+	Goal          string
+	Items         []WorkItemInput
+	DeadlineAt    time.Time
+	MaxBudgetUSD  float64
+	CheckCommands []string
 }
 
 // WorkItemInput is the write-only input shape used when a coordinator expands
 // a project plan.  ID is optional for AddWorkItem and mandatory only when a
 // caller wants another item to depend on a stable, human-chosen identifier.
 type WorkItemInput struct {
-	ID          string
-	Phase       Phase
-	Subject     string
-	Prompt      string
-	DependsOn   []string
-	MaxAttempts int
+	ID               string
+	Phase            Phase
+	Subject          string
+	Prompt           string
+	DependsOn        []string
+	MaxAttempts      int
+	AgentProfile     string
+	PrincipalBinding *principal.Binding
+	Handoff          *HandoffBinding
+	DeadlineAt       time.Time
+	MaxBudgetUSD     float64
+	Deliverables     []string
 }
 
 // ClaimOptions controls an atomic worker claim.
@@ -196,18 +242,36 @@ type Store struct {
 	root            string
 	now             func() time.Time
 	executionMemory execution.Memory
+	probeContext    context.Context
 	mu              sync.Mutex
 	lockWait        time.Duration
-	staleLockAfter  time.Duration
+	principalCheck  func(*principal.Binding) error
 }
 
 // Option configures a Store.
 type Option func(*Store)
 
+// WithPrincipalCheck gates claims before changing attempt state. The callback
+// must only inspect the principal store, never re-enter this work graph.
+func WithPrincipalCheck(check func(*principal.Binding) error) Option {
+	return func(s *Store) { s.principalCheck = check }
+}
+
 // WithExecutionMemory allows coordinator prompts and status output to include
 // the same durable environment rule that the Agent tool uses for recovery.
 func WithExecutionMemory(memory execution.Memory) Option {
 	return func(s *Store) { s.executionMemory = memory }
+}
+
+// WithProbeContext binds only environment discovery to its owner's lifetime.
+// Independent CLI workers use their own default Store and can still record
+// usage or an interrupted claim after the parent service has been cancelled.
+func WithProbeContext(ctx context.Context) Option {
+	return func(s *Store) {
+		if ctx != nil {
+			s.probeContext = ctx
+		}
+	}
 }
 
 // withClock is intentionally package-private; tests need deterministic lease
@@ -224,10 +288,10 @@ func withClock(now func() time.Time) Option {
 // first project run is written.
 func NewStore(root string, options ...Option) *Store {
 	s := &Store{
-		root:           strings.TrimSpace(root),
-		now:            func() time.Time { return time.Now().UTC() },
-		lockWait:       lockWait,
-		staleLockAfter: staleLockAfter,
+		root:         strings.TrimSpace(root),
+		now:          func() time.Time { return time.Now().UTC() },
+		lockWait:     lockWait,
+		probeContext: context.Background(),
 	}
 	for _, option := range options {
 		option(s)
@@ -245,6 +309,9 @@ func (s *Store) Root() string {
 
 // Create initializes a new project run and its first ready work item.
 func (s *Store) Create(input CreateInput) (Run, error) {
+	if err := validateContract(input.MaxBudgetUSD, input.CheckCommands, nil); err != nil {
+		return Run{}, err
+	}
 	if s == nil {
 		return Run{}, errors.New("project coordinator store is unavailable")
 	}
@@ -267,6 +334,11 @@ func (s *Store) Create(input CreateInput) (Run, error) {
 	if err := validateGraph(materialized); err != nil {
 		return Run{}, err
 	}
+	for _, item := range materialized {
+		if err := principal.ValidateBinding(item.PrincipalBinding, workspace); err != nil {
+			return Run{}, err
+		}
+	}
 
 	environment, err := s.environmentFor(workspace)
 	if err != nil {
@@ -274,15 +346,19 @@ func (s *Store) Create(input CreateInput) (Run, error) {
 	}
 	now := s.now()
 	run := Run{
-		Version:     stateVersion,
-		ID:          newID("project"),
-		Workspace:   workspace,
-		Goal:        goal,
-		Status:      RunActive,
-		Environment: environment,
-		Items:       materialized,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		Version:       stateVersion,
+		Revision:      1,
+		ID:            newID("project"),
+		Workspace:     workspace,
+		Goal:          goal,
+		Status:        RunActive,
+		Environment:   environment,
+		Items:         materialized,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+		DeadlineAt:    input.DeadlineAt,
+		MaxBudgetUSD:  input.MaxBudgetUSD,
+		CheckCommands: append([]string(nil), input.CheckCommands...),
 	}
 	run.reconcile(now)
 	run.addEvent(now, "run_created", "", "Created durable project work graph", "")
@@ -392,6 +468,9 @@ func (s *Store) AddWorkItem(workspace, runID string, input WorkItemInput) (WorkI
 			return false, err
 		}
 		candidate := append(append([]WorkItem(nil), run.Items...), items[0])
+		if err := principal.ValidateBinding(items[0].PrincipalBinding, run.Workspace); err != nil {
+			return false, err
+		}
 		if err := validateGraph(candidate); err != nil {
 			return false, err
 		}
@@ -414,8 +493,8 @@ func (s *Store) AddWorkItem(workspace, runID string, input WorkItemInput) (WorkI
 // sequence is protected by the run's filesystem lock.
 func (s *Store) ClaimNext(workspace, runID string, options ClaimOptions) (WorkItem, error) {
 	worker := strings.TrimSpace(options.Worker)
-	if worker == "" {
-		return WorkItem{}, errors.New("worker name is required")
+	if worker == "" || len(worker) > 256 {
+		return WorkItem{}, errors.New("worker name is required and must fit within 256 bytes")
 	}
 	lease := options.Lease
 	if lease <= 0 {
@@ -429,21 +508,35 @@ func (s *Store) ClaimNext(workspace, runID string, options ClaimOptions) (WorkIt
 		if run.Status == RunCancelled || run.Status == RunCompleted {
 			return false, ErrNoReadyWork
 		}
+		var heldPrincipal error
 		for i := range run.Items {
 			item := &run.Items[i]
 			if item.Status != ItemReady {
 				continue
 			}
+			if item.PrincipalBinding != nil && s.principalCheck != nil {
+				if err := s.principalCheck(item.PrincipalBinding); err != nil {
+					if errors.Is(err, principal.ErrInactive) || errors.Is(err, principal.ErrBudget) || errors.Is(err, principal.ErrUsageUnknown) || errors.Is(err, principal.ErrBusy) {
+						heldPrincipal = err
+						continue
+					}
+					return false, err
+				}
+			}
 			now := s.now()
 			item.Status = ItemRunning
 			item.Owner = worker
 			item.Attempts++
-			item.Lease = &Lease{Worker: worker, ClaimedAt: now, ExpiresAt: now.Add(lease)}
+			item.Lease = &Lease{Token: newID("claim"), Worker: worker, ClaimedAt: now, ExpiresAt: now.Add(lease)}
+			item.Usage = append(item.Usage, AttemptUsage{Token: item.Lease.Token, Worker: worker})
 			item.UpdatedAt = now
 			run.UpdatedAt = now
 			run.addEvent(now, "work_claimed", item.ID, item.Subject, worker)
 			claimed = cloneItem(*item)
 			return true, nil
+		}
+		if heldPrincipal != nil {
+			return false, heldPrincipal
 		}
 		return false, ErrNoReadyWork
 	})
@@ -451,19 +544,59 @@ func (s *Store) ClaimNext(workspace, runID string, options ClaimOptions) (WorkIt
 }
 
 // Complete records durable evidence and opens dependent work items.
-func (s *Store) Complete(workspace, runID, itemID, worker, output string) (WorkItem, error) {
+func (s *Store) Complete(ctx context.Context, workspace, runID, itemID string, input CompletionInput) (WorkItem, error) {
+	worker, output := input.Worker, input.Output
+	if err := validateCompletionOutput(output); err != nil {
+		return WorkItem{}, err
+	}
+	before, err := s.Get(workspace, runID)
+	if err != nil {
+		return WorkItem{}, err
+	}
+	claimed, err := before.item(itemID)
+	if err != nil {
+		return WorkItem{}, err
+	}
+	if err := claimed.assertClaim(worker, input.Token); err != nil {
+		return WorkItem{}, err
+	}
+	if err := before.assertOperationsResolved(itemID); err != nil {
+		return WorkItem{}, err
+	}
+	if deadline := WorkDeadline(before, *claimed); !deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+	acceptance, artifacts, acceptanceErr := verifyCompletion(ctx, before, *claimed)
 	var completed WorkItem
 	updated, err := s.withRun(workspace, runID, func(run *Run) (bool, error) {
 		item, err := run.item(itemID)
 		if err != nil {
 			return false, err
 		}
-		if err := item.assertOwner(worker); err != nil {
+		if err := item.assertClaim(worker, input.Token); err != nil {
+			return false, err
+		}
+		if err := run.assertOperationsResolved(item.ID); err != nil {
+			return false, err
+		}
+		if !sameContract(before, *claimed, *run, *item) {
+			return false, errors.New("completion contract changed during verification")
+		}
+		item.Acceptance = &acceptance
+		item.Output = boundText(output, maxPersistedOutput)
+		if acceptanceErr != nil {
+			run.addEvent(s.now(), "acceptance_rejected", itemID, acceptance.Summary, worker)
+			return true, nil
+		}
+		if err := ctx.Err(); err != nil {
 			return false, err
 		}
 		now := s.now()
 		item.Status = ItemCompleted
 		item.Output = boundText(output, maxPersistedOutput)
+		item.Artifacts = artifacts
 		item.Failure = nil
 		item.Lease = nil
 		item.Owner = ""
@@ -474,6 +607,9 @@ func (s *Store) Complete(workspace, runID, itemID, worker, output string) (WorkI
 		completed = cloneItem(*item)
 		return true, nil
 	})
+	if err == nil && acceptanceErr != nil {
+		return WorkItem{}, acceptanceErr
+	}
 	if err == nil {
 		if item, itemErr := updated.item(completed.ID); itemErr == nil {
 			completed = cloneItem(*item)
@@ -482,11 +618,11 @@ func (s *Store) Complete(workspace, runID, itemID, worker, output string) (WorkI
 	return completed, err
 }
 
-// Fail records a concrete reason.  Only known, deterministic environment
+// Fail records a concrete reason. Only explicit interruption/environment
 // recovery codes are automatically requeued, and even those can use at most
 // the work item's configured attempt budget.  Unknown model/provider errors
 // remain visible and require a deliberate recovery decision.
-func (s *Store) Fail(workspace, runID, itemID, worker string, failure Failure, output string) (WorkItem, error) {
+func (s *Store) Fail(workspace, runID, itemID, worker, token string, failure Failure, output string) (WorkItem, error) {
 	failure.Code = strings.TrimSpace(failure.Code)
 	failure.Summary = strings.TrimSpace(failure.Summary)
 	if failure.Code == "" {
@@ -501,12 +637,18 @@ func (s *Store) Fail(workspace, runID, itemID, worker string, failure Failure, o
 		if err != nil {
 			return false, err
 		}
-		if err := item.assertOwner(worker); err != nil {
+		if err := item.assertClaim(worker, token); err != nil {
 			return false, err
 		}
 		now := s.now()
 		failure.ObservedAt = now
 		failure.Recoverable = autoRecoverable(failure.Code)
+		if failure.Code == FailureProviderUsageUnresolved {
+			failure.AutoRecovered = false
+		}
+		if failure.Recoverable && run.assertUsageResolved(item.ID) != nil {
+			failure = providerUsageUnresolvedFailure(now)
+		}
 		item.Output = boundText(output, maxPersistedOutput)
 		item.Failure = &failure
 		item.Lease = nil
@@ -555,6 +697,12 @@ func (s *Store) Recover(workspace, runID, itemID, note string, force bool) (Work
 		if item.Status != ItemFailed && item.Status != ItemBlocked {
 			return false, fmt.Errorf("work item %q is %s, not failed or blocked", item.ID, item.Status)
 		}
+		if err := run.assertOperationsResolved(itemID); err != nil {
+			return false, err
+		}
+		if err := run.assertUsageResolved(itemID); err != nil {
+			return false, err
+		}
 		if item.Attempts >= item.MaxAttempts {
 			if !force {
 				return false, fmt.Errorf("work item %q exhausted %d attempts; use force after fixing the cause", item.ID, item.MaxAttempts)
@@ -577,6 +725,7 @@ func (s *Store) Recover(workspace, runID, itemID, note string, force bool) (Work
 		if detail == "" {
 			detail = "Coordinator requeued the work after reviewing the failure."
 		}
+		item.LastRecoveryRevision = run.Revision + 1
 		run.addEvent(now, "work_requeued", item.ID, detail, "")
 		recovered = cloneItem(*item)
 		return true, nil
@@ -596,6 +745,28 @@ func (s *Store) Recover(workspace, runID, itemID, note string, force bool) (Work
 func BuildWorkerPrompt(run Run, item WorkItem) string {
 	var b strings.Builder
 	b.WriteString("You are executing one durable METIS project work item.\n\n")
+	b.WriteString("Durable operation rules: Bash commands, including finite tests and acceptance checks, must finish in the foreground. Omit run_in_background, await_completion and required_for_completion, or set all three to false; general background-job guidance does not apply to this worker. Use timeout_ms for a bounded foreground command. Confirmed writes can be replayed after recovery without repeating their effects. Do not disguise the same external action by changing its command or arguments. An uncertain operation must be inspected and resolved by the host before this item can resume.\n\n")
+	if !WorkDeadline(run, item).IsZero() {
+		fmt.Fprintf(&b, "Absolute task deadline: %s\n", WorkDeadline(run, item).Format(time.RFC3339))
+	}
+	if remaining := RemainingBudget(run, item); remaining > 0 {
+		fmt.Fprintf(&b, "Remaining estimated USD budget: %.6f\n", remaining)
+	}
+	if len(item.Deliverables) > 0 {
+		fmt.Fprintf(&b, "Required output files: %s\n", strings.Join(item.Deliverables, ", "))
+	}
+	if item.Handoff != nil {
+		fmt.Fprintf(&b, "Structured handoff: %s (task %s), content SHA-256: %s\n", item.Handoff.MessageID, item.Handoff.TaskID, item.Handoff.ContentSHA256)
+		for _, artifact := range item.Handoff.InputArtifacts {
+			fmt.Fprintf(&b, "Verified input artifact: %s SHA-256=%s\n", artifact.Path, artifact.SHA256)
+		}
+	}
+	if item.EventID != "" {
+		fmt.Fprintf(&b, "Triggering event: %s / %s\n", item.EventSource, item.EventID)
+	}
+	if item.Phase == PhaseVerification {
+		fmt.Fprintf(&b, "Host acceptance checks configured: %d. The host reruns these checks after your response; prose cannot substitute for passing checks.\n", len(run.CheckCommands))
+	}
 	fmt.Fprintf(&b, "Project goal: %s\n", run.Goal)
 	fmt.Fprintf(&b, "Workspace: %s\n", run.Workspace)
 	fmt.Fprintf(&b, "Phase: %s\n", item.Phase)
@@ -666,6 +837,13 @@ func (s *Store) withRun(workspace, runID string, mutate func(*Run) (bool, error)
 		return Run{}, envErr
 	}
 	changed := false
+	if run.Revision == 0 {
+		changed = true
+	}
+	if run.Version != stateVersion {
+		run.Version = stateVersion
+		changed = true
+	}
 	if !sameEnvironment(run.Environment, environment) {
 		run.Environment = environment
 		changed = true
@@ -673,9 +851,18 @@ func (s *Store) withRun(workspace, runID string, mutate func(*Run) (bool, error)
 	if run.reconcile(s.now()) {
 		changed = true
 	}
+	archived, err := s.compactOperations(canonical, &run)
+	if err != nil {
+		return Run{}, err
+	}
+	changed = changed || archived
 	mutated, err := mutate(&run)
 	if err != nil {
 		if changed {
+			if run.Revision == ^uint64(0) {
+				return Run{}, errors.New("project coordinator revision overflow")
+			}
+			run.Revision++
 			if writeErr := s.writeRun(canonical, run, false); writeErr != nil {
 				return Run{}, writeErr
 			}
@@ -686,6 +873,10 @@ func (s *Store) withRun(workspace, runID string, mutate func(*Run) (bool, error)
 		changed = true
 	}
 	if changed || mutated {
+		if run.Revision == ^uint64(0) {
+			return Run{}, errors.New("project coordinator revision overflow")
+		}
+		run.Revision++
 		if err := s.writeRun(canonical, run, false); err != nil {
 			return Run{}, err
 		}
@@ -694,7 +885,7 @@ func (s *Store) withRun(workspace, runID string, mutate func(*Run) (bool, error)
 }
 
 func (s *Store) environmentFor(workspace string) (execution.Profile, error) {
-	profile, err := execution.Probe(workspace)
+	profile, err := execution.ProbeContext(s.probeContext, workspace)
 	if err != nil {
 		return execution.Profile{}, err
 	}
@@ -764,11 +955,34 @@ func (s *Store) readRun(workspace, runID string) (Run, error) {
 	if err != nil {
 		return Run{}, err
 	}
-	if run.Version != stateVersion || run.ID != runID || run.Workspace != canonical {
+	if (run.Version != stateVersion && run.Version != handoffStateVersion && run.Version != principalStateVersion && run.Version != ledgerStateVersion && run.Version != legacyStateVersion) || run.ID != runID || run.Workspace != canonical {
 		return Run{}, fmt.Errorf("project coordinator run identity mismatch")
+	}
+	if err := validateContract(run.MaxBudgetUSD, run.CheckCommands, nil); err != nil {
+		return Run{}, fmt.Errorf("invalid persisted project contract: %w", err)
 	}
 	if err := validateGraph(run.Items); err != nil {
 		return Run{}, fmt.Errorf("project coordinator run graph is invalid: %w", err)
+	}
+	for _, item := range run.Items {
+		if item.LastRecoveryRevision > run.Revision {
+			return Run{}, errors.New("work recovery revision exceeds journal revision")
+		}
+		if err := principal.ValidateBinding(item.PrincipalBinding, canonical); err != nil {
+			return Run{}, err
+		}
+	}
+	if err := validateOperations(run); err != nil {
+		return Run{}, fmt.Errorf("project coordinator operation ledger is invalid: %w", err)
+	}
+	if err := s.validateOperationArchive(canonical, run); err != nil {
+		return Run{}, fmt.Errorf("project coordinator operation archive is invalid: %w", err)
+	}
+	run.archiveLookup = func(archive *OperationArchive, id string) (*OperationRecord, error) {
+		return s.archivedOperation(canonical, runID, archive, id)
+	}
+	if err := validateUsageLedger(run); err != nil {
+		return Run{}, fmt.Errorf("project coordinator usage ledger is invalid: %w", err)
 	}
 	return run, nil
 }
@@ -826,7 +1040,10 @@ func (s *Store) writeRun(workspace string, run Run, create bool) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	return syncOperationArchiveDirectory(dir)
 }
 
 func (s *Store) lockRun(workspace, runID string) (func(), error) {
@@ -835,28 +1052,14 @@ func (s *Store) lockRun(workspace, runID string) (func(), error) {
 		return nil, err
 	}
 	locks := filepath.Join(dir, ".locks")
-	if err := os.MkdirAll(locks, 0o700); err != nil {
+	if err := ensureProjectCoordinatorLockDirectory(locks); err != nil {
 		return nil, err
 	}
-	lockPath := filepath.Join(locks, runID+".lock")
-	deadline := time.Now().Add(s.lockWait)
-	for {
-		err := os.Mkdir(lockPath, 0o700)
-		if err == nil {
-			return func() { _ = os.RemoveAll(lockPath) }, nil
-		}
-		if !os.IsExist(err) {
-			return nil, err
-		}
-		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > s.staleLockAfter {
-			_ = os.RemoveAll(lockPath)
-			continue
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out waiting for project coordinator lock for %q", runID)
-		}
-		time.Sleep(15 * time.Millisecond)
+	lock, err := acquireProjectCoordinatorLock(filepath.Join(locks, runID+".lock"), s.lockWait)
+	if err != nil {
+		return nil, err
 	}
+	return lock.release, nil
 }
 
 func (r *Run) item(id string) (*WorkItem, error) {
@@ -873,8 +1076,21 @@ func (i *WorkItem) assertOwner(worker string) error {
 		return fmt.Errorf("work item %q is %s, not running", i.ID, i.Status)
 	}
 	worker = strings.TrimSpace(worker)
-	if worker != "" && i.Owner != "" && worker != i.Owner {
+	if worker == "" || worker != i.Owner {
 		return fmt.Errorf("work item %q is claimed by %q", i.ID, i.Owner)
+	}
+	return nil
+}
+
+func validateCompletionOutput(output string) error {
+	if strings.TrimSpace(output) == "" {
+		return errors.New("completion requires non-empty result evidence")
+	}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.ToLower(strings.Trim(strings.TrimSpace(line), "`"))
+		if strings.HasPrefix(line, "metis_project_status: blocked") || strings.HasPrefix(line, "acceptance_incomplete:") {
+			return errors.New("completion rejected: worker explicitly reported incomplete or blocked acceptance")
+		}
 	}
 	return nil
 }
@@ -883,15 +1099,37 @@ func (r *Run) reconcile(now time.Time) bool {
 	if r.Status == RunCancelled {
 		return false
 	}
-	changed := false
+	changed := r.reconcileOperations(now)
+	if r.reconcileLimits(now) {
+		changed = true
+	}
 	for i := range r.Items {
 		item := &r.Items[i]
+		// Older journals may already have requeued an interrupted request.
+		// Hold that dispatchable state before ClaimNext can spend a replacement
+		// attempt; dependency reconciliation must not make it ready again.
+		if (item.Status == ItemPending || item.Status == ItemReady || item.Status == ItemBlocked) && r.assertUsageResolved(item.ID) != nil {
+			failure := providerUsageUnresolvedFailure(now)
+			item.Status, item.Failure = ItemFailed, &failure
+			item.Owner, item.Lease, item.UpdatedAt = "", nil, now
+			r.addEvent(now, FailureProviderUsageUnresolved, item.ID, failure.Summary, "")
+			changed = true
+			continue
+		}
 		if item.Status != ItemRunning || item.Lease == nil || item.Lease.ExpiresAt.After(now) {
 			continue
 		}
 		item.Owner = ""
 		item.Lease = nil
 		item.UpdatedAt = now
+		if r.assertUsageResolved(item.ID) != nil {
+			failure := providerUsageUnresolvedFailure(now)
+			item.Status, item.Failure = ItemFailed, &failure
+			r.addEvent(now, FailureProviderUsageUnresolved, item.ID, failure.Summary, "")
+			r.addEvent(now, "work_failed", item.ID, "Worker lease expired with unsettled provider usage; automatic recovery is held.", "")
+			changed = true
+			continue
+		}
 		item.Failure = &Failure{
 			Code:        FailureLeaseExpired,
 			Summary:     "Worker lease expired before this work item reported a result.",
@@ -1023,6 +1261,9 @@ func (r *Run) addEvent(at time.Time, kind, itemID, detail, worker string) {
 func materializeItems(inputs []WorkItemInput, now time.Time) ([]WorkItem, error) {
 	items := make([]WorkItem, 0, len(inputs))
 	for _, input := range inputs {
+		if err := validateContract(input.MaxBudgetUSD, nil, input.Deliverables); err != nil {
+			return nil, err
+		}
 		id := strings.TrimSpace(input.ID)
 		if id == "" {
 			id = newID("item")
@@ -1059,15 +1300,21 @@ func materializeItems(inputs []WorkItemInput, now time.Time) ([]WorkItem, error)
 			}
 		}
 		items = append(items, WorkItem{
-			ID:          id,
-			Phase:       phase,
-			Subject:     subject,
-			Prompt:      prompt,
-			DependsOn:   depends,
-			Status:      ItemPending,
-			MaxAttempts: maxAttempts,
-			CreatedAt:   now,
-			UpdatedAt:   now,
+			ID:               id,
+			Phase:            phase,
+			Subject:          subject,
+			Prompt:           prompt,
+			DependsOn:        depends,
+			Status:           ItemPending,
+			MaxAttempts:      maxAttempts,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+			AgentProfile:     input.AgentProfile,
+			PrincipalBinding: clonePrincipalBinding(input.PrincipalBinding),
+			Handoff:          cloneHandoffBinding(input.Handoff),
+			DeadlineAt:       input.DeadlineAt,
+			MaxBudgetUSD:     input.MaxBudgetUSD,
+			Deliverables:     append([]string(nil), input.Deliverables...),
 		})
 	}
 	return items, nil
@@ -1079,6 +1326,18 @@ func validateGraph(items []WorkItem) error {
 	}
 	byID := make(map[string]WorkItem, len(items))
 	for _, item := range items {
+		if err := validateHandoffBinding(item); err != nil {
+			return err
+		}
+		if err := principal.ValidateBinding(item.PrincipalBinding, ""); err != nil {
+			return err
+		}
+		if item.PrincipalBinding != nil && item.AgentProfile != item.PrincipalBinding.Definition.Profile.Name {
+			return errors.New("work item profile name differs from frozen principal binding")
+		}
+		if err := validateContract(item.MaxBudgetUSD, nil, item.Deliverables); err != nil {
+			return fmt.Errorf("invalid work item contract: %w", err)
+		}
 		if !validID(item.ID) || !validPhase(item.Phase) || strings.TrimSpace(item.Subject) == "" || strings.TrimSpace(item.Prompt) == "" || item.MaxAttempts < 1 || item.MaxAttempts > 10 || item.Attempts < 0 || item.ForcedRecoveries < 0 || item.ForcedRecoveries > 1 {
 			return fmt.Errorf("work item %q is invalid", item.ID)
 		}
@@ -1088,6 +1347,12 @@ func validateGraph(items []WorkItem) error {
 		byID[item.ID] = item
 	}
 	for _, item := range items {
+		if item.Handoff != nil {
+			verifier, ok := byID[item.ID+"-verify"]
+			if !ok || verifier.Phase != PhaseVerification || verifier.PrincipalBinding != nil || verifier.Handoff != nil || len(verifier.DependsOn) != 1 || verifier.DependsOn[0] != item.ID {
+				return errors.New("handoff requires its fixed independent verification item")
+			}
+		}
 		seenDeps := map[string]struct{}{}
 		for _, dep := range item.DependsOn {
 			if dep == item.ID {
@@ -1131,7 +1396,16 @@ func validateGraph(items []WorkItem) error {
 }
 
 func autoRecoverable(code string) bool {
-	return code == FailureLeaseExpired || code == string(execution.FailureWorktreeRequiresGit)
+	return code == FailureLeaseExpired || code == FailureWorkerInterrupted || code == FailureProviderStreamInterrupted || code == string(execution.FailureWorktreeRequiresGit)
+}
+
+func providerUsageUnresolvedFailure(now time.Time) Failure {
+	return Failure{
+		Code:            FailureProviderUsageUnresolved,
+		Summary:         "A previous physical provider request has unsettled usage; no replacement attempt was queued.",
+		SuggestedAction: "Inspect the persisted request, settle its bound usage receipt or complete its observed usage, then explicitly recover this work item.",
+		ObservedAt:      now,
+	}
 }
 
 func isExecutionConstraint(code string) bool {
@@ -1240,6 +1514,13 @@ func cloneRun(run Run) Run {
 		clone.Items[i] = cloneItem(run.Items[i])
 	}
 	clone.Events = append([]Event(nil), run.Events...)
+	clone.CheckCommands = append([]string(nil), run.CheckCommands...)
+	clone.Operations = cloneOperations(run.Operations)
+	clone.UsageRequests = cloneUsageRequests(run.UsageRequests)
+	if run.OperationArchive != nil {
+		archive := *run.OperationArchive
+		clone.OperationArchive = &archive
+	}
 	if run.Environment.LastFailure != nil {
 		failure := *run.Environment.LastFailure
 		clone.Environment.LastFailure = &failure
@@ -1249,7 +1530,17 @@ func cloneRun(run Run) Run {
 
 func cloneItem(item WorkItem) WorkItem {
 	clone := item
+	clone.PrincipalBinding = clonePrincipalBinding(item.PrincipalBinding)
+	clone.Handoff = cloneHandoffBinding(item.Handoff)
 	clone.DependsOn = append([]string(nil), item.DependsOn...)
+	clone.Deliverables = append([]string(nil), item.Deliverables...)
+	clone.Artifacts = append([]Artifact(nil), item.Artifacts...)
+	clone.Usage = append([]AttemptUsage(nil), item.Usage...)
+	if item.Acceptance != nil {
+		acceptance := *item.Acceptance
+		acceptance.Checks = append([]CheckResult(nil), item.Acceptance.Checks...)
+		clone.Acceptance = &acceptance
+	}
 	if item.Lease != nil {
 		lease := *item.Lease
 		clone.Lease = &lease
@@ -1259,4 +1550,14 @@ func cloneItem(item WorkItem) WorkItem {
 		clone.Failure = &failure
 	}
 	return clone
+}
+
+func clonePrincipalBinding(binding *principal.Binding) *principal.Binding {
+	if binding == nil {
+		return nil
+	}
+	data, _ := json.Marshal(binding)
+	var copied principal.Binding
+	_ = json.Unmarshal(data, &copied)
+	return &copied
 }

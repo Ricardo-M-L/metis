@@ -22,6 +22,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/shellguard"
 	"github.com/Ricardo-M-L/metis/internal/spill"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
 
 // AutoBackgroundThreshold — wall-clock duration after which a still-
@@ -468,7 +469,7 @@ func (b Bash) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// long builds instead of returning a verbose policy error. This also closes
 	// the common retry loop where a model changes `sleep 12` to `sleep 9` or
 	// wraps time.sleep in Python after the first refusal.
-	if !wantBackground {
+	if !wantBackground && pubtool.OperationExecutorFromContext(ctx) == nil {
 		if wait := detectBlockingWaitPattern(cmd); wait != "" {
 			if b.Jobs == nil {
 				return &tools.Result{
@@ -594,7 +595,7 @@ func (b Bash) executeForegroundWithBgFallback(ctx context.Context, cmdStr string
 	// isn't wired (e.g. very early init / tests), we skip the disk
 	// half and the auto-bg promotion path becomes a no-op.
 	var diskOut *jobs.DiskOutput
-	canPromote := b.Jobs != nil && AutoBackgroundThreshold > 0 && AutoBackgroundThreshold < timeout
+	canPromote := b.Jobs != nil && AutoBackgroundThreshold > 0 && AutoBackgroundThreshold < timeout && pubtool.OperationExecutorFromContext(ctx) == nil
 	if canPromote {
 		var err error
 		diskOut, _, err = b.Jobs.NewDiskOutput()

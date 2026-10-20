@@ -131,7 +131,7 @@
     function showPage(route) {
       app.dataset.page = route.page;
       main.dataset.page = route.page;
-      for (const [id, page] of [['settingsOverlay', 'settings'], ['automationsPage', 'schedules'], ['artifactPreviewOverlay', 'artifact']]) {
+      for (const [id, page] of [['settingsOverlay', 'settings'], ['automationsPage', 'schedules'], ['durableOpsPage', 'operations'], ['artifactPreviewOverlay', 'artifact']]) {
         const element = document.getElementById(id);
         if (element) element.hidden = route.page !== page;
       }
@@ -157,6 +157,7 @@
       let label = text('New conversation', '新对话');
       if (route.page === 'settings') label = text('Settings', '设置') + ' / ' + text(...(settingsNames[route.tab] || settingsNames.general));
       else if (route.page === 'schedules') label = text('Scheduled tasks', '定时任务');
+      else if (route.page === 'operations') label = text('Persistent jobs', '岗位管理');
       else if (route.page === 'artifact') label = document.getElementById('artifactPreviewTitle')?.textContent || text('Artifact', '产物');
       else if (route.sessionId) {
         const session = typeof sessions !== 'undefined' && sessions.find(item => (item.id || item.ID) === route.sessionId);
@@ -176,6 +177,14 @@
         schedules.setAttribute('aria-label', schedules.title);
         const label = schedules.querySelector('span');
         if (label) label.textContent = schedules.title;
+      }
+      const operations = document.getElementById('operationsNav');
+      if (operations) {
+        operations.classList.toggle('active', route.page === 'operations');
+        operations.title = text('Persistent jobs', '岗位管理');
+        operations.setAttribute('aria-label', operations.title);
+        const label = operations.querySelector('span');
+        if (label) label.textContent = operations.title;
       }
       document.querySelector('.sb-settings')?.classList.toggle('active', route.page === 'settings');
     }
@@ -236,6 +245,10 @@
     navigation.register('schedules', {
       enter(route) { showPage(route); return typeof showAutomationsPage === 'function' ? showAutomationsPage() : true; },
       leave() { if (typeof hideAutomationsPage === 'function') hideAutomationsPage(); }
+    });
+    navigation.register('operations', {
+      enter(route) { showPage(route); return typeof showDurableOpsPage === 'function' ? showDurableOpsPage() : true; },
+      leave() { if (typeof hideDurableOpsPage === 'function') hideDurableOpsPage(); }
     });
     navigation.register('artifact', {
       async enter(route, _previous, isCurrent) {

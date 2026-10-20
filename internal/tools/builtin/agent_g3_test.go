@@ -262,8 +262,8 @@ func TestMessageTeammate_DeliversToMailbox(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("delivery should succeed; got IsError: %s", res.Output)
 	}
-	if !strings.Contains(res.Output, "delivered to bob") {
-		t.Errorf("result should confirm delivery; got %q", res.Output)
+	if !strings.Contains(res.Output, "queued in live mailbox for bob") {
+		t.Errorf("result should confirm queueing without claiming recipient acknowledgement; got %q", res.Output)
 	}
 
 	// Drain the mailbox — exactly one message present.

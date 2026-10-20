@@ -125,6 +125,12 @@ func AvailableAgentProfileNames() []string {
 // just a fallback so `metis --agent=explore` works on a fresh
 // install without any user setup.
 func LoadAgentProfile(name string) (*AgentProfile, error) {
+	return LoadAgentProfileForWorkspace(name, "")
+}
+
+// LoadAgentProfileForWorkspace resolves project overrides without changing the
+// process working directory, allowing a service to validate its fixed workspace.
+func LoadAgentProfileForWorkspace(name, workspace string) (*AgentProfile, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil, nil
@@ -136,7 +142,7 @@ func LoadAgentProfile(name string) (*AgentProfile, error) {
 		path   string
 		source AgentProfileSource
 	}{
-		{path: filepath.Join(".metis", "agents", name+".md"), source: AgentProfileSourceProject},
+		{path: filepath.Join(workspace, ".metis", "agents", name+".md"), source: AgentProfileSourceProject},
 		{path: filepath.Join(config.Home(), "agents", name+".md"), source: AgentProfileSourceUser},
 	}
 	for _, candidate := range candidates {

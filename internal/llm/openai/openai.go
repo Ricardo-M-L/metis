@@ -70,6 +70,11 @@ func (e *chatRedactedError) Error() string { return e.message }
 func (e *chatRedactedError) Unwrap() error { return e.classification }
 
 func chatSafeClassification(err error) error {
+	if usage := transport.SafeUsageObserverClassification(err); usage != nil {
+		// Durable accounting failures must not become retryable through a
+		// surrounding network error or retain the callback's private cause.
+		return usage
+	}
 	var safe []error
 	if transport.IsNetworkError(err) {
 		safe = append(safe, transport.ErrNetwork)
@@ -92,10 +97,15 @@ func redactChatError(err error, exactValues ...string) error {
 	if err == nil {
 		return nil
 	}
-	safe := &chatRedactedError{
-		message:        security.RedactValues(err.Error(), exactValues...),
-		classification: chatSafeClassification(err),
+	classification := chatSafeClassification(err)
+	var message string
+	var usage *transport.UsageObserverError
+	if errors.As(classification, &usage) {
+		message = usage.Error()
+	} else {
+		message = security.RedactValues(err.Error(), exactValues...)
 	}
+	safe := &chatRedactedError{message: message, classification: classification}
 	var exhausted *transport.RetryExhaustedError
 	if errors.As(err, &exhausted) {
 		return &transport.RetryExhaustedError{Err: safe, Attempts: exhausted.Attempts}

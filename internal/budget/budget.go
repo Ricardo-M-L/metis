@@ -15,6 +15,7 @@ package budget
 
 import (
 	"fmt"
+	"math"
 	"sync"
 )
 
@@ -32,11 +33,13 @@ type Rates struct {
 // Tracker accumulates spend. Safe for concurrent use — parent and
 // background sub-agent loops add usage from their own goroutines.
 type Tracker struct {
-	mu     sync.Mutex
-	rates  Rates
-	maxUSD float64 // 0 = unlimited (tracking only)
-	spent  float64
-	warned bool
+	mu            sync.Mutex
+	rates         Rates
+	maxUSD        float64 // 0 = unlimited (tracking only)
+	spent         float64
+	observedSpend float64 // durable request/receipt floor, separate from legacy additions
+	warned        bool
+	onSpend       func(float64) error
 
 	// ratesFn lazily re-resolves pricing until it reports a FINAL
 	// answer. Needed because the models.dev catalog warms up in a
@@ -104,9 +107,9 @@ func (t *Tracker) currentRates() Rates {
 }
 
 // AddUsage records one LLM round-trip's token usage.
-func (t *Tracker) AddUsage(in, out, cacheRead, cacheWrite int) {
+func (t *Tracker) AddUsage(in, out, cacheRead, cacheWrite int) error {
 	if t == nil {
-		return
+		return nil
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -116,6 +119,17 @@ func (t *Tracker) AddUsage(in, out, cacheRead, cacheWrite int) {
 		float64(out)/mtok*r.OutputPerMTok +
 		float64(cacheRead)/mtok*r.CacheReadPerMTok +
 		float64(cacheWrite)/mtok*r.CacheWritePerMTok
+	if t.onSpend != nil {
+		return t.onSpend(t.spent)
+	}
+	return nil
+}
+
+// SetPersistence serializes cumulative spend writes across the shared agent tree.
+func (t *Tracker) SetPersistence(write func(float64) error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.onSpend = write
 }
 
 // Reset starts a new top-level session budget while preserving the configured
@@ -127,6 +141,7 @@ func (t *Tracker) Reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.spent = 0
+	t.observedSpend = 0
 	t.warned = false
 }
 
@@ -137,7 +152,43 @@ func (t *Tracker) SpentUSD() float64 {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.spent
+	return math.Max(t.spent, t.observedSpend)
+}
+
+// PricingSnapshot returns the currently resolved rates for durable requests.
+func (t *Tracker) PricingSnapshot() Rates {
+	if t == nil {
+		return Rates{}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.currentRates()
+}
+
+// ObserveSpend enforces durable request/late-receipt charges in the live budget
+// without sending those charges through legacy cumulative persistence again.
+func (t *Tracker) ObserveSpend(spent float64) {
+	if t == nil || math.IsNaN(spent) || math.IsInf(spent, 0) || spent < 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if spent > t.observedSpend {
+		t.observedSpend = spent
+	}
+}
+
+// SetObservedSpend replaces the absolute durable ledger projection, including
+// provider estimate corrections. Callers must serialize reading the ledger and
+// applying this projection, so an older read cannot replace a newer one.
+// Legacy AddUsage spend remains separate and cannot be refunded by this API.
+func (t *Tracker) SetObservedSpend(spent float64) {
+	if t == nil || math.IsNaN(spent) || math.IsInf(spent, 0) || spent < 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.observedSpend = spent
 }
 
 // Exceeded reports whether the cap has been reached.
@@ -147,7 +198,7 @@ func (t *Tracker) Exceeded() bool {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.maxUSD > 0 && t.spent >= t.maxUSD
+	return t.maxUSD > 0 && math.Max(t.spent, t.observedSpend) >= t.maxUSD
 }
 
 // TakeWarning returns a one-shot reminder body when spend first
@@ -159,13 +210,14 @@ func (t *Tracker) TakeWarning() string {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.maxUSD <= 0 || t.warned || t.spent < t.maxUSD*warnFraction {
+	spent := math.Max(t.spent, t.observedSpend)
+	if t.maxUSD <= 0 || t.warned || spent < t.maxUSD*warnFraction {
 		return ""
 	}
 	t.warned = true
 	return fmt.Sprintf(
 		"<system-reminder>Budget check: $%.4f of the $%g USD budget for this session is spent (%.0f%%). Wrap up: finish the essential remaining work and summarize, rather than starting new exploration.</system-reminder>",
-		t.spent, t.maxUSD, t.spent/t.maxUSD*100,
+		spent, t.maxUSD, spent/t.maxUSD*100,
 	)
 }
 
@@ -177,5 +229,5 @@ func (t *Tracker) ExceededMessage() string {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return fmt.Sprintf("USD budget reached ($%.4f spent of $%g cap) — stopping before the next LLM call. Raise --max-budget-usd to continue.", t.spent, t.maxUSD)
+	return fmt.Sprintf("USD budget reached ($%.4f spent of $%g cap) — stopping before the next LLM call. Raise --max-budget-usd to continue.", math.Max(t.spent, t.observedSpend), t.maxUSD)
 }
