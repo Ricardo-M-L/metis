@@ -44,8 +44,11 @@ func (m *Manager) initShadowRepoContext(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
-	if m.initialized || m.initErr != nil {
-		return m.initErr
+	if reason := m.disabledReasonLocked(); reason != nil {
+		return reason
+	}
+	if m.initialized {
+		return nil
 	}
 	err := os.MkdirAll(m.shadowDir, 0o700)
 	if err == nil {
@@ -96,7 +99,7 @@ func (m *Manager) initShadowRepoContext(ctx context.Context) error {
 	if err != nil {
 		m.initErr = err
 		m.disabled = true
-		return err
+		return m.disabledReasonLocked()
 	}
 	m.initialized = true
 	return nil
@@ -156,7 +159,7 @@ func (m *Manager) snapshotContext(ctx context.Context, toolName, argsHash, messa
 	defer m.mu.Unlock()
 	defer func() { m.lastScan, err = observer.finish(err) }()
 	if m.disabled {
-		return "", errors.New("checkpoint: disabled (prior init error)")
+		return "", m.disabledReasonLocked()
 	}
 	observer.stage("init")
 	if err := m.initShadowRepoContext(ctx); err != nil {
@@ -286,7 +289,7 @@ func (m *Manager) ChangedPathsContext(ctx context.Context, hash string) (changed
 	defer m.mu.Unlock()
 	defer func() { m.lastScan, err = observer.finish(err) }()
 	if m.disabled {
-		return nil, errors.New("checkpoint: disabled")
+		return nil, m.disabledReasonLocked()
 	}
 	observer.stage("init")
 	if err := m.initShadowRepoContext(ctx); err != nil {

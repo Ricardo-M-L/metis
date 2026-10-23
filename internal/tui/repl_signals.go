@@ -8,10 +8,12 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
+	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/runtime"
@@ -226,6 +228,11 @@ func (r *REPL) retryLastResponse(ctx context.Context) {
 func (r *REPL) rewindLastEditTurn() string {
 	if r == nil || r.Loop == nil {
 		return "rewind: no active agent loop"
+	}
+	if manager := r.Loop.Checkpointer; manager != nil {
+		if reason := manager.DisabledReason(); errors.Is(reason, checkpoint.ErrDisabledByPolicy) {
+			return "rewind unavailable: " + reason.Error()
+		}
 	}
 	res, ok := r.Loop.Rewind()
 	if !ok {

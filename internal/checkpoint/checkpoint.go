@@ -48,7 +48,8 @@ type Manager struct {
 	sessionID         string
 	shadowDir         string // ~/.metis/checkpoints/<session-id>
 	cwd               string // the working dir whose state we mirror
-	disabled          bool   // turns off all operations after a fatal init error
+	disabled          bool   // unsafe workspace policy or fatal initialization failure
+	disabledByPolicy  bool
 	initialized       bool
 	initErr           error
 	hasBaseline       atomic.Bool
@@ -81,6 +82,7 @@ func NewManager(sessionID, cwd, shadowRoot string) *Manager {
 	// 2026-06-14.
 	if isUnsafeCheckpointRoot(cwd) {
 		m.disabled = true
+		m.disabledByPolicy = true
 	}
 	return m
 }
@@ -94,7 +96,7 @@ func isUnsafeCheckpointRoot(cwd string) bool {
 		return true
 	}
 	clean := filepath.Clean(cwd)
-	if clean == "/" {
+	if clean == string(filepath.Separator) || (filepath.IsAbs(clean) && filepath.Dir(clean) == clean) {
 		return true
 	}
 	home, err := os.UserHomeDir()
@@ -251,7 +253,7 @@ func (m *Manager) RecordManagedPathsContext(ctx context.Context, paths []string)
 	}
 	defer m.mu.Unlock()
 	if m.disabled {
-		return errors.New("checkpoint: disabled")
+		return m.disabledReasonLocked()
 	}
 	if err := m.initShadowRepoContext(ctx); err != nil {
 		return err
@@ -300,7 +302,7 @@ func (m *Manager) CapturePathStatesContext(ctx context.Context, paths []string) 
 	}
 	defer m.mu.Unlock()
 	if m.disabled {
-		return nil, errors.New("checkpoint: disabled")
+		return nil, m.disabledReasonLocked()
 	}
 	if err := m.initShadowRepoContext(ctx); err != nil {
 		return nil, err
@@ -559,7 +561,7 @@ func (m *Manager) Restore(hash string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.disabled {
-		return errors.New("checkpoint: disabled")
+		return m.disabledReasonLocked()
 	}
 	if err := m.initShadowRepo(); err != nil {
 		return err
@@ -578,7 +580,7 @@ func (m *Manager) RestorePaths(hash string, paths []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.disabled {
-		return errors.New("checkpoint: disabled")
+		return m.disabledReasonLocked()
 	}
 	if err := m.initShadowRepo(); err != nil {
 		return err
@@ -606,7 +608,7 @@ func (m *Manager) RestorePathStates(hash string, states map[string]string) error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.disabled {
-		return errors.New("checkpoint: disabled")
+		return m.disabledReasonLocked()
 	}
 	if err := m.initShadowRepo(); err != nil {
 		return err

@@ -7,6 +7,25 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.94] - 2026-10-23
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Fixed
+
+- Distinguish intentional checkpoint exclusion for home and filesystem root
+  directories from actual initialization failures, preserving the original
+  initialization error chain for diagnostics.
+- Skip automatic checkpoint scans in excluded workspaces and explain the policy
+  once per session/workspace binding without creating incomplete rewind points.
+- Show the policy reason when code rewind is requested, while keeping
+  conversation-only rewind available and normal project checkpoints enabled.
+- Recognize Windows current-drive, drive-letter and UNC filesystem roots,
+  and reset the policy notice when switching sessions or workspaces.
+- Keep the policy fast path independent of the snapshot mutex and retain
+  cancellation/retry and real initialization failure warnings.
+
 ## [0.4.93] - 2026-10-23
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

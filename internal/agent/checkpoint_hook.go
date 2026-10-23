@@ -61,7 +61,7 @@ func (l *Loop) snapPreEditContext(ctx context.Context, toolName string, input ma
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
-	if l.Checkpointer == nil || !mutatingTools[toolName] {
+	if l.Checkpointer == nil || !mutatingTools[toolName] || l.Checkpointer.DisabledByPolicy() {
 		return nil
 	}
 	turns := l.CountTurns()
@@ -110,6 +110,26 @@ func (l *Loop) checkpointBudget(phase string) time.Duration {
 // successfully protected rewind point to the user.
 func (l *Loop) runCheckpointStage(ctx context.Context, out chan<- Event, phase, toolName string, run func(context.Context) error) {
 	if l.Checkpointer == nil || !mutatingTools[toolName] {
+		return
+	}
+	// A broad workspace is intentionally excluded, not an initialization
+	// failure or an incomplete snapshot. This immutable policy check must not
+	// wait on the manager's scan mutex outside the bounded stage context.
+	if l.Checkpointer.DisabledByPolicy() {
+		if ctx.Err() != nil {
+			return
+		}
+		l.ckptMu.Lock()
+		notify := !l.ckptPolicyNotified
+		l.ckptPolicyNotified = true
+		l.ckptMu.Unlock()
+		if notify {
+			noticeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+			defer cancel()
+			emit(noticeCtx, out, Event{Kind: EventInfo, Info: fmt.Sprintf(
+				"%v; conversation-only rewind remains available",
+				checkpoint.ErrDisabledByPolicy)})
+		}
 		return
 	}
 	// A first snapshot may cover a multi-project workspace. It has a larger
@@ -273,7 +293,8 @@ func (l *Loop) RewindPoints() []RewindPoint {
 		// code state, so code restore is an available, proven no-op. With no
 		// snapshot history at all, absence is not evidence and remains
 		// unavailable.
-		codeAvailable := (hash != "" || (latestEditTurn > 0 && turn > latestEditTurn)) && checkpointCompleteFromTurn(stack, turn)
+		codeAvailable := l.Checkpointer != nil && !l.Checkpointer.DisabledByPolicy() &&
+			(hash != "" || (latestEditTurn > 0 && turn > latestEditTurn)) && checkpointCompleteFromTurn(stack, turn)
 		points = append(points, RewindPoint{
 			Turn:              turn,
 			Prompt:            prompt,
@@ -337,8 +358,8 @@ func (l *Loop) rewindToTurnExpectedPersist(expected []llm.Message, turn int, sco
 		codeNoop  bool
 	)
 	if scope&RewindCode != 0 {
-		if l.Checkpointer == nil || l.Checkpointer.Disabled() {
-			return RewindResult{}, ErrCheckpointUnavailable
+		if err := l.checkpointUnavailableReason(); err != nil {
+			return RewindResult{}, err
 		}
 		l.ckptMu.Lock()
 		stack := append([]ckptEntry(nil), l.ckptStack...)
@@ -636,7 +657,7 @@ func (l *Loop) recordCheckpointMutationContext(ctx context.Context, toolName str
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
-	if l == nil || l.Checkpointer == nil || err != nil || (res != nil && res.IsError) {
+	if l == nil || l.Checkpointer == nil || l.Checkpointer.DisabledByPolicy() || err != nil || (res != nil && res.IsError) {
 		return nil
 	}
 	l.ckptMu.Lock()
@@ -709,8 +730,8 @@ func (l *Loop) Rewind() (RewindResult, bool) {
 
 // RewindWithPersist is the transactional legacy "last edit" shortcut.
 func (l *Loop) RewindWithPersist(persist func([]llm.Message) error) (RewindResult, error) {
-	if l.Checkpointer == nil {
-		return RewindResult{}, ErrCheckpointUnavailable
+	if err := l.checkpointUnavailableReason(); err != nil {
+		return RewindResult{}, err
 	}
 	l.ckptMu.Lock()
 	if len(l.ckptStack) == 0 {
@@ -725,6 +746,16 @@ func (l *Loop) RewindWithPersist(persist func([]llm.Message) error) (RewindResul
 	}
 	result.Label = e.label
 	return result, nil
+}
+
+func (l *Loop) checkpointUnavailableReason() error {
+	if l == nil || l.Checkpointer == nil {
+		return ErrCheckpointUnavailable
+	}
+	if reason := l.Checkpointer.DisabledReason(); reason != nil {
+		return fmt.Errorf("%w: %w", ErrCheckpointUnavailable, reason)
+	}
+	return nil
 }
 
 // HasRewindPoints reports whether there's at least one snapshot to rewind

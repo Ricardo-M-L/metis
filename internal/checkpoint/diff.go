@@ -29,7 +29,7 @@ func (m *Manager) DiffContext(ctx context.Context, fromHash, toHash string, maxB
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.disabled {
-		return "", ErrSnapshotMissing
+		return "", errors.Join(ErrSnapshotMissing, m.disabledReasonLocked())
 	}
 	if info, err := os.Stat(filepath.Join(m.shadowDir, ".git")); err != nil || !info.IsDir() {
 		return "", ErrSnapshotMissing

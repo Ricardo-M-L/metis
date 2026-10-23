@@ -423,10 +423,11 @@ type Loop struct {
 	// the unified /rewind — restoring BOTH file state and conversation to
 	// a chosen turn. nil disables checkpointing (best-effort feature;
 	// Snap/Restore errors are swallowed). See checkpoint_hook.go.
-	Checkpointer  *checkpoint.Manager
-	ckptMu        sync.Mutex
-	ckptStack     []ckptEntry
-	ckptSnappedAt int // CountTurns() value last snapped; -1 = none yet
+	Checkpointer       *checkpoint.Manager
+	ckptMu             sync.Mutex
+	ckptStack          []ckptEntry
+	ckptSnappedAt      int  // CountTurns() value last snapped; -1 = none yet
+	ckptPolicyNotified bool // one explanation per workspace/session binding
 
 	// DreamNotify is the receive end of the auto-memory extractor's
 	// completion channel (G.5, 2026-05-12). When the extractor's
@@ -1272,6 +1273,7 @@ func (l *Loop) SetCheckpointer(manager *checkpoint.Manager) {
 	l.Checkpointer = manager
 	l.ckptStack = nil
 	l.ckptSnappedAt = -1
+	l.ckptPolicyNotified = false
 }
 
 // Reset clears the conversation.

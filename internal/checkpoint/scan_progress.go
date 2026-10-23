@@ -42,6 +42,8 @@ func (e *SnapshotError) Error() string {
 		reason = context.DeadlineExceeded.Error()
 	} else if errors.Is(e.Err, context.Canceled) {
 		reason = context.Canceled.Error()
+	} else if errors.Is(e.Err, ErrDisabledByPolicy) {
+		reason = ErrDisabledByPolicy.Error()
 	}
 	return fmt.Sprintf("checkpoint %s: %s (elapsed %s; files %d; bytes %d; processed %d)", e.Stage, reason,
 		e.Stats.Elapsed.Round(time.Millisecond), e.Stats.Files, e.Stats.Bytes, e.Stats.ProcessedFiles)
