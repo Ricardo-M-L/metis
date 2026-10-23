@@ -153,11 +153,10 @@ type recoveredErrorGroupItem struct {
 }
 
 func (i *recoveredErrorGroupItem) Render(width int) string {
-	_ = width
 	if i.expand {
 		var out strings.Builder
 		for _, te := range i.events {
-			out.WriteString(renderToolEvent(te, true))
+			out.WriteString(renderToolEventAtWidth(te, true, width))
 		}
 		return normalizeChatItemBoundary(out.String())
 	}

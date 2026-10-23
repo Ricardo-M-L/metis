@@ -105,7 +105,7 @@ func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
 		displayName = strings.TrimPrefix(displayName, "sub: ")
 	}
 	displayTool := displayToolName(displayName)
-	args := toolArgsPreview(te.ToolName, te.Input)
+	args := toolArgsFirstLine(toolArgsPreview(te.ToolName, te.Input))
 	if args != "" && width > 0 {
 		trailingWidth := 2 // parentheses
 		if te.Kind == "start" {
@@ -141,10 +141,16 @@ func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
 	}
 	if te.Kind == "start" {
 		s.WriteString(styleMuted.Render(" …"))
-		s.WriteString("\n")
-		return s.String()
 	}
 	s.WriteString("\n")
+	command, _ := te.Input["command"].(string)
+	hiddenCommand := baseName == "Bash" && command != "" && command != args
+	if expanded && hiddenCommand {
+		s.WriteString(renderExpandedToolCommand(command, args, resultIndent+"   ", width))
+	}
+	if te.Kind == "start" {
+		return s.String()
+	}
 
 	// Result row: ⎿ Xms ✓/✗ summary
 	//
@@ -188,14 +194,17 @@ func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
 	} else {
 		s.WriteString(summarizeNormalizedToolResult(te))
 	}
-	if denied || blocked {
-		// No ctrl+O hint: the reason below is already the full content.
+	if !expanded && hiddenCommand && (denied || blocked || neutralNoMatch) {
+		// A complete diagnostic does not imply the command is fully visible.
+		s.WriteString(styleMuted.Render(" (ctrl+O to inspect command)"))
+	} else if denied || blocked {
+		// No diagnostic hint: the reason below is already the full content.
 	} else if neutralNoMatch {
 		// A read-only search with the conventional exit code 1 means
 		// "nothing found". There is no diagnostic body to expand.
 	} else if partialRecovery && !expanded {
 		s.WriteString(styleMuted.Render(" (ctrl+O to inspect timeout)"))
-	} else if !te.IsError && !expanded && te.Output != "" && collapseToolBodyByDefault(baseName) {
+	} else if !expanded && (hiddenCommand || (!te.IsError && te.Output != "" && collapseToolBodyByDefault(baseName))) {
 		s.WriteString(styleMuted.Render(" (ctrl+O to expand)"))
 	}
 	s.WriteString("\n")
@@ -287,19 +296,15 @@ func truncateMiddleCells(value string, maxCells int) string {
 	tailBudget := maxCells - separatorWidth - headBudget
 	head := xansi.Truncate(value, headBudget, "")
 
-	runes := []rune(value)
-	tailStart := len(runes)
-	tailWidth := 0
-	for tailStart > 0 {
-		candidate := string(runes[tailStart-1])
-		candidateWidth := xansi.StringWidth(candidate)
-		if tailWidth+candidateWidth > tailBudget {
-			break
-		}
-		tailStart--
-		tailWidth += candidateWidth
+	valueWidth := xansi.StringWidth(value)
+	tailStart := valueWidth - tailBudget
+	tail := xansi.Cut(value, tailStart, valueWidth)
+	// Cut retains a wide grapheme spanning its left boundary; skip it if needed.
+	for xansi.StringWidth(tail) > tailBudget {
+		tailStart++
+		tail = xansi.Cut(value, tailStart, valueWidth)
 	}
-	return head + separator + string(runes[tailStart:])
+	return head + separator + tail
 }
 
 // collapseToolBodyByDefault matches Claude Code's compact transcript: high-

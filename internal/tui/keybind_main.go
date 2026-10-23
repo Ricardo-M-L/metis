@@ -78,13 +78,13 @@ func (m *Model) expandableToolEventIDs() []string {
 				}
 			}
 		case *toolEventItem:
-			if typed.te.Kind != "result" || typed.te.ID == "" {
+			if typed.te.Kind == "start" || typed.te.ID == "" {
 				continue
 			}
-			// Render the compact form only on an explicit keypress. This keeps
-			// the hot per-frame path unchanged while ensuring the selector and
-			// the visible `(ctrl+O ...)` affordance cannot disagree.
-			if strings.Contains(renderToolEvent(typed.te, false), "(ctrl+O to ") {
+			// Use the viewport width, including resumed ("end") events, so
+			// commands clipped only by the terminal are still reachable.
+			// Render only on keypress, not on the hot per-frame path.
+			if strings.Contains(renderToolEventAtWidth(typed.te, false, m.width-2), "(ctrl+O to ") {
 				add(typed.te.ID)
 			}
 		}

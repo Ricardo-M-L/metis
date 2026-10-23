@@ -7,6 +7,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.95] - 2026-10-23
+
+CLI-only stable release. Desktop binaries and the shared latest release remain
+unchanged; the CLI stable channel discovers this version independently.
+
+### Fixed
+
+- Keep multiline tool arguments, including Bash heredocs, on a single compact
+  title row instead of letting continuation lines protrude into the left gutter.
+- Reveal full Bash commands with consistently indented, width-wrapped Ctrl+O
+  expansion, including restored calls, compact error results and recovered groups.
+- Preserve terminal grapheme clusters and cell-width limits when shortening tool
+  argument previews, including CJK paths and joined emoji.
+
 ## [0.4.94] - 2026-10-23
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

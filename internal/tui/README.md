@@ -77,3 +77,16 @@ Streaming tool arguments are tracked in `toolArgsStreams` by `ToolUseID`, not
 in one global buffer. A result clears only its own preview, preventing
 parallel tool-call JSON fragments from mixing. Preserve that keying for any
 new streamed tool event.
+
+## Tool transcript layout
+
+Tool leaders show a single-line argument preview. Multiline arguments (including
+Bash heredocs) show their first line and an ellipsis instead of injecting raw
+newlines into the transcript. Width clipping uses terminal cells and preserves
+grapheme clusters, including CJK text and joined emoji.
+
+Ctrl+O reveals a Bash command hidden by the preview or viewport width as an
+indented, width-wrapped block, alongside the existing expanded result. Repeated
+presses walk backward through expandable calls, then collapse; restored calls
+follow the same rule. These presentation helpers never modify the executed
+input, permission preview, or stored tool event.

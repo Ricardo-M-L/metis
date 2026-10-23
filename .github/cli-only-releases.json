@@ -42,6 +42,12 @@
       "prerelease": false,
       "make_latest": false,
       "reason": "Formal CLI-only release of the compact Metis terminal icon; Desktop assets and the shared latest pointer remain unchanged."
+    },
+    "v0.4.95": {
+      "channel": "cli-only-stable",
+      "prerelease": false,
+      "make_latest": false,
+      "reason": "User-authorized CLI display fix for multiline tool titles, indented command expansion and Unicode width boundaries; Desktop assets and the shared latest pointer remain unchanged."
     }
   }
 }
