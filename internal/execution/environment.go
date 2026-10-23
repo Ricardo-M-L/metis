@@ -295,8 +295,9 @@ func (s *Store) pathFor(canonical string) string {
 func gitOutputContext(ctx context.Context, dir string, args ...string) (string, error) {
 	command := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
 	jobs.ApplyProcessGroup(command)
+	cleanup := jobs.NewProcessGroupCleaner(command)
 	command.Cancel = func() error {
-		jobs.KillProcessGroup(command.Process)
+		cleanup.Kill()
 		return nil
 	}
 	// A wrapper can exit while a descendant retains stdout. Bound draining as
@@ -304,7 +305,7 @@ func gitOutputContext(ctx context.Context, dir string, args ...string) (string, 
 	command.WaitDelay = time.Second
 	command.Stderr = nil
 	output, err := command.Output()
-	jobs.KillProcessGroup(command.Process)
+	cleanup.AfterWait(err)
 	return strings.TrimSpace(string(output)), err
 }
 

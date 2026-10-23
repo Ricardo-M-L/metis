@@ -576,7 +576,7 @@ func TestCoordinatorServiceHelperProcess(t *testing.T) {
 		return ""
 	}
 	store := projectcoord.NewStore(filepath.Join(os.Getenv("METIS_HOME"), "project-coordinator"))
-	item, err := store.ClaimNext(value("--cwd"), args[2], projectcoord.ClaimOptions{Worker: value("--worker"), Lease: time.Second})
+	item, err := store.ClaimNext(value("--cwd"), args[2], projectcoord.ClaimOptions{Worker: value("--worker"), Lease: time.Minute})
 	if errors.Is(err, projectcoord.ErrNoReadyWork) {
 		fmt.Printf("{\"outcomes_count\":0,\"run_id\":%q,\"status\":\"active\"}\n", args[2])
 		os.Exit(0)

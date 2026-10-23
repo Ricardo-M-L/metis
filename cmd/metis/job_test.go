@@ -23,6 +23,7 @@ import (
 
 func newPersistentJobCLIFixture(t *testing.T, maxInput int64) (principal.Job, *projectcoord.Store, projectcoord.Run, projectcoord.WorkItem) {
 	t.Helper()
+	requireCoordinatorPOSIXTest(t, "persistent job storage requires POSIX directory fsync")
 	home := t.TempDir()
 	t.Setenv("METIS_HOME", home)
 	workspace, err := projectCoordinatorWorkspace(t.TempDir())

@@ -160,6 +160,7 @@ func TestCoordinatorSupervisorUnknownOrForeignStopRetainsFiles(t *testing.T) {
 
 func coordinatorSupervisorFixture(t *testing.T) (*coordinatorSupervisor, coordinatorServiceOptions, *coordinatorLaunchctlFixture) {
 	t.Helper()
+	requireCoordinatorPOSIXTest(t, "launchd supervisor fixture requires macOS paths, POSIX modes, and a shell runtime")
 	root := t.TempDir()
 	userHome, metisHome := filepath.Join(root, "用户 & home"), filepath.Join(root, "metis-home")
 	for _, path := range []string{userHome, metisHome} {
@@ -380,6 +381,7 @@ func TestCoordinatorSupervisorRejectsUnsafeInstallArguments(t *testing.T) {
 }
 
 func TestCoordinatorSupervisorToolPathPreservesAbsoluteUserTools(t *testing.T) {
+	requireCoordinatorPOSIXTest(t, "launchd tool PATH uses POSIX absolute paths and colon separators")
 	path, err := coordinatorSupervisorToolPath("/Users/example/.local/bin:.:relative:/Library/Frameworks/Python.framework/bin::/usr/bin:/Users/example/.local/bin")
 	if err != nil {
 		t.Fatal(err)

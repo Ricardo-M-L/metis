@@ -7,13 +7,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-## [0.4.92] - 2026-10-23
+## [0.4.93] - 2026-10-23
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
 without Apple notarization.
 
 ### Fixed
 
+- Treat stale handoff projections as superseded snapshots during service competition,
+  while preserving monotonic business receipts and single-assignment admission.
+- Avoid redundant Windows taskkill after Git probes and supervised workers have
+  already exited, while retaining cancellation and incomplete-pipe tree cleanup.
 - Keep Windows native coordinator usage-receipt paths explicitly unsupported and
   fail closed before private file access; correct cross-platform updater tests.
 - Wait for complete subprocess output in MCP redaction tests and allow realistic

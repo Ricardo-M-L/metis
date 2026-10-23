@@ -15,6 +15,7 @@ import (
 )
 
 func TestCoordinatorLearningUsesOnlyCompletedInvocationAndHostChecks(t *testing.T) {
+	requireCoordinatorPOSIXTest(t, "learning state requires POSIX directory fsync and host checks")
 	for _, finished := range []bool{false, true} {
 		t.Run(map[bool]string{false: "interrupted_tool", true: "host_rejected"}[finished], func(t *testing.T) {
 			t.Setenv("METIS_HOME", t.TempDir())
@@ -119,6 +120,7 @@ func TestCoordinatorLearningRejectsChangedActivationAndUnsafeEvidence(t *testing
 
 func coordinatorQualityRegressionFixture(t *testing.T, check string) (*projectcoord.Store, projectcoord.Run, projectcoord.WorkItem, *learning.Store, learning.Invocation) {
 	t.Helper()
+	requireCoordinatorPOSIXTest(t, "learning quality state requires POSIX directory fsync")
 	t.Setenv("METIS_HOME", t.TempDir())
 	workspace, err := projectCoordinatorWorkspace(t.TempDir())
 	if err != nil {

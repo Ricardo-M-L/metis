@@ -171,6 +171,9 @@ jobs:
       - name: Test Windows CLI and lifecycle
         run: go test -count=1 -timeout 180s ./cmd/metis ./install ./internal/artifact ./internal/update
 
+      - name: Test Windows process cleanup lifecycle
+        run: go test -count=1 -timeout 180s ./internal/jobs -run 'TestProcessGroup(Cleaner|Cleanup)'
+
       - name: Cross-build Windows arm64
         shell: pwsh
         run: |

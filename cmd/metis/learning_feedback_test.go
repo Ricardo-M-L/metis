@@ -12,6 +12,7 @@ import (
 )
 
 func TestLearningFeedbackHostCLIConfigurePauseResumeAndReceiptReplay(t *testing.T) {
+	requireCoordinatorPOSIXTest(t, "learning host mutation requires POSIX directory fsync")
 	cfg, _ := learningControllerHostFixture(t)
 	store := learning.NewStore(cfg.Session.SkillDir)
 	if _, err := store.Stage(context.Background(), "test-skill", []byte("BASELINE"), []byte("PROPOSED"), "host"); err != nil {
@@ -61,6 +62,7 @@ func TestLearningFeedbackHostCLIConfigurePauseResumeAndReceiptReplay(t *testing.
 	}
 }
 func TestLearningFeedbackHostCLIRejectsModelOnlyReceipt(t *testing.T) {
+	requireCoordinatorPOSIXTest(t, "learning host mutation requires POSIX directory fsync")
 	cfg, _ := learningControllerHostFixture(t)
 	store := learning.NewStore(cfg.Session.SkillDir)
 	_, _ = store.Stage(context.Background(), "test-skill", []byte("BASELINE"), []byte("PROPOSED"), "host")

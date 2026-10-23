@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -379,6 +380,102 @@ func TestCoordinatorHandoffCompetitionAcrossServicesAndRunsHasOneAssignment(t *t
 	}
 }
 
+func TestCoordinatorHandoffStaleReservationCannotRegressAdvancedReceipt(t *testing.T) {
+	for _, state := range []string{handoff.BusinessAccepted, handoff.BusinessRunning} {
+		t.Run(state, func(t *testing.T) {
+			s, job := coordinatorHandoffFixture(t)
+			stale := coordinatorHandoffSend(t, s, job, &handoff.Task{ID: "stale", Objective: "one authoritative assignment"})
+			assignment := coordinatorHandoffAssignment(s.opts, job.Binding(), stale.ID)
+			// A second host finishes admission and projects a graph revision after
+			// this host has already read a message with no business reservation.
+			coordinatorHandoffReconcile(t, s)
+			if state == handoff.BusinessRunning {
+				if _, err := s.store.ClaimNext(s.opts.workspace, s.opts.runID, projectcoord.ClaimOptions{Worker: "winning-host"}); err != nil {
+					t.Fatal(err)
+				}
+				coordinatorHandoffReconcile(t, s)
+			}
+			before, err := s.handoffStore.Get(context.Background(), stale.ID)
+			if err != nil || stale.Business != nil || before.Business == nil || before.Business.State != state || before.Business.SourceRevision == 0 {
+				t.Fatalf("fixture did not advance past the caller's snapshot: %+v %v", before.Business, err)
+			}
+			graphBefore := coordinatorHandoffRun(t, s)
+			// A loaded Run contains an unexported archive lookup callback, which
+			// cannot be compared with DeepEqual. Compare its durable JSON state.
+			graphBeforeJSON, err := json.Marshal(graphBefore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.handoffStore.ReconcileBusiness(context.Background(), stale.ID, handoff.BusinessUpdate{Assignment: assignment, State: handoff.BusinessAccepted}); !errors.Is(err, handoff.ErrBusinessStale) {
+				t.Fatalf("store allowed revision zero to overwrite an advanced receipt: %v", err)
+			}
+			if _, reserved, err := s.reserveHandoffBusiness(context.Background(), stale.ID, assignment); err != nil || reserved {
+				t.Fatalf("old host must defer to the advanced receipt: reserved=%t err=%v", reserved, err)
+			}
+			loser := assignment
+			loser.RunID = "another-project"
+			if _, reserved, err := s.reserveHandoffBusiness(context.Background(), stale.ID, loser); err != nil || reserved {
+				t.Fatalf("another run acquired the winning assignment: reserved=%t err=%v", reserved, err)
+			}
+			coordinatorHandoffReconcile(t, s)
+			after, err := s.handoffStore.Get(context.Background(), stale.ID)
+			graphAfter := coordinatorHandoffRun(t, s)
+			graphAfterJSON, marshalErr := json.Marshal(graphAfter)
+			if err != nil || marshalErr != nil || !reflect.DeepEqual(before, after) || string(graphBeforeJSON) != string(graphAfterJSON) {
+				t.Fatal("stale admission changed receipt, timestamps or durable graph pair")
+			}
+		})
+	}
+}
+
+func TestCoordinatorHandoffReservationRetainsValidationAndStorageErrors(t *testing.T) {
+	s, job := coordinatorHandoffFixture(t)
+	rec := coordinatorHandoffSend(t, s, job, &handoff.Task{ID: "errors", Objective: "do not hide host errors"})
+	assignment := coordinatorHandoffAssignment(s.opts, job.Binding(), rec.ID)
+	invalid := assignment
+	invalid.WorkItemID = ""
+	if _, reserved, err := s.reserveHandoffBusiness(context.Background(), rec.ID, invalid); err == nil || reserved {
+		t.Fatal("reservation hid invalid host assignment")
+	}
+	if _, reserved, err := s.reserveHandoffBusiness(context.Background(), "msg-"+strings.Repeat("f", 64), assignment); !errors.Is(err, os.ErrNotExist) || reserved {
+		t.Fatal("reservation hid missing durable input")
+	}
+}
+
+func TestCoordinatorHandoffStaleAdmissionDecisionKeepsNewerGraphReceipt(t *testing.T) {
+	for _, decision := range []string{"retired", "cancelled"} {
+		t.Run(decision, func(t *testing.T) {
+			s, job := coordinatorHandoffFixture(t)
+			rec := coordinatorHandoffSend(t, s, job, &handoff.Task{ID: "stale-decision", Objective: "keep newer host evidence"})
+			assignment := coordinatorHandoffAssignment(s.opts, job.Binding(), rec.ID)
+			stale, err := s.handoffStore.ReconcileBusiness(context.Background(), rec.ID, handoff.BusinessUpdate{Assignment: assignment, State: handoff.BusinessAccepted})
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldGraph := coordinatorHandoffRun(t, s)
+			coordinatorHandoffReconcile(t, s)
+			before, err := s.handoffStore.Get(context.Background(), rec.ID)
+			if err != nil || before.Business == nil || before.Business.SourceRevision <= oldGraph.Revision {
+				t.Fatal("winning host did not advance its graph receipt")
+			}
+			if decision == "retired" {
+				if _, err := persistentJobStore().SetStatus(job.ID, principal.Retired); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				oldGraph.Status = projectcoord.RunCancelled
+			}
+			if ready, err := s.handoffAdmissionReady(context.Background(), stale, assignment, oldGraph); err != nil || ready {
+				t.Fatalf("stale terminal decision surfaced a service error: ready=%t err=%v", ready, err)
+			}
+			after, err := s.handoffStore.Get(context.Background(), rec.ID)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatal("stale terminal decision replaced newer graph evidence")
+			}
+		})
+	}
+}
+
 func TestCoordinatorHandoffHostFailureCannotBecomeCompletionWithoutExplicitRecovery(t *testing.T) {
 	s, job := coordinatorHandoffFixture(t)
 	rec := coordinatorHandoffSend(t, s, job, &handoff.Task{ID: "failure", Objective: "fail then recover"})
@@ -498,9 +595,11 @@ func TestCoordinatorServiceJobStartupAcceptsPauseRejectsWrongWorkspaceAndRoute(t
 }
 
 func TestCoordinatorSupervisorPersistsJobAllowlistInLaunchArguments(t *testing.T) {
-	s, opts, _ := coordinatorSupervisorFixture(t)
-	opts.jobIDs = coordinatorServiceJobIDs{"job-one", "job-two"}
-	manifest := coordinatorSupervisorManifest{Executable: s.executable, Label: "label", UserHome: s.userHome, MetisHome: s.metisHome, ToolPath: s.toolPath}
+	// This is pure launch-argument serialization; no POSIX supervisor fixture
+	// or real shell, file permission, signal or launchctl support is required.
+	root := t.TempDir()
+	opts := coordinatorServiceOptions{runID: "run-id", workspace: filepath.Join(root, "project"), agentProfile: "implementation", verifierProfile: "verify", jobIDs: coordinatorServiceJobIDs{"job-one", "job-two"}}
+	manifest := coordinatorSupervisorManifest{Executable: filepath.Join(root, "metis"), Label: "label", UserHome: root, MetisHome: filepath.Join(root, "metis-home")}
 	data, err := coordinatorSupervisorPlist(manifest, opts, "private-token")
 	if err != nil {
 		t.Fatal(err)

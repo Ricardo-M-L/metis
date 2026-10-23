@@ -119,3 +119,30 @@ func TestProbeContextPipeDrainIsBoundedAndDescendantStopped(t *testing.T) {
 	}
 	t.Fatalf("Probe-owned descendant %d survived", pid)
 }
+
+func TestGitOutputContextCleansDescendantAfterSuccessfulLeaderExit(t *testing.T) {
+	workspace, marker := t.TempDir(), filepath.Join(t.TempDir(), "descendant")
+	installProbeGitFixture(t, "/bin/sleep 60 >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > "+probeFixtureQuote(marker)+"\nprintf 'completed\\n'\nexit 0\n")
+	output, err := gitOutputContext(context.Background(), workspace, "rev-parse", "--show-toplevel")
+	if err != nil || output != "completed" {
+		t.Fatalf("Git fixture did not finish normally: output=%q err=%v", output, err)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		output, _ := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "stat=").Output()
+		state := strings.TrimSpace(string(output))
+		if state == "" || strings.HasPrefix(state, "Z") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("normally completed Git wrapper left owned descendant %d alive", pid)
+}

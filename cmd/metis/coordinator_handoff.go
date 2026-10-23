@@ -79,6 +79,20 @@ func coordinatorHandoffAssignment(opts coordinatorServiceOptions, binding princi
 	return handoff.BusinessAssignment{JobID: binding.JobID, Workspace: opts.workspace, RunID: opts.runID, WorkItemID: id, VerificationItemID: id + "-verify", ConfigSHA256: binding.ConfigSHA256}
 }
 
+// Another host can freeze a different assignment or advance this assignment
+// after our mailbox/graph read. Keep its durable receipt and refresh next poll.
+func coordinatorHandoffProjectionSuperseded(err error) bool {
+	return errors.Is(err, handoff.ErrBusinessStale) || errors.Is(err, handoff.ErrBusinessConflict)
+}
+
+func (s *coordinatorService) reserveHandoffBusiness(ctx context.Context, messageID string, assignment handoff.BusinessAssignment) (handoff.Record, bool, error) {
+	rec, err := s.handoffStore.ReconcileBusiness(ctx, messageID, handoff.BusinessUpdate{Assignment: assignment, State: handoff.BusinessAccepted})
+	if coordinatorHandoffProjectionSuperseded(err) {
+		return handoff.Record{}, false, nil
+	}
+	return rec, err == nil, err
+}
+
 func (s *coordinatorService) checkJobAdmission(binding principal.Binding) error {
 	if err := validatePersistentJobRoute(binding); err != nil {
 		return coordinatorAdmissionError{reason: handoff.WaitingRouteUnavailable, err: err}
@@ -153,9 +167,13 @@ func (s *coordinatorService) handoffAdmissionReady(ctx context.Context, rec hand
 		// temporary queue hold. Reserve first to freeze the receipt's authority.
 		if rec.Business == nil {
 			var err error
-			rec, err = s.handoffStore.ReconcileBusiness(ctx, rec.ID, handoff.BusinessUpdate{Assignment: assignment, State: handoff.BusinessAccepted})
+			var reserved bool
+			rec, reserved, err = s.reserveHandoffBusiness(ctx, rec.ID, assignment)
 			if err != nil {
 				return false, err
+			}
+			if !reserved {
+				return false, nil
 			}
 		}
 		state, code, summary := handoff.BusinessCancelled, "task_cancelled", "The assigned project was cancelled before admission."
@@ -163,6 +181,9 @@ func (s *coordinatorService) handoffAdmissionReady(ctx context.Context, rec hand
 			state, code, summary = handoff.BusinessRejected, "job_retired", "The assigned job was retired before admission."
 		}
 		_, err := s.handoffStore.ReconcileBusiness(ctx, rec.ID, handoff.BusinessUpdate{Assignment: assignment, SourceRevision: run.Revision, State: state, Failure: coordinatorHandoffFailure(code, summary, []any{assignment, run.Status})})
+		if coordinatorHandoffProjectionSuperseded(err) {
+			return false, nil
+		}
 		return false, err
 	}
 	_, err := s.handoffStore.SetAdmissionWaiting(ctx, rec.ID, assignment, reason)
@@ -208,20 +229,21 @@ func (s *coordinatorService) reconcileHandoffs(ctx context.Context) error {
 					continue
 				}
 				ready, admissionErr := s.handoffAdmissionReady(ctx, rec, assignment, current)
-				if admissionErr != nil && !errors.Is(admissionErr, handoff.ErrBusinessConflict) && first == nil {
+				if admissionErr != nil && !coordinatorHandoffProjectionSuperseded(admissionErr) && first == nil {
 					first = admissionErr
 				}
 				if !ready {
 					continue
 				}
-				rec, err = s.handoffStore.ReconcileBusiness(ctx, rec.ID, handoff.BusinessUpdate{Assignment: assignment, State: handoff.BusinessAccepted})
-				if errors.Is(err, handoff.ErrBusinessConflict) {
-					continue
-				}
+				var reserved bool
+				rec, reserved, err = s.reserveHandoffBusiness(ctx, rec.ID, assignment)
 				if err != nil {
 					if first == nil {
 						first = err
 					}
+					continue
+				}
+				if !reserved {
 					continue
 				}
 			}
@@ -236,7 +258,7 @@ func (s *coordinatorService) reconcileHandoffs(ctx context.Context) error {
 			if impl == nil {
 				if run.Status == projectcoord.RunCancelled {
 					_, err = s.handoffStore.ReconcileBusiness(ctx, rec.ID, handoff.BusinessUpdate{Assignment: assignment, SourceRevision: run.Revision, State: handoff.BusinessCancelled, Failure: coordinatorHandoffFailure("task_cancelled", "The assigned project was cancelled before admission.", run.Status)})
-					if err != nil && first == nil {
+					if err != nil && !coordinatorHandoffProjectionSuperseded(err) && first == nil {
 						first = err
 					}
 					continue
@@ -245,7 +267,7 @@ func (s *coordinatorService) reconcileHandoffs(ctx context.Context) error {
 					continue
 				}
 				ready, admissionErr := s.handoffAdmissionReady(ctx, rec, assignment, run)
-				if admissionErr != nil && !errors.Is(admissionErr, handoff.ErrBusinessConflict) && first == nil {
+				if admissionErr != nil && !coordinatorHandoffProjectionSuperseded(admissionErr) && first == nil {
 					first = admissionErr
 				}
 				if !ready {
@@ -259,7 +281,7 @@ func (s *coordinatorService) reconcileHandoffs(ctx context.Context) error {
 						u := handoff.BusinessUpdate{Assignment: assignment, SourceRevision: run.Revision, State: handoff.BusinessRejected, Failure: coordinatorHandoffFailure("handoff_input_invalid", "The declared input artifact failed host integrity verification.", rec.ContentSHA256)}
 						_, err = s.handoffStore.ReconcileBusiness(ctx, rec.ID, u)
 					}
-					if err != nil && first == nil {
+					if err != nil && !coordinatorHandoffProjectionSuperseded(err) && first == nil {
 						first = err
 					}
 					continue
@@ -296,7 +318,7 @@ func (s *coordinatorService) reconcileHandoffs(ctx context.Context) error {
 				continue
 			}
 			_, err = s.handoffStore.ReconcileBusiness(ctx, rec.ID, *update)
-			if errors.Is(err, handoff.ErrBusinessStale) || errors.Is(err, handoff.ErrBusinessConflict) {
+			if coordinatorHandoffProjectionSuperseded(err) {
 				continue
 			}
 			if err != nil && first == nil {

@@ -38,6 +38,7 @@ func writeLearningControllerConfig(t *testing.T, home string, cfg *config.Config
 	}
 }
 func TestLearningControllerConfigureFreezesSuiteAndExplicitAllowance(t *testing.T) {
+	requireCoordinatorPOSIXTest(t, "learning host mutation requires POSIX directory fsync")
 	_, home := learningControllerHostFixture(t)
 	data, _ := json.Marshal(validLearningSuiteFixture())
 	suite := filepath.Join(t.TempDir(), "suite.json")

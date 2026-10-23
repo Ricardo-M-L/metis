@@ -445,6 +445,7 @@ type coordinatorService struct {
 
 type coordinatorServiceChild struct {
 	cmd            *exec.Cmd
+	cleanup        *jobs.ProcessGroupCleaner
 	slot           int
 	started        time.Time
 	done           chan struct{}
@@ -587,6 +588,7 @@ func (s *coordinatorService) startChild(slot int) error {
 	jobs.ApplyProcessGroup(cmd)
 	cmd.WaitDelay = time.Second
 	child := &coordinatorServiceChild{cmd: cmd, slot: slot, started: time.Now(), done: make(chan struct{}), stdout: &coordinatorServiceBuffer{limit: 1 << 20}, stderr: &coordinatorServiceBuffer{limit: 64 << 10}}
+	child.cleanup = jobs.NewProcessGroupCleaner(cmd)
 	cmd.Stdout, cmd.Stderr = child.stdout, child.stderr
 	if err := cmd.Start(); err != nil {
 		return err
@@ -596,7 +598,7 @@ func (s *coordinatorService) startChild(slot int) error {
 	s.logger.emit(coordinatorServiceEvent{Kind: "worker_started", Slot: slot + 1, PID: cmd.Process.Pid})
 	go func() {
 		child.err = cmd.Wait()
-		jobs.KillProcessGroup(cmd.Process)
+		child.cleanup.AfterWait(child.err)
 		child.exit = cmd.ProcessState.ExitCode()
 		var result struct {
 			OutcomesCount *int   `json:"outcomes_count"`
@@ -637,7 +639,13 @@ func (s *coordinatorService) observeChild(child *coordinatorServiceChild) {
 func (s *coordinatorService) stopChildren() {
 	var group sync.WaitGroup
 	for _, child := range s.children {
-		_ = processutil.Terminate(child.cmd.Process.Pid)
+		if goruntime.GOOS == "windows" {
+			// Windows Terminate kills only the leader. Keep it available while
+			// taskkill /T discovers and terminates the owned descendant tree.
+			child.cleanup.Kill()
+		} else {
+			_ = processutil.Terminate(child.cmd.Process.Pid)
+		}
 		group.Add(1)
 		go func(child *coordinatorServiceChild) {
 			defer group.Done()
@@ -646,7 +654,7 @@ func (s *coordinatorService) stopChildren() {
 			select {
 			case <-child.done:
 			case <-timer.C:
-				jobs.KillProcessGroup(child.cmd.Process)
+				child.cleanup.Kill()
 				<-child.done
 			}
 		}(child)

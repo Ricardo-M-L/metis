@@ -8,7 +8,6 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
-	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -135,7 +134,17 @@ func coordinatorOperationCanonicalTempDir(t *testing.T) string {
 	return path
 }
 
+func TestCoordinatorOperationResultFileRejectsMissingAndNonRegular(t *testing.T) {
+	dir := coordinatorOperationCanonicalTempDir(t)
+	for _, path := range []string{dir, filepath.Join(dir, "missing")} {
+		if _, err := readCoordinatorOperationResult(path); err == nil {
+			t.Fatalf("accepted missing or non-regular receipt %q", path)
+		}
+	}
+}
+
 func TestCoordinatorOperationResultFileRequiresPrivateCanonicalRegularFile(t *testing.T) {
+	requireCoordinatorPOSIXTest(t, "private operation receipts require POSIX modes and canonical symlink checks")
 	dir := coordinatorOperationCanonicalTempDir(t)
 	path := filepath.Join(dir, "result.json")
 	if err := os.WriteFile(path, []byte(`{"Output":"receipt","IsError":false}`), 0600); err != nil {
@@ -143,15 +152,6 @@ func TestCoordinatorOperationResultFileRequiresPrivateCanonicalRegularFile(t *te
 	}
 	if _, err := readCoordinatorOperationResult(path); err != nil {
 		t.Fatal(err)
-	}
-	if _, err := readCoordinatorOperationResult(dir); err == nil {
-		t.Fatal("accepted a directory as a receipt")
-	}
-	if _, err := readCoordinatorOperationResult(filepath.Join(dir, "missing")); err == nil {
-		t.Fatal("accepted a missing receipt")
-	}
-	if goruntime.GOOS == "windows" {
-		t.Skip("Unix permission and symlink checks require a Unix filesystem")
 	}
 	for _, mode := range []os.FileMode{0644, 0640, 0610, 0700} {
 		if err := os.Chmod(path, mode); err != nil {
@@ -199,7 +199,7 @@ type coordinatorOperationCLIFixture struct {
 	op    projectcoord.OperationRecord
 }
 
-func newCoordinatorOperationCLIFixture(t *testing.T, attempts int) coordinatorOperationCLIFixture {
+func newCoordinatorOperationCLIFixture(t *testing.T, attempts int, leaseOverride ...time.Duration) coordinatorOperationCLIFixture {
 	t.Helper()
 	t.Setenv("METIS_HOME", coordinatorOperationCanonicalTempDir(t))
 	store := projectCoordinatorStore()
@@ -210,7 +210,13 @@ func newCoordinatorOperationCLIFixture(t *testing.T, attempts int) coordinatorOp
 	if err != nil {
 		t.Fatal(err)
 	}
-	item, err := store.ClaimNext(run.Workspace, run.ID, projectcoord.ClaimOptions{Worker: "test-writer", Lease: time.Second})
+	// Metadata and resolution tests do not exercise claim expiry unless asked.
+	// A one-second preparing lease can expire during process startup on Windows.
+	lease := time.Minute
+	if len(leaseOverride) != 0 {
+		lease = leaseOverride[0]
+	}
+	item, err := store.ClaimNext(run.Workspace, run.ID, projectcoord.ClaimOptions{Worker: "test-writer", Lease: lease})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +302,8 @@ func TestCoordinatorOperationMetadataOccurrenceIncludesLegacySlotOne(t *testing.
 }
 
 func TestCoordinatorOperationResolveCLIRequiresFencedLeaseAndExplicitRecovery(t *testing.T) {
-	f := newCoordinatorOperationCLIFixture(t, 1)
+	requireCoordinatorPOSIXTest(t, "applied operation resolution reads a POSIX private receipt")
+	f := newCoordinatorOperationCLIFixture(t, 1, time.Second)
 	if _, err := f.store.MarkOperationUncertain(f.run.Workspace, f.run.ID, f.item.ID, f.item.Owner, f.item.Lease.Token, f.op.ID, "private transport diagnostic"); err != nil {
 		t.Fatal(err)
 	}
@@ -343,9 +350,18 @@ func TestCoordinatorOperationResolveCLIRequiresFencedLeaseAndExplicitRecovery(t 
 
 func TestCoordinatorOperationNotAppliedCLIRecordsResolutionWithoutRequeue(t *testing.T) {
 	f := newCoordinatorOperationCLIFixture(t, 2)
-	time.Sleep(max(time.Until(f.item.Lease.ExpiresAt)+20*time.Millisecond, 0))
+	args := []string{"resolve", f.run.ID, f.op.ID, "--cwd", f.run.Workspace, "--outcome", "not_applied", "--note", "Remote audit confirms no request was applied"}
+	if err := cmdProjectCoordinatorOperations(args); err == nil || !strings.Contains(err.Error(), "unexpired worker lease") {
+		t.Fatalf("active worker was not fenced before resolution: %v", err)
+	}
+	// An acknowledged worker stop releases its claim without waiting for a real
+	// clock or platform process startup. The unresolved operation still requires
+	// the same explicit host resolution and separate recovery.
+	if _, err := f.store.Fail(f.run.Workspace, f.run.ID, f.item.ID, f.item.Owner, f.item.Lease.Token, projectcoord.Failure{Code: projectcoord.FailureWorkerExecution, Summary: "Worker stopped before host audit"}, ""); err != nil {
+		t.Fatal(err)
+	}
 	output, err := captureCoordinatorOperationOutput(t, func() error {
-		return cmdProjectCoordinatorOperations([]string{"resolve", f.run.ID, f.op.ID, "--cwd", f.run.Workspace, "--outcome", "not_applied", "--note", "Remote audit confirms no request was applied"})
+		return cmdProjectCoordinatorOperations(args)
 	})
 	if err != nil {
 		t.Fatal(err)

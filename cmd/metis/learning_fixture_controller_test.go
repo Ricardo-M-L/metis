@@ -11,6 +11,7 @@ import (
 )
 
 func TestLearningControllerFreezesWorkflowCodeFixtureForWatch(t *testing.T) {
+	requireCoordinatorPOSIXTest(t, "learning host mutation requires POSIX directory fsync")
 	_, home := learningControllerHostFixture(t)
 	suite := learning.Suite{Name: "repair", Cases: []learning.Case{{ID: "repair", Prompt: "repair code", ExpectedJSON: json.RawMessage(`{"tests_passed":true}`)}}, MaxTokens: 1000, MaxDurationSeconds: 30}
 	suiteData, _ := json.Marshal(suite)

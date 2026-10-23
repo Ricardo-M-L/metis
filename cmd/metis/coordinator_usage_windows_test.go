@@ -20,6 +20,10 @@ func TestCoordinatorUsageWindowsNativeRecoveryFailsClosedWithoutIO(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	beforeJSON, err := json.Marshal(before)
+	if err != nil {
+		t.Fatal(err)
+	}
 	secret := []byte("host-private-billing-credential")
 	privateFile := filepath.Join(f.home, "private-receipt.json")
 	if err := os.WriteFile(privateFile, secret, 0600); err != nil {
@@ -82,7 +86,10 @@ func TestCoordinatorUsageWindowsNativeRecoveryFailsClosedWithoutIO(t *testing.T)
 		t.Fatal("unsupported recovery changed private file")
 	}
 	after, err := f.store.Get(f.workspace, f.run.ID)
-	if err != nil || !reflect.DeepEqual(before, after) {
+	// Run also carries an unexported archive lookup callback. Compare the
+	// complete durable state instead of function values from separate reads.
+	afterJSON, marshalErr := json.Marshal(after)
+	if err != nil || marshalErr != nil || string(beforeJSON) != string(afterJSON) {
 		t.Fatal("unsupported recovery changed the usage ledger")
 	}
 	// Listing and strict JSON validation remain usable without host-private I/O.
