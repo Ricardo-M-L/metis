@@ -376,6 +376,28 @@ func TestBundleMetadataUsesMetisDisplayNameAndSingleInstance(t *testing.T) {
 	}
 }
 
+func TestBundleMetadataDeclaresSystemEventsUsage(t *testing.T) {
+	for _, name := range []string{"Info.plist", "Info.dev.plist"} {
+		t.Run(name, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("build", "darwin", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			const key = "<key>NSAppleEventsUsageDescription</key>"
+			metadata := string(data)
+			if strings.Count(metadata, key) != 1 {
+				t.Fatal("Desktop bundle must declare exactly one AppleEvents usage description")
+			}
+			_, rest, _ := strings.Cut(metadata, key)
+			rest = strings.TrimSpace(rest)
+			purpose, _, closed := strings.Cut(strings.TrimPrefix(rest, "<string>"), "</string>")
+			if !strings.HasPrefix(rest, "<string>") || !closed || !strings.Contains(purpose, "System Events") || !strings.Contains(purpose, "前台应用") {
+				t.Fatal("AppleEvents purpose must explain the System Events foreground-app safety check")
+			}
+		})
+	}
+}
+
 func TestParseDesktopLaunchArguments(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "workspace")
 	for _, tc := range []struct {

@@ -344,3 +344,86 @@ func TestStatusUsesViewedWorkerContextAndRetainsFinalSnapshot(t *testing.T) {
 		t.Fatalf("completed worker pressure was lost: %#v", finalB)
 	}
 }
+
+func TestStatusContextBreakdownIsOptionalValidatedAndSessionScoped(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		parts   *desktopipc.ContextBreakdown
+		present bool
+	}{
+		{"old worker", nil, false},
+		{"zero is valid", &desktopipc.ContextBreakdown{Estimated: true}, true},
+		{"estimated categories", &desktopipc.ContextBreakdown{SystemTokens: 1400, ToolTokens: 7100, MessageTokens: 239000, Estimated: true}, true},
+		{"negative category", &desktopipc.ContextBreakdown{MessageTokens: -1, Estimated: true}, false},
+		{"missing estimate identity", &desktopipc.ContextBreakdown{MessageTokens: 10}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := testServer(t)
+			s.setWorkerSnapshot("breakdown-owner", desktopipc.Status{Context: &desktopipc.ContextPressure{Used: 331000, Window: 1000000, Model: "exact-model", Breakdown: tc.parts}})
+			request := func(sid string) map[string]any {
+				rr := httptest.NewRecorder()
+				s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status?sessionId="+sid, nil))
+				if rr.Code != http.StatusOK {
+					t.Fatalf("status %d", rr.Code)
+				}
+				var payload map[string]any
+				if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+					t.Fatal(err)
+				}
+				return payload
+			}
+			got := request("breakdown-owner")
+			_, present := got["contextBreakdown"]
+			if present != tc.present || got["contextUsed"] != float64(331000) || got["contextWindow"] != float64(1000000) {
+				t.Fatalf("wrong category contract: %#v", got)
+			}
+			if tc.present {
+				parts := got["contextBreakdown"].(map[string]any)
+				if parts["messageTokens"] != float64(tc.parts.MessageTokens) || parts["estimated"] != true {
+					t.Fatalf("normalized or malformed categories: %#v", parts)
+				}
+			}
+			other := request("other-session")
+			if _, leaked := other["contextBreakdown"]; leaked {
+				t.Fatalf("worker categories leaked across session: %#v", other)
+			}
+		})
+	}
+}
+
+func TestStatusMainLoopPublishesOnlyPreparedContextBreakdown(t *testing.T) {
+	_, store := testServer(t)
+	p := &webStatusCapabilitiesProvider{activationTestProvider: activationTestProvider{name: "route", model: "model"}, capabilities: llm.ContextCapabilities{Window: 1000000, Model: "model"}}
+	loop := agent.NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system body", 2)
+	loop.Model = p.model
+	loop.AppendUser("owned messages")
+	loop.SyncContextCapabilities()
+	loop.EstimateRequestContextTokens(nil)
+	if err := store.WriteHeaderFull(session.Header{ID: "prepared-owner", WorkDir: t.TempDir(), Provider: p.name, Model: p.model, System: "system body", Mode: string(permission.ModeAsk), Status: "idle"}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer("127.0.0.1:0", loop, store, RuntimeBindings{InitialSessionID: "prepared-owner"})
+	loop.EstimateRequestContextTokens(nil)
+	// A status read must consume the prepared prefix instead of assembling fresh
+	// runtime state. This callback would expose any accidental request rebuild.
+	loop.CurrentStateSections = func() []llm.SystemSection { panic("status assembled runtime state") }
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	var got map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["contextSessionId"] != "prepared-owner" || got["contextBreakdown"] == nil {
+		t.Fatalf("prepared local breakdown missing: %#v", got)
+	}
+	loop.ResetSession(nil)
+	rr = httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	got = make(map[string]any)
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := got["contextBreakdown"]; present {
+		t.Fatalf("replaced history retained old prefix: %#v", got)
+	}
+}

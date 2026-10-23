@@ -109,6 +109,70 @@ func (l *Loop) syncCachedContextCapabilities(ctx context.Context, requestBoundar
 	return nil
 }
 
+// TrySyncContextCapabilities is the non-blocking status variant of metadata
+// synchronization. It reads only already-cached provider metadata and skips an
+// update while either request/history or compaction state is busy.
+func (l *Loop) TrySyncContextCapabilities() {
+	if l == nil || !l.mu.TryRLock() {
+		return
+	}
+	provider, model, revision := l.Provider, l.Model, l.routingRevision
+	providerID := identifyContextProvider(provider)
+	l.mu.RUnlock()
+	if provider == nil {
+		return
+	}
+	caps := providerContextCapabilities(provider)
+	if caps.Window <= 0 && caps.BudgetSource == "" && caps.RouteKey == "" {
+		return
+	}
+	if !l.mu.TryLock() {
+		return
+	}
+	defer l.mu.Unlock()
+	// Both acquisitions are try-only. Keeping mu until compactMu is released
+	// lets session Reset observe pending-reset ownership without a handoff gap.
+	if !l.compactMu.TryLock() {
+		return
+	}
+	defer func() {
+		if l.compactorResetPending {
+			if l.Compactor != nil {
+				l.Compactor.ResetCircuit()
+			}
+			l.compactorResetPending = false
+		}
+		l.compactMu.Unlock()
+	}()
+	if l.routingRevision != revision || l.Model != model || identifyContextProvider(l.Provider) != providerID {
+		return
+	}
+	outputBudget := 0
+	if l.Compactor != nil {
+		outputBudget = l.Compactor.MaxOutputTokens
+	}
+	if validateContextCapabilitiesBudget(caps, outputBudget) != nil {
+		return
+	}
+	changed := l.contextCapabilitiesBindingChangedLocked(caps)
+	l.contextCapabilities = caps
+	if !changed {
+		return
+	}
+	if old := l.Compactor; old != nil && (old.MaxContextTokens != caps.Window || old.MaxInputTokens != caps.MaxInputTokens || old.WindowKind != caps.WindowKind) {
+		next := *old
+		next.ProtectedTools = append([]string(nil), old.ProtectedTools...)
+		next.MaxContextTokens, next.WindowKind, next.MaxInputTokens = caps.Window, caps.WindowKind, caps.MaxInputTokens
+		next.MaxOutputTokens = outputBudget
+		next.ApplyWindowTier(next.effectiveInputCap())
+		l.Compactor = &next
+	}
+	l.ContextWindow = caps.Window
+	l.routingRevision++
+	l.invalidateActiveContextLocked()
+	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.Messages)) + l.requestOverheadTokens.Load())
+}
+
 // refreshCapabilitiesForRequest allows a brief status-sampler critical section
 // or an owned manual compaction to finish without sending an obsolete request.
 // Retry reads cached metadata only: discovery is attempted once per boundary.
@@ -233,6 +297,10 @@ func (l *Loop) ContextDetailsSnapshot() (capabilities llm.ContextCapabilities, t
 	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+	return l.contextDetailsLocked()
+}
+
+func (l *Loop) contextDetailsLocked() (capabilities llm.ContextCapabilities, threshold float64, trigger int) {
 	capabilities = l.contextCapabilities
 	if capabilities.Window != l.ContextWindow {
 		// Direct embedders can set the initial ContextWindow before assembly.

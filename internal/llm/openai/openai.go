@@ -133,6 +133,10 @@ type OpenAI struct {
 	ContextBudgetPolicy   *llm.ContextBudgetPolicy
 	MaxTokens             int
 	Temperature           float64
+	// Model-specific canonical effort slots map to endpoint wire values.
+	// Runtime installs a detached map for this exact provider/model binding.
+	ReasoningEffortValues   map[string]string
+	ReasoningEffortDisabled bool
 	// ContextWindow, when > 0, overrides the model-prefix lookup in
 	// MaxContextTokens(). Useful for OpenAI-compatible gateways
 	// (Together, Groq, Ollama) where the served model is a fine-tune
@@ -1100,6 +1104,10 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 	if o.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set OPENAI_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
+	reasoningEffort, err := resolveReasoningEffort(req.Effort, o.ReasoningEffortValues, o.ReasoningEffortDisabled, req.Effort.OpenAI())
+	if err != nil {
+		return nil, err
+	}
 	release, err := o.acquireRequestSlot(ctx)
 	if err != nil {
 		return nil, err
@@ -1115,6 +1123,7 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 
 	doOnce := func(maxTokens int) error {
 		body := toOpenAI(req, o.Model, maxTokens)
+		body.ReasoningEffort = reasoningEffort
 		body.Stream = false
 		buf, err := json.Marshal(body)
 		if err != nil {
@@ -1188,6 +1197,10 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 	if o.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set OPENAI_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
+	reasoningEffort, err := resolveReasoningEffort(req.Effort, o.ReasoningEffortValues, o.ReasoningEffortDisabled, req.Effort.OpenAI())
+	if err != nil {
+		return nil, err
+	}
 	release, err := o.acquireRequestSlot(ctx)
 	if err != nil {
 		return nil, err
@@ -1198,6 +1211,7 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 
 	openOnce := func(maxTokens int) error {
 		body := toOpenAI(req, o.Model, maxTokens)
+		body.ReasoningEffort = reasoningEffort
 		body.Stream = true
 		buf, err := json.Marshal(body)
 		if err != nil {

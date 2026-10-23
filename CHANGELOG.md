@@ -7,7 +7,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.91] - 2026-10-23
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
 ### Fixed
+
+- Keep code checkpoints usable in large multi-project workspaces with bounded
+  parallel scans, incremental mirror writes, stage progress and cancellable budgets.
+  Preserve per-turn baselines, raw file bytes and executable modes; reject incomplete
+  restores instead of reporting a successful partial rewind.
+- Include every selected file in the private snapshot even when a project ignores
+  it, avoiding false "new file" attribution after read-only Bash commands.
+- Pass the originating session identity to tool hooks.
+- Restore the pinned official Computer Use catalog for source builds and improve
+  status, permission guidance and stop controls.
+
 
 - Requeue unfinished coordinator work on normal process cancellation within its
   attempt budget, and release cross-process state locks immediately when their
@@ -21,6 +37,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   host checks before verification nodes can complete.
 
 ### Added
+
+- Manage Desktop providers and models through one settings flow, including
+  discovery, capability limits, reasoning choices, default/session selection,
+  atomic credential/configuration changes and deletion of unused providers.
+- Show compact context usage with system, tool and conversation breakdowns while
+  retaining detailed model limits and provenance in an expandable view.
 
 - Ship a matching CLI inside Metis Desktop, with a signed macOS app resource
   and embedded Linux/Windows runtimes, so Desktop does not require a separate

@@ -273,3 +273,31 @@ func TestDesktopWorkerStatusSeparatesLifecycleFromHeldExecution(t *testing.T) {
 		t.Fatalf("finished status=%+v", finished)
 	}
 }
+
+func TestDesktopWorkerStatusCarriesPreparedContextBreakdown(t *testing.T) {
+	p := &desktopStatusCapabilitiesProvider{capabilities: llm.ContextCapabilities{Window: 1000000, Model: "brand-new-model"}}
+	loop := agent.NewLoop(p, tools.NewRegistry(), permission.New(permission.ModeAsk), nil, "system prompt", 2)
+	loop.Model = p.ModelID()
+	loop.AppendUser("worker owned messages")
+	loop.SyncContextCapabilities()
+	loop.EstimateRequestContextTokens([]llm.ToolSpec{{Name: "Read", Description: "read a file"}})
+	want := loop.ContextUsageSnapshot()
+	sampler := desktopWorkerStatusSampler{loop: loop, known: make(map[string]*agent.Teammate)}
+	got := sampler.snapshot(false)
+	if got.Context == nil || got.Context.Breakdown == nil || !got.Context.Breakdown.Valid() || got.Context.Used != want.Used || got.Context.Model != want.Capabilities.Model || got.Context.Window != want.Capabilities.Window {
+		t.Fatalf("missing coherent context: %+v", got.Context)
+	}
+	parts := got.Context.Breakdown
+	if parts.SystemTokens != want.Breakdown.SystemTokens || parts.ToolTokens != want.Breakdown.ToolTokens || parts.MessageTokens != want.Breakdown.MessageTokens {
+		t.Fatalf("parts changed across worker IPC: got=%+v want=%+v", parts, want.Breakdown)
+	}
+	final := sampler.snapshot(true)
+	if final.Context != got.Context {
+		t.Fatal("cleanup did not retain final complete status")
+	}
+	loop.ResetSession(nil)
+	reset := sampler.snapshot(false)
+	if reset.Context == nil || reset.Context.Breakdown != nil {
+		t.Fatalf("worker retained prior session categories: %+v", reset.Context)
+	}
+}

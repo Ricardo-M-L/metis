@@ -87,6 +87,7 @@ async function initDesktopPreferences() {
 
 const DESKTOP_I18N = {
   en: {
+    contextOccupancy: 'Context used', contextSystem: 'System prompt', contextTools: 'Tool definitions', contextMessages: 'Conversation messages', contextEstimateNote: 'Category estimates may differ from the total.', contextTechnicalDetails: 'Technical details',
     newSession: 'New session', workspaces: 'Workspaces', searchSessions: 'Search sessions…', settings: 'Settings', checkUpdates: 'Check for updates',
     searchSessionsLabel: 'Search sessions', collapseSidebar: 'Collapse sidebar', expandSidebar: 'Expand sidebar',
     context: 'Context', contextDetails: 'Context details', contextOpenDetails: 'Click to view details', contextUsed: 'Used', contextWindow: 'Active window', contextDefaultWindow: 'Endpoint default window', contextMaxWindow: 'Maximum supported', contextMaxInput: 'Maximum input', contextMaxOutput: 'Maximum output', contextSource: 'Data source', contextSourceEndpoint: 'Endpoint', contextSourceCatalog: 'Model catalog', contextSourceConfigured: 'Explicit configuration', contextSourceFallback: 'Conservative fallback', contextSourceUnknown: 'Unconfirmed', autoCompactAt: 'Auto-compact at', subAgents: 'sub-agents', backgroundTasks: 'background tasks',
@@ -99,6 +100,7 @@ const DESKTOP_I18N = {
     layout: 'Layout', groupByWorkspace: 'Grouped by workspace', flatList: 'Flat list', sort: 'Sort', mostRecent: 'Most recent', name: 'Name', manualOrder: 'Manual order', pageNavigation: 'Page navigation'
   },
   'zh-CN': {
+    contextOccupancy: '上下文已用', contextSystem: '系统提示词', contextTools: '工具定义', contextMessages: '对话消息', contextEstimateNote: '分项为本地估算，可能与总量不同。', contextTechnicalDetails: '技术详情',
     newSession: '新会话', workspaces: '工作区', searchSessions: '搜索会话…', settings: '设置', checkUpdates: '检查更新',
     searchSessionsLabel: '搜索会话', collapseSidebar: '收起侧栏', expandSidebar: '展开侧栏',
     context: '上下文', contextDetails: '上下文详情', contextOpenDetails: '点击查看详情', contextUsed: '已使用', contextWindow: '当前窗口', contextDefaultWindow: '端点默认窗口', contextMaxWindow: '最大支持', contextMaxInput: '最大输入', contextMaxOutput: '最大输出', contextSource: '数据来源', contextSourceEndpoint: '接入端点', contextSourceCatalog: '模型目录', contextSourceConfigured: '显式配置', contextSourceFallback: '保守回退', contextSourceUnknown: '未确认', autoCompactAt: '自动压缩阈值', subAgents: '子代理', backgroundTasks: '后台任务',
@@ -496,9 +498,16 @@ function contextCapacitySourceLabel(value, dict) {
   if (source === 'configured_clamped') return dict.contextSourceConfiguredClamped;
   if (source === 'codex_model_catalog' || source.startsWith('catalog')) return dict.contextSourceCatalog;
   if (source === 'endpoint' || source.startsWith('endpoint_')) return dict.contextSourceEndpoint;
-  if (source === 'configured') return dict.contextSourceConfigured;
+  if (source === 'configured' || source === 'user') return dict.contextSourceConfigured;
   if (source.endsWith('fallback')) return dict.contextSourceFallback;
   return dict.contextSourceUnknown;
+}
+
+function contextMeterDetailsToggled(details) {
+  const popover = document.getElementById('contextMeterPopover');
+  if (!popover || !popover.contains(details)) return;
+  popover.dataset.detailsOpen = String(details.open);
+  if (typeof refreshComposerStatPopovers === 'function') refreshComposerStatPopovers();
 }
 
 function renderContextMeter(d, dict) {
@@ -520,7 +529,10 @@ function renderContextMeter(d, dict) {
     syncComposerRuntimeDock();
     return;
   }
-  if (meter.dataset.sessionId !== owner) closeContextMeterPopover();
+  if (meter.dataset.sessionId !== owner) {
+    closeContextMeterPopover();
+    delete popover.dataset.detailsOpen;
+  }
   meter.dataset.sessionId = owner;
   const fraction = used / limit;
   const percent = Math.max(0, Math.min(100, Math.round(fraction * 100)));
@@ -529,6 +541,12 @@ function renderContextMeter(d, dict) {
   const compactAt = compactAtTokens > 0 ? compactAtTokens / limit : Number(d.compactThreshold) || 0;
   const locale = document.documentElement.lang === 'en' ? 'en' : 'zh-CN';
   const exactTokens = value => Math.round(value).toLocaleString(locale) + ' tokens';
+  const compactTokens = value => {
+    const unit = value >= 1000000 ? 1000000 : value >= 1000 ? 1000 : 1;
+    const scaled = value / unit;
+    const precision = unit === 1 || Number.isInteger(scaled) ? 0 : unit === 1000000 && scaled < 10 ? 2 : 1;
+    return scaled.toLocaleString(locale, { maximumFractionDigits: precision }) + (unit === 1000000 ? 'M' : unit === 1000 ? 'K' : '');
+  };
   meter.style.display = '';
   meter.style.setProperty('--context-progress', percent + '%');
   meter.innerHTML = `<span class="context-meter-ring" aria-hidden="true"></span><span>${escHtml(percentLabel)}</span>`;
@@ -563,11 +581,29 @@ function renderContextMeter(d, dict) {
     + `<div><dt>${escHtml(dict.contextSource)}</dt><dd>${escHtml(sourceLabel)}</dd></div>`
     + (d.contextLimitSource && d.contextLimitSource !== source ? `<div><dt>${escHtml(dict.contextLimitSource)}</dt><dd>${escHtml(contextCapacitySourceLabel(d.contextLimitSource, dict))}</dd></div>` : '')
     + (d.contextModelSource ? `<div><dt>${escHtml(dict.contextModelSource)}</dt><dd>${escHtml(contextCapacitySourceLabel(d.contextModelSource, dict))}</dd></div>` : '');
+  const composition = d.contextBreakdown;
+  const categories = [
+    { key: 'systemTokens', name: dict.contextSystem, color: 'system' },
+    { key: 'toolTokens', name: dict.contextTools, color: 'tools' },
+    { key: 'messageTokens', name: dict.contextMessages, color: 'messages' },
+  ];
+  const completeComposition = composition && composition.estimated === true && categories.every(({key}) => Number.isSafeInteger(composition[key]) && composition[key] >= 0);
+  const estimateTotal = completeComposition ? categories.reduce((sum, {key}) => sum + composition[key], 0) : 0;
+  const hasComposition = completeComposition && Number.isSafeInteger(estimateTotal);
+  // Composition is estimated independently of provider-anchored occupancy.
+  // Normalize only the bar's relative colors; keep each displayed estimate.
+  const segments = hasComposition && estimateTotal > 0
+    ? categories.map(({key, color}) => `<span class="context-segment-${color}" style="width:${100 * composition[key] / estimateTotal}%"></span>`).join('')
+    : '<span class="context-segment-messages" style="width:100%"></span>';
+  const compositionRows = hasComposition ? `<dl class="context-meter-breakdown">${categories.map(({key, name, color}) => `<div><dt><span class="context-swatch context-segment-${color}" aria-hidden="true"></span>${escHtml(name)}</dt><dd>≈${escHtml(compactTokens(composition[key]))}</dd></div>`).join('')}</dl><p class="context-meter-estimate-note">${escHtml(dict.contextEstimateNote)}</p>` : '';
+  const previousSummary = popover.querySelector?.('.context-meter-technical > summary');
+  const restoreSummaryFocus = previousSummary && document.activeElement === previousSummary;
   popover.setAttribute('aria-label', dict.contextDetails);
-  popover.innerHTML = `<div class="context-meter-popover-title">${escHtml(dict.contextDetails)} <strong>${escHtml(percentLabel)}</strong></div>
-    <div class="context-meter-progress" aria-hidden="true"><span style="width:${percent}%"></span></div>
-    <dl class="context-meter-details"><div><dt>${escHtml(dict.contextUsed)}</dt><dd>${exactTokens(used)}</dd></div>
-    <div><dt>${escHtml(d.contextWindowKind === 'input' ? dict.contextInputBudget : dict.contextWindow)}</dt><dd>${exactTokens(limit)}</dd></div>${capabilityRows}${compactRow}</dl>`;
+  popover.innerHTML = `<div class="context-meter-summary"><span>${escHtml(dict.contextOccupancy)} <strong>${escHtml(percentLabel)}</strong></span><span class="context-meter-total" aria-label="${escHtml(dict.contextUsed + ' ' + exactTokens(used) + ' / ' + exactTokens(limit))}">≈${escHtml(compactTokens(used))} / ${escHtml(compactTokens(limit))}</span></div>
+    <div class="context-meter-progress" aria-hidden="true"><span class="context-meter-fill" style="width:${Math.max(0, Math.min(100, fraction * 100))}%">${segments}</span></div>
+    ${compositionRows}<details class="context-meter-technical"${popover.dataset.detailsOpen === 'true' ? ' open' : ''} ontoggle="contextMeterDetailsToggled(this)"><summary>${escHtml(dict.contextTechnicalDetails)}</summary><dl class="context-meter-details"><div><dt>${escHtml(dict.contextUsed)}</dt><dd>${exactTokens(used)}</dd></div>
+    <div><dt>${escHtml(d.contextWindowKind === 'input' ? dict.contextInputBudget : dict.contextWindow)}</dt><dd>${exactTokens(limit)}</dd></div>${capabilityRows}${compactRow}</dl></details>`;
+  if (restoreSummaryFocus && !popover.hidden) popover.querySelector?.('.context-meter-technical > summary')?.focus();
   syncComposerRuntimeDock();
 }
 
@@ -1413,21 +1449,24 @@ function computerUseMarkup() {
   const permissions = description.permissions || {};
   const disabled = computerUseBusy ? ' disabled' : '';
   const canInterruptEnable = computerUsePendingAction === 'enable';
-  const canStop = canInterruptEnable || (!computerUseBusy && status && status.running);
+  const canStop = canInterruptEnable || (!computerUseBusy && status && status.stoppable === true);
   const row = (label, value) => `<div class="settings-card-row"><span class="settings-card-label">${escHtml(label)}</span><span class="computer-use-value">${escHtml(value)}</span></div>`;
   const source = status && status.source === 'local' ? uiText('Local build (experimental)', '本地构建（实验性）')
     : status && status.source === 'official' ? uiText('Official component', '官方组件')
     : uiText('Not installed', '未安装');
   const installation = status ? (status.installed ? uiText('Installed', '已安装') : uiText('Not installed', '未安装')) : uiText('Unknown', '未知');
   const state = status ? (status.enabled ? uiText('Enabled', '已启用') : uiText('Disabled', '已停用')) : uiText('Unknown', '未知');
-  const connection = status ? (status.running ? uiText('Running', '运行中') : uiText('Stopped', '已停止')) : uiText('Unknown', '未知');
+  const connection = status ? (status.running ? uiText('Running', '运行中')
+    : status.stoppable ? uiText('Connected — needs attention', '已连接，状态需要检查')
+    : uiText('Stopped', '已停止')) : uiText('Unknown', '未知');
   const permissionRow = (label, key, action) => {
     const nativeDesktop = isNativeComputerUseDesktop();
     const nativeValue = computerUseNativePermissions && computerUseNativePermissions[key];
     const componentValue = permissions[key];
     const desktopLine = nativeDesktop ? `<div class="settings-card-desc">${uiText('METIS Desktop', '桌面应用')} · ${escHtml(computerUsePermissionLabel(nativeValue))}</div>` : '';
     const componentLine = status && status.installed ? `<div class="settings-card-desc">${nativeDesktop ? `${uiText('Component check', '组件预检')} · ` : ''}${escHtml(computerUsePermissionLabel(componentValue))}</div>` : '';
-    const requestDesktop = nativeDesktop && description.platform === 'darwin'
+    const requestDesktop = nativeDesktop && (description.platform === 'darwin'
+      || (!description.platform && nativeValue && nativeValue !== 'unavailable'))
       && nativeValue !== 'granted' && nativeValue !== 'unavailable';
     const requestComponent = status && status.installed && description.platform === 'darwin'
       && ['denied', 'notGranted', 'not-granted', 'not-determined'].includes(componentValue);
@@ -1479,21 +1518,32 @@ async function loadComputerUse() {
   computerUseError = '';
   computerUseNativePermissions = null;
   paintComputerUse();
+  // Desktop permission preflight is independent of helper installation and
+  // health. A failed status response must not hide the native grant controls.
+  const nativePermissions = refreshNativeComputerUsePermissions(operationID);
   try {
     const response = await fetch('/api/computer-use', {cache: 'no-store'});
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || uiText('Unable to read Computer Use status.', '无法读取电脑操作状态。'));
-    if (operationID === computerUseOperationID) computerUseStatus = data;
-    await refreshNativeComputerUsePermissions(operationID);
+    await readComputerUseResponse(response, operationID, uiText('Unable to read Computer Use status.', '无法读取电脑操作状态。'));
   } catch (error) {
     if (operationID === computerUseOperationID) computerUseError = error.message || String(error);
   } finally {
+    await nativePermissions;
     if (operationID === computerUseOperationID) {
       computerUseBusy = false;
       computerUsePendingAction = '';
       paintComputerUse();
     }
   }
+}
+
+async function readComputerUseResponse(response, operationID, fallbackError) {
+  const data = await response.json();
+  const status = response.ok ? data : data.status;
+  if (operationID === computerUseOperationID && status && typeof status === 'object'
+      && ['installed', 'enabled', 'running'].every(key => typeof status[key] === 'boolean')) {
+    computerUseStatus = status;
+  }
+  if (!response.ok) throw new Error(data.error || fallbackError);
 }
 
 async function computerUseAction(action) {
@@ -1507,26 +1557,22 @@ async function computerUseAction(action) {
   computerUsePendingAction = action;
   computerUseError = '';
   paintComputerUse();
+  const refreshPermissions = (action.startsWith('permissions-') && isNativeComputerUseDesktop()) || action.startsWith('helper-');
   try {
     if (action.startsWith('permissions-') && isNativeComputerUseDesktop()) {
       const kind = action === 'permissions-accessibility' ? 'accessibility' : 'screen-recording';
       await requestNative('request-computer-use-permission', {kind}, 120000);
       const response = await fetch('/api/computer-use', {cache: 'no-store'});
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || uiText('Unable to read Computer Use status.', '无法读取电脑操作状态。'));
-      if (operationID === computerUseOperationID) computerUseStatus = data;
-      await refreshNativeComputerUsePermissions(operationID);
+      await readComputerUseResponse(response, operationID, uiText('Unable to read Computer Use status.', '无法读取电脑操作状态。'));
     } else {
       const backendAction = action.startsWith('helper-') ? action.slice('helper-'.length) : action;
       const response = await fetch('/api/computer-use', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: backendAction})});
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || uiText('Computer Use action failed.', '电脑操作请求失败。'));
-      if (operationID === computerUseOperationID) computerUseStatus = data;
-      if (action.startsWith('helper-')) await refreshNativeComputerUsePermissions(operationID);
+      await readComputerUseResponse(response, operationID, uiText('Computer Use action failed.', '电脑操作请求失败。'));
     }
   } catch (error) {
     if (operationID === computerUseOperationID) computerUseError = error.message || String(error);
   } finally {
+    if (refreshPermissions) await refreshNativeComputerUsePermissions(operationID);
     if (operationID === computerUseOperationID) {
       computerUseBusy = false;
       computerUsePendingAction = '';

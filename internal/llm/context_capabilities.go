@@ -23,6 +23,7 @@ type ContextCapabilities struct {
 	ModelMaxInputTokens  int    `json:"modelMaxInputTokens,omitempty"`
 	ModelMaxOutputTokens int    `json:"modelMaxOutputTokens,omitempty"`
 	ModelSource          string `json:"modelSource,omitempty"`
+	ModelOutputSource    string `json:"modelOutputSource,omitempty"`
 	RequestedWindow      int    `json:"requestedWindow,omitempty"`
 	LimitSource          string `json:"limitSource,omitempty"`
 	BudgetSource         string `json:"budgetSource,omitempty"`

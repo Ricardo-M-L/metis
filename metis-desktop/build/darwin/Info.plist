@@ -27,6 +27,8 @@
         <string>true</string>
         <key>NSHumanReadableCopyright</key>
         <string>{{.Info.Copyright}}</string>
+        <key>NSAppleEventsUsageDescription</key>
+        <string>METIS 通过 System Events 读取前台应用，以在电脑操作前校验目标应用，避免将输入发送到其他应用。</string>
         {{if .Info.FileAssociations}}
         <key>CFBundleDocumentTypes</key>
         <array>

@@ -226,11 +226,12 @@ type ProviderSet struct {
 // `?key=...` query param is NOT supported because our retries would
 // log the key on a 4xx.
 type ProviderGemini struct {
-	APIKeyEnv string `toml:"api_key_env"`
-	APIKey    string `toml:"api_key"`
-	BaseURL   string `toml:"base_url"`
-	Model     string `toml:"model"`
-	MaxTokens int    `toml:"max_tokens"`
+	CatalogProvider string `toml:"catalog_provider"`
+	APIKeyEnv       string `toml:"api_key_env"`
+	APIKey          string `toml:"api_key"`
+	BaseURL         string `toml:"base_url"`
+	Model           string `toml:"model"`
+	MaxTokens       int    `toml:"max_tokens"`
 	// ContextWindow is a legacy working budget for the configured Model only.
 	// Exact route/model budgets take precedence; zero enables discovery.
 	ContextWindow int     `toml:"context_window"`

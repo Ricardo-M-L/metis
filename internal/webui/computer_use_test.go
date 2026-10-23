@@ -113,3 +113,24 @@ func TestComputerUseHTTPAvailabilityAndOriginGuards(t *testing.T) {
 		t.Fatalf("callback error = %d %s", rr.Code, rr.Body.String())
 	}
 }
+
+func TestComputerUseHTTPPreservesPartialStatusOnFailure(t *testing.T) {
+	want := computeruse.Status{Installed: false, Enabled: true, Message: "installation check failed"}
+	s := &Server{computerUse: func(context.Context, string) (computeruse.Status, error) {
+		return want, errors.New("helper failed its compatibility check")
+	}}
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		rr := httptest.NewRecorder()
+		s.handleComputerUse(rr, httptest.NewRequest(method, "/api/computer-use", strings.NewReader(`{"action":"stop"}`)))
+		var got struct {
+			Status *computeruse.Status `json:"status"`
+			Error  string              `json:"error"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if rr.Code != http.StatusInternalServerError || got.Status == nil || !reflect.DeepEqual(*got.Status, want) || got.Error != "helper failed its compatibility check" || rr.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("partial runtime status lost: code=%d body=%s", rr.Code, rr.Body.String())
+		}
+	}
+}

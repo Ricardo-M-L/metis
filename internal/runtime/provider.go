@@ -351,6 +351,10 @@ func BuildProviderWithoutPreconnect(cfg *config.Config, name, modelOverride stri
 }
 
 func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconnect bool) (*ProviderBuild, error) {
+	modelSettings, err := lookupProviderModelRuntimeSettings(cfg, name, modelOverride)
+	if err != nil {
+		return nil, err
+	}
 	switch name {
 	case "anthropic":
 		if err := validateCredentialEndpoint(cfg.Provider.Anthropic.BaseURL); err != nil {
@@ -445,7 +449,7 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 		if allowPreconnect {
 			Preconnect(cfg.Provider.Anthropic.BaseURL)
 		}
-		return finalizeProviderBuild(prov, model, cfg.Provider.Anthropic.MaxTokens)
+		return finalizeProviderModelSettingsBuild(prov, model, cfg.Provider.Anthropic.MaxTokens, modelSettings)
 	case "openai-codex":
 		storedCredential, err := auth.GetOAuth("openai-codex")
 		if err != nil {
@@ -490,7 +494,7 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 		if allowPreconnect {
 			Preconnect(prov.BaseURL)
 		}
-		return finalizeProviderBuild(prov, model, cfg.Provider.OpenAICodex.MaxTokens)
+		return finalizeProviderModelSettingsBuild(prov, model, cfg.Provider.OpenAICodex.MaxTokens, modelSettings)
 	case "openai":
 		if err := validateCredentialEndpoint(cfg.Provider.OpenAI.BaseURL); err != nil {
 			return nil, fmt.Errorf("provider %q: %w", name, err)
@@ -531,7 +535,7 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 			if allowPreconnect {
 				Preconnect(cfg.Provider.OpenAI.BaseURL)
 			}
-			return finalizeProviderBuild(prov, model, cfg.Provider.OpenAI.MaxTokens)
+			return finalizeProviderModelSettingsBuild(prov, model, cfg.Provider.OpenAI.MaxTokens, modelSettings)
 		}
 		prov := openai.New(
 			key,
@@ -552,7 +556,7 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 		if allowPreconnect {
 			Preconnect(cfg.Provider.OpenAI.BaseURL)
 		}
-		return finalizeProviderBuild(prov, model, cfg.Provider.OpenAI.MaxTokens)
+		return finalizeProviderModelSettingsBuild(prov, model, cfg.Provider.OpenAI.MaxTokens, modelSettings)
 	case "gemini", "google":
 		if err := validateCredentialEndpoint(cfg.Provider.Gemini.BaseURL); err != nil {
 			return nil, fmt.Errorf("provider %q: %w", name, err)
@@ -582,7 +586,7 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 		if allowPreconnect {
 			Preconnect(cfg.Provider.Gemini.BaseURL)
 		}
-		return finalizeProviderBuild(prov, model, cfg.Provider.Gemini.MaxTokens)
+		return finalizeProviderModelSettingsBuild(prov, model, cfg.Provider.Gemini.MaxTokens, modelSettings)
 	}
 	// Custom provider profiles. Users define unlimited entries under
 	// [provider.custom.<id>] in config.toml, picking a transport
@@ -592,7 +596,7 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 	// vendor exposes both an Anthropic-compatible and OpenAI-compatible
 	// endpoint and one of them has a bug the other doesn't.
 	if raw, ok := cfg.Provider.Custom[name]; ok {
-		return buildCustomProvider(cfg, name, raw, modelOverride, allowPreconnect)
+		return buildCustomProvider(cfg, name, raw, modelOverride, allowPreconnect, modelSettings)
 	}
 	known := []string{"anthropic", "openai", "openai-codex", "gemini"}
 	for k := range cfg.Provider.Custom {
@@ -609,7 +613,7 @@ func buildProvider(cfg *config.Config, name, modelOverride string, allowPreconne
 // Adding a new transport is now "create internal/llm/<name>/, call
 // transport.Register in init(), blank-import it from this file" —
 // no need to grow the case list here.
-func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, modelOverride string, allowPreconnect bool) (*ProviderBuild, error) {
+func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, modelOverride string, allowPreconnect bool, modelSettings *config.ProviderModelSettings) (*ProviderBuild, error) {
 	if err := validateCredentialEndpoint(raw.BaseURL); err != nil {
 		return nil, fmt.Errorf("provider %q: %w", id, err)
 	}
@@ -674,7 +678,7 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 	if allowPreconnect {
 		Preconnect(raw.BaseURL)
 	}
-	return finalizeProviderBuild(provider, res.Model, res.MaxOutputTokens)
+	return finalizeProviderModelSettingsBuild(provider, res.Model, res.MaxOutputTokens, modelSettings)
 }
 
 func validateCredentialEndpoint(baseURL string) error {

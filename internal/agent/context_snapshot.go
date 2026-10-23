@@ -27,6 +27,90 @@ type activeContextSnapshot struct {
 	requestModel    string
 }
 
+// ContextBreakdown describes local estimates of one active request. These
+// categories are not reconciled to provider usage: provider tokenizers and
+// native image accounting may legitimately produce a different total.
+type ContextBreakdown struct {
+	SystemTokens  int  `json:"systemTokens"`
+	ToolTokens    int  `json:"toolTokens"`
+	MessageTokens int  `json:"messageTokens"`
+	Estimated     bool `json:"estimated"`
+}
+
+// ContextUsage is a coherent, detached status reading. Breakdown is absent
+// until a concrete request or its preflight established the complete prefix.
+type ContextUsage struct {
+	Used             int
+	Breakdown        *ContextBreakdown
+	Capabilities     llm.ContextCapabilities
+	CompactThreshold float64
+	CompactAtTokens  int
+	epoch            uint64
+}
+
+type contextPrefixEstimate struct {
+	valid           bool
+	systemTokens    int
+	toolTokens      int
+	historyRevision uint64
+	routingRevision uint64
+	provider        contextProviderIdentity
+	model           string
+}
+
+// ContextUsageSnapshot never assembles a request, hydrates tools, retrieves
+// memory or consumes one-shot request flags. A busy writer returns the last
+// complete reading from this epoch rather than mixing independent samples.
+func (l *Loop) ContextUsageSnapshot() ContextUsage {
+	if l == nil {
+		return ContextUsage{}
+	}
+	if !l.mu.TryRLock() {
+		if cached := l.contextUsageCache.Load(); cached != nil && cached.epoch == l.contextUsageEpoch.Load() {
+			return cloneContextUsage(*cached)
+		}
+		return ContextUsage{}
+	}
+	defer l.mu.RUnlock()
+	overhead := int(l.requestOverheadTokens.Load())
+	used := estimateActiveHistoryTokens(l.Messages) + overhead
+	if base, ok := l.activeContextBaseLocked(); ok {
+		used = max(base+overhead, 0)
+	}
+	caps, threshold, trigger := l.contextDetailsLocked()
+	if caps.Model == "" {
+		caps.Model = l.Model
+	}
+	snapshot := ContextUsage{Used: used, Capabilities: caps,
+		CompactThreshold: threshold, CompactAtTokens: trigger, epoch: l.contextUsageEpoch.Load()}
+	prefix := l.contextPrefix
+	if prefix.valid && prefix.historyRevision == l.historyRevision &&
+		prefix.routingRevision == l.routingRevision && prefix.model == l.Model &&
+		prefix.provider == identifyContextProvider(l.Provider) {
+		snapshot.Breakdown = &ContextBreakdown{SystemTokens: prefix.systemTokens,
+			ToolTokens: prefix.toolTokens, MessageTokens: estimateActiveHistoryTokens(l.Messages), Estimated: true}
+	}
+	l.estTokens.Store(int64(used))
+	l.contextUsageCache.Store(&snapshot)
+	return cloneContextUsage(snapshot)
+}
+
+func cloneContextUsage(snapshot ContextUsage) ContextUsage {
+	if snapshot.Breakdown != nil {
+		parts := *snapshot.Breakdown
+		snapshot.Breakdown = &parts
+	}
+	return snapshot
+}
+
+func (l *Loop) cacheContextPrefixLocked(systemTokens, toolTokens int) {
+	l.contextPrefix = contextPrefixEstimate{valid: true, systemTokens: systemTokens, toolTokens: toolTokens,
+		historyRevision: l.historyRevision, routingRevision: l.routingRevision,
+		provider: identifyContextProvider(l.Provider), model: l.Model}
+	l.contextUsageEpoch.Add(1)
+	l.contextUsageCache.Store(nil)
+}
+
 // contextProviderIdentity distinguishes both a logical provider/model and a
 // rebuilt provider instance. The instance component matters when two clients
 // share the same public name/model but point at different transports or
@@ -80,7 +164,9 @@ func (l *Loop) contextRequestAnchorLocked(provider llm.Provider, req llm.Request
 	if l == nil || provider == nil {
 		return contextRequestAnchor{}
 	}
-	overhead := estimateRequestOverhead(req)
+	systemTokens, toolTokens := estimateRequestPrefix(req)
+	overhead := systemTokens + toolTokens
+	l.cacheContextPrefixLocked(systemTokens, toolTokens)
 	// Keep the render/preflight cache synchronized with the request that was
 	// actually assembled. Dynamic runtime state, plan text, memory and lazy
 	// tool schemas can all change between two turns; inheriting the previous
@@ -120,22 +206,36 @@ func (l *Loop) contextRequestAnchorLocked(provider llm.Provider, req llm.Request
 // the flattened System string on providers that support them, matching the
 // wire encoders and avoiding a second copy in the estimate.
 func estimateRequestOverhead(req llm.Request) int {
-	overhead := 0
+	systemTokens, toolTokens := estimateRequestPrefix(req)
+	return systemTokens + toolTokens
+}
+
+func estimateRequestPrefix(req llm.Request) (systemTokens, toolTokens int) {
 	if len(req.SystemSections) > 0 {
 		for _, section := range req.SystemSections {
-			overhead += 4 + estimateStringTokens(section.Body)
+			systemTokens += 4 + estimateStringTokens(section.Body)
 		}
 	} else {
-		overhead += estimateStringTokens(req.System)
+		systemTokens += estimateStringTokens(req.System)
 	}
 	for _, spec := range req.Tools {
-		overhead += estimateSpecTokens(spec)
+		toolTokens += estimateSpecTokens(spec)
 	}
-	return overhead
+	return systemTokens, toolTokens
 }
 
 func (l *Loop) invalidateActiveContextLocked() {
+	l.invalidateProviderContextLocked()
+	l.contextPrefix = contextPrefixEstimate{}
+}
+
+// A gateway can omit prompt usage without making the locally assembled
+// request prefix unknown. Discard only its provider anchor; session/routing
+// replacements use invalidateActiveContextLocked to clear both sources.
+func (l *Loop) invalidateProviderContextLocked() {
 	l.activeContext = activeContextSnapshot{}
+	l.contextUsageEpoch.Add(1)
+	l.contextUsageCache.Store(nil)
 }
 
 func disjointPromptUsageTokens(usage *usageTotals) (int, bool) {
@@ -280,6 +380,13 @@ func (l *Loop) storeActiveContextSnapshotLocked(usage *usageTotals, anchor conte
 	if l == nil || !anchor.valid {
 		return
 	}
+	// A late response owns no state in a newer session/request binding. In
+	// particular it must not clear a prefix prepared after that replacement.
+	if l.historyRevision != anchor.historyRevision || l.routingRevision != anchor.routingRevision ||
+		len(l.Messages) != anchor.messageCount+1 || l.Model != anchor.requestModel ||
+		identifyContextProvider(l.Provider) != anchor.providerID {
+		return
+	}
 	promptTokens, ok := disjointPromptUsageTokens(usage)
 	tokens := promptTokens
 	var assistant llm.Message
@@ -293,19 +400,14 @@ func (l *Loop) storeActiveContextSnapshotLocked(usage *usageTotals, anchor conte
 	if len(assistant.Content) > 0 {
 		estimatedAnchorTokens += assistantContextTokens(anchor.provider, assistant, 0)
 	}
-	currentProvider := identifyContextProvider(l.Provider)
 	if !ok ||
 		// Compatibility gateways occasionally omit cached/system/tool usage.
 		// Reject only a clear omission; normal tokenizer drift must keep the
 		// provider's authoritative raw count for the UI tooltip.
 		usageClearlyUnderreports(tokens, estimatedAnchorTokens) ||
-		!contextUsageFitsAnchor(usage, promptTokens, tokens, anchor) ||
-		l.historyRevision != anchor.historyRevision ||
-		l.routingRevision != anchor.routingRevision ||
-		len(l.Messages) != anchor.messageCount+1 ||
-		l.Model != anchor.requestModel ||
-		currentProvider != anchor.providerID {
-		l.invalidateActiveContextLocked()
+		!contextUsageFitsAnchor(usage, promptTokens, tokens, anchor) {
+		l.invalidateProviderContextLocked()
+		l.estTokens.Store(int64(estimateActiveHistoryTokens(l.Messages)) + l.requestOverheadTokens.Load())
 		return
 	}
 	l.activeContext = activeContextSnapshot{

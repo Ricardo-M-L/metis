@@ -157,6 +157,28 @@ func NewClient(home string) *Client {
 	return c
 }
 
+// ReadOnlySnapshot returns a detached copy of the already loaded local
+// catalog. It never refreshes metadata or performs network I/O.
+func (c *Client) ReadOnlySnapshot() Catalog {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cached == nil {
+		return nil
+	}
+	data, err := json.Marshal(c.cached)
+	if err != nil {
+		return nil
+	}
+	var snapshot Catalog
+	if json.Unmarshal(data, &snapshot) != nil {
+		return nil
+	}
+	return snapshot
+}
+
 // Get returns the catalog, fetching from network if the cache is stale
 // or missing. Network failures fall back to whatever's on disk; only
 // a completely empty cache + dead network surfaces as an error.

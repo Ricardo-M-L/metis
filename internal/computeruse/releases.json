@@ -1,1 +1,26 @@
-{"releases":[]}
+{
+  "releases": [
+    {
+      "version": "0.0.3",
+      "protocolVersion": 1,
+      "target": "darwin-arm64",
+      "url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.90/metis-cu-darwin-arm64.tar.gz",
+      "sha256": "29eb1a9e1c71267b8e8f598c7d5d81e79319029329f28949305cc4975da35562",
+      "binarySha256": "4a563f6f597efd3b46dec10c5884f2b885c99162a2090bd4d35dc3f3d9a2eb7f",
+      "format": "tar.gz",
+      "binaryPath": "metis-cu",
+      "size": 8342915
+    },
+    {
+      "version": "0.0.3",
+      "protocolVersion": 1,
+      "target": "darwin-amd64",
+      "url": "https://github.com/Ricardo-M-L/metis/releases/download/v0.4.90/metis-cu-darwin-amd64.tar.gz",
+      "sha256": "5b9216e9904754e2171bbc7066d43ba13780e9e00c5418f83ed7b97280bfea67",
+      "binarySha256": "3d8a6af9decd8697913b0dde34ccdcc637d59d82f0b3d6c7d5d3aac2df118987",
+      "format": "tar.gz",
+      "binaryPath": "metis-cu",
+      "size": 9058946
+    }
+  ]
+}

@@ -5041,11 +5041,32 @@ a.tc-web-title:focus-visible,
   margin-bottom: 12px;
 }
 .context-meter-progress span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
-.context-meter-popover.warn .context-meter-progress span { background: var(--warn); }
 .context-meter-details, .session-stats-details, .token-stats-details { display: grid; gap: 6px; margin: 0; }
 .context-meter-details > div, .session-stats-details > div, .token-stats-details > div { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
 .context-meter-details dt, .session-stats-details dt, .token-stats-details dt { color: var(--fg-faint); }
 .context-meter-details dd, .session-stats-details dd, .token-stats-details dd { margin: 0; min-width: 0; color: var(--fg-strong); text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.context-meter-popover { width: 320px; min-width: 0; }
+.context-meter-summary { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; margin-bottom: 14px; color: var(--fg-dim); }
+.context-meter-summary strong { margin-left: 4px; color: var(--fg-strong); font-weight: 600; }
+.context-meter-total { color: var(--fg-strong); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.context-meter-progress { display: flex; height: 5px; margin-bottom: 16px; }
+.context-meter-progress span { flex: 0 1 auto; min-width: 0; border-radius: 1px; }
+.context-meter-progress > .context-meter-fill { display: flex; gap: 1px; border-radius: inherit; background: transparent; }
+.context-meter-breakdown { display: grid; gap: 10px; margin: 0; }
+.context-meter-breakdown > div { display: flex; justify-content: space-between; align-items: center; gap: 14px; }
+.context-meter-breakdown dt { display: flex; align-items: center; gap: 8px; color: var(--fg-dim); }
+.context-meter-breakdown dd { margin: 0; color: var(--fg-strong); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.context-swatch { width: 8px; height: 8px; flex: 0 0 8px; border-radius: 2px; }
+.context-meter-progress .context-segment-system, .context-swatch.context-segment-system { background: #aab3ba; }
+.context-meter-progress .context-segment-tools, .context-swatch.context-segment-tools { background: #a78bfa; }
+.context-meter-progress .context-segment-messages, .context-swatch.context-segment-messages { background: var(--accent); }
+.context-meter-popover.warn .context-meter-progress .context-segment-messages { background: var(--warn); }
+.context-meter-estimate-note, .token-stats-scope { margin: 12px 0 0; color: var(--fg-dim); font-size: 11px; line-height: 1.5; }
+.context-meter-technical { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border-faint); }
+.context-meter-technical > summary { width: fit-content; color: var(--fg-dim); cursor: pointer; }
+.context-meter-technical > summary:hover { color: var(--fg-mid); }
+.context-meter-technical > summary:focus-visible { outline: none; border-radius: 3px; box-shadow: var(--shadow-focus); }
+.context-meter-technical[open] > summary { margin-bottom: 12px; }
 .session-log-btn {
   width: auto !important;
   padding: 0 9px !important;

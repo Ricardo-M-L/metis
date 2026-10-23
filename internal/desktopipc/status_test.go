@@ -48,3 +48,29 @@ func TestContextPressurePreservesCapabilitiesAndReadsOldWorker(t *testing.T) {
 		t.Fatalf("old worker compatibility = %+v err=%v", message, err)
 	}
 }
+
+func TestContextBreakdownOptionalWireContract(t *testing.T) {
+	parts := &ContextBreakdown{SystemTokens: 0, ToolTokens: 0, MessageTokens: 29, Estimated: true}
+	pressure := ContextPressure{Used: 901, Window: 1000000, Breakdown: parts}
+	var wire bytes.Buffer
+	if err := NewEncoder(&wire).Encode(Message{Version: Version, Type: TypeStatus, Status: &Status{Context: &pressure}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"contextBreakdown":`, `"systemTokens":0`, `"toolTokens":0`, `"messageTokens":29`, `"estimated":true`} {
+		if !strings.Contains(wire.String(), field) {
+			t.Fatalf("missing wire field %s: %s", field, wire.String())
+		}
+	}
+	decoded, err := NewDecoder(&wire).Decode()
+	if err != nil || decoded.Status == nil || decoded.Status.Context == nil || decoded.Status.Context.Breakdown == nil || *decoded.Status.Context.Breakdown != *parts || decoded.Status.Context.Used != 901 {
+		t.Fatalf("breakdown IPC=%+v err=%v", decoded, err)
+	}
+	for _, invalid := range []*ContextBreakdown{nil, {}, {SystemTokens: -1, Estimated: true}, {ToolTokens: -1, Estimated: true}, {MessageTokens: -1, Estimated: true}} {
+		if invalid.Valid() {
+			t.Fatalf("invalid categories accepted: %+v", invalid)
+		}
+	}
+	if !parts.Valid() {
+		t.Fatal("zero-valued categories are valid")
+	}
+}

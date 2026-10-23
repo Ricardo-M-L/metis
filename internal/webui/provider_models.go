@@ -68,7 +68,7 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg, err := s.loadProviderConfig()
-		if err != nil || cfg == nil || !providerExists(cfg, body.ID) {
+		if err != nil || cfg == nil || !s.providerExists(cfg, body.ID) {
 			writeError(w, http.StatusInternalServerError, "config unreadable")
 			return
 		}
@@ -89,7 +89,7 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var saved providerView
-	for _, candidate := range configuredProviderViews(cfg) {
+	for _, candidate := range providerViewsForServer(s, cfg) {
 		if candidate.ID == body.ID {
 			saved = candidate
 			break
@@ -216,6 +216,16 @@ func configuredProviderCredential(cfg *config.Config, id string) bool {
 func sameProviderModelEndpoint(a, b providerView) bool {
 	if a.ID == "" || a.ID != b.ID {
 		return false
+	}
+	// The OAuth runtime names its wire adapter separately; its managed model
+	// settings still bind to the fixed OpenAI Responses endpoint.
+	if a.ID == "openai-codex" {
+		if a.Transport == "openai_codex_responses" {
+			a.Transport = "openai_responses"
+		}
+		if b.Transport == "openai_codex_responses" {
+			b.Transport = "openai_responses"
+		}
 	}
 	left, err := auth.NormalizeEndpointBinding(a.ID, a.Transport, a.BaseURL)
 	if err != nil {
@@ -376,8 +386,9 @@ func (s *Server) handleProviderModelSelect(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var body struct {
-		ID    string `json:"id"`
-		Model string `json:"model"`
+		ID               string  `json:"id"`
+		Model            string  `json:"model"`
+		ExpectedRevision *string `json:"expectedRevision"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body")
@@ -387,30 +398,45 @@ func (s *Server) handleProviderModelSelect(w http.ResponseWriter, r *http.Reques
 	body.Model = strings.TrimSpace(body.Model)
 	s.providersMu.Lock()
 	defer s.providersMu.Unlock()
-	cfg, err := s.loadProviderConfig()
-	if err != nil || !providerExists(cfg, body.ID) {
+	snapshot, err := s.readProviderSettings()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "provider settings unreadable")
+		return
+	}
+	var selected *config.ProviderSettingsProvider
+	for i := range snapshot.Providers {
+		if snapshot.Providers[i].ID == body.ID && snapshot.Providers[i].Registered {
+			selected = &snapshot.Providers[i]
+			break
+		}
+	}
+	if selected == nil {
 		writeError(w, http.StatusBadRequest, "unknown provider")
 		return
 	}
-	if s.trustProviderConfig {
-		var source string
-		if _, custom := cfg.Provider.Custom[body.ID]; custom && !builtInProvider(body.ID) {
-			source, err = config.CustomProviderOverrideSource(body.ID)
-		} else {
-			source, err = config.ProviderModelOverrideSource(body.ID)
-		}
-		if err != nil {
-			writeError(w, http.StatusConflict, "provider model source is unreadable")
-			return
-		}
-		if source != "" {
-			writeError(w, http.StatusConflict, "provider model is controlled by "+source)
-			return
+	selected.Model = body.Model
+	found := false
+	for _, model := range selected.Models {
+		if model.ID == body.Model {
+			found = true
+			break
 		}
 	}
-	if err := config.SaveUserProviderModel(body.ID, body.Model); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if !found {
+		selected.Models = append(selected.Models, config.ProviderModelSettings{ID: body.Model, Name: body.Model})
+	}
+	expected := snapshot.Revision
+	if body.ExpectedRevision != nil {
+		expected = *body.ExpectedRevision
+	}
+	result, err := config.SaveProviderSettingsForWorkspace(config.ProviderSettingsMutation{Action: "upsert", ExpectedRevision: expected, ID: body.ID, Provider: selected}, s.trustProviderConfig)
+	if err != nil {
+		providerSettingsError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"id": body.ID, "model": body.Model, "restartRequired": true})
+	if body.ExpectedRevision == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"id": body.ID, "model": body.Model, "restartRequired": true})
+		return
+	}
+	s.writeProviderSettings(w, http.StatusOK, result, map[string]any{"id": body.ID, "model": body.Model, "restartRequired": false})
 }

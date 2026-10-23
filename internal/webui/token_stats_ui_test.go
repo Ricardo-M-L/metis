@@ -74,6 +74,9 @@ assert.equal(bar.style.display,'flex');assert.equal(dock.hidden,false);
 assert.match(markup,/4轮 · 9步 · 55 tok\/s/);
 assert.match(markup,/3995\.0M tok/);
 assert.match(markup,/缓存命中 98%/);
+assert.match(markup,/会话累计用量/);
+assert.match(markup,/累计 3995\.0M tok/);
+assert.match(markup,/缓存已包含在输入中/);
 assert.doesNotMatch(markup,/\btitle=/,'details cannot be exposed by hover');
 assert.equal(tokenTrigger.getAttribute('aria-controls'),'tokenStatsPopover');
 assert.equal(tokenTrigger.getAttribute('aria-expanded'),'false');
@@ -82,7 +85,7 @@ assert.equal(tokenPopover.hidden,true);
 const sessionRows=markup.match(/<dl class="session-stats-details">([\s\S]*?)<\/dl>/)[1];
 assert.doesNotMatch(sessionRows,/输入|缓存|Input|Cache/);
 const tokenRows=markup.match(/<dl class="token-stats-details">([\s\S]*?)<\/dl>/)[1];
-for(const [label,value] of [['总量','3,995,037,709'],['输入总量','3,989,008,295'],
+for(const [label,value] of [['累计总量','3,995,037,709'],['累计输入','3,989,008,295'],
   ['未缓存输入','68,313,736'],['缓存读取','3,904,037,293'],
   ['缓存写入','16,657,266'],['输出','6,029,414']]) {
   assert.match(tokenRows,new RegExp(label+'[\\s\\S]*?'+value+' tok'));
@@ -100,6 +103,8 @@ document.documentElement.lang='en';c.renderCurrentSessionStatsbar();
 assert.equal(document.activeElement,tokenTrigger);
 assert.equal(tokenPopover.hidden,false,'language redraw preserves open token details');
 assert.match(markup,/Cache hit 98%/);
+assert.match(markup,/Cumulative token usage/);
+assert.match(markup,/Cached tokens are part of input/);
 assert.match(markup,/Uncached input[\s\S]*68,313,736 tok/);
 for(const listener of document.listeners.keydown)listener({key:'Escape'});
 assert.equal(tokenPopover.hidden,true);assert.equal(tokenTrigger.getAttribute('aria-expanded'),'false');

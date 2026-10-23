@@ -701,6 +701,8 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/providers/validate", s.handleProviderValidate)
 	mux.HandleFunc("/api/providers/probe", s.handleProviderProbe)
 	mux.HandleFunc("/api/providers/models", s.handleProviderModels)
+	mux.HandleFunc("/api/providers/catalog", s.handleProviderCatalog)
+	mux.HandleFunc("/api/providers/catalog/refresh", s.handleProviderCatalogRefresh)
 	mux.HandleFunc("/api/providers/model", s.handleProviderModelSelect)
 	mux.HandleFunc("/api/providers/", s.handleProviderContextBudget)
 	mux.HandleFunc("/api/effort", s.handleEffort)
@@ -1240,10 +1242,16 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			Mode: string(s.freshPermissionMode), Preset: s.freshPreset, Status: "idle",
 		}
 		s.stateMu.RUnlock()
+		header.Provider, header.Model, err = s.freshProviderRoute()
+		if err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		model := header.Model
 		if body.Model != "" {
 			model = body.Model
 		}
+		header.System, _ = s.freshProviderPrompt(header.Provider, model)
 		id := s.store.NewSessionID()
 		createdAt := time.Now()
 		header.ID, header.CreatedAt, header.Model = id, createdAt, model
@@ -1426,14 +1434,19 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, id string) {
 }
 
 func (s *Server) createFreshSessionForDelete() (*session.Header, error) {
+	providerName, model, err := s.freshProviderRoute()
+	if err != nil {
+		return nil, err
+	}
+	system, _ := s.freshProviderPrompt(providerName, model)
 	id := s.store.NewSessionID()
 	cwd, _ := os.Getwd()
 	hdr := &session.Header{
 		ID:               id,
 		CreatedAt:        time.Now(),
-		Provider:         s.freshProviderName,
-		Model:            s.freshModel,
-		System:           s.freshSystem,
+		Provider:         providerName,
+		Model:            model,
+		System:           system,
 		SystemPromptKind: s.freshSystemPromptKind,
 		WorkDir:          cwd,
 		Mode:             string(s.freshPermissionMode),
@@ -1750,6 +1763,12 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		// The lease is now owned by this request, and is released below with
 		// existing-session leases through one common defer.
 		defer lease.Release()
+		providerName, model, err = s.freshProviderRoute()
+		if err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		system, _ = s.freshProviderPrompt(providerName, model)
 		body.SessionID = s.store.NewSessionID()
 		if err := s.store.WriteHeaderFull(session.Header{
 			ID:               body.SessionID,
@@ -1802,6 +1821,10 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	defer lease.Release()
+	if err := s.requireProviderMembership(hdr.Provider); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
 	// Consume only after the workspace queue wait. A stale token cannot start
 	// even if it was valid when this HTTP request first arrived.
 	if err := s.store.StartDesktopTurn(body.SessionID, body.ResumeToken, body.Resume); err != nil {
@@ -1822,6 +1845,20 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	// valid permission mode use a fresh process; interactive replies are routed
 	// through that worker's private channel without changing its permission policy.
 	if len(imgBlocks) == 0 && s.isolatedRunner != nil && s.isolatedRunner.Eligible(hdr) {
+		// A worker reloads its durable header without activating the parent
+		// Loop. Apply the same model-specific effort boundary before launch.
+		s.effortMu.Lock()
+		latest, _, loadErr := s.store.LoadHeader(body.SessionID)
+		if loadErr == nil && latest != nil {
+			_, loadErr = s.restoreSessionEffort(body.SessionID, latest, latest.Provider, latest.Model)
+		} else if loadErr == nil {
+			loadErr = errors.New("session header unavailable")
+		}
+		s.effortMu.Unlock()
+		if loadErr != nil {
+			writeError(w, http.StatusConflict, loadErr.Error())
+			return
+		}
 		s.handleIsolatedTurn(w, r, body.SessionID, body.Input, turnWorkDir, body.Resume)
 		return
 	}
@@ -2399,6 +2436,16 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 	activeProviderName := s.activeProviderName
 	activeModel := s.activeModel
 	s.stateMu.RUnlock()
+	membershipProvider := hdr.Provider
+	if membershipProvider == "" {
+		membershipProvider = s.freshProviderName
+	}
+	if activeID == id && activeProviderName != "" {
+		membershipProvider = activeProviderName
+	}
+	if err := s.requireProviderMembership(membershipProvider); err != nil {
+		return err
+	}
 	targetWorkDir := strings.TrimSpace(hdr.WorkDir)
 	if targetWorkDir == "" {
 		// Headers written before WorkDir existed must not inherit whichever
@@ -2442,10 +2489,14 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 			s.memoryBinding.CommitWorkspace(preparedMemory)
 			s.memoryBindingErr = nil
 		}
+		selectedEffort, err := s.restoreSessionEffort(id, hdr, activeProviderName, activeModel)
+		if err != nil {
+			return err
+		}
 		commitSessionSwitch()
 		s.contextMu.Lock()
 		s.loop.Restore(history)
-		s.loop.SetEffort(effortFromHeader(hdr.Effort))
+		s.loop.SetEffort(selectedEffort)
 		s.loop.TimingSink = s.store.NewTimingRecorder(id).Record
 		s.stateMu.Lock()
 		if hdr.Preset != "" {
@@ -2569,6 +2620,10 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 	if err := s.persistActiveSessionBoundary("desktop-switch"); err != nil {
 		return err
 	}
+	targetEffort, err = s.restoreSessionEffort(id, hdr, targetProviderName, targetModel)
+	if err != nil {
+		return err
+	}
 	s.cancelMu.Lock()
 	s.stopBackgroundContinuationLocked()
 	s.cancelMu.Unlock()
@@ -2677,6 +2732,7 @@ func (s *Server) invalidateWorkerContext(sessionID string) {
 }
 
 type contextStatusSnapshot struct {
+	breakdown                                              *desktopipc.ContextBreakdown
 	windowKind                                             string
 	modelWindow, modelMaxInputTokens, modelMaxOutputTokens int
 	modelSource, limitSource, budgetSource                 string
@@ -3531,9 +3587,17 @@ func traceFromHistory(s *Server, sid string) []session.TracedNode {
 
 // webModel is one switchable model/profile from config.
 type webModel struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
-	Label    string `json:"label"`
+	Provider             string            `json:"provider"`
+	Model                string            `json:"model"`
+	Label                string            `json:"label"`
+	Name                 string            `json:"name,omitempty"`
+	ContextWindow        int               `json:"contextWindow,omitempty"`
+	MaxOutputTokens      int               `json:"maxOutputTokens,omitempty"`
+	OutputBudget         int               `json:"outputBudget,omitempty"`
+	SupportsVision       *bool             `json:"supportsVision,omitempty"`
+	SupportsReasoning    *bool             `json:"supportsReasoning,omitempty"`
+	ReasoningEfforts     map[string]string `json:"reasoningEfforts,omitempty"`
+	CredentialConfigured bool              `json:"credentialConfigured"`
 }
 
 // handleModels lists the configured models (GET) and switches the active
@@ -3546,7 +3610,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		models := listConfiguredModels(cfg)
+		models := modelsForProviderViews(providerViewsForServer(s, cfg))
 		s.stateMu.RLock()
 		curProvider, curModel := s.activeProviderName, s.activeModel
 		s.stateMu.RUnlock()
@@ -3578,7 +3642,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 		// Resolve provider from config if not supplied.
 		if body.Provider == "" {
-			for _, m := range listConfiguredModels(cfg) {
+			for _, m := range modelsForProviderViews(providerViewsForServer(s, cfg)) {
 				if m.Model == body.Model {
 					body.Provider = m.Provider
 					break
@@ -3590,6 +3654,10 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.buildProvider == nil {
 			writeError(w, http.StatusServiceUnavailable, "provider construction unavailable")
+			return
+		}
+		if !s.providerExists(cfg, body.Provider) {
+			writeError(w, http.StatusConflict, "provider is no longer configured; add it in Model settings or select a configured provider")
 			return
 		}
 		built, err := s.buildProvider(body.Provider, body.Model)
@@ -3609,10 +3677,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			previousRuntime.System, previousRuntime.SystemSections, body.Provider, selectedModel,
 		)
 		capability := reasoningEffortCapability(cfg, body.Provider, selectedModel)
-		selectedEffort := s.loop.EffortValue()
-		if !capability.Supported {
-			selectedEffort = llm.EffortDefault
-		}
+		selectedEffort := effectiveEffortForCapabilities(capability, s.loop.EffortValue())
 		// Persist the desired metadata before mutating the live runtime. A disk
 		// failure therefore leaves provider, prompt, effort and selector exactly
 		// as they were instead of requiring a lossy provider reconstruction.
@@ -3679,52 +3744,42 @@ func (s *Server) commitActiveModelSelectionState(providerName, model, system str
 // only their configured model. Provider/model pairs are de-duplicated so a
 // configured Codex default does not appear twice when it is also in the catalog.
 func listConfiguredModels(cfg *config.Config) []webModel {
-	if cfg == nil {
-		return nil
-	}
+	return modelsForProviderViews(configuredProviderViews(cfg))
+}
+
+func modelsForProviderViews(views []providerView) []webModel {
 	out := make([]webModel, 0)
-	seen := make(map[string]struct{})
-	add := func(provider, model string) {
-		provider = strings.TrimSpace(provider)
-		model = strings.TrimSpace(model)
-		if provider == "" || model == "" {
-			return
+	positions := make(map[string]int)
+	for _, view := range views {
+		add := func(model config.ProviderModelSettings) {
+			if strings.TrimSpace(model.ID) == "" {
+				return
+			}
+			key := view.ID + "\x00" + model.ID
+			index, exists := positions[key]
+			if !exists {
+				index = len(out)
+				positions[key] = index
+				out = append(out, webModel{Provider: view.ID, Model: model.ID, Label: view.DisplayName + " · " + model.ID, CredentialConfigured: view.CredentialConfigured})
+			}
+			item := &out[index]
+			if model.Name != "" {
+				item.Name = model.Name
+			}
+			item.ContextWindow, item.MaxOutputTokens, item.OutputBudget = model.ContextWindow, model.MaxOutputTokens, model.OutputBudget
+			item.SupportsVision, item.SupportsReasoning, item.ReasoningEfforts = model.SupportsVision, model.SupportsReasoning, model.ReasoningEfforts
 		}
-		key := strings.ToLower(provider) + "\x00" + strings.ToLower(model)
-		if _, ok := seen[key]; ok {
-			return
+		if view.ID == "openai-codex" && view.CredentialConfigured {
+			for _, model := range openai.CodexModels() {
+				add(config.ProviderModelSettings{ID: model.ID})
+			}
 		}
-		seen[key] = struct{}{}
-		out = append(out, webModel{Provider: provider, Model: model, Label: provider + " · " + model})
-	}
-	addConfigured := func(provider, model string) {
-		if rtpkg.ProviderHasCredentials(cfg, provider) {
-			add(provider, model)
+		for _, model := range view.Models {
+			add(model)
 		}
-	}
-
-	addConfigured("anthropic", cfg.Provider.Anthropic.Model)
-	addConfigured("openai", cfg.Provider.OpenAI.Model)
-	if rtpkg.ProviderHasCredentials(cfg, "openai-codex") {
-		for _, model := range openai.CodexModels() {
-			add("openai-codex", model.ID)
+		if _, exists := positions[view.ID+"\x00"+view.Model]; !exists {
+			add(config.ProviderModelSettings{ID: view.Model, Name: view.Model})
 		}
-		// Preserve an explicit model override that is not yet in the curated
-		// catalog, while de-duplicating the ordinary configured default.
-		add("openai-codex", cfg.Provider.OpenAICodex.Model)
-	}
-	addConfigured("gemini", cfg.Provider.Gemini.Model)
-
-	customIDs := make([]string, 0, len(cfg.Provider.Custom))
-	for name := range cfg.Provider.Custom {
-		if builtInProvider(name) {
-			continue
-		}
-		customIDs = append(customIDs, name)
-	}
-	sort.Strings(customIDs)
-	for _, name := range customIDs {
-		addConfigured(name, cfg.Provider.Custom[name].Model)
 	}
 	return out
 }
@@ -3815,6 +3870,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if workerContext != nil {
 		contextStatus = contextStatusSnapshot{
 			used: workerContext.Used, window: workerContext.Window,
+			breakdown:     workerContext.Breakdown,
 			defaultWindow: workerContext.DefaultWindow, maxWindow: workerContext.MaxWindow,
 			profileDefaultWindow: workerContext.ProfileDefaultWindow, profileMaxWindow: workerContext.ProfileMaxWindow,
 			maxInputTokens: workerContext.MaxInputTokens, maxOutputTokens: workerContext.MaxOutputTokens, source: workerContext.Source,
@@ -3825,10 +3881,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if s.loop != nil {
 		contextStatus = s.readContextStatus(func() contextStatusSnapshot {
-			s.loop.SyncContextCapabilities()
-			used := s.loop.EstimateContextTokens()
-			caps, threshold, trigger := s.loop.ContextDetailsSnapshot()
-			return contextStatusSnapshot{used: used, window: caps.Window,
+			s.loop.TrySyncContextCapabilities()
+			usage := s.loop.ContextUsageSnapshot()
+			caps, threshold, trigger := usage.Capabilities, usage.CompactThreshold, usage.CompactAtTokens
+			var breakdown *desktopipc.ContextBreakdown
+			if parts := usage.Breakdown; parts != nil {
+				breakdown = &desktopipc.ContextBreakdown{SystemTokens: parts.SystemTokens, ToolTokens: parts.ToolTokens, MessageTokens: parts.MessageTokens, Estimated: parts.Estimated}
+			}
+			return contextStatusSnapshot{used: usage.Used, window: caps.Window, breakdown: breakdown,
 				defaultWindow: caps.DefaultWindow, maxWindow: caps.MaxWindow,
 				profileDefaultWindow: caps.ProfileDefaultWindow, profileMaxWindow: caps.ProfileMaxWindow,
 				maxInputTokens: caps.MaxInputTokens, maxOutputTokens: caps.MaxOutputTokens, source: caps.Source,
@@ -3899,6 +3959,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"planItems":            planItems,
 		"executionStrategy":    executionStrategy,
 		"build":                s.buildVersion,
+	}
+	if contextStatus.sessionID != "" && contextStatus.breakdown.Valid() {
+		payload["contextBreakdown"] = contextStatus.breakdown
 	}
 	if contextStatus.sessionID != "" {
 		payload["contextSessionId"] = contextStatus.sessionID

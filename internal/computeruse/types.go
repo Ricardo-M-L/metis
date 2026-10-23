@@ -26,9 +26,12 @@ type Description struct {
 }
 
 type Status struct {
-	Installed   bool         `json:"installed"`
-	Enabled     bool         `json:"enabled"`
-	Running     bool         `json:"running"`
+	Installed bool `json:"installed"`
+	Enabled   bool `json:"enabled"`
+	Running   bool `json:"running"`
+	// Stoppable is runtime ownership, independent of installation and health
+	// checks. Only an already connected, verified managed helper sets it.
+	Stoppable   bool         `json:"stoppable"`
 	Path        string       `json:"path"`
 	Version     string       `json:"version"`
 	Source      string       `json:"source"`

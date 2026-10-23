@@ -297,3 +297,81 @@ vm.runInContext(source.slice(start), c);
 		t.Fatalf("Computer Use native permission behavior: %v\n%s", err, output)
 	}
 }
+
+func TestComputerUseUnhealthyOwnedConnectionCanBeStopped(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	source, err := staticFS.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const harness = `
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const source = require('node:fs').readFileSync(0, 'utf8');
+const start = source.indexOf('// Computer Use settings only read status on entry.');
+const panel = {innerHTML:'', setAttribute(){}};
+const nativeCalls = [];
+const calls = [];
+const c = {
+  window:{parent:{}}, document:{getElementById:() => panel},
+  uiText:(en, cn) => en,
+  escHtml:value => String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'),
+  requestNative:async action => {nativeCalls.push(action); return {accessibility:'notGranted', screenRecording:'granted'};}
+};
+vm.createContext(c);
+vm.runInContext(source.slice(start), c);
+const button = action => panel.innerHTML.match(new RegExp('<button[^>]*onclick="computerUseAction\\(\'' + action + '\'\\)"[^>]*>'))[0];
+const state = {installed:false, enabled:true, running:false, stoppable:true, description:null};
+(async () => {
+  // The very first read can fail installation validation while the runtime
+  // still owns a verified helper. Retain that partial status and the Stop button.
+  c.fetch = async (url, options) => {calls.push(options); return {ok:false, json:async () => ({error:'checksum <mismatch>', status:state})};};
+  await c.loadComputerUse();
+  assert.doesNotMatch(button('stop'), /disabled/);
+  assert.match(panel.innerHTML, />Connected — needs attention</);
+  assert.doesNotMatch(panel.innerHTML, />Stopped</);
+  assert.match(panel.innerHTML, /checksum &lt;mismatch&gt;/);
+  assert.deepEqual(nativeCalls, ['get-computer-use-permission-status']);
+  assert.match(panel.innerHTML, /METIS Desktop · Not granted/);
+  assert.doesNotMatch(button('permissions-accessibility'), /disabled/);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, undefined);
+
+  // Healthy and unhealthy owned connections are stoppable. A reserved-name
+  // custom connection never gains this control, even if it claims running.
+  for (const [running, stoppable] of [[true,true],[false,true],[false,false],[true,false]]) {
+    c.fetch = async () => ({ok:true, json:async () => ({...state, running, stoppable})});
+    await c.loadComputerUse();
+    assert.equal(button('stop').includes('disabled'), !stoppable);
+  }
+
+  // A stale failed enable response must not republish a connection after Stop.
+  let finishEnable;
+  const actions = [];
+  c.fetch = (url, options) => {
+    const action = JSON.parse(options.body).action;
+    actions.push(action);
+    if (action === 'enable') return new Promise(resolve => {finishEnable=resolve;});
+    return Promise.resolve({ok:false, json:async () => ({error:'installation still invalid', status:{...state, stoppable:false}})});
+  };
+  const enabling = c.computerUseAction('enable');
+  assert.doesNotMatch(button('stop'), /disabled/);
+  await c.computerUseAction('stop');
+  assert.deepEqual(actions, ['enable','stop']);
+  assert.match(button('stop'), /disabled/);
+  assert.match(panel.innerHTML, />Stopped</);
+  const stoppedView = panel.innerHTML;
+  finishEnable({ok:false, json:async () => ({error:'stale enable', status:state})});
+  await enabling;
+  assert.equal(panel.innerHTML, stoppedView);
+})().catch(error => {console.error(error); process.exitCode=1;});
+`
+	cmd := exec.Command(node, "-e", harness)
+	cmd.Stdin = bytes.NewReader(source)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Computer Use unhealthy connection browser behavior: %v\n%s", err, output)
+	}
+}

@@ -147,7 +147,7 @@ const answer=(index,data,ok=true)=>pending[index]({ok,status:ok?200:409,json:asy
   await saveResponse({...response('PostMismatch',600000,600000),capabilities:{...response('PostMismatch').capabilities,routeKey:'wrong-post-route'}});
   assert.match(budgetPanel.controls.result.textContent,/保存上下文预算失败.*接入路线已变化/);
   assert.equal(budgetPanel.controls.input.value,'600000','a mismatched save response keeps the budget draft');
-  const sourceLabels={codex_model_catalog:'模型目录',codex_subscription_models:'订阅接口客户端资料',subscription_model_estimate:'内置订阅表估计',gemini_model_input:'模型输入上限',estimated:'估计预算',configured_clamped:'显式配置（已约束）'};
+  const sourceLabels={codex_model_catalog:'模型目录',codex_subscription_models:'订阅接口客户端资料',subscription_model_estimate:'内置订阅表估计',gemini_model_input:'模型输入上限',estimated:'估计预算',configured_clamped:'显式配置（已约束）',user:'显式配置'};
   for(const [source,label] of Object.entries(sourceLabels)) assert.equal(c.contextCapacitySourceLabel(source),label);
   c.document.documentElement.lang='en';
   assert.equal(c.contextCapacitySourceLabel('codex_subscription_models'),'Subscription client profile');

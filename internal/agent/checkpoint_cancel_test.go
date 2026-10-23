@@ -24,7 +24,7 @@ func TestCheckpointStageBudgetFailureBlocksCodeRewindWithoutHash(t *testing.T) {
 	out := make(chan Event, 8)
 	l.runCheckpointStage(context.Background(), out, "before tool", "Bash", func(ctx context.Context) error {
 		deadline, ok := ctx.Deadline()
-		if !ok || time.Until(deadline) > checkpointStageBudget {
+		if !ok || time.Until(deadline) > l.checkpointBudget("before tool") {
 			t.Fatal("missing automatic checkpoint budget")
 		}
 		return context.DeadlineExceeded

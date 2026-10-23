@@ -196,7 +196,7 @@ function effortLabel(value) {
 function refreshEffortLanguage() {
   const btn = document.getElementById('effortBtn');
   if (btn) btn.title = effortState.supported
-    ? uiText('Reasoning effort for the next model request', '下一次模型请求的思考强度')
+    ? (effortState.applies === 'next model request' ? uiText('Reasoning effort for the next model request', '下一次模型请求使用的思考强度') : uiText('Reasoning effort for the next task', '下一个任务使用的思考强度'))
     : (effortState.reason || uiText('Reasoning effort unavailable', '无法设置思考强度'));
   const label = document.getElementById('effortName');
   if (label) label.textContent = effortLabel(effortState.effort);
@@ -231,7 +231,7 @@ async function chooseEffort(value) {
     document.getElementById('effortMenu').style.display = 'none';
     document.getElementById('effortBtn').setAttribute('aria-expanded', 'false');
     await loadEffort();
-    showToast(uiText('Reasoning effort: ', '思考强度：') + effortLabel(data.effort));
+    showToast((data.applies === 'next model request' ? uiText('Reasoning effort for the next model request: ', '下一次模型请求的思考强度：') : uiText('Reasoning effort for the next task: ', '下一个任务的思考强度：')) + effortLabel(data.effort));
   } catch (e) {
     showToast(uiText('Effort change failed: ', '思考强度修改失败：') + e.message);
   }
@@ -5463,7 +5463,7 @@ let modelMenuOpen = false;
 
 async function toggleModelMenu() {
   const menu = document.getElementById('modelMenu');
-  if (modelMenuOpen) { menu.style.display = 'none'; modelMenuOpen = false; return; }
+  if (modelMenuOpen) { menu.style.display = 'none'; modelMenuOpen = false; document.getElementById('modelBtn')?.setAttribute('aria-expanded', 'false'); return; }
   let activeSelection = {};
   try {
     // Credentials can be added or removed by another METIS process while the
@@ -5476,21 +5476,39 @@ async function toggleModelMenu() {
     activeSelection = d.current || {};
   } catch (_) {
     modelList = [];
-    showToast('Could not refresh models');
+    showToast(uiText('Could not refresh models', '无法刷新模型列表'));
     return;
   }
   const hasAlternative = modelList.some(m =>
     m.provider !== activeSelection.provider || m.model !== activeSelection.model);
-  if (!hasAlternative) { showToast('No other models configured'); return; }
+  if (!hasAlternative) { showToast(uiText('No other models configured', '尚未配置其他模型')); return; }
   menu.innerHTML = modelList.map(m =>
-    `<div class="model-option" onclick="switchModel('${escOnclick(m.provider)}','${escOnclick(m.model)}')">${escHtml(m.label)}</div>`).join('');
+    `<button type="button" role="menuitemradio" aria-checked="${m.provider === activeSelection.provider && m.model === activeSelection.model}" class="model-option" onclick="event.stopPropagation();switchModel('${escOnclick(m.provider)}','${escOnclick(m.model)}')">${escHtml(m.label)}</button>`).join('');
   menu.style.display = 'block';
   modelMenuOpen = true;
+  document.getElementById('modelBtn')?.setAttribute('aria-expanded', 'true');
+  menu.querySelector('[aria-checked="true"]')?.focus();
+}
+
+function modelMenuKeydown(event) {
+  const menu = document.getElementById('modelMenu');
+  const items = Array.from(menu.querySelectorAll('button'));
+  const index = items.indexOf(document.activeElement);
+  if (event.key === 'Escape') {
+    event.preventDefault(); menu.style.display = 'none'; modelMenuOpen = false;
+    document.getElementById('modelBtn')?.setAttribute('aria-expanded', 'false');
+    document.getElementById('modelBtn')?.focus();
+  } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key) && items.length) {
+    event.preventDefault();
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (index + (event.key === 'ArrowUp' ? -1 : 1) + items.length) % items.length;
+    items[next].focus();
+  }
 }
 
 async function switchModel(provider, model) {
   document.getElementById('modelMenu').style.display = 'none';
   modelMenuOpen = false;
+  document.getElementById('modelBtn')?.setAttribute('aria-expanded', 'false');
   const target = typeof ensureComposerSessionSettingsTarget === 'function' ? await ensureComposerSessionSettingsTarget() : undefined;
   if (target === null || target && !target.isCurrent()) return;
   try {
@@ -5505,9 +5523,9 @@ async function switchModel(provider, model) {
     const name = document.getElementById('modelName');
     if (name) name.textContent = (d.model || model).split('/').pop();
 	await loadEffort();
-    showToast('Model: ' + (d.model || model));
+    showToast(uiText('Model: ', '模型：') + (d.model || model));
   } catch (e) {
-    showToast('Model switch failed: ' + e.message);
+    showToast(uiText('Model switch failed: ', '模型切换失败：') + e.message);
   }
 }
 
@@ -6045,6 +6063,7 @@ async function chooseLanguage(value) {
 }
 
 function renderProvidersTab() {
+  if (window.metisProviders) return window.metisProviders.render();
   return `<h2>${uiText('Model Providers', '模型提供商')}</h2>
     <div class="settings-section">
       <div class="settings-section-title">${uiText('Configured providers', '已配置的提供商')}</div>
@@ -6071,6 +6090,10 @@ function renderProvidersTab() {
 }
 
 async function loadProviders() {
+  if (window.metisProviders && document.getElementById('providerSettingsRoot')) {
+    window.metisProviders.mount();
+    return;
+  }
   try {
     const res = await fetch('/api/providers');
     const data = await res.json();
@@ -7271,7 +7294,7 @@ async function openExportsFolder(button) {
 
 document.addEventListener('click', function(e) {
   const menu = document.getElementById('modelMenu');
-  if (menu && !e.target.closest('.model-chip')) { menu.style.display = 'none'; modelMenuOpen = false; }
+  if (menu && !e.target.closest('.model-chip') && !menu.contains(e.target)) { menu.style.display = 'none'; modelMenuOpen = false; document.getElementById('modelBtn')?.setAttribute('aria-expanded', 'false'); }
   const effort = document.getElementById('effortMenu');
   const effortBtn = document.getElementById('effortBtn');
   if (effort && effortBtn && !effort.contains(e.target) && !effortBtn.contains(e.target)) {

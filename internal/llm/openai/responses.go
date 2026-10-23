@@ -59,10 +59,12 @@ type Responses struct {
 	OAuthTokenSource func(context.Context) (ResponsesOAuthCredential, error)
 	// ProviderName distinguishes the ChatGPT Codex backend from the public
 	// OpenAI Responses API while retaining the same wire encoder/parser.
-	ProviderName string
-	MaxTokens    int
-	Temperature  float64
-	StateMode    ResponsesStateMode
+	ProviderName            string
+	MaxTokens               int
+	Temperature             float64
+	ReasoningEffortValues   map[string]string
+	ReasoningEffortDisabled bool
+	StateMode               ResponsesStateMode
 	// PromptCacheKey overrides the stable key derived from the non-volatile
 	// system prefix and function schema. It is sent only when the endpoint's
 	// capability profile allows prompt caching.
@@ -379,6 +381,10 @@ func (r *Responses) buildResponsesRequest(req provider.Request) (*responsesReque
 }
 
 func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Request, volatileInInstructions bool) (*responsesRequest, error) {
+	reasoningEffort, err := resolveReasoningEffort(req.Effort, r.ReasoningEffortValues, r.ReasoningEffortDisabled, string(req.Effort))
+	if err != nil {
+		return nil, err
+	}
 	stateMode := r.effectiveStateMode()
 	var volatile []responsesContentPart
 	out := &responsesRequest{
@@ -407,8 +413,8 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 		// output-token limit. Apply this after per-request overrides as well.
 		out.MaxOutputTokens = 0
 	}
-	if req.Effort != "" {
-		out.Reasoning = &responsesReasoning{Effort: string(req.Effort)}
+	if reasoningEffort != "" {
+		out.Reasoning = &responsesReasoning{Effort: reasoningEffort}
 	}
 	if r.Name() == "openai-codex" {
 		// Public summaries are opt-in independently of reasoning intensity.

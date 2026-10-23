@@ -53,6 +53,7 @@
       const page = pages.get(route.page);
       if (!page) throw new Error('Unknown navigation page: ' + route.page);
       if (!pending && same(current(), route)) return true;
+      if (options.beforeNavigate?.(route, current()) === false) return false;
       const token = ++generation;
       pending = { route, token };
       options.start?.(route, current());
@@ -191,6 +192,7 @@
 
     const navigation = createNavigation({
       initialRoute: { page: 'session', sessionId: activeSession(), view: activeView() },
+      beforeNavigate: (next, previous) => window.metisProviders?.beforeNavigate(next, previous) !== false,
       start: invalidateSelection,
       recorded: showPage,
       changed(route, state) {

@@ -12,6 +12,7 @@
 <link rel="stylesheet" href="session_files.css?v=__BUILD__">
 <link rel="stylesheet" href="automations.css?v=__BUILD__">
 <link rel="stylesheet" href="durable_ops.css?v=__BUILD__">
+<link rel="stylesheet" href="providers.css?v=__BUILD__">
 <link rel="stylesheet" href="navigation.css?v=__BUILD__">
 </head>
 <body>
@@ -212,11 +213,11 @@
             </button>
             <div class="approval-menu" id="approvalMenu" role="menu" aria-label="Permission mode" style="display:none"></div>
             <textarea class="input-field" id="inputField" placeholder="&#25551;&#36848;&#20320;&#24819;&#35201;&#26500;&#24314;&#30340;&#20869;&#23481;" data-i18n-placeholder="composerPlaceholder" rows="1" onkeydown="handleKeydown(event)" oninput="onComposerInput(this)" aria-controls="commandMenu" aria-autocomplete="list"></textarea>
-            <span class="input-chip model-chip" onclick="toggleModelMenu()">
+            <button type="button" id="modelBtn" class="input-chip model-chip" aria-label="Select model" aria-haspopup="menu" aria-expanded="false" aria-controls="modelMenu" onclick="event.stopPropagation();toggleModelMenu()">
               <span id="modelName">5.4</span>
               <span>&#9662;</span>
-              <div class="model-menu" id="modelMenu" style="display:none"></div>
-            </span>
+            </button>
+            <div class="model-menu" id="modelMenu" role="menu" aria-label="Models" onkeydown="modelMenuKeydown(event)" style="display:none"></div>
             <button type="button" class="input-chip effort-chip" id="effortBtn" style="display:none" aria-expanded="false" onclick="toggleEffortMenu(event)">
               <span id="effortName">默认思考</span><span>&#9662;</span>
             </button>
@@ -413,6 +414,7 @@
 <script src="app.js?v=__BUILD__"></script>
 <script src="sessions.js?v=__BUILD__"></script>
 <script src="chat.js?v=__BUILD__"></script>
+<script src="providers.js?v=__BUILD__"></script>
 <script src="artifacts.js?v=__BUILD__"></script>
 <script src="artifact_edit_submit.js?v=__BUILD__"></script>
 <script src="artifact_annotation.js?v=__BUILD__"></script>

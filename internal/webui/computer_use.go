@@ -41,11 +41,17 @@ func (s *Server) handleComputerUse(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	status, err := s.computerUse(r.Context(), action)
+	w.Header().Set("Cache-Control", "no-store")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		// Installation/configuration validation can fail while this runtime
+		// still owns a helper. Retain the host's partial status so Stop remains
+		// available; the browser cannot supply or infer process ownership.
+		writeJSON(w, http.StatusInternalServerError, struct {
+			Status any    `json:"status"`
+			Error  string `json:"error"`
+		}{Status: status, Error: err.Error()})
 		return
 	}
-	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, status)
 }
 

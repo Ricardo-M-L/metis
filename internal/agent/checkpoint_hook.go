@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
+	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
@@ -38,8 +40,8 @@ type ckptEntry struct {
 
 // mutatingTools are the tools whose execution can change the working
 // tree, so a pre-edit snapshot is worth taking. Bash is included
-// conservatively (it often mutates); the snapshot is cheap relative to
-// an LLM turn and only taken once per turn.
+// conservatively (a command's apparent intent is not proof that it cannot
+// mutate files). A complete baseline is established once per user turn.
 var mutatingTools = map[string]bool{
 	"Edit":         true,
 	"Write":        true,
@@ -70,13 +72,10 @@ func (l *Loop) snapPreEditContext(ctx context.Context, toolName string, input ma
 		return nil
 	}
 
-	// Snap BEFORE marking the slot. A read-only Bash (cat/ls/git status)
-	// is in mutatingTools too but produces an empty hash (no diff to
-	// commit); a transient Snap error returns "". In both cases we must
-	// NOT mark the turn snapped — otherwise the real Edit that follows in
-	// the same turn early-returns and the turn loses its only rewind
-	// point. Only a real, non-empty snapshot consumes the slot.
-	hash, err := l.Checkpointer.SnapContext(ctx, toolName, argsHash(input), fmt.Sprintf("before turn %d", turns))
+	// A new turn needs its own mapping even when the files did not change.
+	// BaselineContext validates the live tree and reuses HEAD in that case;
+	// it never replaces an incomplete pre-turn point with a later snapshot.
+	hash, err := l.Checkpointer.BaselineContext(ctx, toolName, argsHash(input), fmt.Sprintf("before turn %d", turns))
 	if err != nil || hash == "" {
 		return err
 	}
@@ -93,7 +92,17 @@ func (l *Loop) snapPreEditContext(ctx context.Context, toolName string, input ma
 	return nil
 }
 
-const checkpointStageBudget = 5 * time.Second
+const (
+	checkpointStageBudget   = 60 * time.Second
+	checkpointInitialBudget = 5 * time.Minute
+)
+
+func (l *Loop) checkpointBudget(phase string) time.Duration {
+	if phase == "before tool" && l.Checkpointer != nil && !l.Checkpointer.HasBaseline() {
+		return checkpointInitialBudget
+	}
+	return checkpointStageBudget
+}
 
 // Automatic checkpointing is best-effort, but never an unbounded part of a
 // tool invocation. Use the original turn context even for atomic tools that
@@ -103,38 +112,69 @@ func (l *Loop) runCheckpointStage(ctx context.Context, out chan<- Event, phase, 
 	if l.Checkpointer == nil || !mutatingTools[toolName] {
 		return
 	}
-	stageCtx, cancel := context.WithTimeout(ctx, checkpointStageBudget)
+	// A first snapshot may cover a multi-project workspace. It has a larger
+	// bounded budget; subsequent scans use incremental mirror writes. Both
+	// still inherit the user's cancellation/deadline without detaching work.
+	started := time.Now()
+	stageCtx, cancel := context.WithTimeout(ctx, l.checkpointBudget(phase))
 	defer cancel()
+	var progressMu sync.Mutex
+	var lastProgress time.Time
+	var lastStage string
+	stageCtx = checkpoint.WithProgress(stageCtx, func(progress checkpoint.SnapshotProgress) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		if time.Since(started) < 2*time.Second || (progress.Stage == lastStage && !lastProgress.IsZero() && time.Since(lastProgress) < 5*time.Second) {
+			return
+		}
+		lastProgress = time.Now()
+		lastStage = progress.Stage
+		// Progress must not make a busy UI or disconnected consumer delay the
+		// snapshot. These are local scalar statistics, never file contents.
+		select {
+		case out <- Event{Kind: EventInfo, Info: fmt.Sprintf("code checkpoint %s: stage=%s elapsed=%.1fs files=%d processed=%d copied=%d unchanged=%d", phase, progress.Stage, time.Since(started).Seconds(), progress.Files, progress.ProcessedFiles, progress.CopiedFiles, progress.UnchangedFiles)}:
+		default:
+		}
+	})
 	if err := run(stageCtx); err != nil {
 		// Cancellation before execution means no new tool was started. A budget
 		// failure while the turn is live still permits execution, and therefore
 		// creates a real protection gap even if there is no baseline hash.
 		if phase == "after tool" || ctx.Err() == nil {
-			l.markCheckpointIncomplete()
+			if !l.markCheckpointIncomplete() {
+				return // Report the original protection gap once per turn.
+			}
 		}
 		warningCtx, cancelWarning := context.WithTimeout(context.WithoutCancel(ctx), 100*time.Millisecond)
 		defer cancelWarning()
 		emit(warningCtx, out, Event{Kind: EventInfo, Info: fmt.Sprintf(
 			"checkpoint %s skipped: %v; code rewind protection may be incomplete for this invocation", phase, err,
 		)})
+	} else if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		select {
+		case out <- Event{Kind: EventInfo, Info: fmt.Sprintf("code checkpoint %s completed in %.1fs", phase, elapsed.Seconds())}:
+		default:
+		}
 	}
 }
 
-func (l *Loop) markCheckpointIncomplete() {
+func (l *Loop) markCheckpointIncomplete() bool {
 	turns := l.CountTurns()
 	l.ckptMu.Lock()
 	defer l.ckptMu.Unlock()
 	for index := len(l.ckptStack) - 1; index >= 0; index-- {
 		if l.ckptStack[index].restoreToTurns == turns-1 {
+			newlyIncomplete := !l.ckptStack[index].incomplete
 			l.ckptStack[index].incomplete = true
 			l.ckptSnappedAt = turns
-			return
+			return newlyIncomplete
 		}
 	}
 	// An unavailable pre-snapshot must not be replaced later in the same turn
 	// by a post-mutation snapshot advertised as the original pre-turn state.
 	l.ckptStack = append(l.ckptStack, ckptEntry{restoreToTurns: turns - 1, label: fmt.Sprintf("before turn %d", turns), incomplete: true})
 	l.ckptSnappedAt = turns
+	return true
 }
 
 func checkpointCompleteFromTurn(stack []ckptEntry, turn int) bool {
@@ -607,7 +647,7 @@ func (l *Loop) recordCheckpointMutationContext(ctx context.Context, toolName str
 	entryIndex := len(l.ckptStack) - 1
 	entry := l.ckptStack[entryIndex]
 	l.ckptMu.Unlock()
-	if entry.incomplete || entry.hash == "" {
+	if entry.incomplete || entry.hash == "" || entry.restoreToTurns != l.CountTurns()-1 {
 		return ErrCheckpointIncomplete
 	}
 
@@ -632,8 +672,14 @@ func (l *Loop) recordCheckpointMutationContext(ctx context.Context, toolName str
 		return nil
 	}
 	states, stateErr := l.Checkpointer.CapturePathStatesContext(ctx, paths)
-	if stateErr != nil || len(states) == 0 {
+	if stateErr != nil {
 		return stateErr
+	}
+	// ChangedPaths yields unique relative paths; explicit file tools yield one
+	// path. A filtered symlink or unsupported file must not turn a partial
+	// fingerprint set into an apparently complete restore.
+	if len(states) != len(paths) {
+		return fmt.Errorf("%w: could not capture every changed file", ErrCheckpointIncomplete)
 	}
 	if err := l.Checkpointer.RecordManagedPathsContext(ctx, paths); err != nil {
 		return err

@@ -1,7 +1,12 @@
 package tui
 
 import (
+	"context"
+	"path/filepath"
 	"sort"
+	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/llm/modelinfo"
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/config"
@@ -244,11 +249,59 @@ func modelChoiceHasCredentials(cfg *config.Config, c screen.ModelChoice) bool {
 	return runtime.ProviderHasCredentials(cfg, c.Provider)
 }
 
+// discoveredModelChoices keeps endpoint model IDs attached to the exact custom
+// profile that advertised them. A failed refresh retains the last validated
+// snapshot; opening the picker never changes the configured default model.
+func discoveredModelChoices(cfg *config.Config) []screen.ModelChoice {
+	if cfg == nil || len(cfg.Provider.Custom) == 0 {
+		return nil
+	}
+	client, err := modelinfo.New(filepath.Join(config.Home(), "cache", "provider-models"), modelinfo.WithTimeout(3*time.Second))
+	if err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ids := make([]string, 0, len(cfg.Provider.Custom))
+	for id := range cfg.Provider.Custom {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var out []screen.ModelChoice
+	for _, id := range ids {
+		raw := cfg.Provider.Custom[id]
+		transport := raw.Transport
+		if transport == "" {
+			transport = "anthropic_messages"
+		}
+		if transport != "openai_chat" && transport != "openai_responses" && transport != "anthropic_messages" {
+			continue
+		}
+		key, err := cfg.ResolveAPIKey(id)
+		if err != nil || strings.TrimSpace(key) == "" {
+			continue
+		}
+		binding := modelinfo.Binding{ProviderID: id, Transport: transport, BaseURL: raw.BaseURL, AuthKind: modelinfo.AuthBearer}
+		if transport == "anthropic_messages" {
+			binding.AuthKind = modelinfo.AuthAPIKeyBearer
+		}
+		models, err := client.RefreshIfStale(ctx, binding, key)
+		if err != nil {
+			models = client.Models(binding)
+		}
+		for _, model := range models {
+			out = append(out, screen.ModelChoice{ID: model.ID, Provider: id, Description: "endpoint model · " + transport})
+		}
+	}
+	return out
+}
+
 func (m *Model) modelPickerChoices(requireVision bool) []screen.ModelChoice {
 	configured := configuredModelChoices(m.cfg)
+	discovered := discoveredModelChoices(m.cfg)
 	out := make([]screen.ModelChoice, 0, len(builtinModelChoices)+len(configured))
 	seen := make(map[string]struct{}, len(builtinModelChoices)+len(configured))
-	for _, group := range [][]screen.ModelChoice{builtinModelChoices, configured} {
+	for _, group := range [][]screen.ModelChoice{builtinModelChoices, configured, discovered} {
 		for _, c := range group {
 			if !modelChoiceHasCredentials(m.cfg, c) {
 				continue

@@ -286,6 +286,9 @@ type Loop struct {
 	// (system/state/memory/tool schemas). Render paths add this without doing
 	// filesystem reads, memory retrieval or registry hydration every frame.
 	requestOverheadTokens atomic.Int64
+	contextPrefix         contextPrefixEstimate // protected by mu
+	contextUsageCache     atomic.Pointer[ContextUsage]
+	contextUsageEpoch     atomic.Uint64
 	// activeContext is the provider-authoritative active-window snapshot from
 	// the most recently completed response. Unlike EventTokens/Budget usage it
 	// is replaced, never accumulated. Protected by mu; estTokens remains the
@@ -947,6 +950,9 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 		runtimeProviderModel = l.Provider.ModelID()
 	}
 	rescueWithoutTools := l.rescueNoTools
+	historyRevision, routingRevision := l.historyRevision, l.routingRevision
+	contextEpoch := l.contextUsageEpoch.Load()
+	providerID := identifyContextProvider(l.Provider)
 	l.mu.RUnlock()
 
 	memBody, retrieveBody := turnMemoryContext, turnMemoryRecall
@@ -1021,20 +1027,29 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 	if rescueWithoutTools {
 		requestTools = nil
 	}
-	overhead := estimateRequestOverhead(llm.Request{
+	systemTokens, toolTokens := estimateRequestPrefix(llm.Request{
 		System: system, SystemSections: requestSections, Tools: requestTools,
 	})
+	overhead := systemTokens + toolTokens
 
-	l.requestOverheadTokens.Store(int64(overhead))
 	total := historyTokens + overhead
 	if hasActiveSnapshot {
 		total = max(activeBase+overhead, 0)
 	}
-	displayTotal := estimateActiveHistoryTokens(l.Messages) + overhead
-	if hasActiveSnapshot {
-		displayTotal = max(activeBase+overhead, 0)
+	// State/memory callbacks run outside mu. A session/model replacement must
+	// not publish the old request prefix into the new binding when they return.
+	l.mu.Lock()
+	if l.historyRevision == historyRevision && l.routingRevision == routingRevision &&
+		l.contextUsageEpoch.Load() == contextEpoch && l.Model == runtimeModel && identifyContextProvider(l.Provider) == providerID {
+		l.requestOverheadTokens.Store(int64(overhead))
+		l.cacheContextPrefixLocked(systemTokens, toolTokens)
+		displayTotal := estimateActiveHistoryTokens(l.Messages) + overhead
+		if base, ok := l.activeContextBaseLocked(); ok {
+			displayTotal = max(base+overhead, 0)
+		}
+		l.estTokens.Store(int64(displayTotal))
 	}
-	l.estTokens.Store(int64(displayTotal))
+	l.mu.Unlock()
 	return total
 }
 
@@ -1669,7 +1684,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	// must not freeze Desktop status, stop, or session-navigation paths.
 	l.prepareTurnMemory(ctx)
 
-	tc := HookContext{Model: l.Model, Turn: l.turnIdx}
+	tc := HookContext{SessionID: tasks.SessionIDFromContext(ctx), Model: l.Model, Turn: l.turnIdx}
 	l.Hooks.EmitSessionStart(ctx, tc, l.System, l.Model)
 
 	// Deferred SessionEnd ensures hook is called on all exit paths.

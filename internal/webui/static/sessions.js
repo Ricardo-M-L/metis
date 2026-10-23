@@ -1159,20 +1159,20 @@ function renderSessionStatsbar(data, sessionId = currentSessionId) {
   const consistentCache = inputCount !== null && cacheRead !== null && cacheWrite !== null && cacheRead + cacheWrite <= inputCount;
   const locale = document.documentElement.lang === 'zh-CN' ? 'zh-CN' : 'en';
   const exact = value => value.toLocaleString(locale) + ' tok';
-  const tokenSummary = fmtTokens(tokenTotal) + ' tok';
+  const tokenSummary = uiText('Total ', '累计 ') + fmtTokens(tokenTotal) + ' tok';
   const cacheSummary = consistentCache && inputCount > 0
     ? uiText('Cache hit ', '缓存命中 ') + Math.round(cacheRead / inputCount * 100) + '%'
     : '';
-  const tokenLabel = uiText('Token usage', 'Token 用量');
+  const tokenLabel = uiText('Cumulative token usage', '会话累计用量');
   const tokenRows = [];
   const addToken = (name, value) => tokenRows.push(`<div><dt>${escHtml(name)}</dt><dd>${escHtml(exact(value))}</dd></div>`);
   if (hasTokens) {
-    addToken(uiText('Total', '总量'), tokenTotal);
-    if (inputCount !== null) addToken(uiText('Input total', '输入总量'), inputCount);
+    addToken(uiText('Cumulative total', '累计总量'), tokenTotal);
+    if (inputCount !== null) addToken(uiText('Cumulative input', '累计输入'), inputCount);
     if (consistentCache) addToken(uiText('Uncached input', '未缓存输入'), inputCount - cacheRead - cacheWrite);
     if (cacheRead !== null) addToken(uiText('Cache read', '缓存读取'), cacheRead);
     if (cacheWrite !== null) addToken(uiText('Cache write', '缓存写入'), cacheWrite);
-    if (outputCount !== null) addToken(uiText('Output', '输出'), outputCount);
+    if (outputCount !== null) addToken(uiText('Cumulative output', '累计输出'), outputCount);
   }
   const tokenWasOpen = !!(previousTokenTrigger && previousTokenTrigger.getAttribute('aria-expanded') === 'true' && hasTokens);
   bar.innerHTML = `${hasSessionSummary ? `<button class="session-stats-trigger" id="sessionStatsTrigger" type="button" aria-expanded="${wasOpen}" aria-controls="sessionStatsPopover" aria-label="${escAttr(label + ': ' + summary)}" onclick="toggleSessionStats(event)">
@@ -1187,6 +1187,7 @@ function renderSessionStatsbar(data, sessionId = currentSessionId) {
     </button><section class="token-stats-popover" id="tokenStatsPopover" role="region" aria-label="${escAttr(tokenLabel)}" ${tokenWasOpen ? '' : 'hidden'}>
       <div class="token-stats-popover-title">${escHtml(tokenLabel)}</div>
       <dl class="token-stats-details">${tokenRows.join('')}</dl>
+      <p class="token-stats-scope">${escHtml(uiText('Adds input and output across model calls. Cached tokens are part of input.', '累加每次模型调用的输入与输出；缓存已包含在输入中。'))}</p>
     </section>` : ''}`;
   bar.style.display = 'flex';
   if (typeof syncComposerRuntimeDock === 'function') syncComposerRuntimeDock();

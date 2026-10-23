@@ -11,10 +11,12 @@ import (
 	goruntime "runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/computeruse"
+	"github.com/Ricardo-M-L/metis/internal/config"
 	mcpsdk "github.com/Ricardo-M-L/metis/internal/mcp"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/slash"
@@ -127,6 +129,9 @@ func TestComputerUseStatusWithoutResourceRequiresVerifiedLiveConnection(t *testi
 			if status.Running != test.wantRunning {
 				t.Fatalf("running=%t, want %t; message=%q", status.Running, test.wantRunning, status.Message)
 			}
+			if computerUseStoppable(t, status) != test.managed {
+				t.Fatalf("only a verified connected managed helper is stoppable: managed=%t status=%+v", test.managed, status)
+			}
 			if test.wantMessage != "" && !strings.Contains(status.Message, test.wantMessage) {
 				t.Fatalf("message=%q, want substring %q", status.Message, test.wantMessage)
 			}
@@ -140,6 +145,10 @@ func TestComputerUseStatusWithoutResourceRequiresVerifiedLiveConnection(t *testi
 func TestComputerUseStatusFixture(t *testing.T) {
 	if os.Getenv("METIS_CU_STATUS_FIXTURE") != "1" {
 		return
+	}
+	if filename := os.Getenv("METIS_CU_STATUS_PID_FILE"); filename != "" {
+		data, _ := json.Marshal(os.Getpid())
+		_ = os.WriteFile(filename, data, 0o600)
 	}
 	scanner := bufio.NewScanner(os.Stdin)
 	writer := json.NewEncoder(os.Stdout)
@@ -166,6 +175,9 @@ func TestComputerUseStatusFixture(t *testing.T) {
 			result = map[string]any{"protocolVersion": "2024-11-05", "capabilities": capabilities, "serverInfo": map[string]any{"name": "metis-cu", "version": "test"}}
 		case "tools/list":
 			result = map[string]any{"tools": []any{}}
+			if os.Getenv("METIS_CU_STATUS_TOOL") == "1" {
+				result = map[string]any{"tools": []any{map[string]any{"name": "probe", "description": "Fixture probe", "inputSchema": map[string]any{"type": "object"}}}}
+			}
 		case "resources/list":
 			switch {
 			case strings.HasPrefix(mode, "unsupported"):
@@ -204,6 +216,9 @@ func TestComputerUseStatusFixture(t *testing.T) {
 			}
 			result = map[string]any{"contents": []any{map[string]any{"uri": "metis-cu://status", "mimeType": "application/json", "text": string(descriptor)}}}
 		case "metis-cu/stop", "metis-cu/end-turn":
+			if filename := os.Getenv("METIS_CU_STATUS_STOP_FILE"); filename != "" {
+				_ = os.WriteFile(filename, []byte(request.Method), 0o600)
+			}
 			result = map[string]any{"stopped": true, "cleaned": true}
 		}
 		if rpcError != nil {
@@ -213,6 +228,124 @@ func TestComputerUseStatusFixture(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func computerUseStoppable(t *testing.T, status computeruse.Status) bool {
+	t.Helper()
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	stoppable, _ := fields["stoppable"].(bool)
+	return stoppable
+}
+
+func TestComputerUseUnhealthyOwnedHelperRemainsStoppable(t *testing.T) {
+	for _, broken := range []string{"health-probe", "installation", "configuration", "home"} {
+		t.Run(broken, func(t *testing.T) {
+			home := cuTestHome(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			installComputerUseStatusFixture(t, ctx, home)
+			if err := mcp.Save(&mcp.Registry{Servers: []mcp.ServerEntry{{Name: mcp.ReservedComputerUseName, Command: mcp.ManagedComputerUseCommand}}}); err != nil {
+				t.Fatal(err)
+			}
+			pidFile, stopFile := filepath.Join(t.TempDir(), "pid"), filepath.Join(t.TempDir(), "stop")
+			server, err := mcptools.NewServerWithEnv(ctx, "computer-use", os.Args[0], []string{
+				"METIS_CU_STATUS_FIXTURE=1", "METIS_CU_STATUS_MODE=rpc-error", "METIS_CU_STATUS_TOOL=1",
+				"METIS_CU_STATUS_PID_FILE=" + pidFile, "METIS_CU_STATUS_STOP_FILE=" + stopFile,
+			}, "-test.run=^TestComputerUseStatusFixture$")
+			if err != nil {
+				t.Fatal(err)
+			}
+			server.MarkManagedComputerUse() // Fixture stands in for the verified launch boundary.
+			rt := &runtime{registry: tools.NewRegistry()}
+			rt.adoptMCPServer(server, server.Tools(), false)
+			t.Cleanup(func() { _ = rt.stopComputerUse() })
+			if broken == "installation" {
+				if err := os.WriteFile(filepath.Join(home, "components", "computer-use", "active.json"), []byte("{"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if broken == "configuration" {
+				if err := os.WriteFile(filepath.Join(home, "mcp.toml"), []byte("invalid = ["), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if broken == "home" {
+				if _, err := config.VerifiedHome(); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(home, filepath.Join(t.TempDir(), "moved-home")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			status, err := rt.computerUseAction(ctx, "status")
+			if broken != "health-probe" && err == nil {
+				t.Fatal("invalid metadata unexpectedly passed validation")
+			}
+			if status.Running || !computerUseStoppable(t, status) {
+				t.Fatalf("unhealthy owned helper must remain stoppable without claiming healthy running: %+v err=%v", status, err)
+			}
+			if broken == "configuration" || broken == "home" {
+				status, err = rt.computerUseAction(ctx, "enable")
+				if err == nil || !computerUseStoppable(t, status) {
+					t.Fatalf("rejected action hid the already owned helper: %+v err=%v", status, err)
+				}
+			}
+			status, err = rt.computerUseAction(ctx, "stop")
+			if broken == "health-probe" && err != nil {
+				t.Fatal(err)
+			}
+			if computerUseStoppable(t, status) || status.Running || len(rt.computerUseServers()) != 0 {
+				t.Fatalf("stop retained owned helper: %+v", status)
+			}
+			if _, exists := rt.registry.Get("mcp__computer-use__probe"); exists {
+				t.Fatal("stopped helper tools remained callable")
+			}
+			if data, err := os.ReadFile(stopFile); err != nil || string(data) != "metis-cu/stop" {
+				t.Fatalf("native cleanup was not acknowledged: %s (%v)", data, err)
+			}
+			data, err := os.ReadFile(pidFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var pid int
+			if err := json.Unmarshal(data, &pid); err != nil {
+				t.Fatal(err)
+			}
+			process, err := os.FindProcess(pid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := process.Signal(syscall.Signal(0)); err == nil {
+				t.Fatalf("stopped helper process %d is still alive", pid)
+			}
+			if broken != "configuration" && broken != "home" {
+				reg, err := mcp.Load()
+				if err != nil || mcp.FindServer(reg, mcp.ReservedComputerUseName).Disabled {
+					t.Fatalf("stop changed persistent enable preference: %+v (%v)", reg, err)
+				}
+			}
+		})
+	}
+}
+
+func TestComputerUseStatusNeverSpawnsLazyHelperForStopOwnership(t *testing.T) {
+	home := cuTestHome(t)
+	var spawns atomic.Int32
+	server := cuTestLazyServer(mcp.ReservedComputerUseName, &spawns)
+	server.MarkManagedComputerUse()
+	rt := &runtime{mcpServers: []*mcptools.Server{server}}
+	t.Cleanup(func() { _ = rt.stopComputerUse() })
+	status, err := rt.computerUseStatus(context.Background(), computeruse.New(home))
+	if err != nil || status.Running || computerUseStoppable(t, status) || spawns.Load() != 0 {
+		t.Fatalf("status must not launch a deferred helper or claim connected ownership: status=%+v err=%v spawns=%d", status, err, spawns.Load())
+	}
 }
 
 func cuTestHome(t *testing.T) string {

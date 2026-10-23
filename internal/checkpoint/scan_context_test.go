@@ -108,13 +108,13 @@ func TestChangedPathsContextPreservesFormatsAndAttribution(t *testing.T) {
 			if err := os.Rename(filepath.Join(cwd, "renamed"), filepath.Join(cwd, "destination")); err != nil {
 				t.Fatal(err)
 			}
-			// Preserve the legacy content-only delta semantics. Execute-bit
-			// fingerprints and restore safety are covered by their own tests.
+			// Mode-only edits need attribution too; otherwise a Bash chmod
+			// disappears from the paths available to a later rewind.
 			if err := os.Chmod(filepath.Join(cwd, "executable"), 0o700); err != nil {
 				t.Fatal(err)
 			}
 			got, err := m.ChangedPathsContext(context.Background(), before)
-			want := []string{"created", "deleted", "destination", "new\nline", "renamed", "tab\tname"}
+			want := []string{"created", "deleted", "destination", "executable", "new\nline", "renamed", "tab\tname"}
 			sort.Strings(want)
 			if err != nil || !reflect.DeepEqual(got, want) {
 				t.Fatalf("delta got=%q want=%q err=%v", got, want, err)

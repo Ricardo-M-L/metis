@@ -76,13 +76,14 @@ type desktopWorkerStatusSampler struct {
 func (s *desktopWorkerStatusSampler) snapshot(final bool) desktopipc.Status {
 	status := desktopipc.Status{Agents: make([]desktopipc.Subagent, 0), Jobs: make([]desktopipc.Job, 0)}
 	if !final && s.loop != nil {
-		s.loop.SyncContextCapabilities()
-		caps, threshold, trigger := s.loop.ContextDetailsSnapshot()
+		s.loop.TrySyncContextCapabilities()
+		usage := s.loop.ContextUsageSnapshot()
+		caps, threshold, trigger := usage.Capabilities, usage.CompactThreshold, usage.CompactAtTokens
 		// An active unknown automatic window replaces an earlier manual
 		// budget. Retaining the last nonzero value would falsely claim that
 		// the route still has a confirmed capacity.
 		pressure := desktopipc.ContextPressure{
-			Used: s.loop.EstimateContextTokens(), Window: caps.Window,
+			Used: usage.Used, Window: caps.Window,
 			DefaultWindow: caps.DefaultWindow, MaxWindow: caps.MaxWindow,
 			ProfileDefaultWindow: caps.ProfileDefaultWindow, ProfileMaxWindow: caps.ProfileMaxWindow,
 			MaxInputTokens: caps.MaxInputTokens, MaxOutputTokens: caps.MaxOutputTokens, Source: caps.Source,
@@ -90,6 +91,11 @@ func (s *desktopWorkerStatusSampler) snapshot(final bool) desktopipc.Status {
 			RequestedWindow: caps.RequestedWindow, LimitSource: caps.LimitSource, BudgetSource: caps.BudgetSource,
 			ProviderID: caps.ProviderID, Model: caps.Model, RouteKey: caps.RouteKey,
 			CompactThreshold: threshold, CompactAtTokens: trigger,
+		}
+		if usage.Breakdown != nil {
+			parts := usage.Breakdown
+			pressure.Breakdown = &desktopipc.ContextBreakdown{SystemTokens: parts.SystemTokens,
+				ToolTokens: parts.ToolTokens, MessageTokens: parts.MessageTokens, Estimated: parts.Estimated}
 		}
 		s.lastContext = &pressure
 	}

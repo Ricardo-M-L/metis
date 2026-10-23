@@ -44,9 +44,13 @@ permissions can differ between launch environments and app signatures.
 
 ## Delivery and local development
 
-The catalog in `internal/computeruse/releases.json` is deliberately empty until
-real compatible releases exist. Do not invent hashes or point it at an arbitrary
-latest release. Official entries pin the helper version, platform, architecture,
+The catalog in `internal/computeruse/releases.json` retains reviewed, published
+helper artifacts so local CLI and Desktop rebuilds keep official installation
+working. The current source pins helper `0.0.3`, published with METIS `v0.4.90`,
+for both macOS architectures. These archive hashes were checked against the
+official release asset metadata before deriving the executable hashes from the
+authenticated archives. Do not invent hashes or point at an arbitrary latest
+release. Official entries pin the helper version, platform, architecture,
 archive SHA-256, executable `binarySha256`, and executable path within the archive.
 The installer checks both hashes before probing executable capabilities, stages
 privately, and resolves the current METIS build's immutable version directory.
@@ -79,8 +83,10 @@ The managed profile additionally verifies the installed absolute executable at
 the stdio transport boundary; selecting a profile alone is not sufficient.
 
 The companion's `docs/component-distribution.md` describes artifact generation.
-Publishing, signing/notarization, supported-platform verification, and populating
-the METIS catalog remain release prerequisites, not automatic effects of a build.
+Publishing, signing/notarization, supported-platform verification, and reviewing
+new catalog entries remain release prerequisites, not automatic effects of a
+local build. Local packaging can reuse the already published, pinned archives;
+it does not need to publish a new component or select a local experimental helper.
 
 Stable releases now make those prerequisites explicit in CI. The release workflow
 checks out the exact helper commit recorded in `.github/computer-use-release.json`,
@@ -94,9 +100,12 @@ written. The generated catalog is copied into the CLI build before Go
 compilation, and the same archives are verified offline into the macOS Desktop
 bundle before signing. The four helper archive assets are included in the stable
 release inventory; CLI-only releases intentionally do not build or publish them.
-A source checkout may therefore keep an empty catalog, while a stable release
-build is blocked unless CI generates a real, protocol-compatible two-target
-catalog.
+The checked-in catalog keeps source builds usable between stable releases. CI
+replaces it with the newly generated, protocol-compatible two-target catalog for
+the release being built; the release build remains blocked if generation fails.
+Catalog availability tests prevent the source catalog from silently becoming
+empty again. Explicit empty-manifest tests still verify that an unpinned build
+cannot trust a self-declared official activation.
 
 Desktop packaging includes the exact pinned release archives under
 `Contents/Resources/computer-use` before signing the application. On install or
@@ -147,6 +156,42 @@ it is not a comprehensive no-GUI sandbox for arbitrary untrusted executables.
   grants may persist in `~/.metis-cu/granted.json`; stop is not grant revocation.
 - Tools report failed post-action observation as unverified. The skill tells the
   model to inspect before retrying an action that may already have taken effect.
+
+## Desktop interaction enhancements
+
+The companion source includes `activate_application` for switching to an
+already running macOS application by its observed PID and bundle ID. It checks
+the target's explicit application grant, binds the activation to its process
+instance, and verifies the foreground identity. It neither launches an app by
+name nor chooses a particular window. After a successful switch, take a fresh
+native AX snapshot and verify the window before sending input. Unsupported
+platforms return an unavailable result.
+
+On macOS, the helper's main OS thread now runs the application event loop while
+the MCP server runs in the background. This keeps foreground application state
+fresh across switches. When Accessibility is already authorized, authorization
+and native AX checks also read the focused PID synchronously; a failed read
+does not fall back to a stale cached identity. Metadata and explicit permission
+commands do not start the server event loop.
+
+`screen_size` reports the actual selected display. Screenshot results carry the
+display origin, logical dimensions and encoded image dimensions, so a model can
+map image coordinates into the global logical coordinate space used by mouse
+tools. A missing selected display fails instead of silently capturing the
+primary display. Explicit screenshot display selection remains sticky; obtain
+fresh geometry after changing displays.
+
+Runtime status separates healthy `running` from host-owned `stoppable` state.
+An unhealthy connection, damaged installation metadata or configuration failure
+does not remove Stop for a helper the runtime already owns. HTTP error responses
+retain partial status, and Desktop permission inspection remains independent of
+helper health. Stop does not change the saved enable preference.
+
+These companion changes require a matching helper build. A local development
+checkout and an immutable helper pin are separate delivery states; building
+Metis alone does not add new tools to an older helper. Native fixture acceptance
+and multi-display regression evidence must be reported separately from release
+signing and notarization.
 
 ## Validation
 

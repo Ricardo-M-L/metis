@@ -249,6 +249,32 @@ assert.match(pop.innerHTML,/当前窗口.*1,050,000 tokens/);
 assert.match(pop.innerHTML,/模型完整容量.*1,050,000 tokens/);
 assert.match(pop.innerHTML,/工作预算.*自动/);
 assert.match(pop.innerHTML,/模型容量来源.*模型目录/);
+const composition = {...profile,contextUsed:331000,contextWindow:1000000,
+  contextBreakdown:{systemTokens:1400,toolTokens:7100,messageTokens:239000,estimated:true}};
+render(composition);
+const compactPanel=pop.innerHTML.split('<details')[0];
+assert.match(compactPanel,/上下文已用.*33%/);
+assert.match(compactPanel,/≈331K \/ 1M/);
+assert.match(compactPanel,/系统提示词.*≈1.4K/);
+assert.match(compactPanel,/工具定义.*≈7.1K/);
+assert.match(compactPanel,/对话消息.*≈239K/);
+assert.equal((compactPanel.match(/<dt>/g)||[]).length,3);
+assert.doesNotMatch(compactPanel,/客户端建议窗口|模型完整容量|最大输入|最大输出|数据来源|自动压缩阈值/);
+assert.match(compactPanel,/分项为本地估算，可能与总量不同/);
+assert.match(compactPanel,/context-meter-fill" style="width:33.1%"/,'the real occupancy drives the total bar, not the sum of estimates');
+assert.match(pop.innerHTML,/<details class="context-meter-technical" ontoggle=/,'technical details start collapsed');
+pop.dataset.detailsOpen='true';render(composition);
+assert.match(pop.innerHTML,/<details class="context-meter-technical" open /,'polling preserves an expanded technical disclosure');
+for (const invalid of [undefined,{}, {systemTokens:1,toolTokens:2,messageTokens:-1,estimated:true},
+  {systemTokens:1,toolTokens:2,messageTokens:3,estimated:false},
+  {systemTokens:Number.MAX_SAFE_INTEGER,toolTokens:Number.MAX_SAFE_INTEGER,messageTokens:0,estimated:true}]) {
+  render({...composition,contextBreakdown:invalid});
+  assert.doesNotMatch(pop.innerHTML,/context-meter-breakdown/,'old or incomplete breakdowns must not invent category values');
+  assert.match(pop.innerHTML,/≈331K \/ 1M/,'missing estimates do not hide valid occupancy');
+}
+render({...composition,contextBreakdown:{systemTokens:0,toolTokens:0,messageTokens:0,estimated:true}});
+assert.equal((pop.innerHTML.match(/<dd>≈0<\/dd>/g)||[]).length,3,'known zero estimates remain visible');
+delete pop.dataset.detailsOpen;
 for (const [source,label] of Object.entries({codex_model_catalog:'模型目录',codex_subscription_models:'订阅接口客户端资料',subscription_model_estimate:'内置订阅表估计',gemini_model_input:'模型输入上限',estimated:'估计预算',configured_clamped:'显式配置（已约束）'})) {
   render({...profile,contextSource:source,contextLimitSource:undefined});
   assert.ok(pop.innerHTML.includes('<dt>数据来源</dt><dd>'+label+'</dd>'),source+' must use its actual dictionary label');
@@ -293,7 +319,7 @@ assert.equal(pop.hidden,true);assert.equal(meter.focused,true);
 c.lastStatusSnapshot=snapshot;
 c.applyLanguage('en');
 assert.equal(document.documentElement.lang,'en');
-assert.match(pop.innerHTML,/Context details[\s\S]*Used[\s\S]*64,000 tokens/);
+assert.match(pop.innerHTML,/Context used[\s\S]*Used[\s\S]*64,000 tokens/);
 assert.equal(meter.getAttribute('aria-label'),'Context 50% · Click to view details');
 assert.equal(meter.getAttribute('title'),undefined);
 assert.doesNotMatch(meter.getAttribute('aria-label'),/64,000|128,000|tokens/);

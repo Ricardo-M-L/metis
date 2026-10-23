@@ -912,7 +912,7 @@ type cliFlags struct {
 	cont                 bool   // -c / --continue: pick up the most recently modified session
 	useTUI               bool
 	noAuthWizard         bool   // skip the first-run wizard (CI / scripted use)
-	effort               string // "low" | "medium" | "high" — Anthropic thinking budget / OpenAI reasoning_effort
+	effort               string // "default" | "low" | "medium" | "high" — provider reasoning preference
 	fast                 bool   // collapse one turn: effort=low + halved max_tokens
 	addDirs              stringList
 	agentProfile         string              // --agent=NAME — load .metis/agents/<name>.md
@@ -1130,7 +1130,7 @@ func parseFlags(args []string) (*cliFlags, []string, error) {
 	f.BoolVar(&out.cont, "c", false, "resume the most recently modified session (short for --continue)")
 	f.BoolVar(&out.useTUI, "tui", false, "use the TUI (default when stdout is a TTY)")
 	f.BoolVar(&out.noAuthWizard, "no-auth-wizard", false, "skip the first-run auth wizard if no API key is found")
-	f.StringVar(&out.effort, "effort", "", "reasoning intensity: low | medium | high")
+	f.StringVar(&out.effort, "effort", "", "reasoning intensity: default | low | medium | high")
 	f.BoolVar(&out.fast, "fast", false, "fast turn: effort=low + halved max_tokens")
 	f.Var(&out.addDirs, "add-dir", "additional directory accessible to tools (repeatable)")
 	f.StringVar(&out.agentProfile, "agent", "", "load agent profile from ~/.metis/agents/<name>.md")
@@ -1371,9 +1371,17 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown permission mode %q (want default|acceptEdits|plan|dontAsk|bypassPermissions|fullAccess)", mode)
 	}
+	// Effort belongs to the resumed conversation too. Desktop workers start
+	// with --resume and read its durable header rather than receiving an
+	// --effort flag. Preserve explicit CLI > saved session > profile defaults;
+	// the non-empty "default" sentinel also blocks a profile's old override.
+	startupEffort := flags.effort
+	if startupEffort == "" && preparedResume != nil && preparedResume.Header != nil {
+		startupEffort = preparedResume.Header.Effort
+	}
 	// Profile-on-CLI merge.
 	mergedModel, mergedMode, mergedEffort, mergedMaxIter :=
-		agentProf.MergeOnto(model, mode, flags.effort, flags.maxIter)
+		agentProf.MergeOnto(model, mode, startupEffort, flags.maxIter)
 	model = mergedModel
 	mode = mergedMode
 	canonicalMode, ok := permission.ParseMode(mode)
@@ -1976,10 +1984,12 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// emits a one-line warning rather than silently dropping the user's
 	// intent. --fast is a separate boolean handled by Loop.buildRequest.
 	if flags.effort != "" {
-		if e, ok := llm.ParseEffort(flags.effort); ok {
+		if flags.effort == "default" {
+			loop.SetEffort(llm.EffortDefault)
+		} else if e, ok := llm.ParseEffort(flags.effort); ok {
 			loop.SetEffort(e)
 		} else {
-			fmt.Fprintf(os.Stderr, "metis: --effort %q ignored (must be low|medium|high)\n", flags.effort)
+			fmt.Fprintf(os.Stderr, "metis: --effort %q ignored (must be default|low|medium|high)\n", flags.effort)
 		}
 	}
 	if flags.fast {

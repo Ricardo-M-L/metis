@@ -37,19 +37,24 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 // Manager owns one shadow repo for one session.
 type Manager struct {
-	mu          sync.Mutex
-	sessionID   string
-	shadowDir   string // ~/.metis/checkpoints/<session-id>
-	cwd         string // the working dir whose state we mirror
-	disabled    bool   // turns off all operations after a fatal init error
-	initialized bool
-	initErr     error
+	mu                sync.Mutex
+	sessionID         string
+	shadowDir         string // ~/.metis/checkpoints/<session-id>
+	cwd               string // the working dir whose state we mirror
+	disabled          bool   // turns off all operations after a fatal init error
+	initialized       bool
+	initErr           error
+	hasBaseline       atomic.Bool
+	lastScan          SnapshotStats
+	rawIndexMigration bool
+	rawFormatMarked   bool
 }
 
 // NewManager constructs a Manager for the given session id.
@@ -218,139 +223,7 @@ func (m *Manager) copyTree() error {
 }
 
 func (m *Manager) copyTreeContext(ctx context.Context) error {
-	// Inventory the eligible live tree before mutating the mirror. This makes
-	// path-type replacement deterministic and ensures a walk/read failure
-	// aborts Snap instead of committing a mixture of old and new files.
-	liveFiles := make(map[string]string)
-	liveDirs := make([]string, 0)
-	if err := filepath.Walk(m.cwd, func(path string, info os.FileInfo, walkErr error) error {
-		if err := ctx.Err(); err != nil {
-			return context.Cause(ctx)
-		}
-		if walkErr != nil {
-			return fmt.Errorf("checkpoint: walk %s: %w", path, walkErr)
-		}
-		if info == nil {
-			return fmt.Errorf("checkpoint: walk %s: missing file info", path)
-		}
-		rel, err := filepath.Rel(m.cwd, path)
-		if err != nil {
-			return fmt.Errorf("checkpoint: relative path for %s: %w", path, err)
-		}
-		if rel == "." {
-			return nil
-		}
-		if info.IsDir() {
-			if skipDirs[info.Name()] {
-				return filepath.SkipDir
-			}
-			if m.shadowDir != "" && (path == m.shadowDir ||
-				strings.HasPrefix(path, m.shadowDir+string(os.PathSeparator)) ||
-				strings.HasPrefix(m.shadowDir, path+string(os.PathSeparator))) {
-				return filepath.SkipDir
-			}
-			normalized, ok := m.managedRelativePath(path)
-			if !ok {
-				return filepath.SkipDir
-			}
-			liveDirs = append(liveDirs, normalized)
-			return nil
-		}
-		if !info.Mode().IsRegular() || info.Size() > maxFileBytes {
-			return nil
-		}
-		normalized, ok := m.managedRelativePath(path)
-		if !ok {
-			return nil
-		}
-		liveFiles[normalized] = path
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	// Remove shadow-worktree files that disappeared from the live tree before
-	// copying current contents. `git add -A` can only stage a deletion after
-	// the stale mirror file itself is gone.
-	// Include untracked mirror files left by a cancelled copy before git add.
-	// Otherwise a deleted live file could reappear in the next snapshot.
-	trackedPaths, err := m.gitOutputBytesContext(ctx, "ls-files", "--cached", "--others", "-z")
-	if err != nil {
-		return fmt.Errorf("checkpoint: enumerate shadow files: %w", err)
-	}
-	for _, rel := range strings.Split(string(trackedPaths), "\x00") {
-		if err := ctx.Err(); err != nil {
-			return context.Cause(ctx)
-		}
-		if rel == "" {
-			continue
-		}
-		normalized, ok := m.validRelativePath(rel)
-		if !ok || normalized != filepath.ToSlash(rel) {
-			return fmt.Errorf("checkpoint: unsafe tracked shadow path %q", rel)
-		}
-		if _, exists := liveFiles[normalized]; !exists {
-			if removeErr := os.RemoveAll(filepath.Join(m.shadowDir, filepath.FromSlash(normalized))); removeErr != nil {
-				return fmt.Errorf("checkpoint: remove stale shadow path %s: %w", normalized, removeErr)
-			}
-		}
-	}
-
-	// Resolve file→directory conflicts in parent-before-child order.
-	for _, rel := range liveDirs {
-		if err := ctx.Err(); err != nil {
-			return context.Cause(ctx)
-		}
-		dst := filepath.Join(m.shadowDir, filepath.FromSlash(rel))
-		if info, err := os.Lstat(dst); err == nil && !info.IsDir() {
-			if err := os.RemoveAll(dst); err != nil {
-				return fmt.Errorf("checkpoint: replace shadow file with directory %s: %w", rel, err)
-			}
-		} else if err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("checkpoint: inspect shadow directory %s: %w", rel, err)
-		}
-		if err := os.MkdirAll(dst, 0o700); err != nil {
-			return fmt.Errorf("checkpoint: create shadow directory %s: %w", rel, err)
-		}
-	}
-
-	for rel, path := range liveFiles {
-		if err := ctx.Err(); err != nil {
-			return context.Cause(ctx)
-		}
-		dst := filepath.Join(m.shadowDir, filepath.FromSlash(rel))
-		// Resolve directory→file (and any non-regular) conflicts explicitly.
-		if info, err := os.Lstat(dst); err == nil && !info.Mode().IsRegular() {
-			if err := os.RemoveAll(dst); err != nil {
-				return fmt.Errorf("checkpoint: replace shadow path with file %s: %w", rel, err)
-			}
-		} else if err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("checkpoint: inspect shadow file %s: %w", rel, err)
-		}
-		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-			return fmt.Errorf("checkpoint: create parent for %s: %w", rel, err)
-		}
-		body, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("checkpoint: read %s: %w", rel, err)
-		}
-		if err := ctx.Err(); err != nil {
-			return context.Cause(ctx)
-		}
-		if err := os.WriteFile(dst, body, 0o600); err != nil {
-			return fmt.Errorf("checkpoint: write %s: %w", rel, err)
-		}
-		mode := os.FileMode(0o600)
-		if info, statErr := os.Stat(path); statErr == nil && info.Mode()&0o111 != 0 {
-			mode = 0o700
-		} else if statErr != nil {
-			return fmt.Errorf("checkpoint: inspect mode %s: %w", rel, statErr)
-		}
-		if err := os.Chmod(dst, mode); err != nil {
-			return fmt.Errorf("checkpoint: chmod %s: %w", rel, err)
-		}
-	}
-	return nil
+	return m.syncTreeContext(ctx, newScanObserver(ctx))
 }
 
 const managedPathsFilename = "metis-managed-paths.json"

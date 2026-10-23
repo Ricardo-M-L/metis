@@ -333,7 +333,7 @@ func TestOpenAICodexAppearsInDesktopModelAndEffortSurfaces(t *testing.T) {
 	}
 }
 
-func TestDesktopModelCatalogUsesAuthenticatedProviderUnion(t *testing.T) {
+func TestDesktopModelCatalogUsesRegisteredProviderMembership(t *testing.T) {
 	t.Run("no credentials hides built-in defaults", func(t *testing.T) {
 		cfg := isolatedWebProviderConfig(t)
 		if got := listConfiguredModels(cfg); len(got) != 0 {
@@ -385,11 +385,14 @@ func TestDesktopModelCatalogUsesAuthenticatedProviderUnion(t *testing.T) {
 			"openai-codex": {Transport: "openai_chat", Model: "shadow-model", APIKey: "shadow-key"},
 		}
 		got := listConfiguredModels(cfg)
-		if len(got) != 2 || got[0].Provider != "alpha" || got[1].Provider != "zeta" {
+		if len(got) != 3 || got[0].Provider != "alpha" || got[1].Provider != "missing" || got[2].Provider != "zeta" {
 			t.Fatalf("custom model order/filter = %+v", got)
 		}
-		if got[0].Model != "shared-model" || got[1].Model != "shared-model" {
+		if got[0].Model != "shared-model" || got[2].Model != "shared-model" {
 			t.Fatalf("provider/model dedupe collapsed distinct providers: %+v", got)
+		}
+		if got[1].CredentialConfigured || !got[0].CredentialConfigured || !got[2].CredentialConfigured {
+			t.Fatalf("registered membership lost separate credential readiness: %+v", got)
 		}
 	})
 }
@@ -521,12 +524,26 @@ func TestProviderAPIStoresSecretsSeparatelyAndNeverEchoesThem(t *testing.T) {
 		t.Fatal("provider validation echoed credential")
 	}
 
-	// SaveUserCustomProvider makes the new profile the default. Deleting it
-	// must fail until the user deliberately selects another provider.
+	// Saving settings never silently changes the global default. Only an
+	// explicit default action protects the new provider from deletion.
+	cfgAfterSave, _, err := config.Load()
+	if err != nil || cfgAfterSave.Provider.Default == "local-gateway" {
+		t.Fatalf("save changed default: %+v, %v", cfgAfterSave, err)
+	}
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/providers/default", bytes.NewBufferString(`{"id":"local-gateway"}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("explicit default: %d %s", rr.Code, rr.Body.String())
+	}
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/api/providers", bytes.NewBufferString(`{"id":"local-gateway"}`)))
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("delete default provider: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/providers", bytes.NewBufferString(`{"id":"openai","transport":"openai_chat","baseUrl":"https://api.openai.com/v1","model":"gpt-4o"}`)))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("register fallback default: %d %s", rr.Code, rr.Body.String())
 	}
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/providers/default", bytes.NewBufferString(`{"id":"openai"}`)))
@@ -560,7 +577,7 @@ func TestProviderAPIRequiresKeyWhenEndpointChanges(t *testing.T) {
 	changeEndpoint := bytes.NewBufferString(`{"id":"route","transport":"openai_responses","baseUrl":"https://new.example.test/v1","model":"new-model"}`)
 	rr := httptest.NewRecorder()
 	s.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/providers", changeEndpoint))
-	if rr.Code != http.StatusConflict || !bytes.Contains(rr.Body.Bytes(), []byte("enter the API key again")) {
+	if rr.Code != http.StatusConflict || !bytes.Contains(rr.Body.Bytes(), []byte("new API key")) {
 		t.Fatalf("endpoint change without key = %d: %s", rr.Code, rr.Body.String())
 	}
 	cfg, _, err := config.Load()

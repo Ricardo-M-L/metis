@@ -96,7 +96,7 @@ func cmdComputerUse(ctx context.Context, args []string) error {
 	return err
 }
 
-func (r *runtime) computerUseAction(ctx context.Context, action string) (computeruse.Status, error) {
+func (r *runtime) computerUseAction(ctx context.Context, action string) (status computeruse.Status, actionErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -105,9 +105,13 @@ func (r *runtime) computerUseAction(ctx context.Context, action string) (compute
 	default:
 		return computeruse.Status{}, fmt.Errorf("unknown Computer Use action %q", action)
 	}
-	home, err := config.VerifiedHome()
-	if err != nil {
-		return computeruse.Status{}, err
+	// Failed install/configuration/permission checks must not hide ownership of
+	// a helper already connected to this runtime. Recheck after any action,
+	// including Stop, without launching or trusting a client-supplied state.
+	defer func() { status = r.computerUseOwnedStatus(status) }()
+	home, homeErr := config.VerifiedHome()
+	if homeErr != nil && action != "stop" && action != "disable" {
+		return r.computerUseOwnedStatus(computeruse.Status{}), homeErr
 	}
 	manager := computeruse.New(home)
 	switch action {
@@ -126,24 +130,26 @@ func (r *runtime) computerUseAction(ctx context.Context, action string) (compute
 			defer r.computerUseMu.Unlock()
 		}
 		stopErr := r.stopComputerUseLocked()
+		var configErr error
 		if action == "disable" {
 			reg, loadErr := mcp.Load()
 			if loadErr != nil {
-				return computeruse.Status{}, errors.Join(stopErr, loadErr)
-			}
-			if entry := mcp.FindServer(reg, mcp.ReservedComputerUseName); entry != nil {
+				configErr = loadErr
+			} else if entry := mcp.FindServer(reg, mcp.ReservedComputerUseName); entry != nil {
 				entry.Disabled = true
-				if err := mcp.Save(reg); err != nil {
-					return computeruse.Status{}, errors.Join(stopErr, err)
-				}
+				configErr = mcp.Save(reg)
 			}
 		}
-		status, statusErr := r.computerUseStatus(ctx, manager)
+		var status computeruse.Status
+		statusErr := homeErr
+		if homeErr == nil {
+			status, statusErr = r.computerUseStatus(ctx, manager)
+		}
 		status.Message = "Computer Use stopped in this session."
 		if r == nil {
 			status.Message = "Startup disabled. Other running sessions must be stopped using their own /cu stop or Desktop Stop control."
 		}
-		return status, errors.Join(stopErr, statusErr)
+		return status, errors.Join(stopErr, configErr, statusErr)
 	case "enable":
 		return r.enableComputerUse(ctx, manager)
 	}
@@ -275,19 +281,19 @@ func runComputerUsePermissionRequest(ctx context.Context, installed computeruse.
 }
 
 func (r *runtime) computerUseStatus(ctx context.Context, manager *computeruse.Manager) (computeruse.Status, error) {
-	status, err := manager.Status(ctx)
-	if err != nil {
-		return status, err
-	}
-	reg, err := mcp.Load()
-	if err != nil {
-		return status, err
-	}
-	if entry := mcp.FindServer(reg, mcp.ReservedComputerUseName); entry != nil {
-		status.Enabled = !entry.Disabled
-		if entry.Command != mcp.ManagedComputerUseCommand {
-			status.Message = "A custom/legacy Computer Use server is configured; it has not been replaced by the managed component."
+	status, installationErr := manager.Status(ctx)
+	status = r.computerUseOwnedStatus(status)
+	reg, configErr := mcp.Load()
+	if configErr == nil {
+		if entry := mcp.FindServer(reg, mcp.ReservedComputerUseName); entry != nil {
+			status.Enabled = !entry.Disabled
+			if entry.Command != mcp.ManagedComputerUseCommand {
+				status.Message = "A custom/legacy Computer Use server is configured; it has not been replaced by the managed component."
+			}
 		}
+	}
+	if err := errors.Join(installationErr, configErr); err != nil {
+		return status, err
 	}
 	for _, srv := range r.computerUseServers() {
 		// Only a connected helper that passed the managed launch validation can
@@ -322,6 +328,20 @@ func (r *runtime) computerUseStatus(ctx context.Context, manager *computeruse.Ma
 		status.Description = description
 	}
 	return status, nil
+}
+
+// The installation on disk may become invalid after launch, or a read-only
+// health RPC may fail. Neither removes this runtime's ownership of an already
+// verified helper. Never spawn a lazy server or trust its reserved name here.
+func (r *runtime) computerUseOwnedStatus(status computeruse.Status) computeruse.Status {
+	status.Stoppable = false
+	for _, srv := range r.computerUseServers() {
+		if srv.IsManagedComputerUseConnected() {
+			status.Stoppable = true
+			break
+		}
+	}
+	return status
 }
 
 var errComputerUseStatusResourceUnsupported = errors.New("Computer Use status resource is unsupported")

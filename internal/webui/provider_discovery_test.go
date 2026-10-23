@@ -205,11 +205,16 @@ func TestProviderModelDiscoveryViewKeepsRuntimeDefaultTransport(t *testing.T) {
 }
 
 func TestProviderModelDiscoveryNativeOpenAIViewUsesConfiguredWireProtocol(t *testing.T) {
-	t.Setenv("METIS_HOME", t.TempDir())
+	isolatedWebProviderConfig(t)
+	registerMembershipFixture(t, config.ProviderSettingsProvider{ID: "openai", Transport: "openai_chat", BaseURL: "https://api.openai.com/v1", Model: "wire-view-model", Models: []config.ProviderModelSettings{{ID: "wire-view-model"}}})
 	for _, tc := range []struct{ wire, want string }{
 		{"", "openai_chat"}, {"chat", "openai_chat"}, {"responses", "openai_responses"},
 	} {
-		cfg := &config.Config{Provider: config.ProviderSet{OpenAI: config.ProviderOpenAI{WireProtocol: tc.wire}, Custom: map[string]config.ProviderRaw{}}}
+		cfg, _, err := config.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.Provider.OpenAI.WireProtocol = tc.wire
 		found := false
 		for _, view := range configuredProviderViews(cfg) {
 			if view.ID == "openai" {

@@ -108,6 +108,12 @@ private channel. A single workspace has one foreground writer lease, so two
 conversations cannot concurrently change the same checkout. Image turns retain
 the serialized in-process runtime while sharing the Desktop execution budget.
 
+**Settings → Model Providers** manages credentials, connections and multiple
+models per provider. Saving a provider keeps the current conversation unchanged;
+the saved default applies to new conversations, and applying a model to the
+current conversation is a separate action. See [model settings](../docs/model-provider-settings.md)
+for capability inheritance, output budgets and reasoning mappings.
+
 **Settings → General → Agent concurrency** exposes three independent limits:
 
 | Setting | Default | Range |

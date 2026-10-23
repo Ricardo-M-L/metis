@@ -61,6 +61,35 @@ func (m *Manager) initShadowRepoContext(ctx context.Context) error {
 	if err == nil {
 		_, err = m.gitOutputBytesContext(ctx, "config", "user.name", "metis")
 	}
+	// The shadow is a byte-for-byte checkpoint store, not another checkout of
+	// the user's repository. Do not let copied .gitattributes, global Git
+	// settings, or their clean filters normalize/execute while taking a snapshot.
+	// info/attributes has higher precedence than every copied attributes file.
+	if err == nil {
+		_, err = m.gitOutputBytesContext(ctx, "config", "core.autocrlf", "false")
+	}
+	if err == nil {
+		var saved []byte
+		saved, err = os.ReadFile(m.rawSnapshotFormatPath())
+		if os.IsNotExist(err) {
+			err = nil
+		}
+		m.rawFormatMarked = string(saved) == rawSnapshotFormat
+		if err == nil && !m.rawFormatMarked {
+			_, indexErr := os.Stat(filepath.Join(m.shadowDir, ".git", "index"))
+			m.rawIndexMigration = indexErr == nil
+			if indexErr != nil && !os.IsNotExist(indexErr) {
+				err = indexErr
+			}
+		}
+	}
+	if err == nil {
+		infoDir := filepath.Join(m.shadowDir, ".git", "info")
+		err = os.MkdirAll(infoDir, 0o700)
+		if err == nil {
+			err = os.WriteFile(filepath.Join(infoDir, "attributes"), []byte("* -text -eol -ident -filter -working-tree-encoding\n"), 0o600)
+		}
+	}
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
@@ -107,23 +136,62 @@ func (m *Manager) gitOutputBytesContext(ctx context.Context, args ...string) ([]
 // command that follows it. Failed copies are never committed; the next copy
 // reconciles both tracked and untracked mirror leftovers before staging.
 func (m *Manager) SnapContext(ctx context.Context, toolName, argsHash, message string) (string, error) {
-	if err := m.lockContext(ctx); err != nil {
+	return m.snapshotContext(ctx, toolName, argsHash, message, false)
+}
+
+// BaselineContext validates the current working tree even when no bytes have
+// changed, and returns the exact verified HEAD in that case. A caller must not
+// attach an old turn's baseline merely because SnapContext returned no new commit.
+func (m *Manager) BaselineContext(ctx context.Context, toolName, argsHash, message string) (string, error) {
+	return m.snapshotContext(ctx, toolName, argsHash, message, true)
+}
+
+func (m *Manager) snapshotContext(ctx context.Context, toolName, argsHash, message string, baseline bool) (hash string, err error) {
+	observer := newScanObserver(ctx)
+	observer.stage("lock")
+	if err = m.lockContext(ctx); err != nil {
+		_, err = observer.finish(err)
 		return "", err
 	}
 	defer m.mu.Unlock()
+	defer func() { m.lastScan, err = observer.finish(err) }()
 	if m.disabled {
 		return "", errors.New("checkpoint: disabled (prior init error)")
 	}
+	observer.stage("init")
 	if err := m.initShadowRepoContext(ctx); err != nil {
 		return "", err
 	}
-	if err := m.copyTreeContext(ctx); err != nil {
+	if err := m.syncTreeContext(ctx, observer); err != nil {
 		return "", err
 	}
-	if _, err := m.gitOutputBytesContext(ctx, "add", "-A"); err != nil {
+	observer.stage("stage")
+	// Inventory already applied the explicit checkpoint scope. A copied
+	// .gitignore must not silently omit existing files from the baseline and
+	// later make a readonly command appear to have created those files.
+	if _, err := m.gitOutputBytesContext(ctx, "add", "-f", "-A"); err != nil {
 		return "", err
 	}
-	_, headErr := m.gitOutputBytesContext(ctx, "rev-parse", "--verify", "HEAD")
+	if m.rawIndexMigration {
+		// A legacy index can cache a normalized blob even when the mirror's
+		// current bytes/mtime are unchanged. Re-clean once under the raw-byte
+		// attributes policy. Historical commits remain untouched.
+		observer.stage("migrate-index")
+		if _, err := m.gitOutputBytesContext(ctx, "add", "--renormalize", "."); err != nil {
+			return "", err
+		}
+	}
+	if !m.rawFormatMarked {
+		if ctx.Err() != nil {
+			return "", context.Cause(ctx)
+		}
+		if err := os.WriteFile(m.rawSnapshotFormatPath(), []byte(rawSnapshotFormat), 0o600); err != nil {
+			return "", err
+		}
+		m.rawFormatMarked = true
+		m.rawIndexMigration = false
+	}
+	head, headErr := m.gitOutputBytesContext(ctx, "rev-parse", "--verify", "HEAD")
 	if ctx.Err() != nil {
 		return "", context.Cause(ctx)
 	}
@@ -133,8 +201,13 @@ func (m *Manager) SnapContext(ctx context.Context, toolName, argsHash, message s
 		return "", err
 	}
 	if len(changed) == 0 && !firstCommit {
+		m.hasBaseline.Store(true)
+		if baseline {
+			return strings.TrimSpace(string(head)), nil
+		}
 		return "", nil
 	}
+	observer.stage("commit")
 	commitMsg := fmt.Sprintf("%s|%s|%s|%s", time.Now().UTC().Format(time.RFC3339), toolName, argsHash, message)
 	args := []string{"commit", "-q", "-m", commitMsg}
 	if firstCommit {
@@ -147,17 +220,29 @@ func (m *Manager) SnapContext(ctx context.Context, toolName, argsHash, message s
 	if err != nil {
 		return "", err
 	}
+	m.hasBaseline.Store(true)
 	return strings.TrimSpace(string(out)), nil
+}
+
+const rawSnapshotFormat = "raw-bytes-v1\n"
+
+func (m *Manager) rawSnapshotFormatPath() string {
+	return filepath.Join(m.shadowDir, ".git", "metis-raw-snapshot-format")
 }
 
 // treeBlobIDs obtains every baseline object ID in one process. NUL records
 // and the first TAB separator preserve filenames containing tabs/newlines.
-func (m *Manager) treeBlobIDs(ctx context.Context, ref string) (map[string]string, error) {
+type treeBlob struct {
+	objectID   string
+	executable bool
+}
+
+func (m *Manager) treeBlobIDs(ctx context.Context, ref string) (map[string]treeBlob, error) {
 	out, err := m.gitOutputBytesContext(ctx, "ls-tree", "-r", "-z", ref)
 	if err != nil {
 		return nil, err
 	}
-	blobs := make(map[string]string)
+	blobs := make(map[string]treeBlob)
 	for _, record := range strings.Split(string(out), "\x00") {
 		if ctx.Err() != nil {
 			return nil, context.Cause(ctx)
@@ -172,7 +257,7 @@ func (m *Manager) treeBlobIDs(ctx context.Context, ref string) (map[string]strin
 		}
 		rel := filepath.ToSlash(path)
 		if normalized, valid := m.validRelativePath(rel); valid && normalized == rel {
-			blobs[rel] = fields[2]
+			blobs[rel] = treeBlob{objectID: fields[2], executable: fields[0] == "100755"}
 		}
 	}
 	return blobs, nil
@@ -191,75 +276,59 @@ func gitBlobID(body []byte, oidLength int) string {
 // ChangedPathsContext keeps the existing content-based attribution and
 // file/skip limits, without per-file Git processes. Raw live blob hashes match
 // the old `git show` versus live bytes comparison (no clean filters invoked).
-func (m *Manager) ChangedPathsContext(ctx context.Context, hash string) ([]string, error) {
-	if err := m.lockContext(ctx); err != nil {
+func (m *Manager) ChangedPathsContext(ctx context.Context, hash string) (changed []string, err error) {
+	observer := newScanObserver(ctx)
+	observer.stage("lock")
+	if err = m.lockContext(ctx); err != nil {
+		_, err = observer.finish(err)
 		return nil, err
 	}
 	defer m.mu.Unlock()
+	defer func() { m.lastScan, err = observer.finish(err) }()
 	if m.disabled {
 		return nil, errors.New("checkpoint: disabled")
 	}
+	observer.stage("init")
 	if err := m.initShadowRepoContext(ctx); err != nil {
 		return nil, err
 	}
+	observer.stage("baseline")
 	target, err := m.treeBlobIDs(ctx, hash)
 	if err != nil {
 		return nil, err
 	}
-	changed := make([]string, 0)
-	err = filepath.Walk(m.cwd, func(path string, info os.FileInfo, walkErr error) error {
-		if ctx.Err() != nil {
-			return context.Cause(ctx)
-		}
-		if walkErr != nil {
-			return fmt.Errorf("checkpoint: inspect live delta %s: %w", path, walkErr)
-		}
-		if info == nil {
-			return fmt.Errorf("checkpoint: inspect live delta %s: missing file info", path)
-		}
-		if info.IsDir() {
-			if path != m.cwd && skipDirs[info.Name()] {
-				return filepath.SkipDir
-			}
-			if m.shadowDir != "" && (path == m.shadowDir || strings.HasPrefix(path, m.shadowDir+string(os.PathSeparator))) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !info.Mode().IsRegular() || info.Size() > maxFileBytes {
-			return nil
-		}
-		rel, err := filepath.Rel(m.cwd, path)
-		if err != nil {
-			return err
-		}
-		rel, ok := m.validRelativePath(rel)
-		if !ok {
-			return nil
-		}
-		before, exists := target[rel]
-		delete(target, rel)
+	source, err := os.OpenRoot(m.cwd)
+	if err != nil {
+		return nil, err
+	}
+	defer source.Close()
+	tree, err := m.inventoryTree(ctx, source, observer)
+	if err != nil {
+		return nil, err
+	}
+	observer.stage("compare")
+	changed, err = processLiveFiles(ctx, tree.files, observer, func(file liveFile) fileResult {
+		before, exists := target[file.rel]
 		if !exists {
-			changed = append(changed, rel)
-			return nil
+			return fileResult{rel: file.rel, changed: true}
 		}
-		after, err := os.ReadFile(path)
+		after, err := readLiveFile(source, file)
 		if err != nil {
-			return fmt.Errorf("checkpoint: read changed path %s: %w", rel, err)
+			return fileResult{err: err}
 		}
-		if gitBlobID(after, len(before)) != before {
-			changed = append(changed, rel)
-		}
-		return nil
+		different := gitBlobID(after, len(before.objectID)) != before.objectID ||
+			(file.info.Mode()&0o111 != 0) != before.executable
+		return fileResult{rel: file.rel, changed: different, unchanged: !different}
 	})
 	if err != nil {
 		return nil, err
 	}
-	if ctx.Err() != nil {
-		return nil, context.Cause(ctx)
+	for _, file := range tree.files {
+		delete(target, file.rel)
 	}
 	for rel := range target {
 		changed = append(changed, rel)
+		observer.stats.RemovedFiles++
 	}
 	sort.Strings(changed)
 	return changed, nil

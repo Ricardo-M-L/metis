@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -1108,6 +1109,11 @@ func TestTurnRejectsImageBeforeMutationWhenProviderDoesNotSupportVision(t *testi
 }
 
 func TestTurnChecksImageCapabilityAfterActivatingTargetSession(t *testing.T) {
+	isolatedWebProviderConfig(t)
+	registerMembershipFixture(t,
+		config.ProviderSettingsProvider{ID: "source-profile", Transport: "openai_chat", BaseURL: "https://vision-fixture.example/v1", Model: "vision-unknown", Models: []config.ProviderModelSettings{{ID: "vision-unknown"}}},
+		config.ProviderSettingsProvider{ID: "target-profile", Transport: "openai_chat", BaseURL: "https://vision-fixture.example/v1", Model: "text-only", Models: []config.ProviderModelSettings{{ID: "text-only"}}},
+	)
 	store, err := session.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -1533,6 +1539,11 @@ func TestUnsafeAPIsAllowSameOriginAndNonBrowserClients(t *testing.T) {
 }
 
 func TestActivateSessionRestoresHeaderStateAndRebindsSidecars(t *testing.T) {
+	isolatedWebProviderConfig(t)
+	registerMembershipFixture(t,
+		config.ProviderSettingsProvider{ID: "source-profile", Transport: "openai_chat", BaseURL: "https://profiles.example/v1", Model: "source-model", Models: []config.ProviderModelSettings{{ID: "source-model"}}},
+		config.ProviderSettingsProvider{ID: "target-profile", Transport: "openai_chat", BaseURL: "https://profiles.example/v1", Model: "target-model", Models: []config.ProviderModelSettings{{ID: "target-model"}}},
+	)
 	store, err := session.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

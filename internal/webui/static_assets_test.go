@@ -148,7 +148,7 @@ func TestDesktopModelMenuRefreshesAuthenticatedCatalogEveryOpen(t *testing.T) {
 		"activeSelection = d.current || {};",
 		"const hasAlternative = modelList.some",
 		"modelList = [];",
-		"showToast('Could not refresh models');",
+		"showToast(uiText('Could not refresh models', '无法刷新模型列表'));",
 	} {
 		if !strings.Contains(menu, want) {
 			t.Fatalf("Desktop model refresh missing %q", want)

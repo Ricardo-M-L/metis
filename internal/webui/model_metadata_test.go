@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
@@ -51,6 +52,11 @@ func TestCommitActiveModelSelectionPersistsSessionHeader(t *testing.T) {
 
 func modelSwitchFixture(t *testing.T, storeRoot string) (*Server, *agent.Loop, *activationTestProvider, string, string) {
 	t.Helper()
+	registerMembershipFixture(t,
+		config.ProviderSettingsProvider{ID: "openai", Transport: "openai_chat", BaseURL: "https://api.openai.com/v1", Model: "gpt-old", Models: []config.ProviderModelSettings{{ID: "gpt-old"}}},
+		config.ProviderSettingsProvider{ID: "anthropic", Transport: "anthropic_messages", BaseURL: "https://api.anthropic.com", Model: "claude-new", Models: []config.ProviderModelSettings{{ID: "claude-new"}, {ID: "claude-resumed"}}},
+		config.ProviderSettingsProvider{ID: "deepseek", Transport: "openai_chat", BaseURL: "https://deepseek.example/v1", Model: "deepseek-v4-pro", Models: []config.ProviderModelSettings{{ID: "deepseek-v4-pro"}}},
+	)
 	store, err := session.NewStore(storeRoot)
 	if err != nil {
 		t.Fatal(err)
