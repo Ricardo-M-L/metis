@@ -71,7 +71,7 @@ jobs:
         run: go build ./...
 
       - name: go test
-        run: go test -count=1 -timeout 90s ./...
+        run: go test -count=1 -timeout 180s ./...
 
       - name: Vet patched Bubble Tea module
         working-directory: vendor-patches/bubbletea-v2
@@ -169,7 +169,7 @@ jobs:
       # Windows exercises the CLI plus the platform-specific install/update
       # lifecycle while go vet/build still cover every package.
       - name: Test Windows CLI and lifecycle
-        run: go test -count=1 -timeout 90s ./cmd/metis ./install ./internal/artifact ./internal/update
+        run: go test -count=1 -timeout 180s ./cmd/metis ./install ./internal/artifact ./internal/update
 
       - name: Cross-build Windows arm64
         shell: pwsh

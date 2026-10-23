@@ -20,7 +20,9 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/projectcoord"
 )
 
-func newCoordinatorUsageTestReconciler(store *projectcoord.Store, workspace, runID, home, receiptDir, command string, log func(coordinatorUsageReconcileEvent)) (*coordinatorUsageReconciler, error) {
+func newCoordinatorUsageTestReconciler(t *testing.T, store *projectcoord.Store, workspace, runID, home, receiptDir, command string, log func(coordinatorUsageReconcileEvent)) (*coordinatorUsageReconciler, error) {
+	t.Helper()
+	requireCoordinatorUsagePrivateFiles(t)
 	r, err := newCoordinatorUsageReconciler(store, workspace, runID, home, receiptDir, command, log)
 	if err == nil {
 		r.helperArguments = []string{"-test.run=^TestCoordinatorUsageAdapterHelperProcess$", "--"}
@@ -68,6 +70,7 @@ func coordinatorUsageShellLiteral(value string) string {
 
 func coordinatorUsageAdapter(t *testing.T, f coordinatorUsageFixture, script string) string {
 	t.Helper()
+	requireCoordinatorUsagePrivateFiles(t)
 	path := filepath.Join(f.home, "trusted-adapter")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0700); err != nil {
 		t.Fatal(err)
@@ -77,7 +80,7 @@ func coordinatorUsageAdapter(t *testing.T, f coordinatorUsageFixture, script str
 
 func TestCoordinatorUsageInboxPersistsReceiptsAndReplaysWithoutDoubleCharging(t *testing.T) {
 	f := newCoordinatorUsageFixture(t)
-	r, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, "", "", nil)
+	r, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +120,7 @@ func TestCoordinatorUsageInboxPersistsReceiptsAndReplaysWithoutDoubleCharging(t 
 
 func TestCoordinatorUsageInboxScopeFailureRetainsEvidenceAndDoesNotBlockValidFile(t *testing.T) {
 	f := newCoordinatorUsageFixture(t)
-	r, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, "", "", nil)
+	r, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +145,7 @@ func TestCoordinatorUsageAdapterUsesOnlyNonsecretIdentityAndAuthoritativeCost(t 
 	coordinatorUsageWriteReceipt(t, receiptPath, f.receipt())
 	stdinPath, envPath := filepath.Join(f.home, "adapter-stdin"), filepath.Join(f.home, "adapter-env")
 	command := coordinatorUsageAdapter(t, f, "/bin/cat > "+coordinatorUsageShellLiteral(stdinPath)+"\n/usr/bin/env > "+coordinatorUsageShellLiteral(envPath)+"\n/bin/cat "+coordinatorUsageShellLiteral(receiptPath))
-	r, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, "", command, nil)
+	r, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, "", command, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +172,7 @@ func TestCoordinatorUsageAdapterUsesOnlyNonsecretIdentityAndAuthoritativeCost(t 
 func TestCoordinatorUsageAdapterEmptyResultKeepsUsageUnknown(t *testing.T) {
 	f := newCoordinatorUsageFixture(t)
 	command := coordinatorUsageAdapter(t, f, "/bin/cat > /dev/null\nprintf '[]'")
-	r, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, "", command, nil)
+	r, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, "", command, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +190,7 @@ func TestCoordinatorUsageAdapterCancelAfterReadyKillsOwnedDescendant(t *testing.
 	f := newCoordinatorUsageFixture(t)
 	pidPath := filepath.Join(f.home, "child-pid")
 	command := coordinatorUsageAdapter(t, f, "/bin/sleep 60 &\nprintf '%s' \"$!\" > "+coordinatorUsageShellLiteral(pidPath)+"\nwait")
-	r, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, "", command, nil)
+	r, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, "", command, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +244,7 @@ func TestCoordinatorUsageAdapterCancelAfterReadyKillsOwnedDescendant(t *testing.
 func TestCoordinatorUsageAdapterTimeoutIsBounded(t *testing.T) {
 	f := newCoordinatorUsageFixture(t)
 	command := coordinatorUsageAdapter(t, f, "/bin/sleep 60")
-	r, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, "", command, nil)
+	r, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, "", command, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +258,7 @@ func TestCoordinatorUsageAdapterTimeoutIsBounded(t *testing.T) {
 
 func TestCoordinatorUsageAtomicEvidencePublicationAndConcurrentReconcile(t *testing.T) {
 	f := newCoordinatorUsageFixture(t)
-	r, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, "", "", nil)
+	r, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +280,7 @@ func TestCoordinatorUsageAtomicEvidencePublicationAndConcurrentReconcile(t *test
 			t.Fatal(err)
 		}
 	}
-	other, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, r.receiptDir, "", nil)
+	other, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, r.receiptDir, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +315,7 @@ func TestCoordinatorUsageAdapterCallerHelperProcess(t *testing.T) {
 	if err != nil || json.Unmarshal(data, &options) != nil {
 		os.Exit(50)
 	}
-	r, err := newCoordinatorUsageTestReconciler(projectcoord.NewStore(options.StoreRoot), options.Workspace, options.RunID, options.Home, "", options.Command, nil)
+	r, err := newCoordinatorUsageTestReconciler(t, projectcoord.NewStore(options.StoreRoot), options.Workspace, options.RunID, options.Home, "", options.Command, nil)
 	if err != nil {
 		os.Exit(51)
 	}
@@ -405,7 +408,7 @@ func TestCoordinatorUsageAdapterRejectsOverflowRawSecretsAndChangedExecutable(t 
 				script = "printf 'provider-private-raw-secret'; printf 'stderr-private-secret' >&2"
 			}
 			command := coordinatorUsageAdapter(t, f, script)
-			r, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, "", command, nil)
+			r, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, "", command, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -425,7 +428,7 @@ func TestCoordinatorUsageAdapterRejectsOverflowRawSecretsAndChangedExecutable(t 
 func TestCoordinatorUsageRunChecksAtStartupAndJoinsOnCancel(t *testing.T) {
 	f := newCoordinatorUsageFixture(t)
 	events := make(chan coordinatorUsageReconcileEvent, 4)
-	r, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, "", "", func(e coordinatorUsageReconcileEvent) { events <- e })
+	r, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, "", "", func(e coordinatorUsageReconcileEvent) { events <- e })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,25 +453,29 @@ func TestCoordinatorUsageRunChecksAtStartupAndJoinsOnCancel(t *testing.T) {
 	}
 }
 
-func TestCoordinatorUsageTrustPathsAndLiveRequestFiltering(t *testing.T) {
+func TestCoordinatorUsageTrustPaths(t *testing.T) {
 	f := newCoordinatorUsageFixture(t)
-	if _, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, filepath.Join(f.workspace, "receipts"), "", nil); err == nil {
+	if _, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, filepath.Join(f.workspace, "receipts"), "", nil); err == nil {
 		t.Fatal("accepted workspace receipt inbox")
 	}
 	command := filepath.Join(f.workspace, "agent-controlled-script")
 	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf '[]'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, "", command, nil); err == nil {
+	if _, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, "", command, nil); err == nil {
 		t.Fatal("accepted workspace adapter")
 	}
 	link := filepath.Join(f.home, "receipt-link")
 	if err := os.Symlink(t.TempDir(), link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newCoordinatorUsageTestReconciler(f.store, f.workspace, f.run.ID, f.home, link, "", nil); err == nil {
+	if _, err := newCoordinatorUsageTestReconciler(t, f.store, f.workspace, f.run.ID, f.home, link, "", nil); err == nil {
 		t.Fatal("accepted inbox symlink")
 	}
+}
+
+func TestCoordinatorUsageLiveRequestFiltering(t *testing.T) {
+	f := newCoordinatorUsageFixture(t)
 	run, err := f.store.Get(f.workspace, f.run.ID)
 	if err != nil {
 		t.Fatal(err)

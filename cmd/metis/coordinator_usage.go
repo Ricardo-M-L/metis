@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"strings"
 	"time"
 
@@ -165,6 +166,16 @@ type coordinatorUsageError struct {
 func (e *coordinatorUsageError) Error() string  { return "coordinator usage: " + e.code }
 func (e *coordinatorUsageError) Unwrap() error  { return e.cause }
 func coordinatorUsageFailure(code string) error { return &coordinatorUsageError{code: code} }
+
+// Native receipt recovery requires owner-only POSIX modes and UID ownership.
+// Windows support needs an equivalent ACL implementation before any private
+// receipt, adapter or billing credential can be accessed there.
+func coordinatorUsagePlatformError() error {
+	if goruntime.GOOS == "windows" {
+		return coordinatorUsageFailure("unsupported_platform_windows")
+	}
+	return nil
+}
 
 func coordinatorUsageImport(ctx context.Context, store *projectcoord.Store, workspace, runID string, receipts []projectcoord.UsageReceipt) (int, error) {
 	imported := 0
@@ -337,6 +348,9 @@ func coordinatorUsageOutsideWorkspace(path, workspace string) bool {
 }
 
 func coordinatorUsageReadPrivateFile(path, workspace string, limit int64, executable bool) ([]byte, os.FileInfo, error) {
+	if err := coordinatorUsagePlatformError(); err != nil {
+		return nil, nil, err
+	}
 	if !filepath.IsAbs(path) {
 		return nil, nil, coordinatorUsageFailure("private_file_requires_absolute_path")
 	}

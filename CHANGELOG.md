@@ -7,13 +7,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-## [0.4.91] - 2026-10-23
+## [0.4.92] - 2026-10-23
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
 without Apple notarization.
 
 ### Fixed
 
+- Keep Windows native coordinator usage-receipt paths explicitly unsupported and
+  fail closed before private file access; correct cross-platform updater tests.
+- Wait for complete subprocess output in MCP redaction tests and allow realistic
+  CI time for durable coordinator storage tests without changing fsync behavior.
 - Keep code checkpoints usable in large multi-project workspaces with bounded
   parallel scans, incremental mirror writes, stage progress and cancellable budgets.
   Preserve per-turn baselines, raw file bytes and executable modes; reject incomplete

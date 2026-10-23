@@ -130,8 +130,12 @@ func TestDesktopManagedApplyRejectsBeforeNetworkOrFilesystemMutation(t *testing.
 				if !errors.Is(err, ErrDesktopManaged) || requests != 0 {
 					t.Errorf("automatic=%t: err=%v requests=%d; want Desktop guard and zero requests", automatic, err, requests)
 				}
-				if _, err := os.Lstat(layout.managedRoot); !errors.Is(err, os.ErrNotExist) {
-					t.Errorf("automatic=%t created update state beside Desktop runtime: %s: %v", automatic, layout.managedRoot, err)
+				// Windows managedRoot is the existing fixture's parent directory.
+				// Check updater-owned state on every platform instead of that container.
+				for _, path := range []string{layout.versionsRoot, layout.stagingRoot, layout.locksRoot, layout.currentVersion} {
+					if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+						t.Errorf("automatic=%t created update state beside Desktop runtime: %s: %v", automatic, path, err)
+					}
 				}
 				if current, err := os.ReadFile(tc.path); err != nil || !reflect.DeepEqual(current, original) {
 					t.Fatalf("Desktop runtime changed: %q: %v", current, err)

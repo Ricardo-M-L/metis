@@ -49,7 +49,14 @@ func TestStdioTransportRedactsConfiguredArgAndShortEnvCredentials(t *testing.T) 
 	if err != nil {
 		t.Fatalf("start credential echo child: %v", err)
 	}
-	waitForStderrContains(t, transport, "ordinary=dev")
+	t.Cleanup(func() {
+		if err := transport.Close(); err != nil {
+			t.Errorf("close credential echo child: %v", err)
+		}
+	})
+	// Close terminates the child process tree. Wait for the final argument so
+	// every configured credential and ordinary value has reached stderr first.
+	waitForStderrContains(t, transport, "arg=--mode=dev")
 	if err := transport.Close(); err != nil {
 		t.Fatalf("close credential echo child: %v", err)
 	}

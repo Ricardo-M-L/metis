@@ -20,6 +20,13 @@ type coordinatorUsageFixture struct {
 	record          projectcoord.UsageRequestRecord
 }
 
+func requireCoordinatorUsagePrivateFiles(t *testing.T) {
+	t.Helper()
+	if err := coordinatorUsagePlatformError(); err != nil {
+		t.Skip("native receipt files require POSIX private modes and UID ownership; Windows ACL support is not implemented")
+	}
+}
+
 func newCoordinatorUsageFixture(t *testing.T) coordinatorUsageFixture {
 	t.Helper()
 	workspace, home := t.TempDir(), t.TempDir()
@@ -95,6 +102,7 @@ func TestCoordinatorUsageReceiptJSONStrictness(t *testing.T) {
 }
 
 func TestCoordinatorUsagePrivateMissingPreservesSafeNotExistSentinel(t *testing.T) {
+	requireCoordinatorUsagePrivateFiles(t)
 	f := newCoordinatorUsageFixture(t)
 	_, _, err := coordinatorUsageReadPrivateFile(filepath.Join(f.home, "missing.json"), f.workspace, coordinatorUsageReceiptLimit, false)
 	if !errors.Is(err, os.ErrNotExist) {
@@ -103,6 +111,7 @@ func TestCoordinatorUsagePrivateMissingPreservesSafeNotExistSentinel(t *testing.
 }
 
 func TestCoordinatorUsagePrivateInputBoundaries(t *testing.T) {
+	requireCoordinatorUsagePrivateFiles(t)
 	f := newCoordinatorUsageFixture(t)
 	path := filepath.Join(f.home, "receipt.json")
 	if err := os.WriteFile(path, []byte("[]"), 0600); err != nil {
@@ -137,6 +146,10 @@ func TestCoordinatorUsagePrivateInputBoundaries(t *testing.T) {
 	if _, _, err := coordinatorUsageReadPrivateFile("relative.json", f.workspace, coordinatorUsageReceiptLimit, false); err == nil {
 		t.Fatal("accepted relative receipt path")
 	}
+}
+
+func TestCoordinatorUsageImportRejectsConflictingReceipt(t *testing.T) {
+	f := newCoordinatorUsageFixture(t)
 	if _, err := coordinatorUsageImport(context.Background(), f.store, f.workspace, f.run.ID, []projectcoord.UsageReceipt{f.receipt()}); err != nil {
 		t.Fatal(err)
 	}

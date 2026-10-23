@@ -54,6 +54,9 @@ type coordinatorUsageReconciler struct {
 }
 
 func newCoordinatorUsageReconciler(store *projectcoord.Store, workspace, runID, home, receiptDir, command string, log func(coordinatorUsageReconcileEvent)) (*coordinatorUsageReconciler, error) {
+	if err := coordinatorUsagePlatformError(); err != nil {
+		return nil, err
+	}
 	if store == nil {
 		return nil, coordinatorUsageFailure("missing_store")
 	}
@@ -145,6 +148,9 @@ func coordinatorUsageCanonicalFuturePath(path string) (string, error) {
 }
 
 func coordinatorUsagePrivateDirectory(path string, expected os.FileInfo) (os.FileInfo, error) {
+	if err := coordinatorUsagePlatformError(); err != nil {
+		return nil, err
+	}
 	info, err := os.Lstat(path)
 	if err != nil || !info.IsDir() || info.Mode().Perm() != 0700 || !coordinatorUsageOwned(info) || (expected != nil && !os.SameFile(expected, info)) {
 		return nil, coordinatorUsageFailure("unsafe_receipt_directory")
@@ -303,6 +309,9 @@ func coordinatorUsageEligibleRequests(run projectcoord.Run, now time.Time) []coo
 }
 
 func coordinatorUsageWriteEvidence(path string, data []byte, workspace string) error {
+	if err := coordinatorUsagePlatformError(); err != nil {
+		return err
+	}
 	file, err := os.CreateTemp(filepath.Dir(path), ".usage-evidence-*")
 	if err != nil {
 		return coordinatorUsageFailure("receipt_write_failed")
@@ -450,6 +459,9 @@ func (r *coordinatorUsageReconciler) queryAdapter(parent context.Context, reques
 // Private CLI mode. It performs no model calls; this independent helper keeps
 // the adapter deadline and lifecycle ownership when the service is SIGKILLed.
 func cmdCoordinatorUsageAdapterHelper(parent context.Context, args []string) error {
+	if err := coordinatorUsagePlatformError(); err != nil {
+		return err
+	}
 	if os.Getenv("METIS_COORDINATOR_USAGE_HELPER") != "1" || os.Getenv(coordinatorParentPIDEnv) == "" {
 		return coordinatorUsageFailure("helper_requires_parent_guard")
 	}

@@ -21,6 +21,7 @@ import (
 
 func coordinatorBillingFixture(t *testing.T, endpoint, provider, model string, withoutRemoteIDs ...bool) coordinatorUsageFixture {
 	t.Helper()
+	requireCoordinatorUsagePrivateFiles(t)
 	home, workspace := t.TempDir(), t.TempDir()
 	store := projectcoord.NewStore(filepath.Join(home, "store"))
 	run, err := store.Create(projectcoord.CreateInput{Workspace: workspace, Goal: "native bill recovery", Items: []projectcoord.WorkItemInput{{ID: "work", Subject: "Work", Prompt: "Do work"}}})
@@ -181,7 +182,10 @@ func TestCoordinatorNativeBillingCannotCrossEndpointScopeOrReadWorkspaceKey(t *t
 		t.Fatal(err)
 	}
 	config := coordinatorBillingWriteConfig(t, f, coordinatorBillingConfig{Provider: "openrouter", LedgerProvider: "openrouter", InferenceEndpoint: "https://openrouter.ai/api/v1/chat/completions", TokenFile: path})
-	r, _ := newCoordinatorUsageReconciler(f.store, f.workspace, f.run.ID, f.home, "", "", nil)
+	r, err := newCoordinatorUsageReconciler(f.store, f.workspace, f.run.ID, f.home, "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := r.configureBilling(config); err == nil {
 		t.Fatal("accepted model-writable billing secret")
 	}
@@ -242,6 +246,7 @@ func TestCoordinatorNativeCLIProxyGUISettlesTokensAndKeepsUnknownMoney(t *testin
 }
 
 func TestCoordinatorNativeBillingProjectsLateReceiptForArchivedJobRun(t *testing.T) {
+	requireCoordinatorUsagePrivateFiles(t)
 	job, store, run, item := newPersistentJobCLIFixture(t, 0)
 	requestID := strings.Repeat("a", 32)
 	_, err := store.BeginUsageRequest(run.Workspace, run.ID, projectcoord.BeginUsageRequestInput{ClientRequestID: requestID, ItemID: item.ID, Worker: item.Owner, ClaimToken: item.Lease.Token, Provider: "fixture", EndpointSHA256: strings.Repeat("b", 64), Model: "model", RequestSHA256: strings.Repeat("c", 64), Prices: projectcoord.UsagePriceSnapshot{Source: "fixture"}})
