@@ -94,7 +94,7 @@ func (l *Loop) consumeStreamWithRecovery(ctx context.Context, p llm.Provider, re
 // multiple copies of the same prompt.
 func (l *Loop) consumeStreamWithRecoveryUsage(ctx context.Context, p llm.Provider, req llm.Request, stream llm.StreamReader, out chan<- Event, session *transport.RecoverySession, accountUsage func(*usageTotals) error) (assistant []llm.ContentBlock, stop string, usage *usageTotals, err error) {
 	defer func() {
-		if err != nil && session != nil {
+		if err != nil && (session != nil || ctx.Err() != nil) {
 			// Keep only human-readable prose for terminal-failure auditing.
 			// Incomplete tool calls, signed/encrypted reasoning and remote
 			// response state must not poison a later resumed request.
@@ -112,15 +112,21 @@ func (l *Loop) consumeStreamWithRecoveryUsage(ctx context.Context, p llm.Provide
 		_ = stream.Close()
 		if accountUsage != nil && usage != nil && (err == nil || *usage != (usageTotals{})) {
 			if ledgerErr := accountUsage(usage); ledgerErr != nil {
-				if err == nil {
+				if err == nil && ctx.Err() == nil {
 					// A completed response cannot authorize tools if its accounting
 					// boundary failed. Preserve the previous success-path behavior.
 					return nil, stop, usage, ledgerErr
 				}
 				// A failed durable write is terminal. Keep both causes without
 				// exposing a pure provider error for an outer task retry to hide it.
-				return assistant, stop, usage, errors.Join(err, ledgerErr)
+				return assistant, stop, usage, errors.Join(err, ledgerErr, ctx.Err())
 			}
+		}
+		// EOF/message_stop can win the transport race with caller cancellation.
+		// Settle observed usage first, then reject that terminal before the loop
+		// can inject a rescue prompt, accept tool calls or claim completion.
+		if cancelErr := ctx.Err(); cancelErr != nil {
+			return assistant, stop, usage, errors.Join(err, cancelErr)
 		}
 		if err == nil || session == nil {
 			return assistant, stop, usage, err

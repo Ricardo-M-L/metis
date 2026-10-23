@@ -14,6 +14,8 @@ without Apple notarization.
 
 ### Fixed
 
+- Honor cancellation at the completed-stream boundary before empty-answer rescue
+  or tool dispatch, retaining observed usage and partial assistant text.
 - Treat stale handoff projections as superseded snapshots during service competition,
   while preserving monotonic business receipts and single-assignment admission.
 - Avoid redundant Windows taskkill after Git probes and supervised workers have
