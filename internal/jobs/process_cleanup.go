@@ -24,7 +24,14 @@ func (c *ProcessGroupCleaner) Kill() {
 	if c == nil || c.command == nil || c.command.Process == nil {
 		return
 	}
-	c.once.Do(func() { KillProcessGroup(c.command.Process) })
+	c.once.Do(func() {
+		KillProcessGroup(c.command.Process)
+		if runtime.GOOS == "windows" {
+			// taskkill may fail to start or hit its deadline. Preserve tree
+			// discovery first, then ensure Wait can still reap the leader.
+			_ = c.command.Process.Kill()
+		}
+	})
 }
 
 // AfterWait preserves Unix descendant cleanup after leader exit and handles
