@@ -8,13 +8,16 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/session"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 )
 
 // Use the real worker startup flags, durable header patches, runtime builder,
@@ -36,6 +39,7 @@ func TestDesktopWorkerStartupRestoresSessionEffortToPhysicalRequest(t *testing.T
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolateResumeRuntimeTest(t)
+			isolateDesktopWorkerRuntimeTrace(t)
 			t.Chdir(t.TempDir())
 			for key, value := range map[string]string{
 				"METIS_AUTO_MEMORY": "0", "METIS_CATALOG_DISABLE": "1", "METIS_NO_UPDATE_CHECK": "1",
@@ -136,5 +140,74 @@ func TestDesktopWorkerStartupRestoresSessionEffortToPhysicalRequest(t *testing.T
 				t.Fatal("worker loop sent no physical request")
 			}
 		})
+	}
+}
+
+// The process-wide store is shared by real runtimes. A test which installs a
+// replacement owns that replacement until its runtimes have finished cleanup.
+func isolateDesktopWorkerRuntimeTrace(t *testing.T) {
+	t.Helper()
+	previous := rtpkg.CurrentTraceAdapter()
+	t.Cleanup(func() {
+		if rtpkg.CurrentTraceAdapter() == previous {
+			return
+		}
+		rtpkg.FlushTrace()
+		if current := rtpkg.CurrentTraceStore(); current != nil {
+			if err := current.Close(); err != nil {
+				t.Errorf("close test-owned trace store: %v", err)
+			}
+		}
+		rtpkg.SetTraceAdapter(previous)
+		builtin.SetTraceStore(rtpkg.CurrentTraceStore())
+		if previous == nil {
+			agent.SetTraceHook(nil)
+		} else {
+			agent.SetTraceHook(previous.OnEvent)
+		}
+	})
+}
+
+func TestDesktopWorkerRuntimeTraceFixtureRestoresPreviousAdapter(t *testing.T) {
+	previous := rtpkg.CurrentTraceAdapter()
+	dir := t.TempDir()
+	// Also release an unfixed fixture on the red run, after recording its bad
+	// global state, so this regression cannot contaminate subsequent tests.
+	defer func() {
+		if rtpkg.CurrentTraceAdapter() != previous {
+			if current := rtpkg.CurrentTraceStore(); current != nil {
+				_ = current.Close()
+			}
+			rtpkg.SetTraceAdapter(previous)
+			builtin.SetTraceStore(rtpkg.CurrentTraceStore())
+			if previous == nil {
+				agent.SetTraceHook(nil)
+			} else {
+				agent.SetTraceHook(previous.OnEvent)
+			}
+		}
+	}()
+	t.Run("owned trace", func(t *testing.T) {
+		isolateDesktopWorkerRuntimeTrace(t)
+		adapter := rtpkg.InstallTrace(dir)
+		if adapter == nil {
+			t.Fatal("trace fixture could not initialize")
+		}
+		adapter.SetSession("trace-owned-session")
+		adapter.OnEvent(agent.Event{Kind: agent.EventTextDelta, TextDelta: "trace must be flushed and closed"})
+		adapter.OnEvent(agent.Event{Kind: agent.EventLoopDone})
+	})
+	if rtpkg.CurrentTraceAdapter() != previous {
+		t.Fatal("fixture retained its process-wide trace adapter after cleanup")
+	}
+	file := filepath.Join(dir, "trace-owned-session.jsonl")
+	data, err := os.ReadFile(file)
+	if err != nil || !strings.Contains(string(data), "trace must be flushed and closed") {
+		t.Fatalf("cleanup lost trace data: %v", err)
+	}
+	// Windows denies this immediately when a buffered writer still owns the
+	// file; deletion succeeds only after the test-owned store closes it.
+	if err := os.Remove(file); err != nil {
+		t.Fatalf("cleanup retained a trace file handle: %v", err)
 	}
 }

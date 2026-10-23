@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/update"
 )
@@ -82,34 +84,69 @@ func TestCmdUpdateDesktopManagedPathsBlockWithoutMarker(t *testing.T) {
 	if filepath.Ext(executable) == ".exe" {
 		name += ".exe"
 	}
+	// A hard link to this running test image cannot be unlinked on Windows.
+	// Copy it first and let a short-lived helper own the mapped image; this
+	// parent owns both aliases and removes them after the helper exits.
+	image, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(root, "desktop-update-helper.exe")
+	if err := os.WriteFile(helper, image, 0755); err != nil {
+		t.Fatal(err)
+	}
 	for _, path := range []string{
 		filepath.Join(root, "Metis.app", "Contents", "Resources", "bin", "metis"),
 		filepath.Join(cache, "metis-desktop", "runtime", strings.Repeat("d", 64), name),
 	} {
 		t.Run(filepath.Base(filepath.Dir(path)), func(t *testing.T) {
-			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-				t.Fatal(err)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, helper, "-test.run=^TestCmdUpdateDesktopManagedAliasHelperProcess$", "-test.count=1")
+			command.Env = append(os.Environ(), "METIS_UPDATE_DESKTOP_ALIAS_TEST="+path)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("Desktop update guard helper: %v: %s", err, output)
 			}
-			if err := os.Link(executable, path); err != nil {
-				if err := os.Symlink(executable, path); err != nil {
-					t.Skipf("cannot create verified executable alias: %v", err)
-				}
-			}
-			oldArg, oldTransport := os.Args[0], http.DefaultTransport
-			os.Args[0] = path
-			calls := 0
-			http.DefaultTransport = updateChannelTransport(func(r *http.Request) (*http.Response, error) {
-				calls++
-				return nil, fmt.Errorf("blocked unexpected remote request")
-			})
-			t.Cleanup(func() { os.Args[0], http.DefaultTransport = oldArg, oldTransport })
-			if err := cmdUpdate(context.Background(), []string{"--force"}); !errors.Is(err, update.ErrDesktopManaged) || calls != 0 {
-				t.Fatalf("manual Desktop path bypassed guard without marker: err=%v requests=%d", err, calls)
-			}
-			result, err := tryAutoInstall(context.Background(), "v99.0.0")
-			if !errors.Is(err, update.ErrDesktopManaged) || calls != 0 || result.installed || result.notice != "" {
-				t.Fatalf("auto Desktop path bypassed guard without marker: result=%+v err=%v requests=%d", result, err, calls)
+			// This is also a native Windows image-handle regression: do not
+			// defer deletion or retry it while a process still owns the alias.
+			if err := os.Remove(path); err != nil {
+				t.Fatalf("helper retained executable alias: %v", err)
 			}
 		})
+	}
+	if err := os.Remove(helper); err != nil {
+		t.Fatalf("helper executable remains mapped after Wait: %v", err)
+	}
+}
+
+func TestCmdUpdateDesktopManagedAliasHelperProcess(t *testing.T) {
+	path := os.Getenv("METIS_UPDATE_DESKTOP_ALIAS_TEST")
+	if path == "" {
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(executable, path); err != nil {
+		t.Fatalf("create verified alias of owned helper image: %v", err)
+	}
+	oldArg, oldTransport := os.Args[0], http.DefaultTransport
+	os.Args[0] = path
+	calls := 0
+	http.DefaultTransport = updateChannelTransport(func(r *http.Request) (*http.Response, error) {
+		calls++
+		return nil, fmt.Errorf("blocked unexpected remote request")
+	})
+	t.Cleanup(func() { os.Args[0], http.DefaultTransport = oldArg, oldTransport })
+	if err := cmdUpdate(context.Background(), []string{"--force"}); !errors.Is(err, update.ErrDesktopManaged) || calls != 0 {
+		t.Fatalf("manual Desktop path bypassed guard without marker: err=%v requests=%d", err, calls)
+	}
+	result, err := tryAutoInstall(context.Background(), "v99.0.0")
+	if !errors.Is(err, update.ErrDesktopManaged) || calls != 0 || result.installed || result.notice != "" {
+		t.Fatalf("auto Desktop path bypassed guard without marker: result=%+v err=%v requests=%d", result, err, calls)
 	}
 }
