@@ -85,8 +85,8 @@ func (EnterPlanMode) Description() string {
 		"gate), while edits and commands that change state are blocked. " +
 		"Use this when the user asked for a proposal before action. When " +
 		"the plan is complete, call ExitPlanMode with the final markdown. " +
-		"Interactive modes present an approval prompt; bypassPermissions and " +
-		"fullAccess use their unattended presets and continue automatically. For " +
+		"Leaving plan mode always requires explicit user approval, including " +
+		"sessions previously using bypassPermissions or fullAccess. For " +
 		"requirements clarification during interactive planning, use AskUser."
 }
 
@@ -174,9 +174,8 @@ func (e EnterPlanMode) Execute(ctx context.Context, _ map[string]any) (*tools.Re
 // flips the loop out of plan mode so subsequent tool calls execute
 // normally.
 //
-// Interactive production paths block on user approval before changing
-// permission mode. A bypass-origin plan uses its unattended preset and returns
-// directly to bypass; rejection and other headless execution remain in plan.
+// Every permission lineage blocks on explicit user approval before changing
+// permission mode. Rejection, cancellation, and headless execution remain in plan.
 type ExitPlanMode struct {
 	tools.BaseTool
 	gate *permission.Gate // optional; production wires via NewExitPlanModeWithGate
@@ -197,10 +196,10 @@ func (ExitPlanMode) Description() string {
 	return "Leave plan mode and surface the final plan to the user. " +
 		"Required argument `plan` is the markdown body of your " +
 		"proposed work — bullet points, file paths, exact commands, " +
-		"expected outcomes. Interactive modes block until the user " +
-		"approves implementation or chooses to keep planning; a " +
-		"bypassPermissions- or fullAccess-origin plan is auto-approved by its preset " +
-		"and continues without an interaction.\n\n" +
+		"expected outcomes. All modes block until the user explicitly " +
+		"approves implementation or chooses to keep planning. Previous " +
+		"bypassPermissions or fullAccess permissions never approve a plan " +
+		"automatically. Without an approval UI, remain in plan mode.\n\n" +
 		"Important: this is the right tool when you want to PROPOSE " +
 		"a multi-step plan and request approval. It is NOT the right tool when you " +
 		"need a structured pick-one-of-N answer — use `AskUser` for " +
@@ -216,7 +215,7 @@ func (ExitPlanMode) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"plan": map[string]any{
 				"type":        "string",
-				"description": "Final plan markdown — what you'll do, in what order, with what side effects. Shown for review in interactive modes; recorded and auto-accepted under the bypassPermissions and fullAccess presets.",
+				"description": "Final plan markdown — what you'll do, in what order, with what side effects. Always shown for explicit user approval before implementation, regardless of prior permission mode.",
 			},
 		},
 	}
@@ -279,20 +278,30 @@ func (e ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Re
 			IsError: true,
 		}, nil
 	}
-	if out := agent.EventOutFromContext(ctx); out != nil {
-		out <- agent.Event{
-			Kind: agent.EventInfo,
-			Info: "[plan proposal]\n" + plan,
+	cancelled := func() (*tools.Result, error) {
+		return &tools.Result{
+			Output:  "ExitPlanMode: approval cancelled; remaining in plan mode",
+			IsError: true,
+		}, nil
+	}
+	if ctx.Err() != nil {
+		return cancelled()
+	}
+	out := agent.EventOutFromContext(ctx)
+	if out != nil {
+		select {
+		case out <- agent.Event{Kind: agent.EventInfo, Info: "[plan proposal]\n" + plan}:
+		case <-ctx.Done():
+			return cancelled()
 		}
 	}
-	// Lightweight embedders/tests that construct the tool without a Gate have
-	// no permission mode to restore and historically used the controller-only
-	// toggle. Preserve that fallback; production always uses WithGate and takes
-	// the blocking approval path below.
+	// A controller-only toggle cannot enforce an approved permission
+	// transition. Fail closed rather than silently releasing its plan gate.
 	if e.gate == nil {
-		ctrl.SetPlanMode(false)
-		ctrl.SetPrePlanMode("")
-		return &tools.Result{Output: "Plan surfaced for review. Plan mode disabled by the controller-only fallback."}, nil
+		return &tools.Result{
+			Output:  "ExitPlanMode: no permission gate is available to approve this plan; remaining in plan mode",
+			IsError: true,
+		}, nil
 	}
 	restore, active := snapshotPlanRestore(e.gate, ctrl)
 	if !active {
@@ -303,26 +312,9 @@ func (e ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Re
 			IsError: true,
 		}, nil
 	}
-	// bypassPermissions is explicitly unattended. EnterPlanMode is allowed to
-	// organize a complex task, but ExitPlanMode must not turn that session back
-	// into an approval workflow. Use the preset policy: approve the plan and
-	// restore bypass without emitting EventAskUser.
-	if restore == permission.ModeBypassPermissions {
-		if err := restorePlanMode(e.gate, ctrl, permission.ModeBypassPermissions); err != nil {
-			return &tools.Result{Output: "ExitPlanMode: " + err.Error(), IsError: true}, nil
-		}
-		return &tools.Result{Output: "Plan accepted by the bypassPermissions unattended policy. Continue implementation in bypassPermissions mode."}, nil
-	}
-	if restore == permission.ModeFullAccess {
-		if err := restorePlanMode(e.gate, ctrl, permission.ModeFullAccess); err != nil {
-			return &tools.Result{Output: "ExitPlanMode: " + err.Error(), IsError: true}, nil
-		}
-		return &tools.Result{Output: "Plan accepted by the fullAccess unattended policy. Continue implementation in fullAccess mode."}, nil
-	}
-
-	// Interactive modes keep the blocking approval boundary. Headless callers
-	// cannot approve, so they remain in plan mode with a structured error.
-	out := agent.EventOutFromContext(ctx)
+	// Plan mode is an explicit read-only boundary, even when entered from an
+	// unattended permission mode. Prior privileges are only a possible target
+	// for a new user decision, never evidence that this plan was approved.
 	if out == nil {
 		return &tools.Result{
 			Output:  "ExitPlanMode: no interactive UI is available to approve this plan; remaining in plan mode",
@@ -331,22 +323,37 @@ func (e ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Re
 	}
 	primaryLabel := "Yes, auto-accept edits"
 	primaryMode := permission.ModeAcceptEdits
-	if restore == permission.ModeBypassPermissions {
+	switch restore {
+	case permission.ModeBypassPermissions:
 		primaryLabel = "Yes, bypass permissions"
 		primaryMode = permission.ModeBypassPermissions
+	case permission.ModeFullAccess:
+		primaryLabel = "Yes, full access (no sandbox)"
+		primaryMode = permission.ModeFullAccess
 	}
 	const manualLabel = "Yes, manually approve edits"
 	const rejectLabel = "No, keep planning"
 	reply := make(chan string, 1)
-	out <- agent.Event{
+	select {
+	case out <- agent.Event{
 		Kind:            agent.EventAskUser,
 		AskUserQuestion: "Ready to implement this plan?",
 		AskUserOptions:  []string{primaryLabel, manualLabel, rejectLabel},
 		AskUserReply:    reply,
+	}:
+	case <-ctx.Done():
+		return cancelled()
 	}
 
 	select {
-	case answer := <-reply:
+	case answer, ok := <-reply:
+		// A queued reply must not revive an already cancelled request.
+		if ctx.Err() != nil {
+			return cancelled()
+		}
+		if !ok {
+			return &tools.Result{Output: "ExitPlanMode: approval dismissed; remaining in plan mode", IsError: true}, nil
+		}
 		switch strings.TrimSpace(answer) {
 		case primaryLabel:
 			if err := restorePlanMode(e.gate, ctrl, primaryMode); err != nil {
@@ -362,9 +369,6 @@ func (e ExitPlanMode) Execute(ctx context.Context, in map[string]any) (*tools.Re
 			return &tools.Result{Output: "User chose to keep planning. Remain in plan mode and revise the proposal before calling ExitPlanMode again."}, nil
 		}
 	case <-ctx.Done():
-		return &tools.Result{
-			Output:  "ExitPlanMode: approval cancelled; remaining in plan mode",
-			IsError: true,
-		}, nil
+		return cancelled()
 	}
 }

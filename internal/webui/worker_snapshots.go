@@ -24,6 +24,10 @@ func (s *Server) setWorkerSnapshot(sessionID string, status desktopipc.Status) {
 	}
 	s.workerTurnsMu.Lock()
 	defer s.workerTurnsMu.Unlock()
+	s.setWorkerSnapshotLocked(sessionID, status)
+}
+
+func (s *Server) setWorkerSnapshotLocked(sessionID string, status desktopipc.Status) {
 	if s.workerSnapshots == nil {
 		s.workerSnapshots = make(map[string]isolatedWorkerSnapshot)
 	}

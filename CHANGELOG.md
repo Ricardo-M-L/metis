@@ -7,6 +7,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+
+## [0.4.96] - 2026-10-23
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed
+without Apple notarization.
+
+### Fixed
+
+- Require explicit user approval before leaving plan mode, including sessions
+  previously using full access or bypass permissions. Rejection, dismissal,
+  cancellation and missing approval UI keep implementation tools blocked.
+- Persist worker permission changes before using them, roll back failed durable
+  writes and prevent stale workers or parent session saves from overwriting the
+  current permission state.
+- Synchronize Desktop permissions with the selected session and its active
+  worker. Reject submissions with a stale displayed mode and keep sending
+  disabled until the authoritative mode is available.
+- Match Glob and Grep path filters relative to the search root, including
+  directory segments, doublestar recursion, brace alternatives and character
+  classes; report malformed patterns instead of returning false empty results.
+- Guide missing-directory recovery toward an authorized existing ancestor and
+  actual discovered paths, and show clear directory-listing and error summaries
+  while preserving full diagnostic details.
+
+
 ## [0.4.95] - 2026-10-23
 
 CLI-only stable release. Desktop binaries and the shared latest release remain

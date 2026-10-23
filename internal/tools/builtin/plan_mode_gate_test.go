@@ -19,9 +19,14 @@ import (
 func withPlanApproval(ctx context.Context, answer string) context.Context {
 	events := make(chan agent.Event, 4)
 	go func() {
-		for ev := range events {
-			if ev.Kind == agent.EventAskUser && ev.AskUserReply != nil {
-				ev.AskUserReply <- answer
+		for {
+			select {
+			case ev := <-events:
+				if ev.Kind == agent.EventAskUser && ev.AskUserReply != nil {
+					ev.AskUserReply <- answer
+					return
+				}
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -131,48 +136,6 @@ func TestExitPlanMode_WithGate_RestoresPrePlanMode(t *testing.T) {
 	}
 	if ctrl.PrePlanMode() != "" {
 		t.Errorf("PrePlanMode should be cleared after restore; got %q", ctrl.PrePlanMode())
-	}
-}
-
-func TestExitPlanMode_BypassPrePlanModeAutoApprovesWithoutUI(t *testing.T) {
-	g := permission.New(permission.ModePlan)
-	tool := NewExitPlanModeWithGate(g)
-	ctrl := &stubPlanController{pre: string(permission.ModeBypassPermissions)}
-	ctx := agent.WithPlanController(context.Background(), ctrl)
-
-	res, err := tool.Execute(ctx, map[string]any{"plan": "step 1: do X"})
-	if err != nil {
-		t.Fatalf("Execute returned error: %v", err)
-	}
-	if res == nil || res.IsError {
-		t.Fatalf("bypass plan exit should auto-approve, got %+v", res)
-	}
-	if g.Mode() != permission.ModeBypassPermissions {
-		t.Fatalf("Gate mode = %q, want bypassPermissions", g.Mode())
-	}
-	if ctrl.PrePlanMode() != "" {
-		t.Fatalf("pre-plan snapshot = %q, want cleared", ctrl.PrePlanMode())
-	}
-}
-
-func TestExitPlanMode_FullAccessPrePlanModeAutoApprovesWithoutUI(t *testing.T) {
-	g := permission.New(permission.ModePlan)
-	tool := NewExitPlanModeWithGate(g)
-	ctrl := &stubPlanController{pre: string(permission.ModeFullAccess)}
-	ctx := agent.WithPlanController(context.Background(), ctrl)
-
-	res, err := tool.Execute(ctx, map[string]any{"plan": "step 1: do X"})
-	if err != nil {
-		t.Fatalf("Execute returned error: %v", err)
-	}
-	if res == nil || res.IsError {
-		t.Fatalf("fullAccess plan exit should auto-approve, got %+v", res)
-	}
-	if g.Mode() != permission.ModeFullAccess {
-		t.Fatalf("Gate mode = %q, want fullAccess", g.Mode())
-	}
-	if ctrl.PrePlanMode() != "" {
-		t.Fatalf("pre-plan snapshot = %q, want cleared", ctrl.PrePlanMode())
 	}
 }
 

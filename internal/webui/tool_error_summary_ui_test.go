@@ -22,7 +22,7 @@ func TestToolErrorSummaryPreservesEvidence(t *testing.T) {
 	if !ok {
 		t.Fatal("missing tool browser fixture boundary")
 	}
-	for _, scenario := range []string{"unattended", "webfetch", "read_missing", "history", "classification_guards"} {
+	for _, scenario := range []string{"unattended", "webfetch", "read_missing", "ls_directory", "ls_errors", "ls_history", "history", "classification_guards"} {
 		t.Run(scenario, func(t *testing.T) {
 			cmd := exec.Command(node, "-e", fixture+toolErrorSummaryBrowserScript, scenario)
 			cmd.Stdin = bytes.NewReader(source)
@@ -110,6 +110,70 @@ if (scenario === 'unattended') {
   const row = area.querySelector('.call-row');
   assert.equal(row.querySelector('.tc-summary').textContent, '文件不存在，查看详情');
   assertFailureEvidence(row, missingFile);
+} else if (scenario === 'ls_directory') {
+  const path = '/project/native/system/src';
+  const input = JSON.stringify({path});
+  const row = start('list-directory', 'LS', input);
+  assert.equal(row.querySelector('.tc-title').textContent, '列出目录');
+  assert.equal(row.querySelector('.tc-summary').textContent, path);
+  assert.equal(row.dataset.variant, 'read', 'LS uses the directory icon rather than a generic tool icon');
+  context.handleToolResult({tool:'LS', id:'list-directory', output:'entry/\npackage.json'});
+  assert.equal(row.dataset.state, 'ok');
+  assert.equal(row.querySelector('.tc-summary').textContent, path);
+  context.lang = 'en'; context.refreshActivityGroupLanguage();
+  assert.equal(row.querySelector('.tc-title').textContent, 'List directory');
+  assert.match(row.querySelector('.tc-disclosure').getAttribute('aria-label'), /List directory.*native\/system\/src.*Completed/);
+} else if (scenario === 'ls_errors') {
+  const path = '/project/native/system/src';
+  for (const [id, output, zh, en] of [
+    ['missing-directory', 'open ' + path + ': no such file or directory', '目录不存在', 'Directory not found'],
+    ['missing-directory-semantic', 'Directory not found: ' + path + '.\nNearest existing parent: /project/native/system\nUse LS on that parent first.\nOriginal error: open ' + path + ': no such file or directory', '目录不存在', 'Directory not found'],
+    ['file-directory', 'open ' + path + ': not a directory', '该路径不是目录', 'Path is not a directory'],
+    ['file-directory-semantic', path + ' is a regular file, not a directory. Use Read to view its contents, or pass the parent directory to LS.', '该路径不是目录', 'Path is not a directory'],
+    ['denied-directory', 'open ' + path + ': permission denied', '无权读取目录', 'Cannot access directory'],
+    ['denied-directory-windows', 'open C:\\project\\src: Access is denied.', '无权读取目录', 'Cannot access directory'],
+    ['missing-directory-windows', 'open C:\\project\\src: The system cannot find the path specified.', '目录不存在', 'Directory not found'],
+  ]) {
+    const input = JSON.stringify({path});
+    const row = start(id, 'LS', input);
+    context.handleToolResult({tool:'LS', id, isError:true, output});
+    assert.equal(row.querySelector('.tc-title').textContent, '列出目录');
+    assert.equal(row.querySelector('.tc-summary').textContent, zh + ' · ' + path);
+    assert.doesNotMatch(row.querySelector('.tc-summary').textContent, /^open /);
+    context.lang = 'en'; context.refreshActivityGroupLanguage();
+    assert.equal(row.querySelector('.tc-title').textContent, 'List directory');
+    assert.equal(row.querySelector('.tc-summary').textContent, en + ' · ' + path);
+    assertFailureEvidence(row, output, input);
+    context.lang = 'zh'; context.refreshActivityGroupLanguage();
+  }
+  const longPath = '/Users/a/Documents/' + 'long-project-name/'.repeat(8) + 'native/system/src';
+  const row = start('long-missing-directory', 'LS', JSON.stringify({path:longPath}));
+  const output = 'open ' + longPath + ': no such file or directory';
+  context.handleToolResult({tool:'LS', id:'long-missing-directory', isError:true, output});
+  const summary = row.querySelector('.tc-summary').textContent;
+  assert(summary.length < 110, 'long absolute paths stay compact in the error summary');
+  assert(summary.endsWith('native/system/src'), 'the useful path tail remains visible');
+  assertFailureEvidence(row, output, JSON.stringify({path:longPath}));
+  context.handleToolResult({tool:'LS', id:'missing-before-start', isError:true, output:'open /missing: no such file or directory'});
+  const beforeStart = area.querySelectorAll('.call-row').at(-1);
+  assert.equal(beforeStart.querySelector('.tc-title').textContent, '列出目录');
+  assert.equal(beforeStart.querySelector('.tc-summary').textContent, '目录不存在，查看详情');
+} else if (scenario === 'ls_history') {
+  const path = '/project/native/system/src';
+  const output = 'open ' + path + ': no such file or directory';
+  context.renderHistoryMessages([
+    {role:'user', content:[{type:'text', text:'List the directory'}]},
+    {role:'assistant', content:[{type:'tool_use', name:'LS', tool_use_id:'old-ls', input:{path}}]},
+    {role:'user', content:[{type:'tool_result', tool_use_id:'old-ls', is_error:true, content:output}]},
+  ]);
+  flushFrames();
+  const row = area.querySelector('.call-row');
+  assert.equal(row.querySelector('.tc-title').textContent, '列出目录');
+  assert.equal(row.querySelector('.tc-summary').textContent, '目录不存在 · ' + path);
+  assertFailureEvidence(row, output);
+  context.lang = 'en'; context.refreshActivityGroupLanguage();
+  assert.equal(row.querySelector('.tc-title').textContent, 'List directory');
+  assert.equal(row.querySelector('.tc-summary').textContent, 'Directory not found · ' + path);
 } else if (scenario === 'history') {
   context.renderHistoryMessages([
     {role:'user', content:[{type:'text', text:'Read and save the report'}]},
@@ -137,12 +201,28 @@ if (scenario === 'unattended') {
   assert.equal(readOk.dataset.state, 'ok', 'success remains success even when file content quotes a missing-file diagnostic');
   assert.equal(readOk.querySelector('.tc-summary').textContent, 'diagnostic-guide.md');
   assert.equal(context.toolDetails[rowKey(readOk)].output, missingFile);
+  const lsOk = start('successful-ls', 'LS', JSON.stringify({path:'/project'}));
+  context.handleToolResult({tool:'LS', id:'successful-ls', output:'no such file or directory\npermission denied'});
+  context.refreshActivityGroupLanguage();
+  assert.equal(lsOk.dataset.state, 'ok', 'directory entries that look like errors are still successful output');
+  assert.equal(lsOk.querySelector('.tc-summary').textContent, '/project');
+  const newlinePath = '/project/: permission denied\nfilename';
+  const newlineInput = JSON.stringify({path:newlinePath});
+  const newlineOutput = 'open ' + newlinePath + ': too many open files';
+  const newlineRow = start('newline-in-directory-path', 'LS', newlineInput);
+  context.handleToolResult({tool:'LS', id:'newline-in-directory-path', isError:true, output:newlineOutput});
+  assert.equal(newlineRow.querySelector('.tc-summary').textContent, newlineOutput.split('\n')[0],
+    'a diagnostic-looking first line inside a Unix filename is not the OS error suffix');
+  assertFailureEvidence(newlineRow, newlineOutput, newlineInput);
   for (const [id, tool, output] of [
     ['command-http', 'Bash', fetch403],
     ['command-missing', 'Bash', missingFile],
     ['read-permission', 'Read', 'open /var/tmp/no such file or directory: permission denied'],
     ['nested-http', 'WebFetch', 'Proxy connection failed\nHTTP 404 Not Found'],
     ['different-policy', 'Write', 'denied by unattended admission policy: dangerous_pattern:rm'],
+    ['unknown-list-error', 'LS', 'Filesystem temporarily unavailable; retry later'],
+    ['path-named-missing', 'LS', 'open /project/no such file or directory: too many open files'],
+    ['path-named-not-directory', 'LS', 'open /project/name is a regular file, not a directory.txt: too many open files'],
   ]) {
     const row = start(id, tool, '{}');
     context.handleToolResult({tool, id, isError:true, output});

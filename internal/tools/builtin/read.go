@@ -55,6 +55,8 @@ When NOT to use Read:
   - Re-reading a file you just edited in this turn — the state tracker already knows the current content; another Read is wasted tokens.
   - Reading binary files (images, compiled binaries). Read will return raw bytes which the model can't interpret.
 
+For an unfamiliar repository, discover the exact file path with Glob or LS before reading it. Do not guess a src layout or filename from a package name. A user-supplied path or a path already returned by a tool can be read directly.
+
 Hard requirements:
   - ` + "`path`" + ` MUST be absolute. Relative paths are rejected.
   - File size cap is 256 MiB; oversized files return an error directing you to ` + "`Bash head/tail`" + ` for a peek.

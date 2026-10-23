@@ -1,6 +1,7 @@
 // Package desktopipc defines the private, versioned Desktop worker protocol.
-// It carries presentation data only; executable permission arguments and Go
-// reply channels never cross the process boundary.
+// It carries presentation data and complete, durably committed root permission
+// snapshots. Executable permission arguments and Go reply channels never cross
+// the process boundary; status frames cannot authorize a tool invocation.
 package desktopipc
 
 import (
@@ -226,6 +227,9 @@ func validate(message Message) error {
 	case TypeStatus:
 		if message.Status == nil || message.Event != nil || message.ID != "" {
 			return errors.New("invalid desktop worker status")
+		}
+		if message.Status.Permission != nil && !message.Status.Permission.Valid() {
+			return errors.New("invalid desktop worker permission state")
 		}
 	case TypeReply:
 		if message.ID == "" || message.Event != nil || message.Status != nil {

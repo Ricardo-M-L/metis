@@ -89,9 +89,9 @@ clearer state tracking and safer inputs:
 | Fetch a known complete URL as static HTML, text, JSON, or another response | `WebFetch` |
 | Render a known complete URL only when `WebFetch` is insufficient because the page requires JavaScript | `WebBrowse` |
 
-`LS` accepts directories and `Read` accepts files. If a tool reports that the
-path type is wrong, switch to the indicated tool rather than retrying the same
-call. Use `Glob` or a safe filesystem query when the type is unknown.
+`LS` lists directories; `Read` reads files. Discover unknown paths with `Glob`
+from a confirmed root or `LS` on a known parent; use exact returned names.
+After a missing/type error, follow its hint, not the same call.
 
 Reserve shell commands for work that genuinely needs a shell. Do not use shell
 output commands to communicate with the user, and do not use fragile shell

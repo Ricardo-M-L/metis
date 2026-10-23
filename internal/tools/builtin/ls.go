@@ -36,7 +36,7 @@ func (l LS) SandboxManager() *sandbox.Manager { return l.sandbox }
 
 func (LS) Name() string { return "LS" }
 func (LS) Description() string {
-	return "List directory entries. Pass an absolute path (e.g. /Users/me/proj); relative paths are resolved against the current working directory. Skips dot-dirs unless include_hidden=true."
+	return "List directory entries. Pass an absolute path (e.g. /Users/me/proj); relative paths are resolved against the current working directory. Discover unfamiliar layouts by listing a confirmed parent or using Glob; do not guess a src directory. If a directory is missing, use the recovery hint to discover its actual location. Skips dot-dirs unless include_hidden=true."
 }
 func (LS) InputSchema() map[string]any {
 	return map[string]any{
@@ -99,6 +99,13 @@ func (l LS) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 
 	entries, err := os.ReadDir(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			output := fmt.Sprintf("Directory not found: %s\nUse LS on a confirmed existing ancestor or Glob with a known existing root to discover the actual path; do not retry the same missing directory.", path)
+			if parent := l.discoveryParent(ctx, path); parent != "" {
+				output += fmt.Sprintf("\nNearest existing directory: %s\nList it with LS({\"path\":%q}), then use the exact returned names.", parent, parent)
+			}
+			return &tools.Result{Output: output + "\nDetails: " + err.Error(), IsError: true}, nil
+		}
 		// Crush-style typed-error rescue: when path is a regular
 		// file the syscall message is just "not a directory" and the
 		// model loops re-trying LS. Stat once so we can hand back
@@ -162,4 +169,36 @@ func (l LS) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 		return &tools.Result{Output: "(empty)"}, nil
 	}
 	return &tools.Result{Output: b.String()}, nil
+}
+
+// discoveryParent only probes authorized ancestors for a recovery hint. It does
+// not list entries, follow a guessed sibling, or execute a replacement request.
+func (l LS) discoveryParent(ctx context.Context, path string) string {
+	parent := filepath.Dir(path)
+	for range 16 {
+		if ctx.Err() != nil || parent == path {
+			return ""
+		}
+		if l.gate != nil {
+			decision, _ := l.gate.CheckPath(ctx, "LS", parent, parent)
+			if decision != permission.DecisionAllow {
+				return ""
+			}
+		}
+		if ctx.Err() != nil {
+			return ""
+		}
+		info, err := os.Stat(parent)
+		if err == nil {
+			if info.IsDir() {
+				return parent
+			}
+			return ""
+		}
+		if !os.IsNotExist(err) {
+			return ""
+		}
+		path, parent = parent, filepath.Dir(parent)
+	}
+	return ""
 }

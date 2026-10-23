@@ -357,6 +357,10 @@ func readIsolatedWorkerOutput(ctx context.Context, reader io.Reader, replies *de
 			continue
 		}
 		if message.Type == desktopipc.TypeStatus {
+			if p := message.Status.Permission; p != nil && p.SessionID != request.SessionID {
+				result.err = errors.New("desktop worker permission state belongs to another session")
+				return result
+			}
 			if request.OnStatus != nil {
 				request.OnStatus(*message.Status)
 			}

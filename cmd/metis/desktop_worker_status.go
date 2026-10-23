@@ -18,12 +18,15 @@ const desktopWorkerStatusTextLimit = 16_000
 // startStatus captures stable registry handles before runtime cleanup clears
 // them. The returned join must run after Cleanup so its last frame contains
 // the reaped child status, including agents removed from the live roster.
-func (b *desktopWorkerBridge) startStatus(roster *agent.Roster, registry *jobs.Registry, loop *agent.Loop) func(func()) {
+func (b *desktopWorkerBridge) startStatus(roster *agent.Roster, registry *jobs.Registry, loop *agent.Loop, permissionSnapshot ...func() *desktopipc.PermissionState) func(func()) {
 	stop, done := make(chan struct{}), make(chan struct{})
 	flush := make(chan chan struct{})
 	go func() {
 		defer close(done)
 		sampler := desktopWorkerStatusSampler{roster: roster, jobs: registry, loop: loop, known: make(map[string]*agent.Teammate)}
+		if len(permissionSnapshot) > 0 {
+			sampler.permissionSnapshot = permissionSnapshot[0]
+		}
 		var previous *desktopipc.Status
 		emit := func(final bool) {
 			status := sampler.snapshot(final)
@@ -70,11 +73,15 @@ type desktopWorkerStatusSampler struct {
 	known  map[string]*agent.Teammate
 	// The final IPC frame follows runtime cleanup. Keep the last reading
 	// captured before cleanup rather than inventing an empty context.
-	lastContext *desktopipc.ContextPressure
+	lastContext        *desktopipc.ContextPressure
+	permissionSnapshot func() *desktopipc.PermissionState
 }
 
 func (s *desktopWorkerStatusSampler) snapshot(final bool) desktopipc.Status {
 	status := desktopipc.Status{Agents: make([]desktopipc.Subagent, 0), Jobs: make([]desktopipc.Job, 0)}
+	if s.permissionSnapshot != nil {
+		status.Permission = s.permissionSnapshot()
+	}
 	if !final && s.loop != nil {
 		s.loop.TrySyncContextCapabilities()
 		usage := s.loop.ContextUsageSnapshot()

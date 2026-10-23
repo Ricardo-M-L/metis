@@ -1664,6 +1664,8 @@ async function resumeSession(id) {
     if (data.session && data.session.id === id) mergeServerSessionMetadata(data.session);
     if (id !== currentSessionId && typeof detachRunningTurnView === 'function') detachRunningTurnView();
     currentSessionId = id;
+    if (typeof invalidatePermissionMode === 'function') invalidatePermissionMode();
+    if (typeof applyStatusPermissionSnapshot === 'function') applyStatusPermissionSnapshot(data, id);
     if (typeof applyResumeSnapshot === 'function') applyResumeSnapshot(data, id);
     if (typeof restoreComposerDraftForView === 'function') restoreComposerDraftForView();
     if (typeof subAgentDetailState !== 'undefined' && subAgentDetailState.agentId &&

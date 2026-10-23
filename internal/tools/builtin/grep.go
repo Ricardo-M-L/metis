@@ -240,6 +240,14 @@ func (g Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		offset = 0
 	}
 	globPat, _ := in["glob"].(string)
+	var fileMatcher globMatcher
+	if globPat != "" {
+		var matchErr error
+		fileMatcher, matchErr = newGlobMatcher(globPat)
+		if matchErr != nil {
+			return &tools.Result{Output: "Grep: invalid pattern in glob filter: " + matchErr.Error(), IsError: true}, nil
+		}
+	}
 
 	re, err := regexp.Compile(patStr)
 	if err != nil {
@@ -370,8 +378,10 @@ func (g Grep) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 			return nil
 		}
 		if globPat != "" {
-			ok, _ := doublestarMatch(globPat, path)
-			if !ok {
+			// Match the actual walk candidate relative to the approved search
+			// root, rather than its logical (possibly absolute) display path.
+			absolutePath, absErr := filepath.Abs(actualPath)
+			if absErr != nil || !fileMatcher.matches(relPath, absolutePath) {
 				return nil
 			}
 		}

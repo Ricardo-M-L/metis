@@ -483,8 +483,11 @@ type runtime struct {
 	// already spawned without a sandbox cannot be made safe retroactively and
 	// therefore must be stopped. Kept separate from Gate's own lock so the
 	// listener never reaches back into Gate while holding runtime state.
-	permissionModeMu sync.Mutex
-	permissionMode   permission.Mode
+	permissionModeMu            sync.Mutex
+	permissionMode              permission.Mode
+	permissionCheckpointMu      sync.RWMutex
+	permissionCheckpoint        func(permission.Mode, string) error
+	permissionCheckpointFailure func()
 	// mcpServers collects handles to live MCP server subprocesses for
 	// Cleanup. Written from the background-launch goroutine kicked off
 	// in setupRuntime when phase-2 async MCP is enabled, hence the
@@ -2615,12 +2618,24 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 	if err != nil {
 		return err
 	}
+	var permissionCheckpoint func() error
 	if worker != nil {
+		workerPermission, err := bindDesktopWorkerPermission(rt, worker)
+		if err != nil {
+			rt.Cleanup()
+			return err
+		}
+		permissionCheckpoint = func() error { return workerPermission.checkpoint(rt) }
+		defer func() {
+			rt.permissionCheckpointMu.Lock()
+			rt.permissionCheckpoint, rt.permissionCheckpointFailure = nil, nil
+			rt.permissionCheckpointMu.Unlock()
+		}()
 		worker.setSubAgentRoster(rt.subAgentRoster)
 		worker.setSteerHandler(func(input string) bool {
 			return rt.loop.SteerInjectWithAccepted(input, func() { rtpkg.RecordUserMessage(rt.sessionID, "[steer] "+input) })
 		})
-		stopStatus := worker.startStatus(rt.subAgentRoster, rt.loop.Jobs, rt.loop)
+		stopStatus := worker.startStatus(rt.subAgentRoster, rt.loop.Jobs, rt.loop, workerPermission.snapshot)
 		defer stopStatus(rt.Cleanup)
 	} else {
 		defer rt.Cleanup()
@@ -2710,6 +2725,7 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 	} else {
 		checkpoint = newHeadlessCheckpoint(rt.loop, rt.store, rt.sessionID)
 	}
+	checkpoint.permissionCheckpoint = permissionCheckpoint
 	// Flush once more after the producer has joined on every return path,
 	// including schema retries and errors. The same cursor is used by Run's
 	// synchronous checkpoints and compaction, so this final save is idempotent.
@@ -4888,6 +4904,7 @@ func installRuntimePermissionListener(rt *runtime) {
 				rt.gate.SetMode(permission.ModeDontAsk)
 			}
 		}
+		rt.checkpointPermissionTransition(m)
 	})
 }
 

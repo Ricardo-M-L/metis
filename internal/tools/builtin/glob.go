@@ -2,11 +2,15 @@ package builtin
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/bmatcuk/doublestar/v4"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
@@ -100,7 +104,7 @@ func (g Glob) SandboxManager() *sandbox.Manager { return g.sandbox }
 
 func (Glob) Name() string { return "Glob" }
 func (Glob) Description() string {
-	return `Find files matching a doublestar glob pattern. Examples: "**/*.go" (all .go files recursively), "src/**/*.ts" (TS files under src), "*.md" (top-level markdown). Returns paths sorted by modification time, newest first.
+	return `Find files matching a doublestar glob pattern relative to root. Examples: "**/*.go" (all .go files recursively), "src/**/*.ts" (TS files under src, including src itself), "apps/*/package.json" (one directory level). Filename-only patterns such as "*.md" search recursively; use "./*.md" for root-level markdown. Supports brace alternatives and character classes. Returns paths sorted by modification time, newest first.
 
 Use Glob for file-name / path patterns. Use Grep when you need to match file CONTENTS instead. Use Bash + find only when you need filters Glob can't express (mtime, size, perms).
 
@@ -195,20 +199,34 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 			IsError: true,
 		}, nil
 	}
+	matcher, err := newGlobMatcher(pattern)
+	if err != nil {
+		return &tools.Result{Output: "Glob: invalid pattern: " + err.Error(), IsError: true}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	root, _ := in["root"].(string)
 	if root == "" {
 		root = "."
 	}
 	logicalRoot := root
 	root = resolvePathAgainstAgentCWD(ctx, root)
-	contextualRoot := root != logicalRoot
 	limit := intArg(in, "limit", 500)
+	if limit <= 0 {
+		return &tools.Result{Output: "Glob: limit must be a positive integer.", IsError: true}, nil
+	}
 
-	// Resolve absolute root for depth calculation. WalkDir uses the
-	// caller's relative path internally, but depth is measured against
-	// the effective starting directory, so we compute prefixLen on the
-	// cleaned absolute path.
-	rootAbs, _ := filepath.Abs(root)
+	// Walk an absolute root, match relative candidates, and reconstruct display
+	// paths from logicalRoot. These must not depend on the process-global cwd
+	// when the caller carries a separate agent workspace.
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
 	rootClean := filepath.Clean(rootAbs)
 
 	// Default max_depth: 8 when starting at the user's home dir
@@ -248,8 +266,14 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	}
 	var hits []hit
 
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(rootClean, func(filePath string, d fs.DirEntry, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
+			if filePath == rootClean {
+				return err
+			}
 			return nil
 		}
 		if d.IsDir() {
@@ -267,7 +291,7 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 			// Depth cap (when set): count separators between the
 			// root and the current path. The root itself is depth 0.
 			if maxDepth > 0 {
-				abs, aerr := filepath.Abs(path)
+				abs, aerr := filepath.Abs(filePath)
 				if aerr == nil {
 					rel, rerr := filepath.Rel(rootClean, filepath.Clean(abs))
 					if rerr == nil {
@@ -283,19 +307,24 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 			}
 			return nil
 		}
-		logicalPath := path
-		if contextualRoot {
-			if rel, relErr := filepath.Rel(rootClean, filepath.Clean(path)); relErr == nil {
-				logicalPath = filepath.Join(logicalRoot, rel)
-			}
+		rel, relErr := filepath.Rel(rootClean, filePath)
+		if relErr != nil {
+			return relErr
 		}
-		matched, _ := doublestarMatch(pattern, logicalPath)
-		if !matched {
+		if rel == "." {
+			// Preserve an explicitly supplied single-file root as well.
+			rel = filepath.Base(filePath)
+		}
+		if !matcher.matches(rel, filePath) {
 			return nil
 		}
 		info, err := d.Info()
 		if err != nil {
 			return nil
+		}
+		logicalPath := filepath.Join(logicalRoot, rel)
+		if filePath == rootClean {
+			logicalPath = logicalRoot
 		}
 		hits = append(hits, hit{path: logicalPath, mod: info.ModTime().UnixNano()})
 		return nil
@@ -333,42 +362,99 @@ func resolvePathAgainstAgentCWD(ctx context.Context, path string) string {
 	return path
 }
 
-// doublestarMatch is a minimal ** glob: ** matches across path separators,
-// * matches a single path segment.
-func doublestarMatch(pattern, path string) (bool, error) {
-	if !strings.Contains(pattern, "**") {
-		return filepath.Match(pattern, filepath.Base(path))
-	}
-	// Build a regex from the pattern.
-	re := globToRegex(pattern)
-	matched, err := matchRegex(re, path)
-	return matched, err
+// globMatcher is prepared once per search. Relative patterns match candidates
+// relative to the search root, independently of the displayed output paths.
+// Keeping those separate is essential for absolute roots and agent CWDs.
+type globMatcher struct {
+	pattern  string
+	basename bool
+	absolute bool
 }
 
-func globToRegex(pat string) string {
-	var b strings.Builder
-	b.WriteByte('^')
-	for i := 0; i < len(pat); i++ {
-		c := pat[i]
-		switch c {
-		case '*':
-			if i+1 < len(pat) && pat[i+1] == '*' {
-				b.WriteString(".*")
-				i++
-			} else {
-				b.WriteString("[^/]*")
+const (
+	maxGlobPatternBytes = 4096
+	maxGlobAlternatives = 256
+	maxGlobBraceDepth   = 16
+)
+
+func newGlobMatcher(pattern string) (globMatcher, error) {
+	if len(pattern) > maxGlobPatternBytes {
+		return globMatcher{}, fmt.Errorf("pattern exceeds %d bytes; narrow the search root or simplify the pattern", maxGlobPatternBytes)
+	}
+	absolute := filepath.IsAbs(pattern)
+	pattern = filepath.ToSlash(pattern)
+	// Preserve filename-only recursive searches, while an explicit ./ anchors
+	// a pattern to root. Do not path.Clean: it changes glob and escape syntax.
+	basename := !strings.Contains(pattern, "/")
+	for strings.HasPrefix(pattern, "./") {
+		pattern = strings.TrimPrefix(pattern, "./")
+	}
+	if !doublestar.ValidatePattern(pattern) {
+		return globMatcher{}, fmt.Errorf("malformed glob; check balanced braces, character classes, and escapes")
+	}
+	if !globAlternativesWithinBudget(pattern) {
+		return globMatcher{}, fmt.Errorf("brace pattern exceeds %d combinations or %d nested groups; split the search into simpler patterns", maxGlobAlternatives, maxGlobBraceDepth)
+	}
+	return globMatcher{pattern: pattern, basename: basename, absolute: absolute}, nil
+}
+
+func (m globMatcher) matches(relativePath, absolutePath string) bool {
+	candidate := filepath.ToSlash(relativePath)
+	if m.absolute {
+		candidate = filepath.ToSlash(absolutePath)
+	} else if m.basename {
+		candidate = path.Base(candidate)
+	}
+	// The pattern was validated once above. This matcher does not build or
+	// compile a new regular expression for every candidate file.
+	return doublestar.MatchUnvalidated(m.pattern, candidate)
+}
+
+// Count potential brace expansions without expanding them. Adjacent groups
+// multiply and nested alternatives add, so even a short {a,b}{c,d}... pattern
+// cannot force exponential recursive matching for every file in a large tree.
+// Syntax validity is already checked by doublestar before this function runs.
+func globAlternativesWithinBudget(pattern string) bool {
+	type group struct{ product, sum int }
+	stack := []group{{product: 1}}
+	inClass := false
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '\\':
+			i++
+		case '[':
+			inClass = true
+		case ']':
+			inClass = false
+		case '{':
+			if !inClass {
+				if len(stack) > maxGlobBraceDepth {
+					return false
+				}
+				stack = append(stack, group{product: 1})
 			}
-		case '?':
-			b.WriteString("[^/]")
-		case '.', '+', '(', ')', '|', '^', '$', '{', '}', '[', ']', '\\':
-			b.WriteByte('\\')
-			b.WriteByte(c)
-		default:
-			b.WriteByte(c)
+		case ',':
+			if !inClass && len(stack) > 1 {
+				g := &stack[len(stack)-1]
+				g.sum += g.product
+				g.product = 1
+				if g.sum >= maxGlobAlternatives {
+					return false
+				}
+			}
+		case '}':
+			if !inClass {
+				g := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				parent := &stack[len(stack)-1]
+				parent.product *= g.sum + g.product
+				if parent.product > maxGlobAlternatives {
+					return false
+				}
+			}
 		}
 	}
-	b.WriteByte('$')
-	return b.String()
+	return true
 }
 
 // globMisuseHint inspects the input bag for fields that suggest the

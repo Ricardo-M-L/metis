@@ -40,6 +40,7 @@ function context() {
     renderHistoryMessages: history => { c.messages = history; }, restoreCompactionHistory: async () => {}, loadArtifactsForSession: async () => {},
     loadEffort: async () => {}, pollStatus: async () => {},
     effortState: { effort: 'default' }, effortLabel: value => value, modelMenuOpen: false,
+    permissionModeGeneration: 0, permissionModeSnapshot: null, permissionModePending: false,
     normalizedPermissionMode: value => value, approvalMode: 'default', confirmFullAccessMode: async () => true,
     syncApprovalChip: mode => { c.approvalMode = mode; }, settingByKey: () => null,
     PERMISSION_LABELS: { acceptEdits: 'Accept edits', fullAccess: 'Full access' }, PERMISSION_LABELS_ZH: { acceptEdits: '自动确认编辑', fullAccess: '完全访问' },
@@ -70,6 +71,7 @@ function context() {
   vm.runInContext(extract('chat.js', 'async function chooseEffort(', '// Events carry the session'), c);
   vm.runInContext(extract('chat.js', 'async function switchModel(', 'const APPROVAL_MODES'), c);
   vm.runInContext(extract('chat.js', 'async function setPermissionMode(', 'async function openPluginSettings('), c);
+  vm.runInContext(extract('chat.js', 'function applySessionPermissionMode(', 'function permissionModeForTurn('), c);
   c.escHtml = c.escAttr = c.escOnclick = String;
   return { c, calls, toasts, rendered, elements };
 }
@@ -389,7 +391,8 @@ function context() {
       const body = JSON.parse(options.body); calls.push({ url, body });
       if (url === '/api/sessions') return { ok: true, json: async () => ({ id: 'new-b', workspaceId: 'b', workDir: '/beta' }) };
       if (url === '/api/sessions/activate') return { ok: true, json: async () => ({ session: { id: 'new-b' } }) };
-      return { ok: true, json: async () => ({ model: 'beta-model', effort: 'high' }) };
+      return { ok: true, json: async () => ({ model: 'beta-model', effort: 'high',
+        ...(url === '/api/settings' ? { permissionSessionId: 'new-b', permissionMode: 'acceptEdits', permissionModeAvailable: true } : {}) }) };
     };
     if (action === 'model') await c.switchModel('provider', 'beta-model');
     if (action === 'effort') await c.chooseEffort('high');

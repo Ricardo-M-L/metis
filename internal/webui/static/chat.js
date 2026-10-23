@@ -779,7 +779,7 @@ function refreshActivityGroupLanguage() {
       const semantic = semanticToolSummary(row.dataset.tool, row.getAttribute('data-args') || '');
       const summary = row.querySelector('.tc-summary');
       const detail = toolDetails[row.dataset.rowKey];
-      if (summary && row.dataset.state === 'error') summary.textContent = semanticToolErrorSummary(row.dataset.tool, detail?.output || '');
+      if (summary && row.dataset.state === 'error') summary.textContent = semanticToolErrorSummary(row.dataset.tool, detail?.output || '', detail?.input || row.getAttribute('data-args') || '');
       else if (semantic !== null && summary) summary.textContent = semantic;
       const inspect = row.querySelector('.tc-inspect');
       if (inspect) inspect.textContent = uiText('Inspect', '查看详情');
@@ -1217,6 +1217,7 @@ async function submitAskAnswer(answer, askId) {
       card.classList.remove('ask-pending');
       card.classList.add('ask-answered');
     }
+    if (String(ask.session || '') === String(currentSessionId || '') && typeof pollStatus === 'function') void pollStatus();
   } catch (e) {
     if (card && card.isConnected) card.querySelectorAll('.ask-option').forEach(b => b.disabled = false);
     showToast('Failed to answer: ' + e.message);
@@ -1606,6 +1607,7 @@ async function prepareDraftSession() {
     if (currentSessionId && currentSessionId !== data.id) return false;
     if (typeof forgetWorkspaceComposerDraft === 'function') forgetWorkspaceComposerDraft(workspaceId);
     currentSessionId = data.id;
+    if (typeof applyStatusPermissionSnapshot === 'function') applyStatusPermissionSnapshot(data, data.id);
     closeMismatchedSubAgentDetails();
     if (!sessions.some(session => session.id === data.id)) sessions = [data, ...sessions];
     if (window.metisNavigation) window.metisNavigation.recordSession(data.id, { replace: true });
@@ -1639,6 +1641,9 @@ async function ensureComposerSessionSettingsTarget() {
     if (!res || !isCurrent()) return null;
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || uiText('The session could not be activated.', '无法激活该会话。'));
+    if (isCurrent() && typeof applyStatusPermissionSnapshot === 'function') {
+      applyStatusPermissionSnapshot(data, sessionId);
+    }
     return isCurrent() ? { sessionId, workspaceId, generation, isCurrent } : null;
   } catch (error) {
     if (isCurrent()) showToast(uiText('Session settings unavailable: ', '暂时无法修改会话设置：') + error.message);
@@ -1936,6 +1941,7 @@ const TOOL_VARIANTS = {
   bash:      { title: 'Run command', titleZh: '运行命令', keys: ['description', 'command'] },
   pwsh:      { title: 'Run command', titleZh: '运行命令', keys: ['description', 'command'] },
   read:      { title: 'Read', titleZh: '读取', keys: ['path', 'file_path', 'url'] },
+  ls:        { title: 'List directory', titleZh: '列出目录', keys: ['path'] },
   web_fetch: { title: 'Read', titleZh: '读取', keys: ['path', 'file_path', 'url'] },
   web_search:{ title: 'Search', titleZh: '搜索', keys: ['query', 'pattern', 'url'] },
   grep:      { title: 'Search in files', titleZh: '搜索文件内容', keys: ['query', 'pattern', 'url'] },
@@ -1964,7 +1970,7 @@ const TOOL_ICONS = {
 function iconKeyOf(name) {
   const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
   if (key === 'bash' || key === 'pwsh') return 'bash';
-  if (key === 'read' || key === 'webfetch') return 'read';
+  if (key === 'read' || key === 'webfetch' || key === 'ls') return 'read';
   if (key === 'websearch' || key === 'grep' || key === 'glob') return 'search';
   if (key === 'write' || key === 'edit') return 'write';
   if (key === 'runcode') return 'code';
@@ -2112,7 +2118,7 @@ function semanticToolSummary(name, input) {
   if (key === 'messageteammate') return field('to') || uiText('Recipient not specified', '未指定接收者');
   return uiText('External channel', '外部频道');
 }
-function semanticToolErrorSummary(name, output = '') {
+function semanticToolErrorSummary(name, output = '', input = '') {
   const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
   const line = firstLine(output);
   // Interpret only known runtime diagnostics. The full result stays in the
@@ -2126,6 +2132,30 @@ function semanticToolErrorSummary(name, output = '') {
   }
   if (key === 'read' && /(?:^|[:：]\s*)(?:no such file or directory|文件不存在)[。.!！]?$/i.test(line)) {
     return uiText('File not found; inspect details', '文件不存在，查看详情');
+  }
+  if (key === 'ls') {
+    let message = '';
+    const diagnostic = String(output || '').trim();
+    // Support both the model-facing LS diagnostic and historical raw OS
+    // results. Check the full OS error suffix before shortening display text:
+    // a Unix filename can contain newlines and diagnostic-looking words.
+    if (/^Directory not found(?:[:.]|$)/i.test(line) || /(?:^|[:：]\s*)(?:no such file or directory|the system cannot find the (?:file|path) specified|目录不存在)[。.!！]?$/i.test(diagnostic)) {
+      message = uiText('Directory not found', '目录不存在');
+    } else if (/(?:^|[:：]\s*)(?:not a directory|不是目录)[。.!！]?$/i.test(diagnostic) || /\s+is a regular file, not a directory\. Use Read to view its contents, or pass the parent directory to LS\.$/i.test(diagnostic)) {
+      message = uiText('Path is not a directory', '该路径不是目录');
+    } else if (/(?:^|[:：]\s*)(?:permission denied|access is denied|operation not permitted|权限不足|拒绝访问)[。.!！]?$/i.test(diagnostic)) {
+      message = uiText('Cannot access directory', '无权读取目录');
+    }
+    if (message) {
+      let path = '';
+      try {
+        const args = JSON.parse(input);
+        if (args && typeof args.path === 'string') path = firstLine(args.path).replace(/[\x00-\x1f\x7f]/g, ' ').trim();
+      } catch (_) {}
+      // The tail distinguishes a guessed nested directory from its parent.
+      if (path.length > 84) path = '…' + path.slice(-83);
+      return path ? message + ' · ' + path : message + uiText('; inspect details', '，查看详情');
+    }
   }
   if (key === 'agent') return uiText('Start failed; inspect details', '启动失败，查看详情');
   if (key === 'messageteammate') return uiText('Message failed; inspect details', '消息发送失败，查看详情');
@@ -2790,7 +2820,7 @@ function handleToolResult(d) {
     const summary = chip.querySelector('.tc-summary');
     if (!ok && summary) {
       summary.classList.add('err');
-      if (!isWebSearchTool(name)) summary.textContent = semanticToolErrorSummary(name, d.output);
+      if (!isWebSearchTool(name)) summary.textContent = semanticToolErrorSummary(name, d.output, chip.getAttribute('data-args') || '');
     }
     updateToolRowAccessibleLabel(chip);
     const out = chip.querySelector('.tc-io-text[data-out]');
@@ -2987,6 +3017,9 @@ async function resolvePermission(id, approve, btn) {
       icon.innerHTML = approve ? '&#10003;' : '&#10007;';
     }
     renderSessions();
+    // Acknowledging approval only queues the worker's transition. Do not
+    // optimistically replace plan mode with the requested execution mode.
+    if (sessionId === String(currentSessionId || '') && typeof pollStatus === 'function') void pollStatus();
   } catch (e) {
     showToast('Failed to resolve permission: ' + e.message);
   }
@@ -3077,6 +3110,8 @@ function newChat() {
   if (typeof detachRunningTurnView === 'function') detachRunningTurnView();
   if (typeof invalidateSessionAsyncLoads === 'function') invalidateSessionAsyncLoads();
   currentSessionId = null;
+  if (typeof invalidatePermissionMode === 'function') invalidatePermissionMode();
+  if (typeof pollStatus === 'function') void pollStatus();
   closeMismatchedSubAgentDetails();
   if (typeof resetTraceForSession === 'function') resetTraceForSession();
   if (typeof resetSessionFiles === 'function') resetSessionFiles();
@@ -3731,6 +3766,14 @@ async function runTurnItem(item) {
     return true;
   }
   if (item.resume && !canResumeCurrentTurn()) return false;
+  // The server atomically compares this expectation with the target session
+  // before starting a worker. A stale chip must never authorize another mode.
+  const expectedPermissionMode = typeof permissionModeForTurn === 'function' ? permissionModeForTurn() : undefined;
+  if (expectedPermissionMode === null) {
+    showToast(uiText('Permission mode is unavailable. Refresh the session or select a mode before sending.', '权限状态尚未确认，请刷新会话或选择权限模式后再发送。'));
+    if (typeof pollStatus === 'function') void pollStatus();
+    return false;
+  }
   if (!item.skipClearTodoPlan && !item.resume) clearTodoPlan();
   const text = item.text || '';
   const images = item.images || [];
@@ -3771,8 +3814,8 @@ async function runTurnItem(item) {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(item.resume
-        ? { sessionId: turnSessionId, resume: true, resumeToken: item.resumeToken }
-        : {sessionId: turnSessionId, workspaceId: turnWorkspaceId, input: text, images: images}),
+        ? { sessionId: turnSessionId, resume: true, resumeToken: item.resumeToken, expectedPermissionMode }
+        : {sessionId: turnSessionId, workspaceId: turnWorkspaceId, input: text, images: images, expectedPermissionMode}),
       signal: foregroundRequest.controller && foregroundRequest.controller.signal
     });
     const data = await res.json();
@@ -3780,7 +3823,12 @@ async function runTurnItem(item) {
     // error status. Their typed terminal reason is not a request/API failure.
     const incompleteReason = data.incomplete ? (data.stopReason || 'incomplete')
       : res.ok && !data.stopped && viewingTurn() && continuationUnchanged() ? runningTurnIncompleteReason : '';
-    if (!res.ok && !data.incomplete) throw new Error(data.error || `turn: ${res.status}`);
+    if (!res.ok && !data.incomplete) {
+      if (viewingTurn() && typeof applyStatusPermissionSnapshot === 'function' && data.permissionModeAvailable !== undefined) {
+        applyStatusPermissionSnapshot(data, String(turnSessionId || ''));
+      }
+      throw new Error(data.error || `turn: ${res.status}`);
+    }
     resolvedTurnSessionId = data.sessionId || turnSessionId;
     foregroundRequest.sessionId = resolvedTurnSessionId;
     if (!runningSessionId && resolvedTurnSessionId) runningSessionId = resolvedTurnSessionId;
@@ -5220,20 +5268,35 @@ async function setPermissionMode(value, trigger) {
   }
   const target = typeof ensureComposerSessionSettingsTarget === 'function' ? await ensureComposerSessionSettingsTarget() : undefined;
   if (target === null || target && !target.isCurrent()) return false;
+  const mutation = ++permissionModeGeneration;
+  permissionModePending = true;
+  syncApprovalChip('unknown');
   try {
     const res = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ changes: [{ key: 'permission.mode', value: mode }] })
+      body: JSON.stringify({ sessionId: target && target.sessionId, changes: [{ key: 'permission.mode', value: mode }] })
     });
     const data = await res.json().catch(() => ({}));
-    if (target && !target.isCurrent()) return false;
+    if (mutation !== permissionModeGeneration) return false;
+    if (target && !target.isCurrent()) {
+      invalidatePermissionMode();
+      if (typeof pollStatus === 'function') void pollStatus();
+      return false;
+    }
+    permissionModePending = false;
     if (!res.ok) throw new Error(data.error || 'mode: ' + res.status);
-    syncApprovalChip(mode);
+    if (!applyStatusPermissionSnapshot(data, String(currentSessionId || ''))) {
+      throw new Error(uiText('The server has not confirmed the permission mode.', '服务端尚未确认权限模式。'));
+    }
     const setting = settingByKey('permission.mode');
-    if (setting) setting.value = mode;
+    if (setting) setting.value = approvalMode;
     showToast(uiText('Permission mode: ', '\u6743\u9650\u6a21\u5f0f\uff1a') + (document.documentElement.lang === 'zh-CN' ? PERMISSION_LABELS_ZH[mode] : PERMISSION_LABELS[mode]));
     return true;
   } catch (error) {
+    if (mutation === permissionModeGeneration) {
+      invalidatePermissionMode();
+      if (typeof pollStatus === 'function') void pollStatus();
+    }
     showToast(uiText('Mode change failed: ', '\u6743\u9650\u6a21\u5f0f\u5207\u6362\u5931\u8d25\uff1a') + error.message);
     return false;
   }
@@ -5767,8 +5830,8 @@ async function initTheme() {
     if (res.ok && data.settings) {
       settingsCache = data;
       applyTheme(currentThemeSetting());
-      const permission = settingByKey('permission.mode');
-      syncApprovalChip(permission ? permission.value : 'default');
+      // Global settings may describe a different session. The owned status
+      // snapshot is the only boot-time authority for the composer mode.
     }
   } catch (_) { /* fall back to the default dark palette */ }
 }
@@ -5798,10 +5861,11 @@ function lockBadge(s) {
 }
 
 function renderEnumSetting(s, labels, descs) {
+  const selectedValue = s.key === 'permission.mode' ? approvalMode : s.value;
   const cards = s.options.map(opt => {
-    const sel = opt === s.value ? ' selected' : '';
+    const sel = opt === selectedValue ? ' selected' : '';
     const lock = s.lockedReason ? ' locked' : '';
-    return `<button type="button" aria-pressed="${opt === s.value ? 'true' : 'false'}" class="radio-card${sel}${lock}" data-key="${escAttr(s.key)}" data-value="${escAttr(opt)}" onclick="chooseEnum(this)">
+    return `<button type="button" aria-pressed="${opt === selectedValue ? 'true' : 'false'}" class="radio-card${sel}${lock}" data-key="${escAttr(s.key)}" data-value="${escAttr(opt)}" onclick="chooseEnum(this)">
       <div class="radio-card-title">${escHtml(labels[opt] || opt)}</div>
       <div class="radio-card-desc">${escHtml(descs[opt] || '')}</div>
     </button>`;
@@ -5862,19 +5926,63 @@ const PERMISSION_DESCS_ZH = {
   fullAccess: '不弹出审批且关闭进程沙箱，可访问任意文件和网络',
 };
 
+// Permission display belongs to one verified session (or the blank composer).
+// Passive snapshots never write settings or infer approval from an old mode.
+function applySessionPermissionMode(sessionId, mode) {
+  if (permissionModePending) return false;
+  if (String(sessionId || '') !== String(currentSessionId || '')) return false;
+  const valid = Object.prototype.hasOwnProperty.call(PERMISSION_LABELS, mode) ? mode : null;
+  permissionModeSnapshot = valid ? { sessionId: String(sessionId || ''), mode: valid } : null;
+  syncApprovalChip(valid || 'unknown');
+  return !!valid;
+}
+
+function invalidatePermissionMode() {
+  permissionModeGeneration++;
+  permissionModePending = false;
+  permissionModeSnapshot = null;
+  syncApprovalChip('unknown');
+}
+
+function applyStatusPermissionSnapshot(data, sessionId) {
+  const owner = String(sessionId || '');
+  if (owner !== String(currentSessionId || '')) return false;
+  if (!data || data.permissionModeAvailable !== true ||
+      typeof data.permissionSessionId !== 'string' || data.permissionSessionId !== owner) {
+    applySessionPermissionMode(owner, null);
+    return false;
+  }
+  return applySessionPermissionMode(owner, data.permissionMode);
+}
+
+function permissionModeForTurn() {
+  const snapshot = permissionModeSnapshot;
+  if (permissionModePending || !snapshot || snapshot.sessionId !== String(currentSessionId || '') ||
+      snapshot.mode !== approvalMode) return null;
+  return snapshot.mode;
+}
+
 function syncApprovalChip(mode) {
-  const valid = Object.prototype.hasOwnProperty.call(PERMISSION_LABELS, mode) ? mode : 'default';
+  const valid = Object.prototype.hasOwnProperty.call(PERMISSION_LABELS, mode) ? mode : 'unknown';
   approvalMode = valid;
   const labels = document.documentElement.lang === 'zh-CN' ? PERMISSION_LABELS_ZH : PERMISSION_LABELS;
   const descs = document.documentElement.lang === 'zh-CN' ? PERMISSION_DESCS_ZH : PERMISSION_DESCS;
-  const label = labels[valid];
+  const label = labels[valid] || uiText('Permissions unavailable', '权限待确认');
   const btn = document.getElementById('approvalBtn');
   const text = document.getElementById('approvalLabel');
   if (text) text.textContent = label;
   if (btn) {
     btn.classList.toggle('active', valid !== 'default');
     btn.setAttribute('aria-label', uiText('Permission mode: ', '权限模式：') + label);
-    btn.title = descs[valid] || label;
+    btn.title = descs[valid] || uiText('Waiting for the session permission state. Sending is blocked until it is confirmed.', '正在确认当前会话的权限状态，确认前不会发送任务。');
+    if (btn.dataset) btn.dataset.permissionMode = valid;
+  }
+  if (typeof document.querySelectorAll === 'function') {
+    document.querySelectorAll('.radio-card[data-key="permission.mode"]').forEach(card => {
+      const selected = card.dataset.value === valid;
+      card.classList.toggle('selected', selected);
+      card.setAttribute('aria-pressed', String(selected));
+    });
   }
   if (approvalMenuOpen) paintApprovalMenu();
 }
@@ -7149,6 +7257,7 @@ function paintConfigFiles(d) {
 }
 
 async function saveSettingValue(key, value) {
+  if (key === 'permission.mode') return setPermissionMode(String(value));
   try {
     const res = await fetch('/api/settings', {
       method: 'POST',
@@ -7160,7 +7269,6 @@ async function saveSettingValue(key, value) {
     const st = settingByKey(key);
     if (st) st.value = String(value);
     if (key === 'ui.theme') applyTheme(value);
-    if (key === 'permission.mode') syncApprovalChip(String(value));
     const live = (data.liveApplied || []).includes(key);
     showToast(live ? 'Saved: ' + key + ' (applied immediately)' : 'Saved: ' + key + ' (applies after restart)');
   } catch (e) {

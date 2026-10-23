@@ -3,7 +3,10 @@
 // Metis Desktop — Client Logic
 // ============================================================
 
-let approvalMode = 'default';
+let approvalMode = 'unknown';
+let permissionModeGeneration = 0;
+let permissionModeSnapshot = null;
+let permissionModePending = false;
 let messages = [];
 let sessions = [];
 let workspaces = [];
@@ -53,6 +56,8 @@ document.addEventListener('DOMContentLoaded', () => {
   detectProject();
   connectEvents();
   initTheme();
+  if (typeof syncApprovalChip === 'function') syncApprovalChip(approvalMode);
+  void pollStatus();
   initChatScroll();
   updateEmptyLayout();
   initLayout(); // DSH AppFrame parity: resizable sidebar/details + auto-collapse
@@ -422,6 +427,8 @@ function showToast(msg) {
 // the conversation it belongs to and only exposed non-interactive names.
 async function pollStatus(shouldApply = () => true) {
   const generation = ++statusRequestGeneration;
+  const permissionGeneration = typeof permissionModeGeneration === 'number' ? permissionModeGeneration : 0;
+  const permissionWasPending = typeof permissionModePending !== 'undefined' && permissionModePending;
   const selectedSessionId = String(currentSessionId || '');
   const viewGeneration = typeof resumeSessionGeneration === 'number' ? resumeSessionGeneration : 0;
   try {
@@ -437,6 +444,10 @@ async function pollStatus(shouldApply = () => true) {
     renderStatusSnapshot(d);
     if (typeof applyResumeSnapshot === 'function') applyResumeSnapshot(d, selectedSessionId);
     if (typeof applyStatusPlanSnapshot === 'function') applyStatusPlanSnapshot(d);
+    if (typeof applyStatusPermissionSnapshot === 'function' &&
+        permissionGeneration === permissionModeGeneration && !permissionWasPending && !permissionModePending) {
+      applyStatusPermissionSnapshot(d, selectedSessionId);
+    }
   } catch (_) { /* status is best-effort */ }
 }
 

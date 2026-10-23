@@ -15,6 +15,7 @@ require (
 	github.com/alecthomas/chroma/v2 v2.24.1
 	github.com/aymanbagabas/go-udiff v0.4.1
 	github.com/aymerick/douceur v0.2.0
+	github.com/bmatcuk/doublestar/v4 v4.10.3
 	github.com/charmbracelet/ultraviolet v0.0.0-20260703014108-f5a850f9c2b7
 	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/chzyer/readline v1.5.1

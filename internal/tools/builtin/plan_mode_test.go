@@ -11,7 +11,7 @@ package builtin
 //   2. ExitPlanMode without context controller returns IsError (it
 //      shouldn't panic; the prompt promises a graceful response).
 //   3. With a fake PlanController in context, EnterPlanMode flips
-//      the flag on and ExitPlanMode flips it back off.
+//      the flag on; ExitPlanMode without a Gate fails closed.
 //   4. ExitPlanMode emits a [plan proposal] EventInfo through the
 //      event channel from context.
 //   5. ExitPlanMode rejects empty / whitespace-only plan input.
@@ -66,9 +66,9 @@ func TestEnterPlanMode_GracefulWithoutController(t *testing.T) {
 	}
 }
 
-func TestExitPlanMode_FlipsControllerOff_AndEmitsPlan(t *testing.T) {
+func TestExitPlanMode_WithoutGate_KeepsPlanningAndEmitsPlan(t *testing.T) {
 	t.Parallel()
-	// Pre-set the controller to "on" so we can observe the flip.
+	// A controller alone cannot enforce or approve a permission transition.
 	ctrl := &stubPlanController{on: true}
 	events := make(chan agent.Event, 4)
 	ctx := agent.WithPlanController(context.Background(), ctrl)
@@ -79,11 +79,11 @@ func TestExitPlanMode_FlipsControllerOff_AndEmitsPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute err: %v", err)
 	}
-	if res.IsError {
-		t.Errorf("ExitPlanMode should not be IsError: %s", res.Output)
+	if !res.IsError {
+		t.Errorf("ExitPlanMode without a Gate must fail closed: %s", res.Output)
 	}
-	if ctrl.on {
-		t.Error("ExitPlanMode did not flip controller off")
+	if !ctrl.on {
+		t.Error("ExitPlanMode disabled plan mode without an approval boundary")
 	}
 	// One EventInfo with the plan should have landed on the channel.
 	select {
@@ -126,11 +126,9 @@ func TestExitPlanMode_RejectsEmptyPlan(t *testing.T) {
 	}
 }
 
-func TestExitPlanMode_NoEventChannel_StillFlipsFlag(t *testing.T) {
+func TestExitPlanMode_NoGateOrUI_KeepsPlanning(t *testing.T) {
 	t.Parallel()
-	// Verify the tool degrades gracefully when no event channel is
-	// attached — the flag flip must still happen so the loop's plan
-	// gate releases on the next iteration.
+	// Without a permission gate or UI there is no approved exit path.
 	ctrl := &stubPlanController{on: true}
 	ctx := agent.WithPlanController(context.Background(), ctrl)
 	tool := NewExitPlanMode()
@@ -138,11 +136,11 @@ func TestExitPlanMode_NoEventChannel_StillFlipsFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute err: %v", err)
 	}
-	if res.IsError {
-		t.Errorf("should not be IsError: %s", res.Output)
+	if !res.IsError {
+		t.Errorf("missing Gate must be a structured error: %s", res.Output)
 	}
-	if ctrl.on {
-		t.Error("controller not flipped off when event channel absent")
+	if !ctrl.on {
+		t.Error("controller flipped off without an approval boundary")
 	}
 }
 

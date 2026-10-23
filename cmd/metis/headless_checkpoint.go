@@ -40,7 +40,8 @@ type headlessCheckpoint struct {
 	// Auto-compaction treats ordinary summary errors as recoverable. A failed
 	// persistence boundary is not: keep it until this invocation returns even
 	// when a later best-effort final save can repair the disk state.
-	compactionErr error
+	compactionErr        error
+	permissionCheckpoint func() error
 }
 
 func newHeadlessCheckpoint(loop *agent.Loop, store *session.Store, id string) *headlessCheckpoint {
@@ -101,6 +102,11 @@ func (c *headlessCheckpoint) persistable(history []llm.Message) []llm.Message {
 }
 
 func (c *headlessCheckpoint) persist(history []llm.Message) error {
+	if c.permissionCheckpoint != nil {
+		if err := c.permissionCheckpoint(); err != nil {
+			return fmt.Errorf("persist headless permission state: %w", err)
+		}
+	}
 	if c.store == nil || c.id == "" {
 		return nil
 	}

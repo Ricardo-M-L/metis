@@ -72,20 +72,21 @@ type Server struct {
 	// turnCoordinator covers both legacy in-process turns and isolated worker
 	// turns. runMu remains for the one process-owned Loop; the coordinator is
 	// what lets independent workspaces make progress concurrently.
-	turnCoordinator     *TurnCoordinator
-	isolatedRunner      IsolatedTurnRunner
-	maxTurnParallelism  int
-	maxTotalAgentSlots  int
-	maxSubagentsPerRoot int
-	desktopAgentSlotDir string
-	workerTurnsMu       sync.Mutex
-	workerTurns         map[string]*isolatedActiveTurn
-	workerSnapshots     map[string]isolatedWorkerSnapshot
-	hub                 *eventHub
-	prefsMu             sync.Mutex
-	workspacesMu        sync.Mutex
-	providersMu         sync.Mutex
-	effortMu            sync.Mutex
+	turnCoordinator       *TurnCoordinator
+	isolatedRunner        IsolatedTurnRunner
+	maxTurnParallelism    int
+	maxTotalAgentSlots    int
+	maxSubagentsPerRoot   int
+	desktopAgentSlotDir   string
+	workerTurnsMu         sync.Mutex
+	workerTurns           map[string]*isolatedActiveTurn
+	workerSnapshots       map[string]isolatedWorkerSnapshot
+	workerPermissionOwned map[string]bool // parent gate is stale until explicit adoption
+	hub                   *eventHub
+	prefsMu               sync.Mutex
+	workspacesMu          sync.Mutex
+	providersMu           sync.Mutex
+	effortMu              sync.Mutex
 
 	// cancelMu guards the identity, cancel func, and completion signal for the
 	// in-flight turn. Keeping the session identity separate from the session
@@ -193,9 +194,10 @@ type askPending struct {
 }
 
 type isolatedActiveTurn struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-	steer  chan IsolatedSteerRequest
+	cancel     context.CancelFunc
+	done       chan struct{}
+	steer      chan IsolatedSteerRequest
+	permission *desktopipc.PermissionState // only frames bound to this turn owner
 }
 
 type hubEvent struct {
@@ -1273,7 +1275,9 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "failed to create session")
 			return
 		}
-		writeJSON(w, http.StatusCreated, sessionItem{ID: id, Title: "Untitled", Model: model, WorkDir: header.WorkDir, WorkspaceID: workspaceIDForPath(header.WorkDir), Status: "idle", CreatedAt: createdAt, UpdatedAt: createdAt})
+		payload := map[string]any{"id": id, "title": "Untitled", "model": model, "workDir": header.WorkDir, "workspaceId": workspaceIDForPath(header.WorkDir), "status": "idle", "createdAt": createdAt, "updatedAt": createdAt}
+		s.addPermissionStatus(payload, id)
+		writeJSON(w, http.StatusCreated, payload)
 	default:
 		w.Header().Set("Allow", "GET, POST")
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1306,6 +1310,10 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status,
 		Archived: s.store.IsArchived(id), CreatedAt: hdr.CreatedAt,
 	}, "messages": agent.PresentationHistory(messages), "workspace": workspace}
+	s.addPermissionStatus(payload, id)
+	item := payload["session"].(sessionItem)
+	item.Mode, _ = payload["permissionMode"].(string)
+	payload["session"] = item
 	s.addDesktopResumeSnapshot(payload, id)
 	writeJSON(w, http.StatusOK, payload)
 }
@@ -1633,10 +1641,15 @@ func (s *Server) handleSessionActivate(w http.ResponseWriter, r *http.Request) {
 	s.stateMu.RUnlock()
 	s.selectWorkspacePathIfCurrent(selectedWorkDir, selectionEpoch)
 	workspace := s.sessionWorkspaceView(hdr, selectedWorkDir)
-	writeJSON(w, http.StatusOK, map[string]any{"session": sessionItem{
+	payload := map[string]any{"session": sessionItem{
 		ID: body.ID, Title: hdr.Title, Model: hdr.Model, WorkDir: workspace.Path, WorkspaceID: workspace.ID,
 		Mode: hdr.Mode, Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status, Archived: s.store.IsArchived(body.ID), CreatedAt: hdr.CreatedAt,
-	}, "messages": agent.PresentationHistory(history), "workspace": workspace})
+	}, "messages": agent.PresentationHistory(history), "workspace": workspace}
+	s.addPermissionStatus(payload, body.ID)
+	item := payload["session"].(sessionItem)
+	item.Mode, _ = payload["permissionMode"].(string)
+	payload["session"] = item
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
@@ -1650,12 +1663,13 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		SessionID   string `json:"sessionId"`
-		WorkspaceID string `json:"workspaceId"`
-		Resume      bool   `json:"resume"`
-		ResumeToken string `json:"resumeToken"`
-		Input       string `json:"input"`
-		Images      []struct {
+		SessionID              string `json:"sessionId"`
+		WorkspaceID            string `json:"workspaceId"`
+		ExpectedPermissionMode string `json:"expectedPermissionMode"`
+		Resume                 bool   `json:"resume"`
+		ResumeToken            string `json:"resumeToken"`
+		Input                  string `json:"input"`
+		Images                 []struct {
 			MediaType string `json:"mediaType"`
 			Data      string `json:"data"`
 		} `json:"images"`
@@ -1821,6 +1835,29 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	defer lease.Release()
+	// Recheck after the queue wait: permission settings may have changed while
+	// this request waited. The chip's expected mode never grants permission.
+	if body.ExpectedPermissionMode != "" {
+		expected, ok := permission.ParseMode(body.ExpectedPermissionMode)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "invalid expected permission mode")
+			return
+		}
+		latest, _, loadErr := s.store.LoadHeader(body.SessionID)
+		if loadErr != nil || latest == nil {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		actual, _, modeErr := s.permissionStateFromHeader(latest)
+		if modeErr != nil {
+			writeError(w, http.StatusConflict, "permission state unavailable")
+			return
+		}
+		if expected != actual {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "permission mode changed; review the current mode before retrying", "permissionSessionId": body.SessionID, "permissionMode": string(actual), "permissionModeAvailable": true})
+			return
+		}
+	}
 	if err := s.requireProviderMembership(hdr.Provider); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
@@ -2023,7 +2060,9 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 		writeError(w, http.StatusConflict, "this session already has a running turn")
 		return
 	}
-	s.workerTurns[sessionID] = &isolatedActiveTurn{cancel: cancel, done: done, steer: steer}
+	workerOwner := &isolatedActiveTurn{cancel: cancel, done: done, steer: steer}
+	s.workerTurns[sessionID] = workerOwner
+	s.markWorkerPermissionOwnerLocked(sessionID)
 	if s.contextWorkerEpochs == nil {
 		s.contextWorkerEpochs = make(map[string]uint64)
 	}
@@ -2075,7 +2114,7 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 		Input:     input,
 		Resume:    len(resume) > 0 && resume[0],
 		Steer:     steer,
-		OnStatus:  func(status desktopipc.Status) { s.setWorkerSnapshot(sessionID, status) },
+		OnStatus:  func(status desktopipc.Status) { s.acceptWorkerStatus(sessionID, workerOwner, status) },
 		OnEvent: func(ev agent.Event) {
 			s.recordWorkerSubAgentLifecycle(sessionID, ev)
 			if !s.publishInteraction(turnCtx, sessionID, ev) && ev.Kind != agent.EventLoopDone {
@@ -2418,6 +2457,17 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 	if !validSessionID(id) || hdr == nil {
 		return errors.New("invalid session")
 	}
+	if live, active := s.liveWorkerPermission(id); active {
+		copy := *hdr
+		// Navigation stays available before the first committed status frame.
+		// A parent-only read-only gate cannot authorize worker execution; the UI
+		// still reports unavailable until this owner's snapshot arrives.
+		copy.Mode, copy.PrePlanMode = string(permission.ModePlan), string(permission.ModeDefault)
+		if live != nil {
+			copy.Mode, copy.PrePlanMode = live.Mode, live.PrePlanMode
+		}
+		hdr = &copy
+	}
 	s.contextMu.RLock()
 	contextEpoch := s.contextWorkerEpochs[id]
 	s.contextMu.RUnlock()
@@ -2476,6 +2526,9 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 	// the in-memory view after a prior failed turn without clearing permission
 	// state or session-scoped loop guards that still belong to this session.
 	if activeID == id {
+		if err := s.syncWorkerPermissionState(id); err != nil {
+			return fmt.Errorf("adopt worker permission state: %w", err)
+		}
 		if preparedMemory != nil {
 			if err := s.flushAndWaitPendingDistillation(activeID, desktopDistillationShutdownGrace); err != nil {
 				return err
@@ -2679,6 +2732,11 @@ func (s *Server) activateSession(id string, hdr *session.Header, history []llm.M
 		s.loop.SetPrePlanMode("")
 		s.loop.SetPlanMode(false)
 	}
+	s.workerTurnsMu.Lock()
+	if s.workerTurns[id] == nil {
+		delete(s.workerPermissionOwned, id)
+	}
+	s.workerTurnsMu.Unlock()
 	s.loop.ResetSession(history)
 	s.loop.TimingSink = s.store.NewTimingRecorder(id).Record
 	rtpkg.RebindLoopRuntime(s.loop, provider, targetModel, targetSystem, id, rtpkg.LoopRuntimeRebindOptions{
@@ -3086,7 +3144,12 @@ func (s *Server) writeActiveSessionState(id, providerName, model, preset, system
 		Effort:           effortHeaderValue(effort),
 		Preset:           preset,
 	}
-	if s.loop.Gate != nil {
+	// Serialize the parent header append with worker admission. A separate
+	// ownership check would race a worker starting between this capture and
+	// the append, allowing the stale parent gate to overwrite its live policy.
+	s.workerTurnsMu.Lock()
+	defer s.workerTurnsMu.Unlock()
+	if s.loop.Gate != nil && !s.workerPermissionOwned[id] {
 		permissionState, err := rtpkg.CapturePermissionModeState(s.loop.Gate, s.loop)
 		if err != nil {
 			return fmt.Errorf("persist active session %s permission state: %w", id, err)
@@ -3991,6 +4054,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resumeSessionID = activeSessionID
 	}
 	s.addDesktopResumeSnapshot(payload, resumeSessionID)
+	s.addPermissionStatus(payload, viewSessionID)
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -4714,13 +4778,12 @@ func (s *Server) listSettings(w http.ResponseWriter) {
 		writeError(w, http.StatusInternalServerError, "config unreadable")
 		return
 	}
-	permValue := cfg.Permission.Mode
-	if s.loop != nil && s.loop.Gate != nil {
-		permValue = string(s.loop.Gate.Mode())
-	}
-	if _, ok := permission.ParseMode(permValue); !ok {
-		permValue = string(permission.ModeDefault)
-	}
+	s.stateMu.RLock()
+	permissionSessionID := s.activeSessionID
+	s.stateMu.RUnlock()
+	permissionView := make(map[string]any)
+	s.addPermissionStatus(permissionView, permissionSessionID)
+	permValue, _ := permissionView["permissionMode"].(string)
 	items := []webSetting{
 		{Key: "permission.mode", Label: "Permission mode", Description: "Default tool approval policy (applies immediately)", Type: "enum",
 			Value: permValue, Options: []string{"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "fullAccess"}},
@@ -4747,12 +4810,14 @@ func (s *Server) listSettings(w http.ResponseWriter) {
 	s.stateMu.RLock()
 	model := s.activeModel
 	s.stateMu.RUnlock()
-	writeJSON(w, http.StatusOK, map[string]any{"settings": items, "model": model})
+	permissionView["settings"], permissionView["model"] = items, model
+	writeJSON(w, http.StatusOK, permissionView)
 }
 
 func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Changes []struct {
+		SessionID *string `json:"sessionId"`
+		Changes   []struct {
 			Key   string `json:"key"`
 			Value string `json:"value"`
 		} `json:"changes"`
@@ -4783,17 +4848,38 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		defer s.runMu.Unlock()
 		s.stateMu.RLock()
+		activePermissionSession := s.activeSessionID
 		workDir := s.activeWorkDir
 		if workDir == "" {
 			workDir = s.freshWorkDir
 		}
 		s.stateMu.RUnlock()
+		if body.SessionID != nil && *body.SessionID != activePermissionSession {
+			writeError(w, http.StatusConflict, "active session changed; select the target session before changing permission mode")
+			return
+		}
+		if activePermissionSession != "" && s.store != nil {
+			permissionLock, acquired, err := s.store.TryAcquireTurnLock(activePermissionSession)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "cannot verify session permission ownership")
+				return
+			}
+			if !acquired {
+				writeError(w, http.StatusConflict, "cannot change permission mode while this session has a running turn; stop it first")
+				return
+			}
+			defer permissionLock.Release()
+		}
 		lease, admitted := s.turnCoordinator.TryAcquire(workDir)
 		if !admitted {
 			writeError(w, http.StatusConflict, "cannot change permission mode while a turn is running; stop the current turn first")
 			return
 		}
 		defer lease.Release()
+		if err := s.syncWorkerPermissionState(activePermissionSession); err != nil {
+			writeError(w, http.StatusConflict, "permission mode unchanged: "+err.Error())
+			return
+		}
 
 	}
 	var settings []config.UserSetting
@@ -4843,7 +4929,7 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		permissionApplied = true
 	}
 	if permissionApplied && s.store != nil {
-		if err := s.persistActiveSessionState(); err != nil {
+		if err := s.persistActiveSessionPermissionState(); err != nil {
 			_ = rtpkg.RestorePermissionModeState(previousPermissionState, s.applyPermissionMode)
 			writeError(w, http.StatusInternalServerError, "permission mode unchanged: "+err.Error())
 			return
@@ -4855,7 +4941,7 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		if permissionApplied {
 			rollbackErr = rtpkg.RestorePermissionModeState(previousPermissionState, s.applyPermissionMode)
 			if s.store != nil {
-				rollbackErr = errors.Join(rollbackErr, s.persistActiveSessionState())
+				rollbackErr = errors.Join(rollbackErr, s.persistActiveSessionPermissionState())
 			}
 
 		}
@@ -4888,7 +4974,14 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 			restart = append(restart, c.Key)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"saved": len(settings), "liveApplied": live, "restartRequired": restart})
+	payload := map[string]any{"saved": len(settings), "liveApplied": live, "restartRequired": restart}
+	if permissionApplied {
+		s.stateMu.RLock()
+		id := s.activeSessionID
+		s.stateMu.RUnlock()
+		s.addPermissionStatus(payload, id)
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func validWebSettingValue(key, value string) bool {
