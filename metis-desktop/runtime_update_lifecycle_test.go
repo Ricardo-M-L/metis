@@ -29,7 +29,7 @@ func TestDesktopUpdateQuiesceWaitsForChildExitAndBlocksAdmission(t *testing.T) {
 	t.Setenv("METIS_WEBUI_HELPER_STOPPED", stopped)
 	app := startUpdateLifecycleBackend(t, "80ms")
 	app.webuiMu.Lock()
-	done := app.webuiDone
+	cmd := app.webuiCmd
 	app.webuiMu.Unlock()
 	started := time.Now()
 	if err := app.quiesceBackendForUpdate(context.Background(), "old.app"); err != nil {
@@ -38,7 +38,10 @@ func TestDesktopUpdateQuiesceWaitsForChildExitAndBlocksAdmission(t *testing.T) {
 	if time.Since(started) < 70*time.Millisecond {
 		t.Fatal("update continued before backend drain")
 	}
-	if !waitForWebUIProcess(done, 0) {
+	// The drain receives cmd.Wait's result before the reaper closes its
+	// notification channel. Inspect the completed process rather than racing
+	// that subsequent close with a second nonblocking receive.
+	if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
 		t.Fatal("backend was not reaped before activation")
 	}
 	if _, err := os.Stat(stopped); err != nil {

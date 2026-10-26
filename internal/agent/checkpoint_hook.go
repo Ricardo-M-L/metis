@@ -36,6 +36,7 @@ type ckptEntry struct {
 	label          string            // human label ("before turn 3")
 	managedPaths   map[string]string // cwd-relative path -> post-tool fingerprint
 	incomplete     bool              // never claim code restore across an unverified mutation
+	scope          string            // a historical scope cannot authorize a different project set
 }
 
 // mutatingTools are the tools whose execution can change the working
@@ -61,7 +62,7 @@ func (l *Loop) snapPreEditContext(ctx context.Context, toolName string, input ma
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
-	if l.Checkpointer == nil || !mutatingTools[toolName] || l.Checkpointer.DisabledByPolicy() {
+	if l.Checkpointer == nil || !mutatingTools[toolName] || l.Checkpointer.AutomaticDisabled() {
 		return nil
 	}
 	turns := l.CountTurns()
@@ -86,6 +87,7 @@ func (l *Loop) snapPreEditContext(ctx context.Context, toolName string, input ma
 			hash:           hash,
 			restoreToTurns: turns - 1, // rewinding drops this turn's edits + conversation
 			label:          fmt.Sprintf("before turn %d", turns),
+			scope:          l.Checkpointer.ScopeKey(),
 		})
 	}
 	l.ckptMu.Unlock()
@@ -115,21 +117,7 @@ func (l *Loop) runCheckpointStage(ctx context.Context, out chan<- Event, phase, 
 	// A broad workspace is intentionally excluded, not an initialization
 	// failure or an incomplete snapshot. This immutable policy check must not
 	// wait on the manager's scan mutex outside the bounded stage context.
-	if l.Checkpointer.DisabledByPolicy() {
-		if ctx.Err() != nil {
-			return
-		}
-		l.ckptMu.Lock()
-		notify := !l.ckptPolicyNotified
-		l.ckptPolicyNotified = true
-		l.ckptMu.Unlock()
-		if notify {
-			noticeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-			defer cancel()
-			emit(noticeCtx, out, Event{Kind: EventInfo, Info: fmt.Sprintf(
-				"%v; conversation-only rewind remains available",
-				checkpoint.ErrDisabledByPolicy)})
-		}
+	if l.Checkpointer.AutomaticDisabled() {
 		return
 	}
 	// A first snapshot may cover a multi-project workspace. It has a larger
@@ -293,7 +281,7 @@ func (l *Loop) RewindPoints() []RewindPoint {
 		// code state, so code restore is an available, proven no-op. With no
 		// snapshot history at all, absence is not evidence and remains
 		// unavailable.
-		codeAvailable := l.Checkpointer != nil && !l.Checkpointer.DisabledByPolicy() &&
+		codeAvailable := l.Checkpointer != nil && !l.Checkpointer.DisabledByPolicy() && checkpointScopeMatches(stack, turn, l.Checkpointer.ScopeKey()) &&
 			(hash != "" || (latestEditTurn > 0 && turn > latestEditTurn)) && checkpointCompleteFromTurn(stack, turn)
 		points = append(points, RewindPoint{
 			Turn:              turn,
@@ -342,6 +330,13 @@ func (l *Loop) rewindToTurnExpectedPersist(expected []llm.Message, turn int, sco
 	if l == nil || (scope != RewindConversation && scope != RewindCode && scope != RewindCodeAndConversation) {
 		return RewindResult{}, ErrInvalidRewindScope
 	}
+	if scope&RewindCode != 0 && l.Checkpointer != nil {
+		release, _, err := l.Checkpointer.BeginRun()
+		if err != nil {
+			return RewindResult{}, err
+		}
+		defer release()
+	}
 	messageIndex, prompt, ok := rewindTarget(expected, turn)
 	if !ok {
 		return RewindResult{}, ErrInvalidRewindPoint
@@ -364,6 +359,9 @@ func (l *Loop) rewindToTurnExpectedPersist(expected []llm.Message, turn int, sco
 		l.ckptMu.Lock()
 		stack := append([]ckptEntry(nil), l.ckptStack...)
 		l.ckptMu.Unlock()
+		if !checkpointScopeMatches(stack, turn, l.Checkpointer.ScopeKey()) {
+			return RewindResult{}, fmt.Errorf("%w: 检查点的项目范围已改变，请先恢复原保护范围", ErrCheckpointUnavailable)
+		}
 		if !checkpointCompleteFromTurn(stack, turn) {
 			return RewindResult{}, ErrCheckpointIncomplete
 		}
@@ -657,7 +655,7 @@ func (l *Loop) recordCheckpointMutationContext(ctx context.Context, toolName str
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
-	if l == nil || l.Checkpointer == nil || l.Checkpointer.DisabledByPolicy() || err != nil || (res != nil && res.IsError) {
+	if l == nil || l.Checkpointer == nil || l.Checkpointer.AutomaticDisabled() || err != nil || (res != nil && res.IsError) {
 		return nil
 	}
 	l.ckptMu.Lock()
@@ -691,6 +689,18 @@ func (l *Loop) recordCheckpointMutationContext(ctx context.Context, toolName str
 	}
 	if len(paths) == 0 {
 		return nil
+	}
+	if toolName != "Bash" {
+		protected := paths[:0]
+		for _, path := range paths {
+			if l.Checkpointer.Protects(path) {
+				protected = append(protected, path)
+			}
+		}
+		paths = protected
+		if len(paths) == 0 {
+			return nil
+		}
 	}
 	states, stateErr := l.Checkpointer.CapturePathStatesContext(ctx, paths)
 	if stateErr != nil {
@@ -751,6 +761,9 @@ func (l *Loop) RewindWithPersist(persist func([]llm.Message) error) (RewindResul
 func (l *Loop) checkpointUnavailableReason() error {
 	if l == nil || l.Checkpointer == nil {
 		return ErrCheckpointUnavailable
+	}
+	if err := l.Checkpointer.RefreshControl(); err != nil {
+		return fmt.Errorf("%w: %w", ErrCheckpointUnavailable, err)
 	}
 	if reason := l.Checkpointer.DisabledReason(); reason != nil {
 		return fmt.Errorf("%w: %w", ErrCheckpointUnavailable, reason)

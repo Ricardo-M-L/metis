@@ -30,6 +30,9 @@ type liveTree struct {
 func (m *Manager) inventoryTree(ctx context.Context, root *os.Root, observer *scanObserver) (liveTree, error) {
 	observer.stage("inventory")
 	var tree liveTree
+	if _, err := normalizeRoots(m.cwd, m.scopeRoots, false); err != nil {
+		return tree, err
+	}
 	cwd, err := filepath.Abs(m.cwd)
 	if err != nil {
 		return tree, err
@@ -66,6 +69,9 @@ func (m *Manager) inventoryTree(ctx context.Context, root *os.Root, observer *sc
 			if skipDirs[entry.Name()] || rel == shadowRel || strings.HasPrefix(shadowRel, rel+"/") {
 				continue
 			}
+			if !m.scopeTraverses(rel) {
+				continue
+			}
 			// DirEntry.Info may resolve its stored name after an ancestor was
 			// renamed; resolve metadata against the held parent handle instead.
 			info, err := directory.Lstat(entry.Name())
@@ -88,6 +94,9 @@ func (m *Manager) inventoryTree(ctx context.Context, root *os.Root, observer *sc
 				continue
 			}
 			if !info.Mode().IsRegular() || info.Size() > maxFileBytes {
+				continue
+			}
+			if !m.scopeContains(rel) {
 				continue
 			}
 			tree.files = append(tree.files, liveFile{rel: rel, info: info})
@@ -260,7 +269,7 @@ func (m *Manager) syncTreeContext(ctx context.Context, observer *scanObserver) e
 		if rel == "" {
 			continue
 		}
-		if normalized, ok := m.validRelativePath(rel); !ok || normalized != filepath.ToSlash(rel) {
+		if normalized, ok := safeRelativePath(rel); !ok || normalized != filepath.ToSlash(rel) {
 			return errors.New("checkpoint: unsafe tracked shadow path")
 		}
 		if _, exists := live[rel]; !exists {

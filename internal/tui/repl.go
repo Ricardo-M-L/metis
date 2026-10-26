@@ -379,6 +379,13 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 				}
 			case slash.SignalRewind:
 				fmt.Fprintln(r.out, r.rewindLastEditTurn())
+			case slash.SignalCheckpoint:
+				state, err := r.Loop.CheckpointCommand(ctx, args)
+				if err != nil {
+					fmt.Fprintln(r.out, "checkpoint: "+err.Error())
+				} else {
+					fmt.Fprintln(r.out, state.String())
+				}
 			case slash.SignalRetry:
 				r.retryLastResponse(ctx)
 			case slash.SignalHistory:

@@ -942,6 +942,8 @@ func (m *Model) handleSubmitWithUserInput(userInputBlocks []llm.ContentBlock, cr
 			} else {
 				m.openRewindScreen()
 			}
+		case slash.SignalCheckpoint:
+			return m, m.checkpointControlCommand(args)
 		case slash.SignalHistory:
 			hs := screen.NewHistoryScreen(m.loop.History(), m.width, m.height)
 			hs.Title = "session history (" + m.sessionID + ")"

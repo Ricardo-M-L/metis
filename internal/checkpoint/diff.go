@@ -96,7 +96,8 @@ func (m *Manager) readOnlyGitDiffContext(ctx context.Context, workTree string, m
 	}
 	args = append(args, "diff", "--no-color", "--no-ext-diff")
 	args = append(args, revisions...)
-	args = append(args, "--", ".")
+	args = append(args, "--")
+	args = append(args, m.scopeRoots...)
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = m.shadowDir
 	if maxBytes <= 0 {
@@ -131,9 +132,9 @@ func (m *Manager) untrackedWorkingTreeDiffs() (string, error) {
 }
 
 func (m *Manager) untrackedWorkingTreeDiffsContext(ctx context.Context, maxBytes int) (string, error) {
-	cmd := exec.CommandContext(ctx,
-		"git", "--work-tree="+m.cwd, "ls-files", "--others", "--exclude-standard", "-z",
-	)
+	args := []string{"--work-tree=" + m.cwd, "ls-files", "--others", "--exclude-standard", "-z", "--"}
+	args = append(args, m.scopeRoots...)
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = m.shadowDir
 	out, err := cmd.Output()
 	if err != nil {

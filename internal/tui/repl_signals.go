@@ -57,6 +57,7 @@ func classifyPlainREPLSignal(sig slash.Signal) plainREPLSignalClass {
 		slash.SignalRetry,
 		slash.SignalUndo,
 		slash.SignalRewind,
+		slash.SignalCheckpoint,
 		slash.SignalHistory,
 		slash.SignalSave,
 		slash.SignalBranch,

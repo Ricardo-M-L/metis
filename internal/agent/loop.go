@@ -1584,6 +1584,18 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		finish = sync.OnceFunc(l.OnRunFinished)
 	}
 	defer finish() // covers early returns before session finalizers are installed
+	if l.Checkpointer != nil {
+		release, changed, err := l.Checkpointer.BeginRun()
+		if err != nil {
+			return err
+		}
+		defer release()
+		if changed {
+			l.ckptMu.Lock()
+			l.ckptSnappedAt = -1
+			l.ckptMu.Unlock()
+		}
+	}
 	// Capture task ownership at the turn boundary. Desktop may let the user
 	// inspect another session while this turn or one of its sub-agents is still
 	// running; tool calls must continue writing to the originating session.

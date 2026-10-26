@@ -36,12 +36,8 @@ func TestCheckpointPolicySkipsAutomaticStagesWithoutProtectionGap(t *testing.T) 
 	if called != 0 || len(l.ckptStack) != 0 {
 		t.Fatalf("policy-disabled workspace ran %d snapshot callbacks and stored %d protection gaps", called, len(l.ckptStack))
 	}
-	if len(out) != 1 {
-		t.Fatalf("want one policy explanation per workspace binding, got %d events", len(out))
-	}
-	notice := (<-out).Info
-	if !strings.Contains(notice, "home directory") || strings.Contains(notice, "init error") || strings.Contains(notice, "incomplete") {
-		t.Fatalf("incorrect policy explanation: %s", notice)
+	if len(out) != 0 {
+		t.Fatalf("automatic disabled hooks must stay quiet; /checkpoint owns the status, got %d events", len(out))
 	}
 	if entries, err := os.ReadDir(shadow); err != nil || len(entries) != 0 {
 		t.Fatalf("policy-disabled workspace touched snapshot storage: %v %v", entries, err)
@@ -118,8 +114,8 @@ func TestCheckpointPolicyNoticeResetsOnWorkspaceRebind(t *testing.T) {
 			return nil
 		})
 	}
-	if len(out) != 2 {
-		t.Fatalf("new workspace binding did not get its own policy explanation: %d", len(out))
+	if len(out) != 0 {
+		t.Fatalf("workspace rebinding must not spam checkpoint policy notices: %d", len(out))
 	}
 	project := t.TempDir()
 	path := filepath.Join(project, "file.txt")

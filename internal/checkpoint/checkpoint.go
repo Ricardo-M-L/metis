@@ -49,7 +49,12 @@ type Manager struct {
 	shadowDir         string // ~/.metis/checkpoints/<session-id>
 	cwd               string // the working dir whose state we mirror
 	disabled          bool   // unsafe workspace policy or fatal initialization failure
-	disabledByPolicy  bool
+	disabledByPolicy  atomic.Bool
+	automaticOff      atomic.Bool
+	scopeRoots        []string
+	scopeKey          atomic.Value
+	controlRevision   string
+	controlErr        error
 	initialized       bool
 	initErr           error
 	hasBaseline       atomic.Bool
@@ -82,7 +87,12 @@ func NewManager(sessionID, cwd, shadowRoot string) *Manager {
 	// 2026-06-14.
 	if isUnsafeCheckpointRoot(cwd) {
 		m.disabled = true
-		m.disabledByPolicy = true
+		m.disabledByPolicy.Store(true)
+	}
+	if cwd != "" {
+		_, _ = m.refreshControlLocked()
+	} else {
+		m.automaticOff.Store(true)
 	}
 	return m
 }
@@ -377,6 +387,18 @@ func (m *Manager) managedRelativePath(path string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		canonicalCWD, cwdErr := filepath.EvalSymlinks(absCWD)
+		canonicalPath, pathErr := canonicalControlCandidate(absPath)
+		if cwdErr != nil || pathErr != nil {
+			return "", false
+		}
+		absCWD = canonicalCWD
+		rel, err = filepath.Rel(canonicalCWD, canonicalPath)
+		if err != nil {
+			return "", false
+		}
+	}
 	normalized, ok := m.validRelativePath(rel)
 	if !ok {
 		return "", false
@@ -400,6 +422,14 @@ func (m *Manager) managedRelativePath(path string) (string, bool) {
 }
 
 func (m *Manager) validRelativePath(rel string) (string, bool) {
+	normalized, ok := safeRelativePath(rel)
+	if !ok || !m.scopeContains(normalized) {
+		return "", false
+	}
+	return normalized, true
+}
+
+func safeRelativePath(rel string) (string, bool) {
 	clean := filepath.Clean(filepath.FromSlash(rel))
 	if clean == "." || clean == ".." || filepath.IsAbs(clean) || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
 		return "", false
@@ -409,7 +439,8 @@ func (m *Manager) validRelativePath(rel string) (string, bool) {
 			return "", false
 		}
 	}
-	return filepath.ToSlash(clean), true
+	normalized := filepath.ToSlash(clean)
+	return normalized, true
 }
 
 func (m *Manager) managedPathsFile() string {

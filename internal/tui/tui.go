@@ -28,6 +28,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
+	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 	"github.com/Ricardo-M-L/metis/internal/computeruse"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -190,8 +191,10 @@ type ExternalHooks struct {
 }
 
 type Model struct {
-	ctx  context.Context
-	loop *agent.Loop
+	ctx               context.Context
+	loop              *agent.Loop
+	checkpointState   *checkpoint.ControlStatus
+	checkpointManager *checkpoint.Manager
 	// cronSvc backs the in-session scheduler (cron_scheduler.go) — the same
 	// CronService the CronCreate/List/Delete tools mutate, so session-only
 	// jobs the model schedules mid-chat fire here. nil ⇒ no in-session ticks.

@@ -689,6 +689,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/settings", s.handleSettings)
 	mux.HandleFunc("/api/computer-use", s.handleComputerUse)
 	mux.HandleFunc("/api/commands/session", s.handleSessionCommand)
+	mux.HandleFunc("/api/checkpoint", s.handleCheckpointControl)
 	mux.HandleFunc("/api/compact", s.handleCompact)
 	mux.HandleFunc("/api/goals", s.handleGoals)
 	mux.HandleFunc("/api/preferences", s.handlePreferences)
@@ -4006,6 +4007,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	executionStrategy := executionStrategyForStatus(len(planItems), subAgents, namedAgents)
 	payload := map[string]any{
 		"subAgents": subAgents, "backgroundTasks": backgroundTasks, "workspace": workspace,
+		"checkpoint":        s.checkpointStatusForView(viewSessionID, selectedWorkDir),
 		"activeWorkspaceId": workspaceIDForPath(selectedWorkDir),
 		"agents":            agentDetails, "jobs": jobDetails,
 		"toolCount": len(toolNames), "tools": toolNames,

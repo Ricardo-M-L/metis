@@ -212,6 +212,7 @@
               <span class="approval-chip-chevron" aria-hidden="true">&#9662;</span>
             </button>
             <div class="approval-menu" id="approvalMenu" role="menu" aria-label="Permission mode" style="display:none"></div>
+            <button class="input-chip checkpoint-chip" id="checkpointBtn" type="button" title="查看代码检查点开关与项目范围" onclick="runCheckpointControl('status')">检查点：…</button>
             <textarea class="input-field" id="inputField" placeholder="&#25551;&#36848;&#20320;&#24819;&#35201;&#26500;&#24314;&#30340;&#20869;&#23481;" data-i18n-placeholder="composerPlaceholder" rows="1" onkeydown="handleKeydown(event)" oninput="onComposerInput(this)" aria-controls="commandMenu" aria-autocomplete="list"></textarea>
             <button type="button" id="modelBtn" class="input-chip model-chip" aria-label="Select model" aria-haspopup="menu" aria-expanded="false" aria-controls="modelMenu" onclick="event.stopPropagation();toggleModelMenu()">
               <span id="modelName">5.4</span>

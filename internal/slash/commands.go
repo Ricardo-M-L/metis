@@ -125,6 +125,7 @@ const (
 	// TUI can route to the Model field directly without queuing the
 	// args as a user message.
 	SignalThinkingDisplay
+	SignalCheckpoint
 )
 
 type Registry struct {
@@ -434,6 +435,9 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 	r.Register(Cmd{Name: "history", Aliases: []string{"hist"}, Description: "show conversation history (Esc / q to close)", Handler: func(_ string) (string, Signal) {
 		// Display is empty — the runtime renders the screen directly.
 		return "", SignalHistory
+	}})
+	r.Register(Cmd{Name: "checkpoint", Description: "查看、开启或关闭代码检查点；主目录可指定项目范围", ArgumentHint: "[status|on [项目目录…]|off]", Category: "session", Handler: func(_ string) (string, Signal) {
+		return "", SignalCheckpoint
 	}})
 	r.Register(Cmd{Name: "save", Description: "fsync the current session to disk", Handler: func(_ string) (string, Signal) {
 		return "", SignalSave

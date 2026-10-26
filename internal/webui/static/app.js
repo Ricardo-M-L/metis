@@ -441,6 +441,7 @@ async function pollStatus(shouldApply = () => true) {
         viewGeneration !== (typeof resumeSessionGeneration === 'number' ? resumeSessionGeneration : 0)) return;
     d.requestGeneration = generation;
     lastStatusSnapshot = d;
+    if (typeof renderCheckpointControl === 'function') renderCheckpointControl(d.checkpoint);
     renderStatusSnapshot(d);
     if (typeof applyResumeSnapshot === 'function') applyResumeSnapshot(d, selectedSessionId);
     if (typeof applyStatusPlanSnapshot === 'function') applyStatusPlanSnapshot(d);

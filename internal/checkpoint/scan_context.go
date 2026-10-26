@@ -158,6 +158,9 @@ func (m *Manager) snapshotContext(ctx context.Context, toolName, argsHash, messa
 	}
 	defer m.mu.Unlock()
 	defer func() { m.lastScan, err = observer.finish(err) }()
+	if m.automaticOff.Load() && !m.disabled {
+		return "", ErrDisabledByUser
+	}
 	if m.disabled {
 		return "", m.disabledReasonLocked()
 	}

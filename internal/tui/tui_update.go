@@ -128,9 +128,9 @@ func (m *Model) Init() tea.Cmd {
 	// only (ephemeral) jobs into this live chat. No-op tick when cronSvc is
 	// nil (headless paths never reach RunTUI anyway).
 	if m.cronSvc != nil {
-		return tea.Batch(sizeTick, cronTickCmd(), m.waitForBackgroundJob())
+		return tea.Batch(sizeTick, cronTickCmd(), m.waitForBackgroundJob(), m.checkpointStatusCommand())
 	}
-	return tea.Batch(sizeTick, m.waitForBackgroundJob())
+	return tea.Batch(sizeTick, m.waitForBackgroundJob(), m.checkpointStatusCommand())
 }
 
 func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
@@ -252,6 +252,23 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+	case checkpointControlResultMsg:
+		if m.loop == msg.loop && m.sessionID == msg.sessionID && m.loop.CheckpointManager() == msg.manager {
+			m.messages = append(m.messages, msg.row)
+			if msg.state != nil {
+				m.checkpointState = msg.state
+				m.checkpointManager = msg.manager
+			}
+		}
+		return m, nil
+	case checkpointPollTick:
+		return m, m.checkpointStatusCommand()
+	case checkpointStatusMsg:
+		if m.sessionID == msg.sessionID && m.loop.CheckpointManager() == msg.manager {
+			m.checkpointState = &msg.state
+			m.checkpointManager = msg.manager
+		}
+		return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return checkpointPollTick{} })
 
 	case bashLocalResultMsg:
 		// Async `!cmd` finished off-thread — append its output here on the

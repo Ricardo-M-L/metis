@@ -2173,6 +2173,11 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// wall-clock time after the fact. Best-effort + cheap; appends one
 	// JSONL line per tool call.
 	loop.TimingSink = store.NewTimingRecorder(rt.sessionID).Record
+	// CLI queries and isolated Desktop workers must use the same persisted
+	// workspace checkpoint controls as the interactive terminal.
+	if cwd, err := os.Getwd(); err == nil {
+		loop.SetCheckpointer(checkpoint.NewManager(rt.sessionID, cwd, ""))
+	}
 
 	// Tell the tasks pkg what session id is current so TodoWrite /
 	// TodoRead persist into the right per-session file. Done last so a

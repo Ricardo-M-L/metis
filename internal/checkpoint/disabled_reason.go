@@ -13,11 +13,10 @@ import (
 var ErrDisabledByPolicy = errors.New("checkpoint: disabled by workspace policy; choose a project directory instead of the home directory or filesystem root")
 
 // DisabledByPolicy reports an intentionally excluded workspace without
-// waiting for a snapshot. The flag is set only by NewManager before publication
-// and never changes, unlike fatal initialization state protected by m.mu. Use
-// this in automatic hook fast paths so waiting for m.mu cannot bypass their
-// cancellable checkpoint budget.
-func (m *Manager) DisabledByPolicy() bool { return m.disabledByPolicy }
+// waiting for a snapshot. Workspace controls refresh it at an idle boundary
+// under a cross-process lease. Automatic hooks read it atomically so a long
+// scan cannot turn a status check into an unbounded mutex wait.
+func (m *Manager) DisabledByPolicy() bool { return m.disabledByPolicy.Load() }
 
 // DisabledReason returns nil while checkpointing is enabled, ErrDisabledByPolicy
 // for an intentionally excluded workspace, or the original wrapped fatal
@@ -32,10 +31,13 @@ func (m *Manager) DisabledReason() error {
 
 // The caller owns m.mu (or has not yet published a newly created Manager).
 func (m *Manager) disabledReasonLocked() error {
+	if m.controlErr != nil {
+		return m.controlErr
+	}
 	if !m.disabled {
 		return nil
 	}
-	if m.disabledByPolicy {
+	if m.disabledByPolicy.Load() {
 		return ErrDisabledByPolicy
 	}
 	if m.initErr != nil {
