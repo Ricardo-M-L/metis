@@ -166,6 +166,7 @@ function decorateSessionFiles() {
       content.after(chips);
     }
   });
+  if (typeof virtualHistoryViewportChanged === 'function') virtualHistoryViewportChanged();
 }
 function showSessionFilePanel() {
   const panel = document.getElementById('sessionFilePanel');

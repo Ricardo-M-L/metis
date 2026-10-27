@@ -474,7 +474,7 @@ func freePort() (int, error) {
 }
 
 func (a *App) GetVersion() string {
-	return "0.4.98"
+	return "0.4.99"
 }
 
 // ChooseWorkspaceDirectory is the native half of the iframe bridge. The web

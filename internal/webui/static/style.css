@@ -7209,3 +7209,8 @@ html[data-presentation-mode='compact'] .think-row:not(.redacted):not([data-runni
   .activity-turn[data-state='running'] .activity-turn-duration::before { animation: none; }
   .activity-turn-chevron, .activity-group-summary::before { transition: none; }
 }
+
+/* Virtual history peers keep their existing sibling/ownership structure. */
+.history-virtual-spacer { flex: 0 0 auto; min-height: 0; padding: 0; margin: 0; pointer-events: none; overflow: hidden; }
+.chat-area > [data-virtual-turn-key] { flex-shrink: 0; }
+.chat-area > [data-virtual-history="true"] { animation: none; }

@@ -1662,6 +1662,7 @@ async function resumeSession(id) {
     // Direct links (for example, automation runs) may target a saved session
     // outside the current list page. Cache only its verified server metadata.
     if (data.session && data.session.id === id) mergeServerSessionMetadata(data.session);
+    if (typeof virtualHistorySaveViewport === 'function') virtualHistorySaveViewport();
     if (id !== currentSessionId && typeof detachRunningTurnView === 'function') detachRunningTurnView();
     currentSessionId = id;
     if (typeof invalidatePermissionMode === 'function') invalidatePermissionMode();

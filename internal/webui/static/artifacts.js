@@ -17,7 +17,12 @@ const artifactState = {
   previewURL: '',
   previewError: '',
   restoreFocus: null,
-  deletePending: false
+  deletePending: false,
+  deletedBySession: new Map(),
+  authoritativeSession: '',
+  authoritativeIDs: new Set(),
+  mutationSequence: 0,
+  liveRevisions: new Map()
 };
 
 function artifactValue(source, names, fallback) {
@@ -105,16 +110,64 @@ function artifactByID(id) {
   return artifactState.artifacts.find(item => item.id === String(id || '')) || null;
 }
 
-function upsertArtifact(item) {
+function artifactDeletedIDs(sessionId = currentSessionId) {
+  const owner = String(sessionId || '');
+  let deleted = artifactState.deletedBySession.get(owner);
+  if (!deleted) {
+    deleted = new Set();
+    artifactState.deletedBySession.set(owner, deleted);
+    while (artifactState.deletedBySession.size > 64) artifactState.deletedBySession.delete(artifactState.deletedBySession.keys().next().value);
+  }
+  return deleted;
+}
+
+function artifactIsDeleted(id, sessionId = currentSessionId) {
+  return artifactState.deletedBySession.get(String(sessionId || ''))?.has(String(id || '')) || false;
+}
+
+function newerArtifactValue(existing, incoming, historical = false) {
+  if (!existing) return incoming;
+  if (existing.currentVersion > incoming.currentVersion) return existing;
+  if (existing.currentVersion === incoming.currentVersion) {
+    if (historical) return existing;
+    const oldTime = Date.parse(existing.updatedAt || existing.createdAt || '');
+    const newTime = Date.parse(incoming.updatedAt || incoming.createdAt || '');
+    if (Number.isFinite(oldTime) && (!Number.isFinite(newTime) || oldTime > newTime)) return existing;
+  }
+  const versions = new Map(existing.versions.map(version => [version.number, version]));
+  incoming.versions.forEach(version => versions.set(version.number, version));
+  return { ...existing, ...incoming, versions: [...versions.values()].sort((a, b) => b.number - a.number) };
+}
+
+function upsertArtifact(item, options = {}) {
   const normalized = normalizeArtifact(item);
   if (!normalized) return null;
-  if (normalized.sessionId && normalized.sessionId !== String(currentSessionId || '')) return null;
+  const sessionId = String(currentSessionId || '');
+  if (normalized.sessionId && normalized.sessionId !== sessionId || artifactIsDeleted(normalized.id, sessionId)) return null;
+  const historical = !!options.historical;
+  if (historical && artifactState.authoritativeSession === sessionId && !artifactState.authoritativeIDs.has(normalized.id)) return null;
+  if (artifactState.sessionId !== sessionId) {
+    artifactState.sessionId = sessionId;
+    artifactState.artifacts = [];
+    artifactState.authoritativeSession = '';
+    artifactState.authoritativeIDs.clear();
+    artifactState.liveRevisions.clear();
+  }
   const index = artifactState.artifacts.findIndex(candidate => candidate.id === normalized.id);
-  if (index < 0) artifactState.artifacts.unshift(normalized);
-  else artifactState.artifacts[index] = Object.assign({}, artifactState.artifacts[index], normalized);
-  renderArtifactGallery();
-  updateArtifactTabCount();
-  return index < 0 ? artifactState.artifacts[0] : artifactState.artifacts[index];
+  const existing = index < 0 ? null : artifactState.artifacts[index];
+  const saved = newerArtifactValue(existing, normalized, historical);
+  if (index < 0) artifactState.artifacts.unshift(saved);
+  else artifactState.artifacts[index] = saved;
+  if (options.authoritative) artifactState.authoritativeIDs.add(saved.id);
+  if (!historical && !options.authoritative) {
+    artifactState.liveRevisions.set(saved.id, ++artifactState.mutationSequence);
+    artifactState.authoritativeIDs.add(saved.id);
+  }
+  if (saved !== existing) {
+    renderArtifactGallery();
+    updateArtifactTabCount();
+  }
+  return saved;
 }
 
 function artifactAPIPath(id, action, version, sessionId) {
@@ -220,6 +273,7 @@ function createArtifactCard(item, context) {
   const card = document.createElement('article');
   card.className = context === 'chat' ? 'artifact-card artifact-chat-card' : 'artifact-card artifact-gallery-card';
   card.dataset.artifactId = item.id;
+  card.dataset.artifactVersion = String(item.currentVersion);
   card.tabIndex = 0;
   card.setAttribute('role', 'button');
   card.setAttribute('aria-label', 'Open artifact ' + item.title);
@@ -273,50 +327,72 @@ function createArtifactCard(item, context) {
 function renderArtifactPresentation(toolRow, presentation) {
   const item = artifactFromPresentation(presentation);
   if (!item || !toolRow || !toolRow.parentElement) return false;
-  const saved = upsertArtifact(item) || item;
+  const saved = upsertArtifact(item, { historical: typeof renderingActivityHistory !== 'undefined' && renderingActivityHistory });
+  // A deleted/absent historical artifact is still a consumed presentation;
+  // replay must not revive it through a text fallback or a new gallery entry.
+  if (!saved) return true;
+  if (typeof virtualHistoryRememberArtifact === 'function') virtualHistoryRememberArtifact(saved, toolRow);
+  if (typeof virtualHistoryAllowArtifact === 'function' && !virtualHistoryAllowArtifact(saved)) return true;
   const area = document.getElementById('chatArea');
   const group = toolRow.closest('.activity-group');
-  // An Artifact is a visible result in the conversation, not a tool detail.
-  // Only close its own active process section: concurrent results from an old
-  // group may arrive after a newer group has already started.
   if (group && group.parentElement === area &&
       typeof activityGroupEl !== 'undefined' && activityGroupEl === group &&
       typeof finishActivityGroup === 'function') finishActivityGroup();
   const selector = '.artifact-chat-card[data-artifact-id="' + CSS.escape(saved.id) + '"]';
   const existing = area && area.querySelector(selector);
-  const card = createArtifactCard(saved, 'chat');
-  if (existing) existing.replaceWith(card);
-  else if (group && group.parentElement === area) {
-    // Multiple Artifact results from one group keep their arrival order.
+  const card = existing ? refreshArtifactChatCard(existing, saved) : createArtifactCard(saved, 'chat');
+  if (!existing && group && group.parentElement === area) {
     let anchor = group;
     while (anchor.nextElementSibling?.classList.contains('artifact-chat-card')) anchor = anchor.nextElementSibling;
     anchor.insertAdjacentElement('afterend', card);
-  } else toolRow.insertAdjacentElement('afterend', card);
-  // Also repair a card that was already nested in a folded process section.
+  } else if (!existing) toolRow.insertAdjacentElement('afterend', card);
   const nestedGroup = card.closest('.activity-group');
   if (nestedGroup && nestedGroup.parentElement === area) nestedGroup.insertAdjacentElement('afterend', card);
+  const owner = typeof virtualHistoryArtifactAnchor === 'function' ? virtualHistoryArtifactAnchor(saved) : group;
+  if (owner?.dataset.virtualTurnKey) card.dataset.virtualTurnKey = owner.dataset.virtualTurnKey;
   updateEmptyLayout();
   autoScroll();
+  if (typeof virtualHistoryViewportChanged === 'function') virtualHistoryViewportChanged();
   return true;
+}
+
+function refreshArtifactChatCard(card, item) {
+  // Keep the peer node identity registered by the virtual viewport.
+  if (typeof card.replaceChildren === 'function') {
+    const fresh = createArtifactCard(item, 'chat');
+    card.replaceChildren(...Array.from(fresh.childNodes || fresh.children || []));
+    card.setAttribute('aria-label', 'Open artifact ' + item.title);
+    card.dataset.artifactVersion = String(item.currentVersion);
+  }
+  return card;
 }
 
 function syncArtifactChatCards(items) {
   const area = document.getElementById('chatArea');
   if (!area) return;
   (items || []).forEach(item => {
+    if (typeof artifactIsDeleted === 'function' && artifactIsDeleted(item.id)) return;
+    if (typeof virtualHistoryRememberArtifact === 'function') virtualHistoryRememberArtifact(item, null);
+    if (typeof virtualHistoryAllowArtifact === 'function' && !virtualHistoryAllowArtifact(item)) return;
     const selector = '.artifact-chat-card[data-artifact-id="' + CSS.escape(item.id) + '"]';
     const existing = area.querySelector(selector);
     if (existing) {
+      refreshArtifactChatCard(existing, item);
       const nestedGroup = existing.closest('.activity-group');
       if (nestedGroup && nestedGroup.parentElement === area) nestedGroup.insertAdjacentElement('afterend', existing);
       return;
     }
-    if (typeof finishActivityGroup === 'function') finishActivityGroup();
+    const owner = typeof virtualHistoryArtifactAnchor === 'function' ? virtualHistoryArtifactAnchor(item) : null;
+    if (!owner && typeof finishActivityGroup === 'function') finishActivityGroup();
     const card = createArtifactCard(item, 'chat');
-    if (turnStatusEl && turnStatusEl.parentElement === area) area.insertBefore(card, turnStatusEl);
+    if (owner && owner.parentElement === area) {
+      if (owner.dataset.virtualTurnKey) card.dataset.virtualTurnKey = owner.dataset.virtualTurnKey;
+      owner.insertAdjacentElement('afterend', card);
+    } else if (turnStatusEl && turnStatusEl.parentElement === area) area.insertBefore(card, turnStatusEl);
     else area.appendChild(card);
   });
   updateEmptyLayout();
+  if (typeof virtualHistoryViewportChanged === 'function') virtualHistoryViewportChanged();
 }
 
 function renderArtifactGallery() {
@@ -348,9 +424,15 @@ async function loadArtifactsForSession(sessionId, options = {}) {
   if (normalizedSession !== String(currentSessionId || '')) return [];
   const sequence = ++artifactState.requestSequence;
   const generation = artifactState.sessionGeneration;
+  const mutationSequence = artifactState.mutationSequence;
   const isLatest = () => sequence === artifactState.requestSequence &&
     generation === artifactState.sessionGeneration && normalizedSession === String(currentSessionId || '');
-  if (artifactState.sessionId !== normalizedSession) artifactState.artifacts = [];
+  if (artifactState.sessionId !== normalizedSession) {
+    artifactState.artifacts = [];
+    artifactState.authoritativeSession = '';
+    artifactState.authoritativeIDs.clear();
+    artifactState.liveRevisions.clear();
+  }
   artifactState.sessionId = normalizedSession;
   artifactState.loading = !!normalizedSession;
   const loading = document.getElementById('artifactsLoading');
@@ -370,12 +452,31 @@ async function loadArtifactsForSession(sessionId, options = {}) {
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'artifacts: ' + res.status);
     if (!isLatest()) return [];
-    artifactState.artifacts = artifactListPayload(data);
+    const incoming = artifactListPayload(data).filter(item => !artifactIsDeleted(item.id, normalizedSession));
+    const previous = new Map(artifactState.artifacts.map(item => [item.id, item]));
+    const merged = incoming.map(item => newerArtifactValue(previous.get(item.id), item));
+    const known = new Set(merged.map(item => item.id));
+    // A list request may have taken its snapshot before a new live result.
+    artifactState.artifacts.forEach(item => {
+      if (!known.has(item.id) && !artifactIsDeleted(item.id, normalizedSession) &&
+          (artifactState.liveRevisions.get(item.id) || 0) > mutationSequence) {
+        merged.push(item);
+        known.add(item.id);
+      }
+    });
+    artifactState.artifacts = merged;
+    artifactState.authoritativeSession = normalizedSession;
+    artifactState.authoritativeIDs = known;
+    document.querySelectorAll('.artifact-chat-card').forEach(card => {
+      if (!known.has(card.dataset.artifactId)) {
+        if (typeof virtualHistoryForgetArtifact === 'function') virtualHistoryForgetArtifact(card.dataset.artifactId);
+        card.remove();
+      }
+    });
     if (options.rebuildCards) syncArtifactChatCards(artifactState.artifacts);
     return artifactState.artifacts;
   } catch (error) {
     if (isLatest()) {
-      artifactState.artifacts = [];
       if (!options.silent) showToast('Unable to load artifacts: ' + error.message);
     }
     return [];
@@ -404,6 +505,9 @@ function resetArtifactsForSession() {
   if (deleteOverlay) deleteOverlay.hidden = true;
   artifactState.sessionId = '';
   artifactState.artifacts = [];
+  artifactState.authoritativeSession = '';
+  artifactState.authoritativeIDs = new Set();
+  artifactState.liveRevisions = new Map();
   artifactState.loading = false;
   renderArtifactGallery();
   updateArtifactTabCount();
@@ -411,6 +515,7 @@ function resetArtifactsForSession() {
 }
 
 function openArtifactsPanel() {
+  if (typeof virtualHistorySaveViewport === 'function') virtualHistorySaveViewport();
   const main = document.querySelector('.main');
   const app = document.querySelector('.app');
   if (!main || !app) return;
@@ -438,6 +543,7 @@ function leaveArtifactsPanel() {
   if (app) app.classList.remove('artifacts-mode');
   const tab = document.getElementById('tabArtifacts');
   if (tab) tab.classList.remove('active');
+  if (typeof virtualHistoryViewportChanged === 'function') virtualHistoryViewportChanged();
 }
 
 async function fetchArtifactDetail(id, shouldApply = () => true) {
@@ -455,7 +561,7 @@ async function fetchArtifactDetail(id, shouldApply = () => true) {
     const raw = artifactValue(data, ['artifact', 'data', 'Artifact'], data);
     const item = normalizeArtifact(raw);
     if (item && item.sessionId && item.sessionId !== sessionId) return null;
-    return upsertArtifact(item) || existing;
+    return upsertArtifact(item, { authoritative: true }) || existing;
   } catch (error) {
     if (!isCurrent()) return null;
     if (existing) return existing;
@@ -710,6 +816,10 @@ async function confirmArtifactDeletion() {
     const data = await res.json().catch(() => ({}));
     if (!isCurrent()) return;
     if (!res.ok) throw new Error(data.error || 'delete: ' + res.status);
+    artifactDeletedIDs(sessionId).add(id);
+    artifactState.authoritativeIDs.delete(id);
+    artifactState.liveRevisions.delete(id);
+    if (typeof virtualHistoryForgetArtifact === 'function') virtualHistoryForgetArtifact(id);
     document.querySelectorAll('.artifact-card[data-artifact-id="' + CSS.escape(id) + '"]').forEach(card => card.remove());
     artifactState.artifacts = artifactState.artifacts.filter(item => item.id !== id);
     cancelArtifactDeletion();

@@ -8,6 +8,28 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 
+## [0.4.99] - 2026-10-27
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG continue the
+established ad-hoc signing channel without Apple notarization.
+
+### Fixed
+
+- Commit streamed text and scroll-follow updates in the same paint frame to
+  prevent the viewport from falling behind and repeatedly catching up.
+- Preserve reading position when final Markdown rendering replaces content in
+  WKWebView, including final buffered characters and first-session replies.
+- Keep virtualized history nonempty during canonical refreshes and restore the
+  visible window atomically instead of flashing blank or mounting all history.
+- Allocate a session before the first streamed reply and preserve unsent text
+  and attachments across allocation failures, permission delays and later edits.
+
+### Improved
+
+- Render Markdown incrementally and virtualize long conversations while retaining
+  reading anchors, text selection, tool ownership and session restoration.
+
+
 ## [0.4.96] - 2026-10-23
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are ad-hoc signed

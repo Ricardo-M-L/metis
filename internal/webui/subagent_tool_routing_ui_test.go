@@ -38,10 +38,11 @@ const subagentToolRoutingScript = `
 let attachedActions = 0;
 Object.assign(context, {
   streamingEl: null, streamingText: '', streamMsgIdx: -1, streamedTextThisTurn: false,
+  followOutput: true, chatScrollFrame: 0,
   turnFirstTokenMs: 0, runningTurnIncompleteReason: '', currentView: 'chat', updateSendBtn() {}, loadSessions() {},
   loadSessionStatsbar() {}, attachMessageActions() { attachedActions++; },
 });
-vm.runInContext(extract('function handleTextDelta(d)', 'const foregroundRequests ='), context);
+vm.runInContext(extract('function scheduleStreamingRender()', 'const foregroundRequests ='), context);
 vm.runInContext(extract('function startStreamingMessage()', '// A provider turn_end'), context);
 
 const assistantRows = () => area.querySelectorAll('.message-assistant');

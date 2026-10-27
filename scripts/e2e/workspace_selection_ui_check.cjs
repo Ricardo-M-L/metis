@@ -10,6 +10,10 @@ function extract(file, from, until) {
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+const draftHeader = (id, workspaceId = 'a', workDir = '/alpha') => ({
+  id, workspaceId, workDir,
+  permissionSessionId: id, permissionMode: 'default', permissionModeAvailable: true,
+});
 function context() {
   const calls = [], toasts = [], rendered = [];
   const input = { value: 'old draft', style: {}, dispatchEvent() {}, focus() {} };
@@ -43,7 +47,7 @@ function context() {
     permissionModeGeneration: 0, permissionModeSnapshot: null, permissionModePending: false,
     normalizedPermissionMode: value => value, approvalMode: 'default', confirmFullAccessMode: async () => true,
     syncApprovalChip: mode => { c.approvalMode = mode; }, settingByKey: () => null,
-    PERMISSION_LABELS: { acceptEdits: 'Accept edits', fullAccess: 'Full access' }, PERMISSION_LABELS_ZH: { acceptEdits: '自动确认编辑', fullAccess: '完全访问' },
+    PERMISSION_LABELS: { default: 'Default', plan: 'Plan', acceptEdits: 'Accept edits', fullAccess: 'Full access' }, PERMISSION_LABELS_ZH: { default: '默认确认', plan: '计划模式', acceptEdits: '自动确认编辑', fullAccess: '完全访问' },
     workspaceLabel: path => String(path || '').split('/').filter(Boolean).at(-1) || 'metis',
     detachRunningTurnView() { c.detached = (c.detached || 0) + 1; },
     closeWorkspaceMenu() {}, clearTodoPlan() {}, resumeAutoScroll() {}, beginUserTurn() {}, finishUserTurn() {},
@@ -295,35 +299,46 @@ function context() {
     assert.equal(c.currentSessionId, 'created-b');
     checks++;
   }
-  // An old blank first turn must not attach its SSE or fallback to the new blank.
+  // Allocation gives the first turn a durable owner. It must not attach its
+  // SSE or fallback to the blank view requested by a later workspace click.
   {
     const { c, calls, elements } = context(), completion = deferred();
     c.currentSessionId = null;
     c.fetch = async (url, options) => {
       calls.push({ url, body: JSON.parse(options.body) });
+      if (url === '/api/sessions') return { ok: true, json: async () => draftHeader('late-a') };
       if (url === '/api/turns') return completion.promise;
       return { ok: true, json: async () => ({ activeId: 'b', workspace: c.workspaces[1] }) };
     };
     const turn = c.runTurnItem({ text: 'A first turn' }); await tick();
     const request = c.pendingForegroundRequest;
     assert.equal(calls[0].body.workspaceId, 'a');
+    assert.equal(calls[0].url, '/api/sessions');
+    assert.equal(calls.find(call => call.url === '/api/turns').body.sessionId, 'late-a');
+    assert(request, 'the allocated origin must own its in-flight request');
+    const runningOwner = c.runningSessionId;
+    assert.equal(runningOwner, 'late-a');
     await c.openWorkspace('b');
     assert.equal(request.controller.signal.aborted, false, 'navigation must not cancel the original task');
     assert.equal(c.sameSession({ session: 'late-a' }), false, 'old A SSE must not claim B blank view');
-    assert.equal(c.runningSessionId, null, 'old A SSE must not claim B running owner');
+    assert.equal(c.runningSessionId, runningOwner, 'old A SSE must not change the already-owned background task');
+    assert.equal(c.currentSessionId, null, 'old A SSE must not claim the B blank composer');
+    assert.equal(c.isViewedTurnRunning(), false, 'B blank view must not display A as its own running task');
     completion.resolve({ ok: true, json: async () => ({ sessionId: 'late-a', text: 'A final' }) }); await turn;
     assert.equal(c.currentSessionId, null);
     assert.equal(c.messages.length, 0, 'old A fallback must not enter B blank transcript');
     checks++;
   }
-  // Failed navigation keeps a first turn's null owner valid, including legacy
+  // Failed navigation keeps the allocated first-turn owner valid, including
   // Desktop before its isolated-turn capability status has arrived.
   {
     const { c } = context(), completion = deferred();
     c.currentSessionId = null;
     c.parallelTurnsEnabled = () => false;
-    c.fetch = async url => url === '/api/turns' ? completion.promise :
-      { ok: false, json: async () => ({ error: 'directory unavailable' }) };
+    c.fetch = async url => url === '/api/sessions'
+      ? { ok: true, json: async () => draftHeader('fresh-a') }
+      : url === '/api/turns' ? completion.promise
+      : { ok: false, json: async () => ({ error: 'directory unavailable' }) };
     const turn = c.runTurnItem({ text: 'A first turn' }); await tick();
     assert.equal(await c.openWorkspace('b'), false);
     assert.equal(c.sameSession({ session: 'fresh-a' }), true, 'failed navigation must preserve the visible first-turn stream owner');
@@ -355,8 +370,10 @@ function context() {
   {
     const { c } = context(), completion = deferred();
     c.currentSessionId = null; c.parallelTurnsEnabled = () => false;
-    c.fetch = async url => url === '/api/turns' ? completion.promise :
-      { ok: false, status: 404, json: async () => ({ error: 'session missing' }) };
+    c.fetch = async url => url === '/api/sessions'
+      ? { ok: true, json: async () => draftHeader('fresh-a') }
+      : url === '/api/turns' ? completion.promise
+      : { ok: false, status: 404, json: async () => ({ error: 'session missing' }) };
     const turn = c.runTurnItem({ text: 'A first turn' }); await tick();
     assert.equal(await c.resumeSession('missing-history'), false);
     assert.equal(c.sameSession({ session: 'fresh-a' }), true);

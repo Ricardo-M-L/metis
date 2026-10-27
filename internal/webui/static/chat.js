@@ -25,6 +25,16 @@ let queuedTurnPendingItem = null;
 let streamingEl = null;
 let streamingText = '';
 let streamedTextThisTurn = false;
+let streamRenderFrame = 0;
+let streamRenderSession = '';
+let pendingTextRender = false;
+let pendingThinkingRender = false;
+const streamingMarkdownStates = new WeakMap();
+let historyMessageBatch = [];
+let chatHistoryViewport = null;
+let virtualHistoryState = null;
+let virtualHistorySaveTimer = 0;
+let virtualHistoryRefreshGeneration = 0;
 let effortState = { supported: false, effort: 'default', options: [] };
 let effortRequestGeneration = 0;
 const CHAT_BOTTOM_THRESHOLD = 56;
@@ -49,7 +59,10 @@ function onLive(type, handler) {
     if (!acceptLiveEvent(e)) return;
     try {
       const data = JSON.parse(e.data);
-      if (sameSession(data)) handler(data);
+      if (sameSession(data)) {
+        if (type !== 'text_delta' && type !== 'thinking_delta') flushStreamingRender();
+        handler(data);
+      }
     } catch (_) {}
   });
 }
@@ -560,6 +573,7 @@ function activityGroupNearBottom(items) {
 }
 
 function scheduleActivityGroupFollow(group) {
+  if (renderingActivityHistory) return;
   if (!group || activityGroupFollowPending.has(group) || typeof requestAnimationFrame !== 'function') return;
   activityGroupFollowPending.add(group);
   requestAnimationFrame(() => {
@@ -574,6 +588,7 @@ function scheduleActivityGroupFollow(group) {
 }
 
 function scheduleActivityGroupScroll(group) {
+  if (renderingActivityHistory) return;
   if (!group || activityGroupScrollPending.has(group) || typeof requestAnimationFrame !== 'function') return;
   activityGroupScrollPending.add(group);
   requestAnimationFrame(() => {
@@ -818,8 +833,8 @@ const REDACTED_THINKING_PLACEHOLDER = 'Reasoning redacted by provider';
 function thinkPreview(text, running) {
   const normalized = String(text || '').trim();
   if (!normalized) return '';
-  const lines = normalized.split('\n');
-  return (running ? lines[lines.length - 1] : lines[0]).trim();
+  const split = running ? normalized.lastIndexOf('\n') : normalized.indexOf('\n');
+  return (split < 0 ? normalized : running ? normalized.slice(split + 1) : normalized.slice(0, split)).trim();
 }
 
 // One renderer is shared by live streaming and persisted-history replay so
@@ -865,15 +880,27 @@ function appendThinkingRow(text, options = {}) {
 // Thinking disclosure (DSH ReasoningRow parity): collapsed "Think" row that
 // accumulates reasoning deltas, with a sweep shimmer while running.
 function handleThinkingDelta(d) {
+  if (streaming) endStreamingMessage(false);
   if (turnStartMs && !turnFirstTokenMs) turnFirstTokenMs = Date.now();
+  thinkingText += d.delta || '';
+  pendingThinkingRender = true;
+  streamRenderSession = String(currentSessionId || '');
+  if (!thinkingEl) flushStreamingRender();
+  else scheduleStreamingRender();
+}
+
+function renderThinkingDelta() {
   if (!thinkingEl) {
     thinkStartMs = Date.now();
     thinkingEl = appendThinkingRow('', { running: true });
   }
-  thinkingText += d.delta || '';
   const body = thinkingEl.querySelector('.think-body');
-  if (body) body.textContent = thinkingText;
-  // DSH parity: while streaming, the collapsed row previews the LATEST line.
+  if (body) {
+    const node = body.firstChild;
+    if (node && node.nodeType === 3 && body.childNodes.length === 1 && thinkingText.startsWith(node.data)) {
+      node.appendData(thinkingText.slice(node.data.length));
+    } else body.textContent = thinkingText;
+  }
   const summary = thinkingEl.querySelector('.think-summary');
   if (summary) summary.textContent = thinkPreview(thinkingText, true);
   scheduleActivityGroupFollow(thinkingEl.closest('.activity-group'));
@@ -882,6 +909,7 @@ function handleThinkingDelta(d) {
 
 // Safety-filtered reasoning: show the DSH-style locked placeholder row.
 function handleRedactedThinking() {
+  if (streaming) endStreamingMessage(false);
   // Redacted provider blocks are atomic and independent from plaintext
   // reasoning. Never attach their opaque payload to the DOM.
   finishThinking();
@@ -904,6 +932,10 @@ function thinkRowKeydown(event, head) {
 }
 
 function finishThinking() {
+  if (pendingThinkingRender) {
+    pendingThinkingRender = false;
+    renderThinkingDelta();
+  }
   if (thinkingEl) {
     thinkingEl.removeAttribute('data-running');
     // DSH parity: once done, the collapsed preview shows the FIRST line.
@@ -1438,16 +1470,55 @@ async function restoreCompactionHistory(sessionId = currentSessionId, shouldAppl
   } catch (_) {}
 }
 
+// Rendering owns one pending frame for the currently viewed transcript. A
+// terminal/tool boundary flushes it synchronously; navigation cancels it.
+function scheduleStreamingRender() {
+  if (streamRenderFrame) return;
+  if (typeof requestAnimationFrame !== 'function') { flushStreamingRender(); return; }
+  streamRenderFrame = requestAnimationFrame(() => {
+    streamRenderFrame = 0;
+    flushStreamingRender();
+  });
+}
+
+function cancelStreamingRender() {
+  if (streamRenderFrame && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(streamRenderFrame);
+  streamRenderFrame = 0;
+  pendingTextRender = false;
+  pendingThinkingRender = false;
+  streamRenderSession = '';
+}
+
+function flushStreamingRender() {
+  if (streamRenderFrame && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(streamRenderFrame);
+  streamRenderFrame = 0;
+  if (streamRenderSession !== String(currentSessionId || '')) { cancelStreamingRender(); return; }
+  const text = pendingTextRender, thinking = pendingThinkingRender;
+  pendingTextRender = false;
+  pendingThinkingRender = false;
+  if (thinking) renderThinkingDelta();
+  if (text) renderTextDelta();
+  // This can run inside an animation frame. Finish following in the same
+  // paint as the DOM commit instead of waiting for autoScroll's next frame.
+  if ((thinking || text) && chatScrollFrame) flushChatScroll();
+}
+
 function handleTextDelta(d) {
-  // The first answer token settles the preceding provider reasoning row.
   finishThinking();
   if (turnStartMs && !turnFirstTokenMs) turnFirstTokenMs = Date.now();
   streamedTextThisTurn = true;
   if (!streaming) streaming = true;
   streamingText += d.delta || '';
+  pendingTextRender = true;
+  streamRenderSession = String(currentSessionId || '');
+  // The first visible token paints immediately, including when the tab's
+  // animation frames are suspended. Subsequent chunks share one frame.
+  if (!streamingEl) flushStreamingRender();
+  else scheduleStreamingRender();
+}
+
+function renderTextDelta() {
   const visibleText = visibleTranscriptText(streamingText, true);
-  // Internal envelopes and empty deltas can precede a tool call. Do not
-  // create an empty assistant row that would leave a large gap in the chat.
   if (streamingEl && !visibleText.trim()) {
     streamingEl.remove();
     streamingEl = null;
@@ -1455,9 +1526,98 @@ function handleTextDelta(d) {
   if (!streamingEl && visibleText.trim()) startStreamingMessage();
   if (streamingEl) {
     const box = streamingEl.querySelector('.message-content');
-    box.innerHTML = formatContent(visibleText);
+    if (box) renderStreamingMarkdown(box, visibleText);
   }
   autoScroll();
+}
+
+function streamMarkdownHasDisplayMath(text) {
+  return text.includes('$$') || text.includes('\\[') || text.includes('\\]');
+}
+
+function streamMarkdownNeedsFullRender(text) {
+  return streamMarkdownHasDisplayMath(text) || /(?:CODEBLOCK|MATHDISPLAY)\d+/.test(text);
+}
+
+// Blank lines outside completed code blocks close the line-oriented
+// formatter's lists/tables. Keep two completed regions mutable. Display
+// math uses whole-document placeholder numbering, so that path never freezes.
+function streamMarkdownFreezeOffset(source) {
+  if (streamMarkdownNeedsFullRender(source)) return 0;
+  const scan = source.replace(/```([\w+-]*)\n?([\s\S]*?)```/g, value => '\u0000'.repeat(value.length));
+  const unfinished = scan.indexOf('```');
+  const limit = unfinished < 0 ? source.length : unfinished;
+  let lineStart = 0;
+  const boundaries = [];
+  for (let i = 0; i < limit; i++) {
+    if (scan[i] !== '\n') continue;
+    if (/^[ \t\r]*$/.test(scan.slice(lineStart, i))) boundaries.push(i + 1);
+    lineStart = i + 1;
+  }
+  return boundaries.length > 2 ? boundaries[boundaries.length - 3] : 0;
+}
+
+function removeStreamingTail(box, state) {
+  while (box.childNodes.length > state.frozenChildren) box.lastChild.remove();
+}
+
+function renderStreamingMarkdown(box, text) {
+  // Display delimiters and literal placeholder references can make the
+  // formatter reinterpret earlier source. Drop an already-frozen prefix as soon as it appears.
+  if (streamMarkdownNeedsFullRender(text)) {
+    streamingMarkdownStates.delete(box);
+    box.innerHTML = formatContent(text);
+    return;
+  }
+  // Lightweight embedders may expose only innerHTML. Real browser nodes use
+  // cached block nodes and an append-only text node for an open code fence.
+  if (!box.childNodes || typeof box.insertAdjacentHTML !== 'function') {
+    box.innerHTML = formatContent(text);
+    return;
+  }
+  let state = streamingMarkdownStates.get(box);
+  if (!state || !text.startsWith(state.text)) {
+    box.textContent = '';
+    state = { text: '', frozenLength: 0, frozenChildren: 0, tail: null, openFence: null };
+    streamingMarkdownStates.set(box, state);
+  }
+  const cut = streamMarkdownFreezeOffset(text.slice(state.frozenLength));
+  if (cut > 0) {
+    removeStreamingTail(box, state);
+    box.insertAdjacentHTML('beforeend', formatContent(text.slice(state.frozenLength, state.frozenLength + cut)));
+    state.frozenLength += cut;
+    state.frozenChildren = box.childNodes.length;
+    state.tail = null;
+    state.openFence = null;
+  }
+  const tail = text.slice(state.frozenLength);
+  if (tail !== state.tail) {
+    // A growing fence is a single mutable text node. It does not require
+    // re-escaping/replacing all previous code lines for each token.
+    const fence = /(^|\n)[ \t]*```([\w+-]*)[ \t]*\r?\n([\s\S]*)$/.exec(tail);
+    const open = fence && !fence[3].includes('```')
+      ? { prefix: tail.slice(0, fence.index + fence[1].length), lang: fence[2], code: fence[3] } : null;
+    if (open && state.openFence && state.openFence.prefix === open.prefix &&
+        state.openFence.lang === open.lang && open.code.startsWith(state.openFence.code)) {
+      const node = state.openFence.node;
+      node.appendData(open.code.slice(state.openFence.code.length));
+      state.openFence.code = open.code;
+    } else {
+      removeStreamingTail(box, state);
+      state.openFence = null;
+      if (open && typeof document.createTextNode === 'function') {
+        box.insertAdjacentHTML('beforeend', formatContent(open.prefix) + codeBlockHtml({ lang: open.lang, code: '' }));
+        const code = box.lastElementChild && box.lastElementChild.querySelector('pre code');
+        if (code) {
+          const node = document.createTextNode(open.code);
+          code.appendChild(node);
+          state.openFence = { ...open, node };
+        }
+      } else box.insertAdjacentHTML('beforeend', formatContent(tail));
+    }
+    state.tail = tail;
+  }
+  state.text = text;
 }
 
 const foregroundRequests = new Map();
@@ -1693,6 +1853,9 @@ function setTurnRunning(running, sessionId) {
 // agent turn remains alive and tracked by runningSessionId; only its old live
 // rendering pointers are discarded so completion cannot write into session B.
 function detachRunningTurnView() {
+  if (typeof virtualHistoryDetach === 'function') virtualHistoryDetach();
+  cancelStreamingRender();
+  cancelChatScroll();
   interactionSnapshotGeneration++;
   saveSessionQueue();
   const request = foregroundRequests.get(String(currentSessionId || ''));
@@ -1783,7 +1946,7 @@ function startStreamingMessage() {
   // from a previous turn would make later turns write into the old
   // message. lastElementChild is the node inserted right above.
   area.insertAdjacentHTML('beforeend', `
-    <div class="message message-assistant" data-activity-turn-id="${escAttr(turnID)}">
+    <div class="message message-assistant" data-live-uncommitted="true" data-activity-turn-id="${escAttr(turnID)}">
       <div class="message-avatar">M</div>
       <div class="message-body">
         <div class="message-content"></div>
@@ -1793,16 +1956,78 @@ function startStreamingMessage() {
   autoScroll();
 }
 
+function captureStreamingReadAnchor(box) {
+  const area = document.getElementById('chatArea');
+  if (renderingActivityHistory || !area || followOutput || area._metisScrollGesture?.active) return null;
+  const saved = { area, sessionId: String(currentSessionId || '') };
+  const viewport = typeof chatHistoryViewport !== 'undefined' ? chatHistoryViewport : null;
+  if (viewport && !viewport.destroyed && viewport.area === area && viewport.sessionId === saved.sessionId) {
+    const anchor = viewport.captureAnchor();
+    if (anchor) return { ...saved, viewport, anchor };
+  }
+  if (typeof area.getBoundingClientRect !== 'function') return null;
+  const rect = area.getBoundingClientRect();
+  const intersects = node => {
+    if (typeof node.getBoundingClientRect !== 'function') return false;
+    const bounds = node.getBoundingClientRect();
+    return bounds.bottom > rect.top && bounds.top < rect.bottom && bounds.bottom > bounds.top;
+  };
+  let target = Array.from(area.children || []).find(intersects);
+  if (!target) return null;
+  let path = null;
+  if (target === box || typeof target.contains === 'function' && target.contains(box)) {
+    const children = Array.from(box.children || []);
+    const visible = children.filter(intersects);
+    target = visible.find(node => node.getBoundingClientRect().top >= rect.top) || visible[0] || box;
+    path = target === box ? [] : [children.indexOf(target)];
+  }
+  return { ...saved, box, target, path, offset: target.getBoundingClientRect().top - rect.top };
+}
+
+function restoreStreamingReadAnchor(saved) {
+  if (!saved || followOutput || saved.area._metisScrollGesture?.active ||
+      document.getElementById('chatArea') !== saved.area || String(currentSessionId || '') !== saved.sessionId) return;
+  if (saved.viewport) {
+    if (chatHistoryViewport === saved.viewport && !saved.viewport.destroyed && saved.viewport.restoreAnchor(saved.anchor)) saved.viewport.flush();
+    return;
+  }
+  let target = saved.target;
+  if (saved.path) {
+    target = saved.box;
+    for (const index of saved.path) target = target && target.children && target.children[index];
+  }
+  if (!target || target.isConnected === false || typeof target.getBoundingClientRect !== 'function') return;
+  const delta = target.getBoundingClientRect().top - saved.area.getBoundingClientRect().top - saved.offset;
+  if (Math.abs(delta) > 0.5) {
+    programmaticChatScroll = true;
+    saved.area.scrollTop += delta;
+    saved.area._metisProgrammaticTop = saved.area.scrollTop;
+  }
+  updateScrollFollowUI();
+}
+
 function endStreamingMessage(refresh = true) {
   finishThinking();
+  cancelStreamingRender();
   // The stream is complete: a trailing literal "<" is now answer text, not
   // an internal tag prefix that still needs to be buffered.
   const visibleText = visibleTranscriptText(streamingText);
+  let readAnchor = null;
   if (!streamingEl && visibleText.trim()) startStreamingMessage();
   if (streamingEl) {
     const box = streamingEl.querySelector('.message-content');
     if (visibleText.trim()) {
-      if (box) box.innerHTML = formatContent(visibleText);
+      if (box) {
+        const html = formatContent(visibleText);
+        // Replacing even identical content can synchronously clamp a paused
+        // WKWebView scroller. Keep settled nodes, and protect reading when a
+        // final buffered character or code fence really changes the markup.
+        if (box.innerHTML !== html) {
+          readAnchor = captureStreamingReadAnchor(box);
+          box.innerHTML = html;
+        }
+        streamingMarkdownStates.delete(box);
+      }
       attachMessageActions(streamingEl, streamMsgIdx);
     } else {
       streamingEl.remove();
@@ -1812,7 +2037,10 @@ function endStreamingMessage(refresh = true) {
   streaming = false;
   streamingEl = null;
   streamingText = '';
+  if (visibleText.trim()) autoScroll();
   updateSendBtn();
+  restoreStreamingReadAnchor(readAnchor);
+  if (visibleText.trim() && chatScrollFrame) flushChatScroll();
   if (refresh !== false) {
     loadSessions();
     loadSessionStatsbar();
@@ -1835,6 +2063,7 @@ function finishUserTurn() {
 
 // Called at the start of each user turn to reset per-turn stream state.
 function beginUserTurn() {
+  if (typeof virtualHistoryRefreshGeneration !== 'undefined') virtualHistoryRefreshGeneration++;
   streamedTextThisTurn = false;
   runningTurnIncompleteReason = '';
   // If the previous turn's turn_end never arrived (SSE drop/reconnect),
@@ -1851,6 +2080,9 @@ function beginUserTurn() {
 // new chat, and SSE reconnect so nothing from a previous session leaks
 // into the next (timer, pending question, tool details, thinking row).
 function resetTurnState() {
+  if (typeof virtualHistoryDetach === 'function') virtualHistoryDetach();
+  cancelStreamingRender();
+  cancelChatScroll();
   interactionSnapshotGeneration++;
   clearTodoPlan();
   runningTurnIncompleteReason = '';
@@ -1888,12 +2120,14 @@ function openToolDetail(id) {
   document.querySelectorAll('.call-row.selected').forEach(c => c.classList.remove('selected'));
   const card = document.querySelector('.call-row[data-row-key="' + escAttr(id) + '"]');
   if (card) card.classList.add('selected');
+  if (typeof virtualHistoryPinToolDetail === 'function') virtualHistoryPinToolDetail(card);
   document.getElementById('detailsPlaceholder').style.display = 'none';
   document.getElementById('detailsTabs').style.display = 'flex';
   renderDetailPanel();
 }
 
 function closeToolDetail() {
+  if (typeof virtualHistoryPinToolDetail === 'function') virtualHistoryPinToolDetail(null);
   selectedToolId = null;
   document.querySelectorAll('.call-row.selected').forEach(c => c.classList.remove('selected'));
   document.getElementById('detailsPlaceholder').style.display = '';
@@ -2520,6 +2754,7 @@ function updateSubagentRowExecutionPhase(row, phase) {
 function reconcileSubagentToolRows(roster) {
   const owner = String(currentSessionId || '');
   if (!owner || !roster || String(roster.sessionId || '') !== owner || !Array.isArray(roster.agents)) return;
+  if (typeof virtualHistoryRecordAgent === 'function') roster.agents.forEach(agent => virtualHistoryRecordAgent(agent, agent.status));
   const agents = new Map(roster.agents.filter(agent => String(agent.sessionId || '') === owner && agent.agentId)
     .map(agent => [String(agent.agentId), agent]));
   document.querySelectorAll('.call-row[data-subagent-id]').forEach(row => {
@@ -2541,6 +2776,7 @@ function handleSubagentLifecycle(d, status) {
   const agentId = String(d.agentId || '');
   if (!owner || owner !== String(currentSessionId || runningSessionId || '') ||
       !d.parentToolUseId || !agentId) return;
+  if (typeof virtualHistoryRecordAgent === 'function') virtualHistoryRecordAgent({ ...d, sessionId: owner }, status);
   // Background children can end after the parent turn has completed. Search
   // connected rows in the viewed session, including earlier turns and replayed
   // history, rather than limiting lifecycle facts to the current turn.
@@ -2686,7 +2922,7 @@ function handleToolStart(d) {
   if (!renderingActivityHistory && streaming) endStreamingMessage(false);
   // A new tool call is a provider event boundary: settle reasoning before
   // inserting the tool so the visible timeline keeps source order.
-  finishThinking();
+  if (!renderingActivityHistory) finishThinking();
   const v = toolVariantOf(name);
   const summary = toolSummaryText(name, input);
   const pretty = inlineToolInputText(input);
@@ -3031,23 +3267,131 @@ function isChatNearBottom(area) {
 }
 
 function updateScrollFollowUI() {
+  if (renderingActivityHistory) return;
   const button = document.getElementById('jumpLatestBtn');
-  const area = document.getElementById('chatArea');
-  if (button) button.hidden = followOutput || isChatNearBottom(area);
+  if (button) button.hidden = followOutput;
 }
 
 function onChatScroll() {
-  if (programmaticChatScroll) return;
   const area = document.getElementById('chatArea');
-  followOutput = isChatNearBottom(area);
+  if (!area) return;
+  const gesture = area._metisScrollGesture;
+  if (gesture && gesture.active) {
+    updateChatScrollGestureDirection(area, gesture);
+    programmaticChatScroll = false;
+    followOutput = false;
+    updateScrollFollowUI();
+    return;
+  }
+  if (followOutput) {
+    const expected = area._metisProgrammaticTop;
+    const atExpected = programmaticChatScroll && expected !== undefined && Math.abs(area.scrollTop - expected) < 1;
+    programmaticChatScroll = false;
+    // Scroll anchoring, clamping and async history layout also emit scroll
+    // events. Only an input gesture may pause follow; layout keeps it alive.
+    if (!atExpected) autoScroll();
+    return;
+  }
+  programmaticChatScroll = false;
+  if (area._metisScrollIntent === 'down') followOutput = isChatNearBottom(area);
+  if (followOutput) area._metisScrollIntent = '';
+  updateScrollFollowUI();
+}
+
+function pauseChatScrollForUser(area, intent = 'up') {
+  if (!area) return;
+  area._metisScrollIntent = intent;
+  programmaticChatScroll = false;
+  followOutput = false;
+  if (typeof chatHistoryViewport !== 'undefined' && chatHistoryViewport) chatHistoryViewport.userScrollIntent();
+  if (chatScrollFrame && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(chatScrollFrame);
+  chatScrollFrame = 0;
   updateScrollFollowUI();
 }
 
 function pauseAutoScrollOnWheel(event) {
-  if (event.deltaY >= 0) return;
-  programmaticChatScroll = false;
-  followOutput = false;
-  updateScrollFollowUI();
+  const area = document.getElementById('chatArea');
+  if (event.deltaY < 0) pauseChatScrollForUser(area);
+  else if (area && event.deltaY > 0) {
+    area._metisScrollIntent = 'down';
+    if (typeof chatHistoryViewport !== 'undefined' && chatHistoryViewport) chatHistoryViewport.userScrollIntent();
+  }
+}
+
+function pauseAutoScrollOnKey(event) {
+  if (event.defaultPrevented) return;
+  const target = event.target;
+  if (target && (target.isContentEditable || typeof target.closest === 'function' &&
+      target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])'))) return;
+  const area = document.getElementById('chatArea');
+  const space = event.key === ' ' || event.key === 'Spacebar';
+  if (space && (event.ctrlKey || event.altKey || event.metaKey || target &&
+      typeof target.closest === 'function' && target.closest('button, a, summary, [role="button"]'))) return;
+  if (['ArrowUp', 'PageUp', 'Home'].includes(event.key) || space && event.shiftKey) pauseChatScrollForUser(area);
+  else if (event.key === 'End') autoScroll(true);
+  else if (area && (['ArrowDown', 'PageDown'].includes(event.key) || space)) {
+    area._metisScrollIntent = 'down';
+    if (typeof chatHistoryViewport !== 'undefined' && chatHistoryViewport) chatHistoryViewport.userScrollIntent();
+  }
+}
+
+function updateChatScrollGestureDirection(area, gesture) {
+  const top = area.scrollTop;
+  if (typeof gesture.top === 'number' && top !== gesture.top) area._metisScrollIntent = top > gesture.top ? 'down' : 'up';
+  gesture.top = top;
+}
+
+function beginChatPointerScroll(event) {
+  if (event.pointerType === 'touch' || event.button !== 0) return;
+  const area = document.getElementById('chatArea');
+  if (!area) return;
+  const rect = area.getBoundingClientRect();
+  const gutter = Math.max(16, area.offsetWidth - area.clientWidth);
+  const rtl = typeof getComputedStyle === 'function' && getComputedStyle(area).direction === 'rtl';
+  const scrollbar = event.target === area && (rtl ? event.clientX <= rect.left + gutter : event.clientX >= rect.right - gutter);
+  area._metisScrollGesture = { id: event.pointerId, y: event.clientY, top: area.scrollTop, active: scrollbar };
+  if (scrollbar) pauseChatScrollForUser(area);
+}
+
+function moveChatPointerScroll(event) {
+  const area = document.getElementById('chatArea');
+  const gesture = area && area._metisScrollGesture;
+  if (!gesture || gesture.touch || gesture.id !== event.pointerId || Math.abs(event.clientY - gesture.y) < 4) return;
+  gesture.active = true;
+  pauseChatScrollForUser(area, event.clientY > gesture.y ? 'down' : 'up');
+}
+
+function endChatPointerScroll(event) {
+  const area = document.getElementById('chatArea');
+  const gesture = area && area._metisScrollGesture;
+  if (!gesture || gesture.touch || gesture.id !== event.pointerId) return;
+  updateChatScrollGestureDirection(area, gesture);
+  delete area._metisScrollGesture;
+  const remaining = area.scrollHeight - area.scrollTop - area.clientHeight;
+  if (gesture.active && (remaining <= 1 || area._metisScrollIntent === 'down' && remaining <= CHAT_BOTTOM_THRESHOLD)) autoScroll(true);
+}
+
+function beginChatTouchScroll(event) {
+  const area = document.getElementById('chatArea');
+  if (area && event.touches.length === 1) area._metisScrollGesture = { touch: true, y: event.touches[0].clientY, top: area.scrollTop, active: false };
+}
+
+function moveChatTouchScroll(event) {
+  const area = document.getElementById('chatArea');
+  const gesture = area && area._metisScrollGesture;
+  if (!gesture || !gesture.touch || event.touches.length !== 1 || Math.abs(event.touches[0].clientY - gesture.y) < 4) return;
+  gesture.active = true;
+  pauseChatScrollForUser(area, event.touches[0].clientY < gesture.y ? 'down' : 'up');
+}
+
+function endChatTouchScroll() {
+  const area = document.getElementById('chatArea');
+  const gesture = area && area._metisScrollGesture;
+  if (!gesture || !gesture.touch) return;
+  updateChatScrollGestureDirection(area, gesture);
+  delete area._metisScrollGesture;
+  const remaining = area.scrollHeight - area.scrollTop - area.clientHeight;
+  if (gesture.active && (remaining <= 1 || area._metisScrollIntent === 'down' && remaining <= CHAT_BOTTOM_THRESHOLD)) autoScroll(true);
 }
 
 function initChatScroll() {
@@ -3055,35 +3399,65 @@ function initChatScroll() {
   if (!area || area.dataset.scrollFollowReady === 'true') return;
   area.dataset.scrollFollowReady = 'true';
   area.addEventListener('scroll', onChatScroll, { passive: true });
-  // A trackpad/wheel-up gesture must win even if it lands in the same frame as
-  // a live delta that just moved the transcript programmatically.
   area.addEventListener('wheel', pauseAutoScrollOnWheel, { passive: true });
+  if (!area.getAttribute('tabindex')) area.tabIndex = 0;
+  area.addEventListener('keydown', pauseAutoScrollOnKey);
+  area.addEventListener('pointerdown', beginChatPointerScroll, { passive: true });
+  document.addEventListener('pointermove', moveChatPointerScroll, { passive: true });
+  document.addEventListener('pointerup', endChatPointerScroll, { passive: true });
+  document.addEventListener('pointercancel', endChatPointerScroll, { passive: true });
+  area.addEventListener('touchstart', beginChatTouchScroll, { passive: true });
+  area.addEventListener('touchmove', moveChatTouchScroll, { passive: true });
+  area.addEventListener('touchend', endChatTouchScroll, { passive: true });
+  area.addEventListener('touchcancel', endChatTouchScroll, { passive: true });
+  updateScrollFollowUI();
+}
+
+function cancelChatScroll() {
+  if (chatScrollFrame && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(chatScrollFrame);
+  chatScrollFrame = 0;
+  programmaticChatScroll = false;
+  const area = document.getElementById('chatArea');
+  if (area && arguments[0] !== true) {
+    delete area._metisScrollGesture;
+    delete area._metisScrollIntent;
+    delete area._metisProgrammaticTop;
+  }
+}
+
+function flushChatScroll(area = document.getElementById('chatArea')) {
+  if (chatScrollFrame && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(chatScrollFrame);
+  chatScrollFrame = 0;
+  if (!area || !followOutput || area._metisScrollGesture?.active || document.getElementById('chatArea') !== area) return;
+  programmaticChatScroll = true;
+  area.scrollTop = area.scrollHeight;
+  area._metisProgrammaticTop = area.scrollTop;
   updateScrollFollowUI();
 }
 
 function autoScroll(force = false) {
+  if (renderingActivityHistory) return;
+  if (typeof chatHistoryViewport !== 'undefined' && chatHistoryViewport) {
+    chatHistoryViewport.adoptTailNodes();
+    const unit = chatHistoryViewport.units.at(-1);
+    const record = unit && chatHistoryViewport.mounted.get(unit.key);
+    if (record) virtualHistoryAssignContentKeys(unit, record.nodes);
+  }
   const area = document.getElementById('chatArea');
-  if (!area) return;
-  // Harness renders TurnStatus after every conversation node. METIS appends
-  // live nodes imperatively, so move the stable status element back to the
-  // tail whenever a thinking/tool/message row arrives.
+  if (!area || area._metisScrollGesture?.active) return;
   if (turnStatusEl && turnStatusEl.parentElement === area && area.lastElementChild !== turnStatusEl) {
     area.appendChild(turnStatusEl);
   }
-  if (force) followOutput = true;
-  if (!followOutput) {
-    updateScrollFollowUI();
-    return;
+  if (force) {
+    if (typeof chatHistoryViewport !== 'undefined' && chatHistoryViewport) chatHistoryViewport.restoreAnchor({ sessionId: chatHistoryViewport.sessionId, follow: true });
+    followOutput = true;
+    area._metisScrollIntent = '';
   }
-  programmaticChatScroll = true;
-  area.scrollTop = area.scrollHeight;
-  if (chatScrollFrame) cancelAnimationFrame(chatScrollFrame);
-  chatScrollFrame = requestAnimationFrame(() => {
-    chatScrollFrame = 0;
-    programmaticChatScroll = false;
-    followOutput = isChatNearBottom(area);
-    updateScrollFollowUI();
-  });
+  updateScrollFollowUI();
+  if (!followOutput) return;
+  if (chatScrollFrame) return;
+  if (typeof requestAnimationFrame === 'function') chatScrollFrame = requestAnimationFrame(() => flushChatScroll(area));
+  else flushChatScroll(area);
 }
 
 function resumeAutoScroll() {
@@ -3334,7 +3708,9 @@ async function sendMessage(busyBehavior) {
     return;
   }
   const input = document.getElementById('inputField');
-  const text = input.value.trim();
+  const submittedInput = input.value;
+  const submittedImages = attachments.slice();
+  const text = submittedInput.trim();
   if (!text && !attachments.length) return resumeCurrentTurn();
   // Rename changes only the session label. It remains a local command while
   // a turn (or an ask) is active, including when the composer defaults to
@@ -3370,12 +3746,23 @@ async function sendMessage(busyBehavior) {
     return;
   }
 
-  if (!currentSessionId && !await prepareDraftSession()) return;
-  const item = { text: text, images: attachments.slice() };
-  input.value = '';
-  autoResize(input);
-  attachments = [];
-  renderAttachments();
+  if (!currentSessionId && !await prepareDraftSession({ force: true })) return;
+  if (typeof permissionModeForTurn === 'function' && permissionModeForTurn() === null) {
+    showToast(uiText('Permission mode is unavailable. Refresh the session or select a mode before sending.', '权限状态尚未确认，请刷新会话或选择权限模式后再发送。'));
+    if (typeof pollStatus === 'function') void pollStatus();
+    return;
+  }
+  const item = { text: text, images: submittedImages };
+  // Allocation can await the network while the composer remains editable.
+  // Send the clicked snapshot and retain any newer draft or attachments.
+  if (input.value === submittedInput) {
+    input.value = '';
+    autoResize(input);
+  }
+  if (attachments.length === submittedImages.length && attachments.every((image, index) => image === submittedImages[index])) {
+    attachments = [];
+    renderAttachments();
+  }
 
   if (isViewedTurnRunning()) {
     await submitBusyInput(item, busyBehavior || desktopPreferences.busyEnter || 'queue');
@@ -3766,6 +4153,18 @@ async function runTurnItem(item) {
     return true;
   }
   if (item.resume && !canResumeCurrentTurn()) return false;
+  // Give a new transcript its durable owner before creating live turn keys,
+  // including when concurrent turns are disabled.
+  if (!currentSessionId) {
+    const ownedQueue = drainingQueuedTurns ? queuedTurns : null;
+    if (!await prepareDraftSession({ force: true })) {
+      if (ownedQueue && !ownedQueue.includes(item)) {
+        ownedQueue.unshift(item);
+        if (queuedTurns === ownedQueue) renderQueuedTurns();
+      }
+      return false;
+    }
+  }
   // The server atomically compares this expectation with the target session
   // before starting a worker. A stale chip must never authorize another mode.
   const expectedPermissionMode = typeof permissionModeForTurn === 'function' ? permissionModeForTurn() : undefined;
@@ -3778,8 +4177,8 @@ async function runTurnItem(item) {
   const text = item.text || '';
   const images = item.images || [];
   const turnSessionId = currentSessionId;
-  // Bind this request before any asynchronous work; later navigation must not
-  // redirect a blank session into the newly selected workspace.
+  // Draft allocation validates navigation itself. Bind the remaining work
+  // now so a later navigation cannot redirect this request to another view.
   const turnWorkspaceId = typeof activeWorkspaceId === 'string' ? activeWorkspaceId : '';
   const viewGenerationAtSubmit = resumeSessionGeneration;
   const continuationGenerationAtSubmit = turnSessionId ? (backgroundContinuationGenerations.get(turnSessionId) || 0) : backgroundContinuationGeneration;
@@ -3797,6 +4196,15 @@ async function runTurnItem(item) {
     : turnSessionId
       ? currentSessionId === turnSessionId
       : currentSessionId === null && resumeSessionGeneration === foregroundRequest.viewGeneration;
+
+  const area = document.getElementById('chatArea');
+  if (typeof HistoryVirtualViewport === 'function' && typeof chatHistoryViewport !== 'undefined' &&
+      !chatHistoryViewport && currentSessionId &&
+      area && area.childNodes && typeof area.insertBefore === 'function' &&
+      typeof area.getBoundingClientRect === 'function' && typeof document.createDocumentFragment === 'function' &&
+      !area.querySelector('.message, .call-row, .think-row, .perm-card')) {
+    renderHistoryMessages([]);
+  }
 
   // Hide welcome
   const welcome = document.getElementById('welcomeScreen');
@@ -3889,6 +4297,12 @@ async function runTurnItem(item) {
     if (viewingTurn() && continuationUnchanged() && typeof pollStatus === 'function') {
       await pollStatus(() => viewingTurn() && continuationUnchanged() &&
         resumeSessionGeneration === foregroundRequest.viewGeneration);
+    }
+    if (viewingTurn() && continuationUnchanged() && resolvedTurnSessionId && typeof HistoryVirtualViewport === 'function') {
+      const refreshGeneration = ++virtualHistoryRefreshGeneration;
+      const sessionId = resolvedTurnSessionId;
+      void syncViewedSessionHistory(sessionId, () => viewingTurn() && continuationUnchanged() &&
+        refreshGeneration === virtualHistoryRefreshGeneration && !viewedHistoryTurnIsRunning());
     }
     updateSendBtn();
     loadSessionStatsbar();
@@ -4002,28 +4416,41 @@ function messageActionsMarkup(role, date = new Date()) {
   return `<div class="msg-actions">${copy}${ratings}${branch}${feedback}${time}</div>`;
 }
 
+function flushHistoryMessageBatch() {
+  if (!historyMessageBatch.length) return;
+  const area = document.getElementById('chatArea');
+  const html = historyMessageBatch.join('');
+  historyMessageBatch = [];
+  if (area) area.insertAdjacentHTML('beforeend', html);
+}
+
 function addMessage(role, content, remember = true, idx = -1, historyTurn = 0, activitySteer = false) {
+  if (role === 'user' && remember && !activitySteer && typeof virtualHistoryBeginLiveTurn === 'function') virtualHistoryBeginLiveTurn(content);
   finishActivityGroup();
   const now = remember ? new Date() : null;
   if (remember) messages.push({ role, content, time: now });
   const index = idx >= 0 ? idx : (remember ? messages.length - 1 : -1);
   const area = document.getElementById('chatArea');
-  const idxAttr = index >= 0 ? ` data-idx="${index}"` : '';
+  const idxAttr = index >= 0 ? ` data-idx="${index}"` + (remember ? ' data-live-uncommitted="true"' : ` data-source-message-index="${index}"`) : '';
   const turnAttr = historyTurn > 0 ? ` data-history-turn="${historyTurn}"` : '';
   const activityAttr = role === 'assistant' && historyTurn > 0
     ? ` data-activity-turn-id="history-${historyTurn}"` : '';
   const steerAttr = role === 'user' && activitySteer ? ' data-activity-steer="true"' : '';
 
+  const append = html => {
+    if (renderingActivityHistory) historyMessageBatch.push(html);
+    else area.insertAdjacentHTML('beforeend', html);
+  };
   if (role === 'user') {
     const artifactEditMarkup = typeof artifactAnnotationMessageMarkup === 'function'
       ? artifactAnnotationMessageMarkup(content) : null;
-    area.insertAdjacentHTML('beforeend', `
+    append(`
       <div class="message message-user"${idxAttr}${turnAttr}${steerAttr}>
         <div class="message-bubble">${artifactEditMarkup === null ? escHtml(content) : artifactEditMarkup}</div>
         ${messageActionsMarkup('user', now)}
       </div>`);
   } else {
-    area.insertAdjacentHTML('beforeend', `
+    append(`
       <div class="message message-assistant"${idxAttr}${turnAttr}${activityAttr}>
         <div class="message-avatar">M</div>
         <div class="message-body">
@@ -4033,8 +4460,7 @@ function addMessage(role, content, remember = true, idx = -1, historyTurn = 0, a
       </div>`);
   }
 
-  autoScroll();
-  updateEmptyLayout();
+  if (!renderingActivityHistory) { autoScroll(); updateEmptyLayout(); }
 }
 
 // Attach the hover actions row to a streamed assistant message.
@@ -4095,7 +4521,12 @@ async function rateMessage(btn, rating) {
 
 async function branchMessage(btn) {
   const msg = btn.closest('.message');
-  const idx = msg ? parseInt(msg.dataset.idx, 10) : NaN;
+  const unit = typeof virtualHistoryUnitForNode === 'function' ? virtualHistoryUnitForNode(msg) : null;
+  if (msg && (msg.dataset.liveUncommitted === 'true' || unit && unit.live)) {
+    showToast(uiText('Wait for this reply to finish saving before branching', '请等待当前回复保存后再创建分支'));
+    return;
+  }
+  const idx = msg ? parseInt(msg.dataset.sourceMessageIndex ?? msg.dataset.idx, 10) : NaN;
   if (!currentSessionId || !Number.isFinite(idx)) { showToast('Cannot branch this message'); return; }
   try {
     const res = await fetch('/api/fork', {
@@ -4171,15 +4602,35 @@ function refreshHistoricalSubagentStatuses(sessionId, generation) {
       const [agentId, matchingRows] = entries[next++];
       const requestedStatuses = new Map(matchingRows.map(row => [row, row.dataset.subagentStatus]));
       try {
-        const response = await fetch('/api/subagents/' + encodeURIComponent(agentId) +
-          '?sessionId=' + encodeURIComponent(sessionId), { cache: 'no-store' });
-        if (!response.ok) continue;
-        const body = await response.json();
+        const state = typeof virtualHistoryState !== 'undefined' && virtualHistoryState?.sessionId === sessionId ? virtualHistoryState : null;
+        const cached = state && state.agents.get(agentId);
+        if (cached && ['completed', 'failed', 'killed'].includes(cached.status)) {
+          matchingRows.forEach(row => { if (row.isConnected) updateSubagentRowStatus(row, cached.status); });
+          continue;
+        }
+        let request = state && state.agentRequests.get(agentId);
+        if (!request && state && (state.agentRetryAt.get(agentId) || 0) > Date.now()) continue;
+        if (!request) {
+          request = (async () => {
+            const response = await fetch('/api/subagents/' + encodeURIComponent(agentId) +
+              '?sessionId=' + encodeURIComponent(sessionId), { cache: 'no-store' });
+            return response.ok ? (await response.json()).agent : null;
+          })();
+          if (state) state.agentRequests.set(agentId, request);
+        }
+        let detail;
+        try { detail = await request; }
+        finally {
+          if (state && state.agentRequests.get(agentId) === request) {
+            state.agentRequests.delete(agentId);
+            state.agentRetryAt.set(agentId, Date.now() + 1000);
+          }
+        }
         if (!stillViewing()) return;
-        const detail = body && body.agent;
         if (!detail || String(detail.agentId || '') !== agentId ||
             String(detail.sessionId || '') !== sessionId ||
             !['queued', 'running', 'completed', 'failed', 'killed'].includes(detail.status)) continue;
+        if (typeof virtualHistoryRecordAgent === 'function') virtualHistoryRecordAgent(detail, detail.status);
         matchingRows.forEach(row => {
           if (!row.isConnected || row.dataset.ownerSession !== sessionId ||
               row.dataset.subagentSessionId !== sessionId ||
@@ -4193,29 +4644,9 @@ function refreshHistoricalSubagentStatuses(sessionId, generation) {
   for (let i = 0; i < Math.min(4, entries.length); i++) void drain();
 }
 
-function renderHistoryMessages(history) {
-  const historySessionId = String(currentSessionId || '');
-  if (typeof loadSessionFiles === 'function') void loadSessionFiles(currentSessionId);
-  queueMicrotask(() => restoreTodoPlanFromHistory(history));
-  const area = document.getElementById('chatArea');
-  // Avoid forcing a layout/scroll for every reconstructed history block. The
-  // selected transcript is pinned once, after the complete history exists.
-  followOutput = false;
-  // Row keys are render-local identities. A history refresh replaces every
-  // row, so any open inspector must release its old row and content first.
-  closeToolDetail();
-  toolDetails = {};
-  area.innerHTML = '';
-  activityGroupsByTurn.clear();
-  activityHistoryGeneration++;
-  activityGroupEl = null;
-  activityTurnEl = null;
-  activityCurrentTurnId = '';
-  renderingActivityHistory = true;
-  activityHistoryTurn = 0;
-  let i = 0;
-  let historyTurn = 0;
-  (history || []).forEach(m => {
+function appendHistoryEntries(history, historySessionId, initialTurn = 0, sourceStart = 0) {
+  let historyTurn = initialTurn;
+  (history || []).forEach((m, sourceOffset) => {
     const role = m.role === 'user' ? 'user' : 'assistant';
     const blocks = Array.isArray(m.content)
       ? m.content
@@ -4228,11 +4659,12 @@ function renderHistoryMessages(history) {
     activityHistoryTurn = historyTurn;
     blocks.forEach(b => {
       if (!b || typeof b !== 'object') return;
+      if (b.type !== 'text') flushHistoryMessageBatch();
       if (b.type === 'text' && (b.text || '').trim()) {
         const rawShown = role === 'user' && String(b.text).startsWith('[user steer mid-turn] ')
           ? String(b.text).slice('[user steer mid-turn] '.length) : b.text;
         const shown = visibleTranscriptText(rawShown);
-        if (shown.trim()) addMessage(role, shown, false, i++, historyTurn,
+        if (shown.trim()) addMessage(role, shown, false, sourceStart + sourceOffset, historyTurn,
           role === 'user' && String(b.text).startsWith('[user steer mid-turn] '));
       } else if (role === 'assistant' && b.type === 'thinking' && (b.text || '').trim()) {
         try {
@@ -4285,7 +4717,389 @@ function renderHistoryMessages(history) {
       }
     });
   });
+  flushHistoryMessageBatch();
   finishActivityGroup();
+  return historyTurn;
+}
+
+// The viewport owns historical DOM, while the complete transcript remains
+// source data. Never use a missing offscreen row as evidence it does not exist.
+function virtualHistoryCaptureAnchor() {
+  return chatHistoryViewport && !chatHistoryViewport.destroyed ? chatHistoryViewport.captureAnchor() : null;
+}
+
+function virtualHistorySaveViewport() {
+  if (virtualHistorySaveTimer) { clearTimeout(virtualHistorySaveTimer); virtualHistorySaveTimer = 0; }
+  if (chatHistoryViewport && !chatHistoryViewport.destroyed) chatHistoryViewport.save();
+}
+
+function virtualHistoryRestoreAnchor(anchor) {
+  return !!(chatHistoryViewport && chatHistoryViewport.restoreAnchor(anchor));
+}
+
+function virtualHistoryViewportChanged() {
+  if (chatHistoryViewport) chatHistoryViewport.schedule();
+}
+
+function virtualHistoryDetach() {
+  virtualHistorySaveViewport();
+  if (chatHistoryViewport) chatHistoryViewport.destroy();
+  chatHistoryViewport = null;
+  virtualHistoryState = null;
+  virtualHistoryRefreshGeneration++;
+}
+
+function virtualHistoryNodes(nodes, selector) {
+  return nodes.flatMap(node => [
+    ...(typeof node.matches === 'function' && node.matches(selector) ? [node] : []),
+    ...Array.from(node.querySelectorAll ? node.querySelectorAll(selector) : []),
+  ]);
+}
+
+function virtualHistoryUnitForNode(node) {
+  const key = node && node.closest && node.closest('[data-virtual-turn-key]')?.dataset.virtualTurnKey;
+  return chatHistoryViewport && key ? chatHistoryViewport.getUnit(key) : null;
+}
+
+function virtualHistoryBeginLiveTurn(content) {
+  const state = virtualHistoryState;
+  if (!state || !chatHistoryViewport || state.sessionId !== String(currentSessionId || '')) return;
+  const previous = state.units.at(-1);
+  const turn = (previous ? previous.turn : 0) + 1;
+  const sourceStart = previous ? previous.sourceEnd : 0;
+  const unit = { key: state.sessionId + ':history-' + turn, turn, entries: [], sourceStart, sourceEnd: sourceStart + 1,
+    entrySourceIndices: [], textIndexStart: previous ? previous.textIndexEnd : 0, textIndexEnd: previous ? previous.textIndexEnd + 1 : 1,
+    signature: 'live:' + (++virtualHistoryRefreshGeneration), estimatedHeight: 100, pinReasons: ['live-uncommitted'], live: true, liveUserText: String(content || '') };
+  state.units = [...state.units, unit];
+  chatHistoryViewport.setUnits(state.units);
+}
+
+function virtualHistoryAssignContentKeys(unit, nodes) {
+  const counts = new Map();
+  virtualHistoryNodes(nodes, '.message, .think-row, .call-row').forEach(node => {
+    const kind = node.classList.contains('message-user') ? 'user' : node.classList.contains('message-assistant') ? 'assistant'
+      : node.classList.contains('think-row') ? 'thinking' : 'tool';
+    const count = counts.get(kind) || 0;
+    counts.set(kind, count + 1);
+    node.dataset.virtualContentKey = kind + ':' + count;
+  });
+}
+
+function virtualHistoryRememberArtifact(item, row) {
+  const state = virtualHistoryState;
+  if (!state || !item || !item.id) return;
+  const current = state.artifacts.get(String(item.id));
+  if (current && state.units.some(unit => unit.key === current)) return;
+  const unit = virtualHistoryUnitForNode(row) || state.renderingUnit || state.units[state.units.length - 1];
+  if (unit) state.artifacts.set(String(item.id), unit.key);
+}
+
+function virtualHistoryAllowArtifact(item) {
+  const state = virtualHistoryState;
+  if (!state || !chatHistoryViewport) return true;
+  const key = state.artifacts.get(String(item && item.id || ''));
+  return !key || state.renderingUnit?.key === key || chatHistoryViewport.mounted.has(key);
+}
+
+function virtualHistoryArtifactAnchor(item) {
+  const key = virtualHistoryState?.artifacts.get(String(item && item.id || ''));
+  const record = key && chatHistoryViewport?.mounted.get(key);
+  if (!record) return null;
+  return record.nodes.filter(node => node.parentElement === chatHistoryViewport.area).at(-1) || null;
+}
+
+function virtualHistoryForgetArtifact(id) {
+  virtualHistoryState?.artifacts.delete(String(id || ''));
+  virtualHistoryViewportChanged();
+}
+
+function virtualHistoryCollectOwners(state) {
+  state.units.forEach(unit => unit.entries.forEach(message => {
+    const blocks = Array.isArray(message.content) ? message.content : [];
+    blocks.forEach(block => {
+      const presentation = block && block.presentation;
+      const artifact = presentation && presentation.artifact;
+      if (artifact && artifact.id && !state.artifacts.has(String(artifact.id))) state.artifacts.set(String(artifact.id), unit.key);
+      const child = presentation && presentation['metis.agent_started'] === true && presentation.subagent;
+      if (child && child.agentId) state.agentOwners.set(String(child.agentId), unit.key);
+    });
+  }));
+}
+
+function virtualHistoryRecordAgent(info, status) {
+  const state = virtualHistoryState;
+  if (!state || !chatHistoryViewport || !info || String(info.sessionId || info.session || '') !== state.sessionId || !info.agentId) return;
+  const id = String(info.agentId), previous = state.agents.get(id);
+  if (previous && ['completed', 'failed', 'killed'].includes(previous.status) && ['queued', 'running'].includes(status)) return;
+  const key = state.agentOwners.get(id);
+  state.agents.set(id, { ...previous, ...info, status });
+  if (key) chatHistoryViewport.setPinned(key, 'agent:' + id, ['queued', 'running'].includes(status));
+}
+
+function virtualHistoryPinToolDetail(row) {
+  if (!virtualHistoryState || !chatHistoryViewport) return;
+  const oldKey = virtualHistoryState.selectedToolKey || virtualHistoryState.selection?.key;
+  if (oldKey) chatHistoryViewport.setPinned(oldKey, 'tool-detail', false);
+  const unit = virtualHistoryUnitForNode(row);
+  virtualHistoryState.selectedToolKey = unit ? unit.key : '';
+  if (unit) {
+    chatHistoryViewport.setPinned(unit.key, 'tool-detail', true);
+    const calls = virtualHistoryNodes(chatHistoryViewport.mounted.get(unit.key)?.nodes || [], '.call-row');
+    virtualHistoryState.selection = { key: unit.key, signature: unit.signature, trace: row.dataset.traceCallId || '',
+      id: row.dataset.id || '', index: calls.indexOf(row), tab: detailTab };
+  } else if (!virtualHistoryState.rebuilding) virtualHistoryState.selection = null;
+}
+
+function virtualHistoryCaptureUnit(unit, nodes) {
+  const state = virtualHistoryState;
+  if (!state) return;
+  const groups = virtualHistoryNodes(nodes, '.activity-group');
+  const thinks = virtualHistoryNodes(nodes, '.think-row');
+  const calls = virtualHistoryNodes(nodes, '.call-row');
+  state.ui.delete(unit.key);
+  state.ui.set(unit.key, { signature: state.signatureAliases?.get(unit.key) || unit.signature,
+    groups: groups.map(group => ({ open: group.classList.contains('open'), scrollTop: group.querySelector('.activity-group-items')?.scrollTop || 0 })),
+    thoughts: thinks.map(row => row.classList.contains('open')),
+    tools: calls.map(row => ({ trace: row.dataset.traceCallId || '', id: row.dataset.id || '', open: row.classList.contains('open') })),
+    turn: virtualHistoryNodes(nodes, '.activity-turn').map(turn => ({ open: turn.classList.contains('open'), userOpen: turn.dataset.userOpen, userTouched: turn.dataset.userTouched })),
+  });
+  while (state.ui.size > 128) state.ui.delete(state.ui.keys().next().value);
+  calls.forEach(row => { delete toolDetails[row.dataset.rowKey]; });
+  activityGroupsByTurn.delete('history-' + unit.turn);
+}
+
+function virtualHistoryApplyUnit(unit, nodes) {
+  const state = virtualHistoryState;
+  if (!state || state.sessionId !== String(currentSessionId || '')) return;
+  virtualHistoryAssignContentKeys(unit, nodes);
+  nodes.forEach((node, index) => {
+    if (!unit.live) node.dataset.virtualHistory = 'true';
+    node.dataset.virtualItemKey = String(index);
+  });
+  const saved = state.ui.get(unit.key);
+  if (saved && saved.signature === unit.signature) {
+    virtualHistoryNodes(nodes, '.activity-turn').forEach((turn, index) => {
+      const value = saved.turn[index];
+      if (!value) return;
+      if (value.userOpen !== undefined) turn.dataset.userOpen = value.userOpen;
+      if (value.userTouched !== undefined) turn.dataset.userTouched = value.userTouched;
+      setActivityTurnOpen(turn, value.open);
+    });
+    virtualHistoryNodes(nodes, '.activity-group').forEach((group, index) => {
+      const value = saved.groups[index];
+      if (!value) return;
+      group.classList.toggle('open', value.open);
+      const button = group.querySelector('.activity-group-summary');
+      if (button) button.setAttribute('aria-expanded', String(value.open));
+      const items = group.querySelector('.activity-group-items');
+      if (items) items.scrollTop = value.scrollTop;
+    });
+    virtualHistoryNodes(nodes, '.think-row').forEach((row, index) => {
+      row.classList.toggle('open', !!saved.thoughts[index]);
+      row.querySelector('.think-head')?.setAttribute('aria-expanded', String(!!saved.thoughts[index]));
+    });
+    virtualHistoryNodes(nodes, '.call-row').forEach((row, index) => {
+      const value = saved.tools[index];
+      if (value && value.open && (value.trace ? value.trace === row.dataset.traceCallId : value.id === row.dataset.id)) toggleToolInline(row.dataset.rowKey);
+    });
+  }
+  const metric = state.metrics.get(unit.turn);
+  applyHistoryMessageMetadata({ turnMetrics: metric ? [metric] : [], events: state.errors.get(unit.turn) || [] }, state.sessionData || {}, unit.turn);
+  virtualHistoryNodes(nodes, '.call-row[data-subagent-id]').forEach(row => {
+    const child = state.agents.get(String(row.dataset.subagentId || ''));
+    if (child) { updateSubagentRowStatus(row, child.status); updateSubagentRowExecutionPhase(row, child.executionPhase); }
+  });
+  if (!unit.live && unit === state.units.at(-1) && viewedHistoryTurnIsRunning()) {
+    activityCurrentTurnId = 'history-' + unit.turn;
+    activityTurnEl = virtualHistoryNodes(nodes, '.activity-turn')[0] || null;
+    if (activityTurnEl) {
+      activityTurnEl.dataset.state = 'running';
+      updateActivityTurnLabel(activityTurnEl);
+      applyActivityPresentationTurn(activityTurnEl);
+    }
+    const groups = virtualHistoryNodes(nodes, '.activity-group');
+    const active = groups.filter(group => group.querySelector('.call-row[data-state="running"], .call-row[data-state="incomplete"]')).at(-1);
+    activityGroupEl = active || null;
+    if (active) active.dataset.running = 'true';
+  }
+  if (typeof decorateSessionFiles === 'function') decorateSessionFiles();
+  if (typeof syncArtifactChatCards === 'function') syncArtifactChatCards();
+  const selection = state.selection;
+  if (selection && selection.key === unit.key && selection.signature === unit.signature) {
+    const calls = virtualHistoryNodes(nodes, '.call-row');
+    const row = selection.trace ? calls.find(row => row.dataset.traceCallId === selection.trace)
+      : calls[selection.index] && calls[selection.index].dataset.id === selection.id ? calls[selection.index] : null;
+    if (row && selectedToolId !== row.dataset.rowKey) {
+      const tab = selection.tab;
+      openToolDetail(row.dataset.rowKey);
+      if (tab && tab !== 'summary') switchDetailTab(tab, document.querySelectorAll('.detail-tab')[tab === 'input' ? 1 : 2]);
+    }
+  }
+  virtualHistoryScheduleAgentRefresh();
+}
+
+function virtualHistoryScheduleAgentRefresh() {
+  const state = virtualHistoryState;
+  if (!state || state.agentRefreshQueued) return;
+  state.agentRefreshQueued = true;
+  queueMicrotask(() => {
+    state.agentRefreshQueued = false;
+    if (state === virtualHistoryState) refreshHistoricalSubagentStatuses(state.sessionId, activityHistoryGeneration);
+  });
+}
+
+function appendVirtualHistoryTurn(unit) {
+  const area = document.getElementById('chatArea');
+  if (unit.live) return Array.from(area.children).filter(node => node.dataset.virtualTurnKey === unit.key);
+  const previous = { group: activityGroupEl, turn: activityTurnEl, key: activityCurrentTurnId,
+    rendering: renderingActivityHistory, historyTurn: activityHistoryTurn, batch: historyMessageBatch };
+  const before = area.lastChild;
+  activityGroupEl = null;
+  activityTurnEl = null;
+  activityCurrentTurnId = '';
+  renderingActivityHistory = true;
+  activityHistoryTurn = unit.turn;
+  historyMessageBatch = [];
+  activityGroupsByTurn.delete('history-' + unit.turn);
+  virtualHistoryState.renderingUnit = unit;
+  try {
+    appendHistoryEntries(unit.entries, virtualHistoryState.sessionId, Math.max(0, unit.turn - 1), unit.sourceStart);
+    if (activityTurnEl) finishActivityTurn(unit === virtualHistoryState.units.at(-1) && viewedHistoryTurnIsRunning() ? 'running' : 'finished');
+    const nodes = [];
+    for (let node = before ? before.nextSibling : area.firstChild; node; node = node.nextSibling) if (node.nodeType === 1) nodes.push(node);
+    return nodes;
+  } finally {
+    virtualHistoryState.renderingUnit = null;
+    activityGroupEl = previous.group;
+    activityTurnEl = previous.turn;
+    activityCurrentTurnId = previous.key;
+    renderingActivityHistory = previous.rendering;
+    activityHistoryTurn = previous.historyTurn;
+    historyMessageBatch = previous.batch;
+  }
+}
+
+function renderVirtualHistoryMessages(history) {
+  const sessionId = String(currentSessionId || '');
+  const area = document.getElementById('chatArea');
+  const previous = virtualHistoryState && virtualHistoryState.sessionId === sessionId ? virtualHistoryState : null;
+  const sameViewport = !!(previous && chatHistoryViewport && !chatHistoryViewport.destroyed && chatHistoryViewport.sessionId === sessionId);
+  if (previous) {
+    previous.rebuilding = true;
+    if (previous.selection) previous.selection.tab = detailTab;
+  }
+  let anchor = chatHistoryViewport && chatHistoryViewport.sessionId === sessionId ? chatHistoryViewport.captureAnchor() : null;
+  virtualHistorySaveViewport();
+  cancelStreamingRender();
+  cancelChatScroll(sameViewport);
+  if (!area._metisScrollGesture?.active && area._metisScrollIntent === 'down') area._metisScrollIntent = '';
+  historyMessageBatch = [];
+  if (!sameViewport) {
+    if (chatHistoryViewport) chatHistoryViewport.destroy();
+    chatHistoryViewport = null;
+    closeToolDetail();
+    toolDetails = {};
+    activityGroupsByTurn.clear();
+    activityGroupEl = null;
+    activityTurnEl = null;
+    activityCurrentTurnId = '';
+    area.innerHTML = '';
+  }
+  area.dataset.historyVirtual = 'true';
+  activityHistoryGeneration++;
+  const units = buildHistoryTurnIndex(history, sessionId, { visibleText: visibleTranscriptText });
+  const liveAnchor = anchor && previous && previous.units.find(unit => unit.key === anchor.key && unit.live);
+  const committed = liveAnchor && units.find(unit => unit.key === liveAnchor.key && unit.entries.some(message =>
+    message.role === 'user' && visibleTranscriptText(messageText(message.content)).trim() === visibleTranscriptText(liveAnchor.liveUserText).trim()));
+  if (committed) anchor = { ...anchor, signature: committed.signature };
+  const signatureAliases = new Map();
+  if (previous) previous.units.filter(unit => unit.live).forEach(live => {
+    const canonical = units.find(unit => unit.key === live.key && unit.entries.some(message =>
+      message.role === 'user' && visibleTranscriptText(messageText(message.content)).trim() === visibleTranscriptText(live.liveUserText).trim()));
+    if (!canonical) return;
+    signatureAliases.set(live.key, canonical.signature);
+    const saved = previous.ui.get(live.key);
+    if (saved && saved.signature === live.signature) saved.signature = canonical.signature;
+    if (previous.selection && previous.selection.key === live.key && previous.selection.signature === live.signature) previous.selection.signature = canonical.signature;
+  });
+  virtualHistoryState = { sessionId, units, ui: previous ? previous.ui : new Map(), metrics: new Map(), errors: new Map(),
+    sessionData: {}, artifacts: new Map(), agentOwners: new Map(), agents: previous ? previous.agents : new Map(), renderingUnit: null,
+    selection: previous && previous.selection && units.some(unit => unit.key === previous.selection.key && unit.signature === previous.selection.signature) ? previous.selection : null,
+    agentRequests: new Map(), agentRetryAt: new Map(), agentRefreshQueued: false, rebuilding: false, signatureAliases };
+  virtualHistoryCollectOwners(virtualHistoryState);
+  activityHistoryLastTurn = units.at(-1)?.turn || 0;
+  if (sameViewport) {
+    // Preserve same-signature historical nodes, native text selection and
+    // inspector ownership while committing newly durable live turns.
+    chatHistoryViewport.setUnits(units, { anchor });
+    if (previous.selection && !virtualHistoryState.selection) closeToolDetail();
+  } else {
+  chatHistoryViewport = new HistoryVirtualViewport({ area, sessionId, units, anchor,
+    renderTurn: appendVirtualHistoryTurn,
+    beforeUnmount: virtualHistoryCaptureUnit,
+    afterMount: virtualHistoryApplyUnit,
+    isFollowing: () => followOutput,
+    onFollow: value => { followOutput = value; updateScrollFollowUI(); },
+    onViewport: () => {
+      if (virtualHistorySaveTimer) clearTimeout(virtualHistorySaveTimer);
+      const viewport = chatHistoryViewport;
+      virtualHistorySaveTimer = setTimeout(() => {
+        virtualHistorySaveTimer = 0;
+        if (viewport && viewport === chatHistoryViewport) viewport.save();
+      }, 200);
+    },
+  });
+  }
+  if (virtualHistoryState.selection) chatHistoryViewport.setPinned(virtualHistoryState.selection.key, 'tool-detail', true);
+  virtualHistoryState.agents.forEach((child, id) => {
+    const key = virtualHistoryState.agentOwners.get(id);
+    if (key && ['queued', 'running'].includes(child.status)) chatHistoryViewport.setPinned(key, 'agent:' + id, true);
+  });
+  if (viewedHistoryTurnIsRunning() && units.length) chatHistoryViewport.ensureMounted(units[units.length - 1].key);
+  queueMicrotask(() => restoreTodoPlanFromHistory(history));
+  if (typeof loadSessionFiles === 'function') void loadSessionFiles(sessionId);
+  if (typeof statusRosterForSelectedSession === 'function' && typeof lastStatusSnapshot !== 'undefined') reconcileSubagentToolRows(statusRosterForSelectedSession(lastStatusSnapshot));
+  void restoreHistoryMessageMetadata(sessionId, activityHistoryGeneration);
+  updateEmptyLayout();
+  // Replacing the sole mounted live turn must commit its canonical window
+  // and reading anchor before this task can paint a spacer-only transcript.
+  if (sameViewport) chatHistoryViewport.flush();
+}
+
+function renderHistoryMessages(history) {
+  const area = document.getElementById('chatArea');
+  if (typeof HistoryVirtualViewport === 'function' && area && area.childNodes && typeof area.insertBefore === 'function' &&
+      typeof area.getBoundingClientRect === 'function' && typeof document.createDocumentFragment === 'function') {
+    renderVirtualHistoryMessages(Array.isArray(history) ? history : []);
+    return;
+  }
+  renderHistoryMessagesLegacy(history);
+}
+
+function renderHistoryMessagesLegacy(history) {
+  cancelStreamingRender();
+  cancelChatScroll();
+  historyMessageBatch = [];
+  const historySessionId = String(currentSessionId || '');
+  if (typeof loadSessionFiles === 'function') void loadSessionFiles(currentSessionId);
+  queueMicrotask(() => restoreTodoPlanFromHistory(history));
+  const area = document.getElementById('chatArea');
+  // Avoid forcing a layout/scroll for every reconstructed history block. The
+  // selected transcript is pinned once, after the complete history exists.
+  followOutput = false;
+  // Row keys are render-local identities. A history refresh replaces every
+  // row, so any open inspector must release its old row and content first.
+  closeToolDetail();
+  toolDetails = {};
+  area.innerHTML = '';
+  activityGroupsByTurn.clear();
+  activityHistoryGeneration++;
+  activityGroupEl = null;
+  activityTurnEl = null;
+  activityCurrentTurnId = '';
+  renderingActivityHistory = true;
+  activityHistoryTurn = 0;
+  const historyTurn = appendHistoryEntries(history, historySessionId);
   activityHistoryLastTurn = historyTurn;
   const lastTurnKey = 'history-' + historyTurn;
   const viewedTurnRunning = viewedHistoryTurnIsRunning();
@@ -4330,6 +5144,7 @@ function restoreHistoryTurnState(turn, state, reason = '') {
 
 async function restoreHistoryMessageMetadata(sessionId, generation = activityHistoryGeneration) {
   if (!sessionId) return;
+  const refreshGeneration = typeof virtualHistoryRefreshGeneration === 'undefined' ? 0 : virtualHistoryRefreshGeneration;
   try {
     const readJSON = async url => {
       const res = await fetch(url);
@@ -4339,12 +5154,28 @@ async function restoreHistoryMessageMetadata(sessionId, generation = activityHis
       readJSON('/api/trace?sessionId=' + encodeURIComponent(sessionId) + '&limit=1'),
       readJSON('/api/sessions/' + encodeURIComponent(sessionId)),
     ]);
-    if (currentSessionId !== sessionId || generation !== activityHistoryGeneration) return;
+    if (currentSessionId !== sessionId || generation !== activityHistoryGeneration ||
+        typeof virtualHistoryRefreshGeneration !== 'undefined' && refreshGeneration !== virtualHistoryRefreshGeneration) return;
     const data = traceResult.status === 'fulfilled' ? (traceResult.value || {}) : {};
     const sessionData = sessionResult.status === 'fulfilled' ? (sessionResult.value || {}) : {};
+    if (typeof virtualHistoryState !== 'undefined' && virtualHistoryState && virtualHistoryState.sessionId === sessionId) {
+      virtualHistoryState.metrics = new Map((data.turnMetrics || []).map(metric => [Number(metric.turn), metric]));
+      virtualHistoryState.errors = new Map();
+      (data.events || []).forEach(event => {
+        const turn = Number(event.turn) || 0;
+        if (!virtualHistoryState.errors.has(turn)) virtualHistoryState.errors.set(turn, []);
+        virtualHistoryState.errors.get(turn).push(event);
+      });
+      virtualHistoryState.sessionData = sessionData;
+    }
+    applyHistoryMessageMetadata(data, sessionData);
+  } catch (_) {}
+}
+
+function applyHistoryMessageMetadata(data, sessionData, onlyTurn = null) {
     (data.turnMetrics || []).forEach(metric => {
       const turn = Number(metric.turn) || 0;
-      if (turn <= 0) return;
+      if (turn <= 0 || onlyTurn !== null && turn !== onlyTurn) return;
 
       const userActions = document.querySelector(`.message-user[data-history-turn="${turn}"] .msg-actions`);
       const startedAt = new Date(metric.startedAt || '');
@@ -4384,7 +5215,7 @@ async function restoreHistoryMessageMetadata(sessionId, generation = activityHis
     (data.events || []).forEach(event => {
       if (event.kind !== 'error' || Number(event.depth || 0) !== 0 || event.parentID) return;
       const turn = Number(event.turn) || 0;
-      if (turn <= 0) return;
+      if (turn <= 0 || onlyTurn !== null && turn !== onlyTurn) return;
       restoreHistoryTurnState(document.querySelector(`.activity-turn[data-history-turn="${turn}"]`), 'error', event.text || '');
     });
     const lastTurn = activityHistoryLastTurn;
@@ -4393,8 +5224,8 @@ async function restoreHistoryMessageMetadata(sessionId, generation = activityHis
     const sessionStatus = String(sessionData.session && sessionData.session.status || '').toLowerCase();
     const lastState = ({ completed: 'completed', stopped: 'stopped', failed: 'error' })[sessionStatus] ||
       (sessionStatus === 'running' && viewedHistoryTurnIsRunning() ? 'running' : '');
-    if (lastActivityTurn && lastState) restoreHistoryTurnState(lastActivityTurn, lastState, sessionStatus);
-  } catch (_) {}
+    if ((onlyTurn === null || onlyTurn === lastTurn) && lastActivityTurn && lastState) restoreHistoryTurnState(lastActivityTurn, lastState, sessionStatus);
+
 }
 
 function showError(text) {
@@ -4565,16 +5396,18 @@ function inlineMd(s) {
       const safe = /^(https?:|mailto:)/i.test(url) ? url : '#';
       return '<a href="' + escAttr(safe) + '" target="_blank" rel="noopener">' + text + '</a>';
     });
-  for (let i = 0; i < codeStash.length; i++) {
-    out = out.split('CODESPAN' + i + 'XQ').join('<code class="md-inline-code">' + escHtml(codeStash[i]) + '</code>');
-  }
-  for (let i = 0; i < stash.length; i++) {
-    out = out.split('MATHINLINE' + i + 'ZQ').join(renderMathInline(stash[i]));
-  }
-  for (let i = 0; i < localLinks.length; i++) {
-    const link = localLinks[i];
-    out = out.split('LOCALFILELINK' + i + 'XQ').join('<button type="button" class="session-file-link" disabled data-session-file-path="' + escAttr(link.path) + '">' + escHtml(link.label) + '</button>');
-  }
+  out = out.replace(/CODESPAN(\d+)XQ|MATHINLINE(\d+)ZQ|LOCALFILELINK(\d+)XQ/g, (token, codeIndex, mathIndex, linkIndex) => {
+    if (codeIndex !== undefined) {
+      const code = codeStash[Number(codeIndex)];
+      return code === undefined ? token : '<code class="md-inline-code">' + escHtml(code) + '</code>';
+    }
+    if (mathIndex !== undefined) {
+      const tex = stash[Number(mathIndex)];
+      return tex === undefined ? token : renderMathInline(tex);
+    }
+    const link = localLinks[Number(linkIndex)];
+    return !link ? token : '<button type="button" class="session-file-link" disabled data-session-file-path="' + escAttr(link.path) + '">' + escHtml(link.label) + '</button>';
+  });
   return out;
 }
 
@@ -5491,10 +6324,25 @@ function autoResize(el) {
   updateSendBtn();
 }
 
+function virtualHistoryHasVisibleContent(area) {
+  const viewport = typeof chatHistoryViewport !== 'undefined' ? chatHistoryViewport : null;
+  if (!area || !viewport || viewport.destroyed || viewport.area !== area ||
+      viewport.sessionId !== String(currentSessionId || '')) return false;
+  return viewport.units.some(unit => unit.textIndexEnd > unit.textIndexStart ||
+    (Array.isArray(unit.entries) ? unit.entries : []).some(message =>
+      (Array.isArray(message.content) ? message.content : []).some(block => block &&
+        (block.type === 'tool_use' || message.role !== 'user' &&
+          (block.type === 'redacted_thinking' || block.type === 'thinking' && String(block.text || '').trim())))));
+}
+
 function updateEmptyLayout() {
   const main = document.querySelector('.main');
   if (!main) return;
-  const hasContent = document.querySelectorAll('.message').length > 0
+  // A virtual window can briefly contain only spacers while a changed live
+  // turn is remounted. Its transcript is still nonempty: welcome-page sizing
+  // would stretch those spacers into a false, full-history-sized viewport.
+  const hasContent = virtualHistoryHasVisibleContent(document.getElementById('chatArea'))
+    || document.querySelectorAll('.message').length > 0
     || !!document.querySelector('.call-row')
     || !!document.querySelector('.think-row')
     || !!document.querySelector('.perm-card');
@@ -7411,3 +8259,5 @@ document.addEventListener('click', function(e) {
     effort.style.display = 'none'; effortBtn.setAttribute('aria-expanded', 'false');
   }
 });
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') window.addEventListener('pagehide', virtualHistorySaveViewport);

@@ -101,7 +101,7 @@ function setup() {
  const tabs=['general','appearance','providers','presets','plugins','computer-use','routing','config'].map(tab=>{const item=new Element();item.dataset.settingsTab=tab;return item;});
  const modal=new Element();modal.hidden=true;
  const c={console,Promise,Map,Set,setTimeout,clearTimeout,currentSessionId:'A',currentView:'trace',settingsTab:'general',settingsCache:{settings:[]},
-  pendingSessionId:null,selectionGeneration:0,artifactState:{active:null,previewSequence:0},sessions:[{id:'A',title:'Session A'}],
+  pendingSessionId:null,selectionGeneration:0,artifactState:{active:null,previewSequence:0,authoritativeIDs:new Set(),liveRevisions:new Map()},sessions:[{id:'A',title:'Session A'}],
   document:{documentElement:{lang:'zh-CN'},getElementById:get,
    querySelector:s=>s==='.app'?app:s==='.main'?main:s==='.main.artifacts-mode'&&main.classes.has('artifacts-mode')?main:s==='.sb-settings'?sidebar:null,
    querySelectorAll:s=>s==='.settings-item'?tabs:s==='[aria-modal="true"]'?[modal]:[],

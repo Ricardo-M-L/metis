@@ -116,6 +116,11 @@ class Element {
   get innerHTML() { return this._html; }
   insertAdjacentHTML(position, html) {
     assert.equal(position, 'beforeend');
+    const messageStarts = [...String(html).matchAll(/<div class="message message-(?:user|assistant)"/g)].map(match => match.index);
+    if (messageStarts.length > 1) {
+      messageStarts.forEach((start, index) => this.insertAdjacentHTML(position, html.slice(start, messageStarts[index + 1])));
+      return;
+    }
     const node = new Element();
     node.className = html.match(/<div class="([^"]+)"/)?.[1] || '';
     for (const [, key, value] of html.matchAll(/\b(data-[\w-]+)="([^"]*)"/g)) node.setAttribute(key, value);
@@ -222,6 +227,11 @@ const c = {
   turnStatusEl: null, turnStatusTimer: null,
 };
 vm.createContext(c);
+vm.runInContext(extract('let streamRenderFrame =', 'let effortState ='), c);
+vm.runInContext(extract('function scheduleStreamingRender()', 'const foregroundRequests ='), c);
+vm.runInContext(extract('function flushHistoryMessageBatch()', 'function addMessage('), c);
+vm.runInContext(extract('let chatScrollFrame =', 'const seenLiveEventIDs'), c);
+vm.runInContext(extract('function cancelChatScroll()', 'function autoScroll('), c);
 vm.runInContext(extract('function sameSession(d)', 'let thinkingEl = null;'), c);
 vm.runInContext(extract('let thinkingEl = null;', 'const THINK_ORBIT_ICON'), c);
 vm.runInContext(extract('const THINK_ORBIT_ICON', 'let todoPlanItems ='), c);
@@ -886,6 +896,7 @@ let hiddenChunkText = '';
 for (const piece of ['<', 's', 'ystem-reminder', '>', 'private instructions', '</', 'system-reminder', '>']) {
   hiddenChunkText += piece;
   c.handleTextDelta({delta:piece});
+  flushFrames();
   assert.equal(c.visibleTranscriptText(hiddenChunkText, true), '', 'hidden chunk ' + JSON.stringify(piece));
   assert.equal(area.querySelectorAll('.message-assistant').length, 0,
     'no partial internal tag or private body may appear in a chat bubble');
@@ -905,11 +916,13 @@ let mixedRaw = beforeEnvelope;
 for (const piece of ['<', 's', 'ystem-reminder', '>', 'private instructions', '</', 'system-reminder', '>']) {
   mixedRaw += piece;
   c.handleTextDelta({delta:piece});
+  flushFrames();
   assert.equal(c.visibleTranscriptText(mixedRaw, true), beforeEnvelope);
   assert.equal(area.querySelector('.message-assistant').querySelector('.message-content').innerHTML,
     beforeEnvelope, 'partial hidden markup must not leak or erase preceding public text');
 }
 c.handleTextDelta({delta:' Visible after'});
+flushFrames();
 assert.equal(area.querySelectorAll('.message-assistant').length, 1);
 assert.equal(area.querySelector('.message-assistant').querySelector('.message-content').innerHTML,
   'Visible before  Visible after');

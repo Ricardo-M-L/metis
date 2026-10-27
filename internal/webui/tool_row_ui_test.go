@@ -194,6 +194,11 @@ class Element {
   get innerHTML() { return this._html; }
   insertAdjacentHTML(position, html) {
     assert.equal(position, 'beforeend');
+    const messageStarts = [...String(html).matchAll(/<div class="message message-(?:user|assistant)"/g)].map(match => match.index);
+    if (messageStarts.length > 1) {
+      messageStarts.forEach((start, index) => this.insertAdjacentHTML(position, html.slice(start, messageStarts[index + 1])));
+      return;
+    }
     if (/class="message message-(user|assistant)"/.test(html)) {
       const role = html.match(/class="message message-(user|assistant)"/)?.[1];
       const message = new Element(); message.className = 'message message-' + role;
@@ -328,6 +333,11 @@ context = {
   openSubAgentDetails: (id, trigger, owner) => context.openedAgents.push({id, trigger, owner}),
 };
 vm.createContext(context);
+vm.runInContext(extract('let streamRenderFrame =', 'let effortState ='), context);
+vm.runInContext(extract('function scheduleStreamingRender()', 'const foregroundRequests ='), context);
+vm.runInContext(extract('function flushHistoryMessageBatch()', 'function addMessage('), context);
+vm.runInContext(extract('let chatScrollFrame =', 'const seenLiveEventIDs'), context);
+vm.runInContext(extract('function cancelChatScroll()', 'function autoScroll('), context);
 vm.runInContext(extract('let thinkingEl = null;', 'const THINK_ORBIT_ICON'), context);
 vm.runInContext(extract('function openToolDetail(id)', '// DSH ToolRow parity'), context);
 vm.runInContext(extract('const TOOL_VARIANTS =', 'const FILE_DIFF_MAX_LINES'), context);

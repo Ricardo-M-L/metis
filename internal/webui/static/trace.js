@@ -54,6 +54,7 @@ function metaOf(kind) {
 }
 
 function switchView(view) {
+  if (currentView === 'chat' && view !== 'chat' && typeof virtualHistorySaveViewport === 'function') virtualHistorySaveViewport();
   if (view !== 'artifacts' && typeof leaveArtifactsPanel === 'function') {
     leaveArtifactsPanel();
   }
@@ -72,6 +73,7 @@ function switchView(view) {
   } else {
     invalidateTraceLoads();
     updateEmptyLayout();
+    if (view === 'chat' && typeof virtualHistoryViewportChanged === 'function') virtualHistoryViewportChanged();
   }
 }
 

@@ -425,9 +425,11 @@ function automationForegroundTurnActive(sessionId) {
 }
 
 function automationHistoryView(area) {
+  const virtualAnchor = typeof virtualHistoryCaptureAnchor === 'function' ? virtualHistoryCaptureAnchor() : null;
   const rows = Array.from(area.querySelectorAll?.('.call-row') || []);
   const selected = typeof selectedToolId === 'undefined' ? null : rows.find(row => row.dataset.rowKey === selectedToolId);
   return {
+    virtualAnchor,
     scrollTop: area.scrollTop,
     nearBottom: area.scrollHeight - area.scrollTop - area.clientHeight <= 56,
     selectedTrace: selected?.dataset.traceCallId || '',
@@ -444,6 +446,8 @@ function automationHistoryView(area) {
 }
 
 function automationRestoreHistoryView(area, view) {
+  if (view.virtualAnchor && typeof virtualHistoryRestoreAnchor === 'function' &&
+      virtualHistoryRestoreAnchor(view.virtualAnchor)) return;
   const turns = Array.from(area.querySelectorAll?.('.activity-turn') || []);
   view.openTurns.forEach(index => {
     const turn = turns[index];

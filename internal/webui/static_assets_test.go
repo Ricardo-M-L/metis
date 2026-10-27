@@ -955,7 +955,6 @@ func TestRunningTurnCanBeViewedInBackgroundAndStoppedBySession(t *testing.T) {
 		"INTERNAL_TRANSCRIPT_SECTION_RE",
 		"const visibleText = visibleTranscriptText(streamingText, true)",
 		"if (!streamingEl && visibleText.trim()) startStreamingMessage()",
-		"box.innerHTML = formatContent(visibleText)",
 		"Math.min(100, Math.round(used / limit * 100))",
 	} {
 		if !strings.Contains(chat, want) {
