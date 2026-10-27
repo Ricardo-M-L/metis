@@ -4636,7 +4636,7 @@ const COMPOSER_COMMANDS = [
   { name: '/undo', label: 'Undo last turn', hint: 'Remove the latest exchange and restore its prompt', category: 'Session' },
   { name: '/edit', label: 'Edit last prompt', hint: 'Undo the latest exchange and restore its prompt', category: 'Session' },
   { name: '/save', label: 'Save session', hint: 'Flush the current transcript to disk', category: 'Session' },
-  { name: '/checkpoint', label: '代码检查点', hint: 'status · on [项目目录…] · off；主目录支持指定项目范围', category: 'Session' },
+  { name: '/checkpoint', label: '代码检查点', hint: 'status · on · off；仅切换当前会话', category: 'Session' },
   { name: '/compact', label: 'Compact history', hint: 'Summarize older context now', category: 'Session' },
   { name: '/export', label: 'Export session log', hint: 'Write the current transcript to a file', category: 'Session' },
   { name: '/feedback', label: 'Record feedback', hint: 'Save a private log-only note', category: 'Session' },
@@ -4971,31 +4971,6 @@ async function executeComposerCommand(text, targetSessionId = currentSessionId) 
     default: return false;
   }
   return true;
-}
-
-function renderCheckpointControl(state) {
-  const button = document.getElementById('checkpointBtn');
-  if (!button) return;
-  button.textContent = !state ? '检查点：未知' : state.enabled ? '检查点：开' : '检查点：关';
-  button.title = state ? ['工作区：' + state.workspace, '保护范围：' + (state.roots || []).join('、'), state.reason || '', '/checkpoint on [项目目录…] · /checkpoint off'].filter(Boolean).join('\n') : '暂时无法读取检查点状态';
-  button.setAttribute('aria-label', button.textContent + '，点击查看保护范围');
-}
-
-async function runCheckpointControl(input) {
-  const selectedSessionId = String(currentSessionId || '');
-  const workspaceId = String(activeWorkspaceId || '');
-  const command = String(input || 'status').trim();
-  if (/^on(?:\s|$)/i.test(command)) showToast('正在建立代码检查点基线…');
-  try {
-    const res = await fetch('/api/checkpoint', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({sessionId:selectedSessionId,workspaceId:workspaceId,command:command})
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || 'checkpoint: ' + res.status);
-    if (selectedSessionId === String(currentSessionId || '') && workspaceId === String(activeWorkspaceId || '')) renderCheckpointControl(data.checkpoint);
-    showToast(data.message || '检查点设置已更新');
-  } catch (error) { showToast(error.message); }
 }
 
 async function runSessionCommand(command) {

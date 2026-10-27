@@ -42,9 +42,9 @@ func TestControlHomeScopePersistsAndDoesNotCaptureSiblings(t *testing.T) {
 	if _, ok := paths["project with spaces/file.txt"]; !ok {
 		t.Fatalf("wrong files: %+v", paths)
 	}
-	next := NewManager("another-session", home, "")
+	next := NewManager("scoped", home, "")
 	if next.DisabledByPolicy() || !next.ControlStatus().Enabled {
-		t.Fatal("scope did not survive new session")
+		t.Fatal("scope did not survive reopening the same session")
 	}
 	if _, err := m.Command(context.Background(), "off"); err != nil {
 		t.Fatal(err)
@@ -96,7 +96,7 @@ func TestControlRejectsEscapesSymlinksAndActiveRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	other := NewManager("other-session", home, "")
+	other := NewManager("scope-reject", home, "")
 	if _, err := other.Command(context.Background(), "off"); err == nil || !strings.Contains(err.Error(), "busy") {
 		t.Fatalf("changed active settings: %v", err)
 	}

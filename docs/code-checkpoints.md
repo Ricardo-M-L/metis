@@ -16,6 +16,25 @@ ignored by a project's `.gitignore`. Otherwise an unchanged ignored file can
 be misclassified as newly created and incorrectly selected for deletion during
 rewind. Force-staging applies only to the private shadow repository.
 
+`/checkpoint on`, `/checkpoint off`, and `/checkpoint status` control the current
+session. Desktop exposes the same session switch. The preference is stored under
+`checkpoint-controls/sessions/`, keyed by the durable session ID and canonical
+workspace path, and verified against both identities when read. CLI and Desktop
+opening the same session see the same preference after refresh or resume;
+different sessions in one workspace remain independent. Settings changes are
+refused while that session is running, without preventing another session from
+changing its own preference. The previous workspace-wide preference is retained
+on disk but is not broadcast into new or resumed sessions.
+
+A new-chat preview only reads defaults; it never writes a workspace preference.
+Desktop creates a durable session before changing the switch. Project workspaces
+default to enabled. The bare user home and filesystem root default to disabled,
+and enabling there without a narrower scope is rejected with a request to use a
+project workspace. Desktop does not offer a project-scope picker. This avoids
+quietly scanning the entire home directory. Existing explicitly scoped CLI
+commands remain compatible for advanced callers, but are not part of the
+Desktop switch or its command help.
+
 The shadow repository stores raw file bytes. Its own highest-priority attributes
 disable text, encoding, ident and clean-filter transformations, and its local
 `core.autocrlf` is false. Project and global Git configuration are not changed.

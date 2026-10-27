@@ -39,22 +39,29 @@ func (s *Server) handleCheckpointControl(w http.ResponseWriter, r *http.Request)
 			WorkspaceID string `json:"workspaceId"`
 			Command     string `json:"command"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&body); err != nil {
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid checkpoint request")
 			return
 		}
 		sessionID, workspaceID, command = body.SessionID, body.WorkspaceID, body.Command
+		action, paths, err := checkpoint.ParseControlArgs(command)
+		if err != nil || len(paths) != 0 {
+			writeError(w, http.StatusBadRequest, "用法：/checkpoint [status|on|off]")
+			return
+		}
+		if sessionID == "" && action != "status" {
+			writeError(w, http.StatusBadRequest, "checkpoint: 请先创建会话")
+			return
+		}
 	}
 	workspace, status, err := s.checkpointWorkspace(sessionID, workspaceID)
 	if err != nil {
 		writeError(w, status, err.Error())
 		return
 	}
-	id := sessionID
-	if id == "" {
-		id = "workspace-" + workspaceIDForPath(workspace)
-	}
-	manager := checkpoint.NewManager(id, workspace, "")
+	manager := checkpoint.NewManager(sessionID, workspace, "")
 	if r.Method == http.MethodGet {
 		writeJSON(w, http.StatusOK, manager.ControlStatus())
 		return
@@ -62,13 +69,21 @@ func (s *Server) handleCheckpointControl(w http.ResponseWriter, r *http.Request)
 	state, err := manager.Command(r.Context(), command)
 	if err != nil {
 		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "workspace busy") {
+		if strings.Contains(err.Error(), "session busy") || strings.Contains(err.Error(), "workspace busy") {
 			code = http.StatusConflict
 		}
 		writeError(w, code, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"checkpoint": state, "message": state.String()})
+	message := "检查点状态已更新"
+	action, _, _ := checkpoint.ParseControlArgs(command)
+	switch action {
+	case "on":
+		message = "检查点已开启"
+	case "off":
+		message = "检查点已关闭"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"checkpoint": state, "message": message})
 }
 
 func (s *Server) checkpointStatusForView(sessionID, workspace string) checkpoint.ControlStatus {
@@ -76,8 +91,8 @@ func (s *Server) checkpointStatusForView(sessionID, workspace string) checkpoint
 		if path, _, err := s.checkpointWorkspace(sessionID, ""); err == nil {
 			workspace = path
 		} else {
-			return checkpoint.ControlStatus{Enabled: false, Reason: err.Error()}
+			return checkpoint.ControlStatus{SessionID: sessionID, Enabled: false, Reason: err.Error()}
 		}
 	}
-	return checkpoint.NewManager("desktop-status", workspace, "").ControlStatus()
+	return checkpoint.NewManager(sessionID, workspace, "").ControlStatus()
 }

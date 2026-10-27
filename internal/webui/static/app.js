@@ -427,6 +427,7 @@ function showToast(msg) {
 // the conversation it belongs to and only exposed non-interactive names.
 async function pollStatus(shouldApply = () => true) {
   const generation = ++statusRequestGeneration;
+  const checkpointGeneration = typeof checkpointControlGeneration === 'number' ? checkpointControlGeneration : 0;
   const permissionGeneration = typeof permissionModeGeneration === 'number' ? permissionModeGeneration : 0;
   const permissionWasPending = typeof permissionModePending !== 'undefined' && permissionModePending;
   const selectedSessionId = String(currentSessionId || '');
@@ -441,7 +442,7 @@ async function pollStatus(shouldApply = () => true) {
         viewGeneration !== (typeof resumeSessionGeneration === 'number' ? resumeSessionGeneration : 0)) return;
     d.requestGeneration = generation;
     lastStatusSnapshot = d;
-    if (typeof renderCheckpointControl === 'function') renderCheckpointControl(d.checkpoint);
+    if (typeof renderCheckpointControl === 'function' && checkpointGeneration === (typeof checkpointControlGeneration === 'number' ? checkpointControlGeneration : 0)) renderCheckpointControl(d.checkpoint);
     renderStatusSnapshot(d);
     if (typeof applyResumeSnapshot === 'function') applyResumeSnapshot(d, selectedSessionId);
     if (typeof applyStatusPlanSnapshot === 'function') applyStatusPlanSnapshot(d);

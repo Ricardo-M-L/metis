@@ -14,7 +14,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/session"
 )
 
-func TestCheckpointDesktopAndCLIShareWorkspaceControls(t *testing.T) {
+func TestCheckpointDesktopAndCLIShareSessionControls(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -24,7 +24,8 @@ func TestCheckpointDesktopAndCLIShareWorkspaceControls(t *testing.T) {
 	}
 	s, store := testServer(t)
 	sid := "checkpoint-web-session"
-	err := store.WriteHeaderFull(session.Header{ID: sid, WorkDir: home, Model: "test", Provider: "test"})
+	workspace := filepath.Join(home, "project")
+	err := store.WriteHeaderFull(session.Header{ID: sid, WorkDir: workspace, Model: "test", Provider: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,13 +37,10 @@ func TestCheckpointDesktopAndCLIShareWorkspaceControls(t *testing.T) {
 		h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/checkpoint", bytes.NewReader(body)))
 		return rr
 	}
-	if rr := post("on"); rr.Code != http.StatusBadRequest {
-		t.Fatalf("unscoped home: %d %s", rr.Code, rr.Body.String())
-	}
-	if rr := post("on project"); rr.Code != http.StatusOK {
+	if rr := post("on"); rr.Code != http.StatusOK {
 		t.Fatalf("enable: %d %s", rr.Code, rr.Body.String())
 	}
-	cli := checkpoint.NewManager("cli-session", home, "")
+	cli := checkpoint.NewManager(sid, workspace, "")
 	if cli.DisabledByPolicy() || !cli.ControlStatus().Enabled {
 		t.Fatal("Desktop did not enable CLI")
 	}

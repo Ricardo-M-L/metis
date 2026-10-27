@@ -19,6 +19,7 @@ import (
 var ErrDisabledByUser = errors.New("checkpoint: 已手动关闭，使用 /checkpoint on 开启")
 
 type ControlStatus struct {
+	SessionID string   `json:"sessionId"`
 	Workspace string   `json:"workspace"`
 	Enabled   bool     `json:"enabled"`
 	Mode      string   `json:"mode"`
@@ -28,6 +29,7 @@ type ControlStatus struct {
 }
 type controlSettings struct {
 	Version   int      `json:"version"`
+	SessionID string   `json:"sessionId"`
 	Workspace string   `json:"workspace"`
 	Enabled   bool     `json:"enabled"`
 	Roots     []string `json:"roots"`
@@ -90,7 +92,7 @@ func ParseControlArgs(input string) (string, []string, error) {
 	action := strings.ToLower(words[0])
 	paths := words[1:]
 	if action != "on" && action != "off" && action != "status" {
-		return "", nil, errors.New("用法：/checkpoint [status|on [项目目录…]|off]")
+		return "", nil, errors.New("用法：/checkpoint [status|on|off]")
 	}
 	if action != "on" && len(paths) > 0 {
 		return "", nil, errors.New("只有 /checkpoint on 可以指定项目目录")
@@ -98,7 +100,10 @@ func ParseControlArgs(input string) (string, []string, error) {
 	return action, paths, nil
 }
 
-func controlPaths(workspace string) (string, string, error) {
+func controlPaths(sessionID, workspace string) (string, string, error) {
+	if strings.TrimSpace(workspace) == "" {
+		return "", "", errors.New("checkpoint: 当前会话未绑定工作区")
+	}
 	abs, err := filepath.Abs(workspace)
 	if err != nil {
 		return "", "", err
@@ -107,7 +112,12 @@ func controlPaths(workspace string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	sum := sha256.Sum256([]byte(canonical))
+	if sessionID == "" {
+		// A new-chat preview has no durable owner yet. It may display defaults,
+		// but must never inherit or create a workspace-wide preference.
+		return canonical, "", nil
+	}
+	sum := sha256.Sum256([]byte(sessionID + "\x00" + canonical))
 	metisHome := os.Getenv("METIS_HOME")
 	if metisHome == "" {
 		home, homeErr := os.UserHomeDir()
@@ -116,17 +126,20 @@ func controlPaths(workspace string) (string, string, error) {
 		}
 		metisHome = filepath.Join(home, ".metis")
 	}
-	base := filepath.Join(metisHome, "checkpoint-controls")
+	base := filepath.Join(metisHome, "checkpoint-controls", "sessions")
 	return canonical, filepath.Join(base, hex.EncodeToString(sum[:])+".json"), nil
 }
-func readControl(workspace string) (controlSettings, string, error) {
-	cwd, path, err := controlPaths(workspace)
+func readControl(sessionID, workspace string) (controlSettings, string, error) {
+	cwd, path, err := controlPaths(sessionID, workspace)
 	if err != nil {
 		return controlSettings{}, "", err
 	}
-	state := controlSettings{Version: 1, Workspace: cwd, Enabled: !isUnsafeCheckpointRoot(cwd), Revision: "auto"}
+	state := controlSettings{Version: 2, SessionID: sessionID, Workspace: cwd, Enabled: !isUnsafeCheckpointRoot(cwd), Revision: "auto"}
 	if state.Enabled {
 		state.Roots = []string{"."}
+	}
+	if sessionID == "" {
+		return state, "", nil
 	}
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
@@ -152,7 +165,7 @@ func readControl(workspace string) (controlSettings, string, error) {
 	if err = decoder.Decode(&state); err != nil {
 		return state, path, fmt.Errorf("checkpoint settings: %w", err)
 	}
-	if state.Version != 1 || state.Workspace != cwd || state.Revision == "" {
+	if state.Version != 2 || state.SessionID != sessionID || state.Workspace != cwd || state.Revision == "" {
 		return state, path, errors.New("checkpoint: settings identity mismatch")
 	}
 	if state.Roots, err = normalizeRoots(cwd, state.Roots, false); err != nil {
@@ -287,8 +300,11 @@ func writeControl(path string, state controlSettings) error {
 	defer dir.Close()
 	return dir.Sync()
 }
-func controlLease(workspace string, exclusive bool) (func(), error) {
-	_, path, err := controlPaths(workspace)
+func controlLease(sessionID, workspace string, exclusive bool) (func(), error) {
+	if sessionID == "" {
+		return nil, errors.New("checkpoint: 请先创建会话")
+	}
+	_, path, err := controlPaths(sessionID, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -325,7 +341,7 @@ func controlLease(workspace string, exclusive bool) (func(), error) {
 		if err != nil {
 			return nil, err
 		}
-		return nil, errors.New("checkpoint: workspace busy，任务结束后再更改检查点设置")
+		return nil, errors.New("checkpoint: session busy，任务结束后再更改检查点设置")
 	}
 	return sync.OnceFunc(func() { _ = unlockControl(file); _ = file.Close() }), nil
 }
@@ -348,7 +364,7 @@ func (m *Manager) applyControlLocked(state controlSettings) bool {
 	return changed
 }
 func (m *Manager) refreshControlLocked() (bool, error) {
-	state, _, err := readControl(m.cwd)
+	state, _, err := readControl(m.sessionID, m.cwd)
 	if err != nil {
 		m.controlErr = err
 		m.automaticOff.Store(true)
@@ -357,11 +373,11 @@ func (m *Manager) refreshControlLocked() (bool, error) {
 	return m.applyControlLocked(state), nil
 }
 
-// A shared workspace lease keeps settings stable through the whole model turn,
+// A shared session lease keeps settings stable through the whole model turn,
 // including every before/after-tool snapshot. Other CLI/Desktop processes must
 // wait for idle rather than changing attribution halfway through a mutation.
 func (m *Manager) BeginRun() (func(), bool, error) {
-	release, err := controlLease(m.cwd, false)
+	release, err := controlLease(m.sessionID, m.cwd, false)
 	if err != nil {
 		return nil, false, err
 	}
@@ -445,8 +461,8 @@ func (m *Manager) Protects(path string) bool {
 	return rel != ".." && !filepath.IsAbs(rel) && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && m.scopeContains(filepath.ToSlash(rel))
 }
 func (m *Manager) ControlStatus() ControlStatus {
-	state, _, err := readControl(m.cwd)
-	status := ControlStatus{Workspace: state.Workspace, Enabled: state.Enabled, Mode: "auto", Roots: []string{}, Revision: state.Revision}
+	state, _, err := readControl(m.sessionID, m.cwd)
+	status := ControlStatus{SessionID: m.sessionID, Workspace: state.Workspace, Enabled: state.Enabled, Mode: "auto", Roots: []string{}, Revision: state.Revision}
 	if state.Revision != "auto" {
 		if state.Enabled {
 			status.Mode = "on"
@@ -464,7 +480,7 @@ func (m *Manager) ControlStatus() ControlStatus {
 		if status.Mode == "off" {
 			status.Reason = "已手动关闭；已有快照保留"
 		} else {
-			status.Reason = "当前是主目录或根目录，请用 /checkpoint on 项目目录… 指定保护范围"
+			status.Reason = "请在项目工作区中开启"
 		}
 	}
 	return status
@@ -474,14 +490,11 @@ func (s ControlStatus) String() string {
 	if s.Enabled {
 		state = "开启"
 	}
-	result := "代码检查点：" + state + "\n工作区：" + s.Workspace
-	if len(s.Roots) > 0 {
-		result += "\n保护范围：" + strings.Join(s.Roots, "、")
-	}
+	result := "代码检查点：" + state
 	if s.Reason != "" {
 		result += "\n" + s.Reason
 	}
-	return result + "\n/checkpoint on [项目目录…] · /checkpoint off · /checkpoint status"
+	return result + "\n/checkpoint on · /checkpoint off · /checkpoint status"
 }
 func (m *Manager) Command(ctx context.Context, args string) (ControlStatus, error) {
 	action, paths, err := ParseControlArgs(args)
@@ -491,14 +504,17 @@ func (m *Manager) Command(ctx context.Context, args string) (ControlStatus, erro
 	if action == "status" {
 		return m.ControlStatus(), nil
 	}
-	release, err := controlLease(m.cwd, true)
+	release, err := controlLease(m.sessionID, m.cwd, true)
 	if err != nil {
 		return ControlStatus{}, err
 	}
 	defer release()
-	old, path, err := readControl(m.cwd)
+	old, path, err := readControl(m.sessionID, m.cwd)
 	if err != nil {
 		return ControlStatus{}, err
+	}
+	if action == "on" && len(paths) == 0 && isUnsafeCheckpointRoot(old.Workspace) {
+		return ControlStatus{}, errors.New("请在项目工作区中开启")
 	}
 	next := old
 	next.Enabled = action == "on"
