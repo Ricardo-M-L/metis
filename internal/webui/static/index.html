@@ -14,6 +14,7 @@
 <link rel="stylesheet" href="durable_ops.css?v=__BUILD__">
 <link rel="stylesheet" href="providers.css?v=__BUILD__">
 <link rel="stylesheet" href="navigation.css?v=__BUILD__">
+<link rel="stylesheet" href="subagents.css?v=__BUILD__">
 </head>
 <body>
 <div class="app details-closed">
@@ -235,19 +236,40 @@
       </div>
     </div>
 
-    <div class="subagent-detail-overlay" id="subAgentDetailOverlay" hidden>
-      <section class="subagent-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="subAgentDetailTitle" aria-describedby="subAgentDetailDescription" tabindex="-1">
+    <div class="subagent-detail-overlay" id="subAgentDetailOverlay" data-presentation="page" hidden>
+      <section class="subagent-detail-dialog" role="region" aria-labelledby="subAgentDetailTitle" aria-describedby="subAgentDetailDescription" tabindex="-1">
         <header class="subagent-detail-head">
-          <div>
-            <p class="subagent-detail-eyebrow" id="subAgentDetailEyebrow">SUB-AGENT</p>
-            <h2 id="subAgentDetailTitle">子代理详情</h2>
-            <p id="subAgentDetailDescription" class="subagent-detail-subtitle">正在读取子代理状态…</p>
+          <div class="subagent-detail-lineage">
+            <button class="subagent-detail-back" id="subAgentBack" type="button" aria-label="返回主对话" onclick="closeSubAgentDetails()">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6.5 3.5-4.5 4.5 4.5 4.5M2.5 8h11"/></svg>
+              <span>返回主对话</span>
+            </button>
+            <svg class="subagent-detail-lineage-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 4 4 4-4 4"/></svg>
+            <h2 id="subAgentDetailTitle">子代理会话</h2>
           </div>
-          <button class="subagent-detail-close" id="subAgentDetailClose" type="button" aria-label="关闭" title="关闭" onclick="closeSubAgentDetails()">
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>
-          </button>
+          <div class="subagent-detail-actions">
+            <button class="subagent-detail-action" id="subAgentInfoToggle" type="button" aria-label="详情" aria-controls="subAgentDetailInfo" aria-expanded="false" onclick="toggleSubAgentInfo()">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/><path d="M8 7v4M8 5h.01"/></svg>
+              <span>详情</span>
+            </button>
+            <button class="subagent-detail-action subagent-detail-icon-button" id="subAgentPresentationToggle" type="button" aria-label="在侧边查看" title="在侧边查看" aria-pressed="false" onclick="toggleSubAgentPresentation()">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M9.5 2.5v11"/></svg>
+            </button>
+            <button class="subagent-detail-close subagent-detail-icon-button" id="subAgentDetailClose" type="button" aria-label="关闭" title="关闭" onclick="closeSubAgentDetails()">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>
+            </button>
+          </div>
         </header>
-        <div class="subagent-detail-body" id="subAgentDetailBody" aria-live="polite" aria-busy="false"></div>
+        <div class="subagent-detail-toolbar">
+          <p id="subAgentDetailDescription" class="subagent-detail-subtitle" role="status">正在读取子代理状态…</p>
+          <div class="subagent-detail-metrics" id="subAgentDetailMetrics"></div>
+        </div>
+        <aside class="subagent-detail-info" id="subAgentDetailInfo" aria-label="子代理详情" hidden></aside>
+        <div class="subagent-detail-body" id="subAgentDetailBody" role="region" aria-label="子代理会话内容" aria-live="off" aria-busy="false" tabindex="0"></div>
+        <footer class="subagent-detail-footer">
+          <span id="subAgentReadOnlyLabel">子代理会话 · 只读</span>
+          <div class="subagent-detail-footer-actions" id="subAgentDetailFooterActions"></div>
+        </footer>
       </section>
     </div>
 
@@ -416,6 +438,7 @@
 <script src="sessions.js?v=__BUILD__"></script>
 <script src="history_virtual.js?v=__BUILD__"></script>
 <script src="chat.js?v=__BUILD__"></script>
+<script src="subagent_view.js?v=__BUILD__"></script>
 <script src="checkpoint.js?v=__BUILD__"></script>
 <script src="providers.js?v=__BUILD__"></script>
 <script src="artifacts.js?v=__BUILD__"></script>

@@ -46,7 +46,7 @@ c.lastStatusSnapshot={viewRoster:{sessionId:'session-a',agents,heldExecutionSlot
 c.renderStatusPopover();
 assert.match(pop.innerHTML,/执行槽（采样）.*2\s*\/\s*8/);
 assert.match(pop.innerHTML,/当前会话子代理占用.*2/);
-assert.equal((pop.innerHTML.match(/运行中 · /g)||[]).length,3,'three live agents can hold only two sampled slots');
+assert.equal((pop.innerHTML.match(/class="status-agent-task">运行中 · /g)||[]).length,3,'three live agents can hold only two sampled slots');
 for (const phase of ['执行中','等待后台任务','排队中']) assert.match(pop.innerHTML,new RegExp(phase));
 assert.doesNotMatch(pop.innerHTML,/foreign/);
 assert.match(pop.innerHTML,/运行中/,'lifecycle remains distinct from execution phase');

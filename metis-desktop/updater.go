@@ -168,12 +168,19 @@ func (u desktopUpdater) install(ctx context.Context, current, appPath string, re
 		return status, err
 	}
 	defer func() { _ = releaseLock() }()
+	if err := desktopTrialInstallAdmission(appPath); err != nil {
+		return status, err
+	}
 	parent := filepath.Dir(appPath)
 	stageRoot, err := os.MkdirTemp(parent, ".metis-update-")
 	if err != nil {
 		return status, fmt.Errorf("create update staging directory beside Desktop app: %w", err)
 	}
-	defer os.RemoveAll(stageRoot)
+	defer func() {
+		if !desktopActivationHasParkedOld(appPath, stageRoot) {
+			_ = os.RemoveAll(stageRoot)
+		}
+	}()
 	if err := os.Chmod(stageRoot, 0o700); err != nil {
 		return status, err
 	}
@@ -648,15 +655,24 @@ func activateDesktopCandidate(candidate, appPath, goos string) error {
 	if err := removeDesktopRollback(backup, goos); err != nil {
 		return fmt.Errorf("remove previous Desktop rollback: %w", err)
 	}
-	if err := os.Rename(appPath, backup); err != nil {
-		return fmt.Errorf("preserve current Desktop version: %w", err)
+	if err := recordDesktopActivation(candidate, appPath); err != nil {
+		return fmt.Errorf("record atomic Desktop activation: %w", err)
 	}
-	if err := os.Rename(candidate, appPath); err != nil {
-		rollbackErr := os.Rename(backup, appPath)
+	if err := desktopAtomicSwap(candidate, appPath); err != nil {
+		return fmt.Errorf("atomically activate Desktop update: %w", err)
+	}
+	if err := desktopSyncDirectory(filepath.Dir(appPath)); err != nil {
+		return err
+	}
+	if err := os.Rename(candidate, backup); err != nil {
+		rollbackErr := desktopAtomicSwap(candidate, appPath)
 		if rollbackErr != nil {
-			return fmt.Errorf("activate Desktop update: %v; rollback also failed: %v", err, rollbackErr)
+			return fmt.Errorf("preserve previous Desktop: %v; atomic rollback also failed: %w", err, rollbackErr)
 		}
-		return fmt.Errorf("activate Desktop update: %w", err)
+		return fmt.Errorf("preserve previous Desktop: %w", err)
+	}
+	if err := desktopSyncDirectory(filepath.Dir(appPath)); err != nil {
+		return err
 	}
 	return nil
 }

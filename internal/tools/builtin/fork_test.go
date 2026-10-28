@@ -2,14 +2,121 @@ package builtin
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
+
+type forkPlanCatalogProvider struct {
+	fakeProvider
+	sawTools map[string]bool
+}
+
+func (p *forkPlanCatalogProvider) Stream(ctx context.Context, req llm.Request) (llm.StreamReader, error) {
+	p.sawTools = make(map[string]bool)
+	for _, tool := range req.Tools {
+		p.sawTools[tool.Name] = true
+	}
+	return p.fakeProvider.Stream(ctx, req)
+}
+
+func TestForkChildCannotControlRootPlanMode(t *testing.T) {
+	gate := permission.New(permission.ModeBypassPermissions)
+	registry := tools.NewRegistry()
+	for _, name := range []string{"Read", "EnterPlanMode", "ExitPlanMode"} {
+		registry.Register(parentGateBoundBoundaryTool{name: name, gate: gate})
+	}
+	provider := &forkPlanCatalogProvider{fakeProvider: fakeProvider{events: []llm.StreamEvent{{Type: "text_delta", TextDelta: "findings"}, {Type: "message_delta", StopReason: "end_turn"}, {Type: "message_stop"}}}}
+	ctx := agent.WithParentSnapshot(context.Background(), agent.ParentSnapshot{System: "system", Model: "model", Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "inspect"}}}}})
+	result, err := NewFork(gate, provider, registry).Execute(ctx, map[string]any{"directive": "return a plan directly"})
+	if err != nil || result == nil || result.IsError {
+		t.Fatalf("Fork failed: %+v %v", result, err)
+	}
+	for _, name := range []string{"EnterPlanMode", "ExitPlanMode"} {
+		if provider.sawTools[name] {
+			t.Fatalf("Fork child still exposes parent permission tool %s", name)
+		}
+	}
+	if !provider.sawTools["Read"] {
+		t.Fatal("Fork lost read-only planning capability")
+	}
+}
+
+type forkErrorCleanupTool struct {
+	tools.BaseTool
+	entered, cancelled chan struct{}
+	release            <-chan struct{}
+}
+
+func (forkErrorCleanupTool) Name() string                { return "ForkCleanupProbe" }
+func (forkErrorCleanupTool) Description() string         { return "owned cleanup probe" }
+func (forkErrorCleanupTool) InputSchema() map[string]any { return map[string]any{"type": "object"} }
+func (forkErrorCleanupTool) Concurrency(map[string]any) tools.Concurrency {
+	return tools.ConcurrencyExclusive
+}
+func (forkErrorCleanupTool) CanUse(context.Context, map[string]any) (tools.Permission, string) {
+	return tools.PermissionAllow, "test"
+}
+func (p forkErrorCleanupTool) Execute(ctx context.Context, _ map[string]any) (*tools.Result, error) {
+	agent.EventOutFromContext(ctx) <- agent.Event{Kind: agent.EventError, Err: errors.New("owned child failure")}
+	close(p.entered)
+	<-ctx.Done()
+	close(p.cancelled)
+	<-p.release
+	return &tools.Result{Output: "cleanup joined"}, nil
+}
+
+func TestForkErrorCancelsAndJoinsChildBeforeReturning(t *testing.T) {
+	gate := permission.New(permission.ModeBypassPermissions)
+	registry := tools.NewRegistry()
+	entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	registry.Register(forkErrorCleanupTool{entered: entered, cancelled: cancelled, release: release})
+	provider := &fakeProvider{events: []llm.StreamEvent{{Type: "tool_use_start", ToolUseID: "fork-cleanup", ToolName: "ForkCleanupProbe"}, {Type: "tool_input_delta", ToolUseID: "fork-cleanup", InputDelta: "{}"}, {Type: "tool_use_stop", ToolUseID: "fork-cleanup"}, {Type: "message_delta", StopReason: "tool_use"}, {Type: "message_stop"}}}
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	ctx := agent.WithParentSnapshot(parent, agent.ParentSnapshot{System: "system", Model: "model", Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "inspect"}}}}})
+	joined := make(chan *tools.Result, 1)
+	go func() {
+		result, _ := NewFork(gate, provider, registry).Execute(ctx, map[string]any{"directive": "run cleanup probe"})
+		joined <- result
+	}()
+	var releaseOnce sync.Once
+	finishCleanup := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() { cancelParent(); finishCleanup() })
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("child probe did not start")
+	}
+	select {
+	case result := <-joined:
+		t.Fatalf("Fork returned before cancelling/joining child: %+v", result)
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("Fork did not cancel child after error")
+	}
+	select {
+	case result := <-joined:
+		t.Fatalf("Fork returned before cleanup barrier: %+v", result)
+	default:
+	}
+	finishCleanup()
+	select {
+	case result := <-joined:
+		if result == nil || !result.IsError {
+			t.Fatalf("Fork lost child error: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Fork did not return after child cleanup joined")
+	}
+}
 
 // helloForkProvider — same shape as helloProvider in agent_test.go
 // but a different text payload so a test asserting on the output

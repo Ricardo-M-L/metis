@@ -200,7 +200,7 @@ func (r *runtime) adoptMCPServerAtGeneration(server *mcptools.Server, discovered
 }
 
 // onPermissionModeChanged records the ordered Gate transition and revokes
-// process-owned work exactly when fullAccess is left. The new Gate mode has
+// process-owned work when fullAccess is left or Plan is entered. The new Gate mode has
 // already committed, so no new model action can acquire the old approval
 // posture while revocation runs.
 func (r *runtime) onPermissionModeChanged(next permission.Mode) {
@@ -210,26 +210,33 @@ func (r *runtime) onPermissionModeChanged(next permission.Mode) {
 }
 
 // recordPermissionModeChange updates the listener-owned transition state and
-// reports whether the edge leaves fullAccess. Splitting the record from the
+// reports whether the edge must drain old execution resources. Splitting the record from the
 // revocation lets the production listener restore the new sandbox posture
 // before it waits on process cleanup, while focused lifecycle tests and reduced
 // embedders can still use onPermissionModeChanged as an atomic convenience.
 func (r *runtime) recordPermissionModeChange(next permission.Mode) bool {
+	_, revoke := r.recordPermissionModeTransition(next)
+	return revoke
+}
+
+func (r *runtime) recordPermissionModeTransition(next permission.Mode) (permission.Mode, bool) {
 	if r == nil {
-		return false
+		return permission.ModeDefault, false
 	}
 	next = permission.CanonicalMode(string(next))
 	r.permissionModeMu.Lock()
-	previous := r.permissionMode
+	previous := permission.CanonicalMode(string(r.permissionMode))
 	r.permissionMode = next
-	leavingFullAccess := previous == permission.ModeFullAccess && next != permission.ModeFullAccess
+	revoke := (previous == permission.ModeFullAccess && next != permission.ModeFullAccess) ||
+		(previous != permission.ModePlan && next == permission.ModePlan)
 	r.permissionModeMu.Unlock()
-	return leavingFullAccess
+	return previous, revoke
 }
 
 // revokeFullAccessResources stops every long-lived operation that may have
-// captured the unsandboxed process posture. Sandboxing cannot be retrofitted
-// onto an existing process, so MCP/Computer Use must reconnect explicitly
+// captured the old execution posture. This same strict lifecycle barrier is
+// required on entering Plan: an existing process can continue writing without
+// making another tool call. MCP/Computer Use must reconnect explicitly
 // after the transition. Jobs, monitors and sub-agents remain reusable through
 // their stable registries, but the old generation is cancelled and forgotten.
 func (r *runtime) revokeFullAccessResources() {

@@ -156,6 +156,9 @@ func TestDesktopUpdaterDoesNotAdvertiseUnsafeWindowsActivation(t *testing.T) {
 }
 
 func TestDesktopUpdaterDownloadsVerifiesAndAtomicallyReplacesBundle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("simulated macOS activation requires atomic directory exchange, unavailable on Windows")
+	}
 	archive := makeDesktopZip(t, "1.2.0", "new-build")
 	sum := sha256.Sum256(archive)
 	assetName := "metis-desktop-darwin-universal.zip"

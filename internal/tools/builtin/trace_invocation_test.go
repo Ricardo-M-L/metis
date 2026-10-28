@@ -316,8 +316,8 @@ func TestForkTraceInvocationEndsOnlyAfterChildRunExitsOnError(t *testing.T) {
 		if ev.Kind == agent.EventError && ev.TraceInvocationID == "fork-error-internal" {
 			errorOnce.Do(func() { close(errorObserved) })
 			// emit sends EventError to Fork.Execute before notifying the trace
-			// hook. Holding the child here gives us a deterministic window in
-			// which Execute has returned but Loop.Run has not yet unwound.
+			// hook. Holding the child here proves both trace ownership and
+			// Fork.Execute stay alive until Loop.Run has actually unwound.
 			<-releaseErrorHook
 		}
 	})
@@ -353,11 +353,8 @@ func TestForkTraceInvocationEndsOnlyAfterChildRunExitsOnError(t *testing.T) {
 	}
 	select {
 	case res := <-result:
-		if res == nil || !res.IsError || !strings.Contains(res.Output, "fork child failed") {
-			t.Fatalf("Fork Execute result = %+v", res)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Fork Execute did not return after receiving EventError")
+		t.Fatalf("Fork Execute returned before child Run joined: %+v", res)
+	default:
 	}
 	for _, ev := range capture.snapshot() {
 		if ev.Kind == agent.EventTraceInvocationEnd && ev.TraceInvocationID == "fork-error-internal" {
@@ -366,6 +363,14 @@ func TestForkTraceInvocationEndsOnlyAfterChildRunExitsOnError(t *testing.T) {
 	}
 
 	close(releaseErrorHook)
+	select {
+	case res := <-result:
+		if res == nil || !res.IsError || !strings.Contains(res.Output, "fork child failed") {
+			t.Fatalf("Fork Execute result = %+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Fork Execute did not return after child Run joined")
+	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		var ends int

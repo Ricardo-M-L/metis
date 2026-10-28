@@ -828,6 +828,25 @@ func renderDenyReasonBody(reason string, expanded bool) string {
 	return s.String()
 }
 
+// Glob's final diagnostic describes traversal/output limits, not another file.
+// Keep completeness visible in the collapsed summary even when its full
+// explanation sits below the output preview; expanded output retains it intact.
+func globResultPathCount(output string) (count int, incomplete bool) {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	last := strings.TrimSpace(lines[len(lines)-1])
+	if strings.HasPrefix(last, "[Glob search incomplete:") && strings.HasSuffix(last, "]") {
+		incomplete = true
+		lines = lines[:len(lines)-1]
+	}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && line != "(no matches)" {
+			count++
+		}
+	}
+	return count, incomplete
+}
+
 // summarizeToolResult crafts the per-tool one-line description that
 // follows the ⎿ checkmark. Format is `<elapsed> · <tool-specific phrase>`.
 func summarizeToolResult(te ToolEvent) string {
@@ -922,15 +941,19 @@ func summarizeNormalizedToolResult(te ToolEvent) string {
 		if te.IsError {
 			return fmt.Sprintf("%s · failed", dur)
 		}
-		if strings.HasPrefix(strings.TrimSpace(te.Output), "(no matches)") {
-			return fmt.Sprintf("%s · No files matched", dur)
+		n, incomplete := globResultPathCount(te.Output)
+		status := ""
+		if incomplete {
+			status = " · search incomplete"
 		}
-		n := lineCount(te.Output)
+		if n == 0 {
+			return fmt.Sprintf("%s · No files matched%s", dur, status)
+		}
 		word := "files"
 		if n == 1 {
 			word = "file"
 		}
-		return fmt.Sprintf("%s · Found %d %s", dur, n, word)
+		return fmt.Sprintf("%s · Found %d %s%s", dur, n, word, status)
 	case "SubAgentOutput":
 		// SubAgentOutput's LLM-facing output begins with a machine KV
 		// line "agent_id=agt-XXX name=YYY status=running …" — useful

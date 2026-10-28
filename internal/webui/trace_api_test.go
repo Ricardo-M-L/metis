@@ -459,11 +459,11 @@ func TestCoalesceTraceToolArgsPreservesInterruptedStreams(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("coalesced rows = %d, want 2: %+v", len(got), got)
 	}
-	if got[0].Event.Kind != "tool_start" || got[0].Event.ToolUseID != "a" || got[0].Event.Text != `{"path":"authoritative"}` {
-		t.Fatalf("completed stream = %+v", got[0].Event)
+	if got[0].Event.Kind != "tool_start" || got[0].Event.ToolUseID != "b" || got[0].Event.Text != `{"path":"b` {
+		t.Fatalf("interrupted stream lost its original position: %+v", got[0].Event)
 	}
-	if got[1].Event.Kind != "tool_start" || got[1].Event.ToolUseID != "b" || got[1].Event.Text != `{"path":"b` {
-		t.Fatalf("interrupted stream = %+v", got[1].Event)
+	if got[1].Event.Kind != "tool_start" || got[1].Event.ToolUseID != "a" || got[1].Event.Text != `{"path":"authoritative"}` {
+		t.Fatalf("completed stream = %+v", got[1].Event)
 	}
 }
 

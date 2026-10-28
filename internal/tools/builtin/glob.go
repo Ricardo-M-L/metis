@@ -18,7 +18,8 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
-// heavySkipDirs are directories Glob refuses to descend into. Beyond
+// heavySkipDirs are directories Glob skips during broad searches. An explicitly
+// selected root or literal pattern prefix can still name these directories. Beyond
 // the original .git / node_modules / vendor / .venv, the 2026-05-05
 // 41-second incident showed Glob walking the user's entire home tree
 // (Library, Caches, Documents, ...) when the model launched it from
@@ -106,7 +107,7 @@ func (Glob) Name() string { return "Glob" }
 func (Glob) Description() string {
 	return `Find files matching a doublestar glob pattern relative to root. Examples: "**/*.go" (all .go files recursively), "src/**/*.ts" (TS files under src, including src itself), "apps/*/package.json" (one directory level). Filename-only patterns such as "*.md" search recursively; use "./*.md" for root-level markdown. Supports brace alternatives and character classes. Returns paths sorted by modification time, newest first.
 
-Use Glob for file-name / path patterns. Use Grep when you need to match file CONTENTS instead. Use Bash + find only when you need filters Glob can't express (mtime, size, perms).
+Use Glob for file-name / path patterns. Use Grep when you need to match file CONTENTS instead. Use Bash + find only when you need filters Glob can't express (mtime, size, perms). Broad searches skip generated/cache directories (e.g. build, dist, vendor, node_modules); select one as root or name it in the pattern's literal directory prefix to search it. The current workspace is always searchable. Results report skipped directories, depth limits, unreadable entries, and output truncation; an incomplete empty search does not prove a file is absent.
 
 ## Examples
 
@@ -145,7 +146,7 @@ func (Glob) InputSchema() map[string]any {
 			},
 			"root": map[string]any{
 				"type":        "string",
-				"description": "Directory to search from. Defaults to cwd.",
+				"description": "Directory to search from. Defaults to cwd. The selected root is searched even when its name is normally skipped (e.g. build or vendor); generated/cache descendants remain skipped unless explicitly named in the pattern's literal prefix.",
 			},
 			"limit": map[string]any{
 				"type":        "integer",
@@ -165,6 +166,40 @@ func (g Glob) CanUse(ctx context.Context, in map[string]any) (tools.Permission, 
 	// that directory from the glob pattern into `root`.
 	root := resolvePathAgainstAgentCWD(ctx, searchScopePath(in))
 	d, src := g.gate.CheckPath(ctx, "Glob", searchPermissionInput(in), root)
+	if d == permission.DecisionDeny {
+		return mapDecision(d), src
+	}
+	// A relative literal prefix was not present as an absolute path in the
+	// original permission payload. Check newly included heavy directories too,
+	// so root=/repo, pattern=build/** cannot bypass a rule for /repo/build.
+	// Keep the strongest decision: an approved parent cannot erase a child ASK
+	// or DENY, and a parent ASK must not hide a more specific child DENY.
+	pattern, _ := in["pattern"].(string)
+	matcher, err := newGlobMatcher(pattern)
+	if err != nil {
+		return mapDecision(d), src // Execute reports the invalid pattern before I/O.
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return tools.PermissionDeny, "glob:invalid-root"
+	}
+	var explicitHeavy []string
+	for dir := range globExplicitDirectories(filepath.Clean(rootAbs), matcher) {
+		if _, heavy := heavySkipDirs[filepath.Base(dir)]; heavy {
+			explicitHeavy = append(explicitHeavy, dir)
+		}
+	}
+	sort.Strings(explicitHeavy)
+	for _, dir := range explicitHeavy {
+		input := searchPermissionInput(in) + "\n" + dir + string(filepath.Separator)
+		next, nextSource := g.gate.CheckPath(ctx, "Glob", input, dir)
+		if next == permission.DecisionDeny {
+			return mapDecision(next), nextSource
+		}
+		if next == permission.DecisionAsk && d == permission.DecisionAllow {
+			d, src = next, nextSource
+		}
+	}
 	return mapDecision(d), src
 }
 
@@ -228,6 +263,10 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		return nil, err
 	}
 	rootClean := filepath.Clean(rootAbs)
+	// Honor literal directory selection without changing the authorized search
+	// root. This allows build/**/*.go and /repo/build/**/*.go while **/*.go
+	// continues to skip build. Do not follow symlinks or infer a broader root.
+	explicitDirs := globExplicitDirectories(rootClean, matcher)
 
 	// Default max_depth: 8 when starting at the user's home dir
 	// (covers any reasonable repo without enumerating Library/),
@@ -265,6 +304,7 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		mod  int64
 	}
 	var hits []hit
+	var skippedHeavy, skippedDepth, unreadable int
 
 	err = filepath.WalkDir(rootClean, func(filePath string, d fs.DirEntry, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -274,6 +314,7 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 			if filePath == rootClean {
 				return err
 			}
+			unreadable++
 			return nil
 		}
 		if d.IsDir() {
@@ -281,7 +322,8 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 			// Heavy skip-list: VCS internals, language package caches,
 			// macOS Library tree, build outputs. Materially shortens
 			// the cold-start glob from $HOME — see heavySkipDirs.
-			if _, skip := heavySkipDirs[name]; skip {
+			if _, skip := heavySkipDirs[name]; skip && filePath != rootClean && !explicitDirs[filePath] {
+				skippedHeavy++
 				return filepath.SkipDir
 			}
 			// Hidden dirs other than the explicit ones above are
@@ -300,6 +342,7 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 							depth = strings.Count(rel, string(filepath.Separator)) + 1
 						}
 						if depth >= maxDepth {
+							skippedDepth++
 							return filepath.SkipDir
 						}
 					}
@@ -320,6 +363,7 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		}
 		info, err := d.Info()
 		if err != nil {
+			unreadable++
 			return nil
 		}
 		logicalPath := filepath.Join(logicalRoot, rel)
@@ -333,6 +377,7 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		return nil, err
 	}
 	sort.Slice(hits, func(i, j int) bool { return hits[i].mod > hits[j].mod })
+	matched := len(hits)
 	if len(hits) > limit {
 		hits = hits[:limit]
 	}
@@ -342,9 +387,51 @@ func (g Glob) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		b.WriteByte('\n')
 	}
 	if b.Len() == 0 {
-		return &tools.Result{Output: "(no matches)"}, nil
+		b.WriteString("(no matches)")
+	}
+	var incomplete []string
+	if skippedHeavy > 0 {
+		incomplete = append(incomplete, fmt.Sprintf("skipped %d generated/cache directories; select the intended directory as root or name it in the literal pattern prefix", skippedHeavy))
+	}
+	if skippedDepth > 0 {
+		incomplete = append(incomplete, fmt.Sprintf("skipped %d directories at max_depth=%d; narrow root or increase max_depth", skippedDepth, maxDepth))
+	}
+	if unreadable > 0 {
+		incomplete = append(incomplete, fmt.Sprintf("skipped %d unreadable entries; check filesystem permissions", unreadable))
+	}
+	if matched > limit {
+		incomplete = append(incomplete, fmt.Sprintf("showing %d of %d matches; narrow root or the pattern", limit, matched))
+	}
+	if len(incomplete) > 0 {
+		fmt.Fprintf(&b, "\n[Glob search incomplete: %s]\n", strings.Join(incomplete, "; "))
 	}
 	return &tools.Result{Output: b.String()}, nil
+}
+
+// globExplicitDirectories contains only the literal ancestors named before the
+// first pattern metacharacter, bounded by root. SplitPattern preserves glob
+// semantics and unescapes literal names; filepath.Clean must not touch the
+// wildcard-bearing pattern itself. Directories below a wildcard remain subject
+// to the normal skip-list, even if the wildcard could match a heavy directory.
+func globExplicitDirectories(root string, matcher globMatcher) map[string]bool {
+	prefix, _ := doublestar.SplitPattern(matcher.pattern)
+	prefix = filepath.FromSlash(prefix)
+	if !matcher.absolute {
+		prefix = filepath.Join(root, prefix)
+	}
+	prefix = filepath.Clean(prefix)
+	rel, err := filepath.Rel(root, prefix)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil
+	}
+	// Rejoin the relative path so case-insensitive volume/root spellings still
+	// converge to the exact WalkDir root on Windows.
+	prefix = filepath.Join(root, rel)
+	dirs := make(map[string]bool)
+	for dir := prefix; dir != root; dir = filepath.Dir(dir) {
+		dirs[dir] = true
+	}
+	return dirs
 }
 
 // resolvePathAgainstAgentCWD keeps path-aware tools independent of the

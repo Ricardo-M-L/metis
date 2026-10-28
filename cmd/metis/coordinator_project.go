@@ -847,6 +847,12 @@ func printCoordinatorRun(w *os.File, run projectcoord.Run) {
 		fmt.Fprintf(w, "Deadline:  %s\n", run.DeadlineAt.Format(time.RFC3339))
 	}
 	fmt.Fprintf(w, "Host acceptance checks: %d\n", len(run.CheckCommands))
+	readiness := projectcoord.HostAcceptanceReadiness(run)
+	fmt.Fprintf(w, "Host acceptance configuration: %s\n", readiness.Status)
+	fmt.Fprintln(w, readiness.Summary)
+	if readiness.ConfigurationHint != "" {
+		fmt.Fprintf(w, "Configure on the host: %s\n", readiness.ConfigurationHint)
+	}
 	fmt.Fprintf(w, "Environment: git=%t", run.Environment.IsGitRepository)
 	if run.Environment.IsLinkedWorktree {
 		fmt.Fprint(w, ", linked-worktree=true")

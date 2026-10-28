@@ -11,11 +11,15 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
 
 func TestDesktopUpdaterDrainsOnlyVerifiedCandidateBeforeActivation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("simulated macOS activation requires atomic directory exchange, unavailable on Windows")
+	}
 	for _, stage := range []string{"success", "validation failure", "drain failure", "activation failure", "candidate disappeared", "context cancelled"} {
 		t.Run(stage, func(t *testing.T) {
 			appPath := filepath.Join(t.TempDir(), "METIS.app")

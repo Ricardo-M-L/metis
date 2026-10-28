@@ -376,6 +376,10 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 				continue
 			}
 			tsStart := time.Now()
+			emit(ctx, out, Event{
+				Kind: EventToolStart, ToolUseID: b.ToolUseID, ToolName: b.ToolName,
+				ToolInput: b.ToolInput, TraceCallID: traceCallID,
+			})
 			results[i] = handleToolSearch(l, b)
 			emit(ctx, out, Event{
 				Kind: EventToolResult, ToolUseID: b.ToolUseID, ToolName: b.ToolName,

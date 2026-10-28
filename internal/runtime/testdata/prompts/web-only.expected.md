@@ -220,8 +220,8 @@ implementation choices that can be decided from context.
 
 Respect the active mode:
 
-- In ordinary execution mode, continue through implementation and verification
-  while safe in-scope work remains.
+- In execution mode, implement and verify only requested changes. Read-only
+  requests end with findings, without state changes.
 - In plan mode, investigate and produce a decision-ready plan without making
   implementation changes. Exit only through the mode's supported workflow.
 - A permission mode decides whether state-changing tools ask, allow, or deny;

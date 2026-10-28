@@ -4892,21 +4892,33 @@ func installRuntimePermissionListener(rt *runtime) {
 			rt.loop.SetPlanMode(m == permission.ModePlan)
 		}
 		// Record before reconciliation so a partially-failed fullAccess entry
-		// followed by recursive dontAsk still appears as a fullAccess exit.
+		// followed by a recursive fail-closed change still revokes old work.
 		// Actual cleanup runs after the new sandbox posture is installed, keeping
 		// the Gate->sandbox window as small as possible on a normal exit.
-		leavingFullAccess := rt.recordPermissionModeChange(m)
+		previous, revoke := rt.recordPermissionModeTransition(m)
 		err := startupReconcilePermissionSandbox(rt.sandbox, rt.loop, m)
-		if leavingFullAccess {
+		if revoke {
 			rt.revokeFullAccessResources()
 		}
 		if err != nil {
-			// Internal Gate.SetMode callers (session restore and plan tools) do
-			// not return an error. Fail closed to dontAsk instead of leaving a
-			// visible bypass posture without its credential boundary.
+			// dontAsk still admits explicit allow rules, so it is not a safe
+			// fallback for a failed Plan boundary. Keep/readopt Plan until the
+			// user can make a new decision against a healthy sandbox posture.
 			fmt.Fprintf(os.Stderr, "metis: permission mode %q rejected: %v\n", m, err)
-			if m != permission.ModeDontAsk {
-				rt.gate.SetMode(permission.ModeDontAsk)
+			if rt.gate.Mode() == m {
+				if m == permission.ModePlan || previous == permission.ModePlan {
+					if rt.loop != nil {
+						if pre, ok := permission.ParseMode(rt.loop.PrePlanMode()); !ok || pre == permission.ModePlan {
+							rt.loop.SetPrePlanMode(string(permission.ModeDefault))
+						}
+						rt.loop.SetPlanMode(true)
+					}
+					if m != permission.ModePlan {
+						rt.gate.SetMode(permission.ModePlan)
+					}
+				} else if m != permission.ModeDontAsk {
+					rt.gate.SetMode(permission.ModeDontAsk)
+				}
 			}
 		}
 		rt.checkpointPermissionTransition(m)

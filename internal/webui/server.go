@@ -100,7 +100,9 @@ type Server struct {
 	backgroundSession    string
 	backgroundGeneration uint64
 
-	roster *agent.Roster
+	roster            *agent.Roster
+	subAgentReadMu    sync.Mutex
+	subAgentReadCache map[string]subAgentPersistedView
 
 	// buildVersion is stamped at NewServer and injected into index.html so
 	// every server start serves unique asset URLs - the browser can never
@@ -721,6 +723,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/routing", s.handleRouting)
 	mux.HandleFunc("/api/trace", s.handleTrace)
 	mux.HandleFunc("/api/trace/export", s.handleTraceExport)
+	mux.HandleFunc("/api/subagents", s.handleSubAgents)
 	mux.HandleFunc("/api/subagents/", s.handleSubAgentDetail)
 	mux.HandleFunc("/api/export", s.handleExport)
 	mux.HandleFunc("/api/exports/open", s.handleExportsOpen)
@@ -4081,22 +4084,27 @@ const subAgentDetailPreviewRefreshInterval = time.Second
 // SSE companion. Keeping this view detached from Teammate means the browser
 // never holds a pointer to mutable roster state.
 type subAgentDetailView struct {
-	SessionID          string    `json:"sessionId"`
-	Name               string    `json:"name"`
-	AgentID            string    `json:"agentId"`
-	Status             string    `json:"status"`
-	ExecutionPhase     string    `json:"executionPhase,omitempty"`
-	HoldsExecutionSlot bool      `json:"holdsExecutionSlot"`
-	Background         bool      `json:"background"`
-	StartedAt          time.Time `json:"startedAt"`
-	EndedAt            time.Time `json:"endedAt"`
-	ElapsedMS          int64     `json:"elapsedMs"`
-	Output             string    `json:"output"`
-	OutputTruncated    bool      `json:"outputTruncated"`
-	Result             string    `json:"result"`
-	ResultTruncated    bool      `json:"resultTruncated"`
-	StopHint           string    `json:"stopHint"`
-	ExitError          string    `json:"exitError"`
+	activityRevision     string
+	Task                 string            `json:"task"`
+	Usage                subAgentUsageView `json:"usage"`
+	ConversationRevision string            `json:"conversationRevision"`
+	SessionID            string            `json:"sessionId"`
+	Name                 string            `json:"name"`
+	Model                string            `json:"model"`
+	AgentID              string            `json:"agentId"`
+	Status               string            `json:"status"`
+	ExecutionPhase       string            `json:"executionPhase,omitempty"`
+	HoldsExecutionSlot   bool              `json:"holdsExecutionSlot"`
+	Background           bool              `json:"background"`
+	StartedAt            time.Time         `json:"startedAt"`
+	EndedAt              time.Time         `json:"endedAt"`
+	ElapsedMS            int64             `json:"elapsedMs"`
+	Output               string            `json:"output"`
+	OutputTruncated      bool              `json:"outputTruncated"`
+	Result               string            `json:"result"`
+	ResultTruncated      bool              `json:"resultTruncated"`
+	StopHint             string            `json:"stopHint"`
+	ExitError            string            `json:"exitError"`
 }
 
 func trimSubAgentDetailOutput(value string) (string, bool) {
@@ -4131,13 +4139,17 @@ func (s *Server) handleSubAgentDetail(w http.ResponseWriter, r *http.Request) {
 	if stream {
 		path = strings.TrimSuffix(path, "/events")
 	}
+	conversation := !stop && !stream && strings.HasSuffix(path, "/conversation")
+	if conversation {
+		path = strings.TrimSuffix(path, "/conversation")
+	}
 	agentID := path
-	if agentID == "" || agentID != strings.TrimSpace(agentID) || len(agentID) > 128 || strings.ContainsAny(agentID, "/\\") {
+	if !agent.ValidSubAgentID(agentID) {
 		writeError(w, http.StatusBadRequest, "invalid sub-agent id")
 		return
 	}
 	sessionID := r.URL.Query().Get("sessionId")
-	if sessionID == "" || sessionID != strings.TrimSpace(sessionID) || len(sessionID) > 128 || strings.ContainsAny(sessionID, "/\\") {
+	if !agent.ValidSubAgentID(sessionID) {
 		writeError(w, http.StatusBadRequest, "invalid parent session id")
 		return
 	}
@@ -4149,28 +4161,85 @@ func (s *Server) handleSubAgentDetail(w http.ResponseWriter, r *http.Request) {
 		s.handleSubAgentStop(w, r, sessionID, agentID)
 		return
 	}
+	if conversation {
+		s.handleSubAgentConversation(w, r, sessionID, agentID)
+		return
+	}
 
 	view, ok := s.subAgentDetailView(sessionID, agentID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "sub-agent not found")
 		return
 	}
+	s.enrichSubAgentDetail(&view, true)
 	writeJSON(w, http.StatusOK, map[string]any{"agent": view})
 }
 
 func (s *Server) subAgentDetailView(sessionID, agentID string) (subAgentDetailView, bool) {
+	return s.readSubAgentDetailView(sessionID, agentID, nil)
+}
+
+func (s *Server) readSubAgentDetailView(sessionID, agentID string, beforeRosterRead func()) (subAgentDetailView, bool) {
+	// A resumed ordinary child can replace its transcript under another
+	// parent. An old worker snapshot must not override the current disk owner.
+	var initialHeader *pubsess.Header
+	if s.store != nil {
+		if header, err := agent.LoadSubAgentHeader(s.store.Dir, agentID); err == nil {
+			if header.SubAgentOf != sessionID {
+				return subAgentDetailView{}, false
+			}
+			initialHeader = &header
+		}
+	}
 	if view, ok := s.workerSubAgentDetail(sessionID, agentID); ok {
-		return view, true
+		return s.validateSubAgentDetailHeader(sessionID, agentID, view, initialHeader, false)
 	}
 	if !s.subAgentBelongsToSession(sessionID, agentID) {
 		return subAgentDetailView{}, false
 	}
 	if s.roster != nil {
+		if beforeRosterRead != nil {
+			beforeRosterRead()
+		}
 		if teammate, ok := s.roster.LookupByAgentID(agentID); ok && teammate != nil {
-			return subAgentDetailFromRoster(sessionID, teammate), true
+			view := subAgentDetailFromRoster(sessionID, teammate)
+			return s.validateSubAgentDetailHeader(sessionID, agentID, view, initialHeader, true)
 		}
 	}
-	return s.subAgentDetailFromTranscript(sessionID, agentID)
+	view, ok := s.subAgentDetailFromTranscript(sessionID, agentID)
+	if !ok {
+		return subAgentDetailView{}, false
+	}
+	return s.validateSubAgentDetailHeader(sessionID, agentID, view, initialHeader, true)
+}
+
+// A process-wide roster can be replaced between its owning header check and
+// detached snapshot. Verify the same immutable run again before returning any
+// output. Worker-only identities may precede a transcript, and keep model
+// unknown until their own parent-validated header is available.
+func (s *Server) validateSubAgentDetailHeader(sessionID, agentID string, view subAgentDetailView, initial *pubsess.Header, requireHeader bool) (subAgentDetailView, bool) {
+	if requireHeader && initial == nil {
+		return subAgentDetailView{}, false
+	}
+	if s.store == nil {
+		return view, !requireHeader && initial == nil
+	}
+	current, err := agent.LoadSubAgentHeader(s.store.Dir, agentID)
+	if err != nil {
+		return view, !requireHeader && initial == nil
+	}
+	if current.SubAgentOf != sessionID {
+		return subAgentDetailView{}, false
+	}
+	if initial != nil {
+		before, _ := json.Marshal(initial)
+		after, _ := json.Marshal(current)
+		if string(before) != string(after) {
+			return subAgentDetailView{}, false
+		}
+	}
+	view.Model = current.Model
+	return view, true
 }
 
 func subAgentDetailFromRoster(sessionID string, teammate *agent.Teammate) subAgentDetailView {
@@ -4217,30 +4286,7 @@ func (s *Server) subAgentBelongsToSession(sessionID, agentID string) bool {
 }
 
 func (s *Server) subAgentDetailFromTranscript(sessionID, agentID string) (subAgentDetailView, bool) {
-	if s == nil || s.store == nil {
-		return subAgentDetailView{}, false
-	}
-	snap, err := agent.LoadSubAgentSnapshot(s.store.Dir, agentID)
-	if err != nil || snap.Header.SubAgentOf != sessionID {
-		return subAgentDetailView{}, false
-	}
-	view := subAgentDetailView{
-		SessionID: sessionID, Name: snap.Header.TeammateName, AgentID: agentID,
-		Status: "unknown", StartedAt: snap.Header.CreatedAt,
-	}
-	if terminal := snap.Terminal; terminal != nil {
-		view.Status = terminal.Status
-		view.Background = terminal.Background
-		view.EndedAt = terminal.EndedAt
-		view.Output, view.OutputTruncated = trimSubAgentDetailOutput(terminal.Output)
-		view.Result, view.ResultTruncated = trimSubAgentDetailOutput(terminal.Result)
-		view.StopHint = terminal.StopHint
-		view.ExitError = terminal.ExitError
-		if elapsed := terminal.EndedAt.Sub(snap.Header.CreatedAt); elapsed > 0 {
-			view.ElapsedMS = elapsed.Milliseconds()
-		}
-	}
-	return view, true
+	return s.persistedSubAgentView(sessionID, agentID)
 }
 
 // handleSubAgentEvents emits a snapshot followed by output deltas over SSE.
@@ -4259,6 +4305,7 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, se
 		writeError(w, http.StatusNotFound, "sub-agent not found")
 		return
 	}
+	s.enrichSubAgentDetail(&current, false)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -4296,12 +4343,13 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, se
 				flusher.Flush()
 				return
 			}
+			s.enrichSubAgentDetail(&next, false)
 			if !subAgentStatusActive(next.Status) {
 				_ = writeSubAgentSSE(w, "terminal", map[string]any{"agent": next})
 				flusher.Flush()
 				return
 			}
-			if next.Status != current.Status {
+			if next.Status != current.Status || next.ExecutionPhase != current.ExecutionPhase || next.HoldsExecutionSlot != current.HoldsExecutionSlot || next.ConversationRevision != current.ConversationRevision {
 				if !writeSubAgentSSE(w, "snapshot", map[string]any{"agent": next}) {
 					return
 				}
@@ -4346,20 +4394,25 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, se
 
 func subAgentDeltaPayload(view subAgentDetailView, delta string) map[string]any {
 	return map[string]any{
-		"sessionId":       view.SessionID,
-		"agentId":         view.AgentID,
-		"name":            view.Name,
-		"status":          view.Status,
-		"background":      view.Background,
-		"startedAt":       view.StartedAt,
-		"endedAt":         view.EndedAt,
-		"elapsedMs":       view.ElapsedMS,
-		"delta":           delta,
-		"outputTruncated": view.OutputTruncated,
-		"result":          view.Result,
-		"resultTruncated": view.ResultTruncated,
-		"stopHint":        view.StopHint,
-		"exitError":       view.ExitError,
+		"conversationRevision": view.ConversationRevision,
+		"usage":                view.Usage,
+		"executionPhase":       view.ExecutionPhase,
+		"holdsExecutionSlot":   view.HoldsExecutionSlot,
+		"sessionId":            view.SessionID,
+		"agentId":              view.AgentID,
+		"name":                 view.Name,
+		"model":                view.Model,
+		"status":               view.Status,
+		"background":           view.Background,
+		"startedAt":            view.StartedAt,
+		"endedAt":              view.EndedAt,
+		"elapsedMs":            view.ElapsedMS,
+		"delta":                delta,
+		"outputTruncated":      view.OutputTruncated,
+		"result":               view.Result,
+		"resultTruncated":      view.ResultTruncated,
+		"stopHint":             view.StopHint,
+		"exitError":            view.ExitError,
 	}
 }
 
@@ -5013,19 +5066,21 @@ func validWebSettingValue(key, value string) bool {
 
 // traceEventView is the wire shape of one trajectory node for the web UI.
 type traceEventView struct {
-	ID        string `json:"id"`
-	Kind      string `json:"kind"`
-	Turn      int    `json:"turn"`
-	Sequence  int64  `json:"sequence"`
-	TS        string `json:"ts"`
-	ToolName  string `json:"toolName,omitempty"`
-	ToolUseID string `json:"toolUseID,omitempty"`
-	ParentID  string `json:"parentID,omitempty"`
-	Text      string `json:"text,omitempty"`
-	Source    string `json:"source,omitempty"`
-	IsError   bool   `json:"isError,omitempty"`
-	ElapsedMs int64  `json:"elapsedMs,omitempty"`
-	Depth     int    `json:"depth"`
+	ID                string `json:"id"`
+	Kind              string `json:"kind"`
+	Turn              int    `json:"turn"`
+	Sequence          int64  `json:"sequence"`
+	TS                string `json:"ts"`
+	ToolName          string `json:"toolName,omitempty"`
+	ToolUseID         string `json:"toolUseID,omitempty"`
+	TraceInvocationID string `json:"traceInvocationID,omitempty"`
+	TraceCallID       string `json:"traceCallID,omitempty"`
+	ParentID          string `json:"parentID,omitempty"`
+	Text              string `json:"text,omitempty"`
+	Source            string `json:"source,omitempty"`
+	IsError           bool   `json:"isError,omitempty"`
+	ElapsedMs         int64  `json:"elapsedMs,omitempty"`
+	Depth             int    `json:"depth"`
 }
 
 type traceStats struct {
@@ -5478,19 +5533,21 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 			stats.CacheWrite += cw
 		}
 		events = append(events, traceEventView{
-			ID:        ev.ID,
-			Kind:      ev.Kind,
-			Turn:      ev.Turn,
-			Sequence:  ev.Sequence,
-			TS:        traceDisplayTimestamp(ev.TS),
-			ToolName:  ev.ToolName,
-			ToolUseID: ev.ToolUseID,
-			ParentID:  ev.ParentID,
-			Text:      redactTraceText(ev.Text),
-			Source:    ev.Source,
-			IsError:   ev.IsError,
-			ElapsedMs: ev.ElapsedMs,
-			Depth:     n.Depth,
+			ID:                ev.ID,
+			Kind:              ev.Kind,
+			Turn:              ev.Turn,
+			Sequence:          ev.Sequence,
+			TS:                traceDisplayTimestamp(ev.TS),
+			ToolName:          ev.ToolName,
+			ToolUseID:         ev.ToolUseID,
+			TraceInvocationID: ev.TraceInvocationID,
+			TraceCallID:       ev.TraceCallID,
+			ParentID:          ev.ParentID,
+			Text:              redactTraceText(ev.Text),
+			Source:            ev.Source,
+			IsError:           ev.IsError,
+			ElapsedMs:         ev.ElapsedMs,
+			Depth:             n.Depth,
 		})
 	}
 	stats.ToolMs = activeTraceToolDuration(measuredNodes)
@@ -5605,75 +5662,6 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		"hasMore":     pageStart > 0,
 		"nextCursor":  nextCursor,
 	})
-}
-
-// coalesceTraceToolArgs removes transport-level parameter fragments from the
-// user-facing trajectory. A completed tool_start already carries the provider's
-// authoritative full JSON. If a stream ended before tool_start, the fragments
-// become one synthetic tool row so evidence is preserved without hundreds of
-// one-token rows.
-func coalesceTraceToolArgs(nodes []session.TracedNode) []session.TracedNode {
-	type partial struct {
-		node session.TracedNode
-		text strings.Builder
-	}
-	keyOf := func(ev session.TraceEvent) string {
-		if ev.ToolUseID != "" {
-			return "id:" + ev.ToolUseID
-		}
-		return "name:" + ev.ToolName
-	}
-	partials := make(map[string]*partial)
-	order := make([]string, 0)
-	out := make([]session.TracedNode, 0, len(nodes))
-	for _, node := range nodes {
-		ev := node.Event
-		if ev.Kind == "tool_args" || ev.Kind == "tool_args_delta" {
-			key := keyOf(ev)
-			p := partials[key]
-			if p == nil {
-				p = &partial{node: node}
-				partials[key] = p
-				order = append(order, key)
-			}
-			p.text.WriteString(ev.Text)
-			continue
-		}
-		if ev.Kind == "tool_start" {
-			key := keyOf(ev)
-			p := partials[key]
-			partialKey := key
-			// Older trace files predate tool identity persistence on args
-			// deltas. Fall back to the same-name stream, then the anonymous
-			// stream; provider tool calls serialize their input deltas.
-			if p == nil && ev.ToolName != "" {
-				partialKey = "name:" + ev.ToolName
-				p = partials[partialKey]
-			}
-			if p == nil {
-				partialKey = "name:"
-				p = partials[partialKey]
-			}
-			if p != nil {
-				current := strings.TrimSpace(ev.Text)
-				if current == "" || current == "null" || current == "{}" {
-					node.Event.Text = p.text.String()
-				}
-				delete(partials, partialKey)
-			}
-		}
-		out = append(out, node)
-	}
-	for _, key := range order {
-		p := partials[key]
-		if p == nil || p.text.Len() == 0 {
-			continue
-		}
-		p.node.Event.Kind = "tool_start"
-		p.node.Event.Text = p.text.String()
-		out = append(out, p.node)
-	}
-	return out
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {

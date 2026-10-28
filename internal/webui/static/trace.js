@@ -255,58 +255,95 @@ function coalesceTraceCompactions(events) {
   return display;
 }
 
+// Mirror the server's occurrence-aware legacy matching. Provider IDs and tool
+// names can repeat; neither may attach a result to a different turn or owner.
+function traceToolMatchRank(a, b) {
+  if ((a.turn || 0) !== (b.turn || 0) ||
+      (a.traceInvocationID && b.traceInvocationID && a.traceInvocationID !== b.traceInvocationID)) return 0;
+  if (a.traceCallID && b.traceCallID) return a.traceCallID === b.traceCallID ? 4 : 0;
+  const aID = a.toolUseID || '';
+  const bID = b.toolUseID || (b.kind === 'tool_result' ? b.parentID : '') || '';
+  if (aID && bID) return aID === bID ? 3 : 0;
+  if (a.toolName && a.toolName === b.toolName) return 2;
+  if (!a.toolName && !aID) return 1;
+  return 0;
+}
+
+function traceMatchTool(candidates, ev, eventOf = value => value) {
+  let best = null, bestRank = 0, tied = false;
+  for (const candidate of candidates) {
+    const rank = traceToolMatchRank(eventOf(candidate), ev);
+    if (rank > bestRank) { best = candidate; bestRank = rank; tied = false; }
+    else if (rank > 0 && rank === bestRank) tied = true;
+  }
+  return tied ? null : best;
+}
+
+function inheritTraceToolIdentity(dst, src) {
+  for (const key of ['toolName', 'toolUseID', 'traceInvocationID', 'traceCallID']) {
+    if (!dst[key] && src[key]) dst[key] = src[key];
+  }
+}
+
+// Older servers/transports can still expose argument fragments. Recover them
+// in place, including calls which already have a result but never emitted a start.
+function coalesceTraceToolArguments(events) {
+  const active = new Set(), slots = [];
+  for (const original of events) {
+    const ev = Object.assign({}, original);
+    if (ev.kind === 'tool_args' || ev.kind === 'tool_args_delta') {
+      let partial = traceMatchTool(active, ev, value => value.event);
+      if (!partial) {
+        partial = { event: ev, text: '', consumed: false, resultSeen: false };
+        active.add(partial);
+        slots.push({ partial });
+      }
+      partial.text += ev.text || '';
+      inheritTraceToolIdentity(partial.event, ev);
+      continue;
+    }
+    if (ev.kind === 'tool_start' || ev.kind === 'tool_result') {
+      const partial = traceMatchTool(active, ev, value => value.event);
+      if (partial) {
+        active.delete(partial);
+        inheritTraceToolIdentity(ev, partial.event);
+        if (ev.kind === 'tool_start') {
+          partial.consumed = true;
+          if (partial.text && ['', '{}', 'null'].includes(String(ev.text || '').trim())) ev.text = partial.text;
+        } else {
+          partial.resultSeen = true;
+          inheritTraceToolIdentity(partial.event, ev);
+        }
+      }
+    }
+    slots.push({ event: ev });
+  }
+  return slots.flatMap(slot => {
+    const p = slot.partial;
+    if (!p) return [slot.event];
+    if (p.consumed || (!p.text && !p.resultSeen)) return [];
+    return [Object.assign({}, p.event, { kind: 'tool_start', text: p.text })];
+  });
+}
+
 function buildTraceRows(events) {
-  const displayEvents = coalesceTraceCompactions(events);
+  const displayEvents = coalesceTraceToolArguments(coalesceTraceCompactions(events));
   const rows = [];
-  const pendingTool = new Map();   // toolUseID -> tool row awaiting result
-  const pendingByName = [];
-  const partialArgs = new Map();   // toolUseID/name -> interrupted arg stream
-  const partialOrder = [];
-  const toolKey = ev => ev.toolUseID ? 'id:' + ev.toolUseID : 'name:' + (ev.toolName || '');
+  const pendingTool = new Set();
   for (let i = 0; i < displayEvents.length; i++) {
     const ev = Object.assign({}, displayEvents[i]);
     if (ev.kind === 'turn_end' || ev.kind === 'loop_done') continue; // boundaries only
 
-    if (ev.kind === 'tool_args' || ev.kind === 'tool_args_delta') {
-      const key = toolKey(ev);
-      if (!partialArgs.has(key)) {
-        partialArgs.set(key, { ev: Object.assign({}, ev), idx: i, text: '' });
-        partialOrder.push(key);
-      }
-      partialArgs.get(key).text += ev.text || '';
-      continue;
-    }
-
-    if (ev.kind === 'tool_start') {
-      const key = toolKey(ev);
-      let partialKey = key;
-      let partial = partialArgs.get(partialKey);
-      if (!partial && ev.toolName) {
-        partialKey = 'name:' + ev.toolName;
-        partial = partialArgs.get(partialKey);
-      }
-      if (!partial) {
-        partialKey = 'name:';
-        partial = partialArgs.get(partialKey);
-      }
-      if (partial) {
-        const current = String(ev.text || '').trim();
-        if (!current || current === '{}' || current === 'null') ev.text = partial.text;
-        partialArgs.delete(partialKey);
-      }
-    }
-
     if (ev.kind === 'tool_result') {
-      const key = ev.toolUseID || '';
-      let target = key ? pendingTool.get(key) : null;
-      if (!target && ev.toolName) {
-        target = pendingByName.find(r => r.toolName === ev.toolName && !r.resultText) || null;
-      }
+      const target = traceMatchTool(pendingTool, ev);
       if (target) {
         target.resultText = ev.text || '';
         target.resultIsError = !!ev.isError;
+        target.hasResult = true;
         target.resultIdx = i;
-        if (!target.toolUseID) target.toolUseID = key;
+        if (ev.elapsedMs) target.elapsedMs = ev.elapsedMs;
+        inheritTraceToolIdentity(target, ev);
+        pendingTool.delete(target);
         continue;
       }
     }
@@ -325,18 +362,20 @@ function buildTraceRows(events) {
       parentID: ev.parentID || '',
       toolName: ev.toolName || '',
       toolUseID: ev.toolUseID || '',
+      traceInvocationID: ev.traceInvocationID || '',
+      traceCallID: ev.traceCallID || '',
       text: ev.kind === 'thinking_redacted'
         ? TRACE_REDACTED_THINKING_PLACEHOLDER
-        : (ev.text || ''),
-      resultText: '',
-      resultIsError: false,
+        : (ev.kind === 'tool_result' ? '' : (ev.text || '')),
+      resultText: ev.kind === 'tool_result' ? (ev.text || '') : '',
+      resultIsError: ev.kind === 'tool_result' && !!ev.isError,
+      hasResult: ev.kind === 'tool_result',
       lane: meta.lane,
       tokens: null,
     };
     if (ev.kind === 'error' && ev.toolName) row.lane = 2;
     if (ev.kind === 'tool_start') {
-      if (row.toolUseID) pendingTool.set(row.toolUseID, row);
-      pendingByName.push(row);
+      pendingTool.add(row);
     }
     if (ev.kind === 'tokens') {
       const m = /input=(\d+) output=(\d+)(?: cache_write=(\d+))?(?: cache_read=(\d+))?/.exec(ev.text || '');
@@ -346,21 +385,6 @@ function buildTraceRows(events) {
     }
     rows.push(row);
   }
-  // Preserve an interrupted provider stream as one pending tool row.
-  for (const key of partialOrder) {
-    const partial = partialArgs.get(key);
-    if (!partial || !partial.text) continue;
-    const ev = Object.assign({}, partial.ev, { kind: 'tool_start', text: partial.text });
-    const meta = metaOf(ev.kind);
-    rows.push({
-      idx: partial.idx, kind: ev.kind, turn: ev.turn || 0, seq: ev.sequence,
-      ts: ev.ts, elapsedMs: ev.elapsedMs || 0, isError: !!ev.isError,
-      depth: ev.depth || 0, parentID: ev.parentID || '', toolName: ev.toolName || '',
-      toolUseID: ev.toolUseID || '', text: ev.text || '', resultText: '',
-      resultIsError: false, lane: meta.lane, tokens: null,
-    });
-  }
-  rows.sort((a, b) => a.idx - b.idx);
   return rows;
 }
 
@@ -402,9 +426,13 @@ function rowMatches(r) {
   return hay.includes(traceSearchQuery);
 }
 
+function traceRowHasResult(r) {
+  return !!(r.hasResult || r.kind === 'tool_result' || r.resultText || r.resultIsError);
+}
+
 function rowState(r) {
   if (r.isError || r.resultIsError) return 'error';
-  if (isToolRow(r) && r.kind === 'tool_start' && !r.resultText && !r.resultIsError) return 'running';
+  if (isToolRow(r) && r.kind === 'tool_start' && !traceRowHasResult(r)) return 'running';
   return 'complete';
 }
 
@@ -667,7 +695,7 @@ function contentHtml(r) {
     const args = oneLine(r.text);
     const argsHtml = args ? `<span class="tt-tool-args">${escHtml(args)}</span>` : '';
     const head = `<span class="tt-content-text">${name}${argsHtml}</span>`;
-    const hasResult = r.resultText || r.resultIsError;
+    const hasResult = traceRowHasResult(r);
     if (!hasResult) return head;
     const resText = oneLine(r.resultText) || '(no output)';
     return `<span class="tt-result-preview"><span class="tt-result-request">${head}</span><span class="tt-inline-result${r.resultIsError ? ' err' : ''}"><span class="arrow">\u2192</span><span class="tt-inline-result-text">${escHtml(resText)}</span></span></span>`;
@@ -819,9 +847,9 @@ function inspectorBody(r, tab) {
     return `<pre class="tt-payload${r.isError ? ' err' : ''}">${escHtml(formatTracePayload(r.text))}</pre>`;
   }
   if (tab === 'result') {
-    if (!r.resultText && !r.resultIsError) return '<p class="tt-no-payload">No result captured</p>';
+    if (!traceRowHasResult(r)) return '<p class="tt-no-payload">No result captured</p>';
     const cls = r.resultIsError ? ' err' : (r.resultText === 'No output' ? ' no-output' : '');
-    return `<pre class="tt-payload${cls}">${escHtml(formatTracePayload(r.resultText))}</pre>`;
+    return `<pre class="tt-payload${cls}">${escHtml(formatTracePayload(r.resultText || '(no output)'))}</pre>`;
   }
   if (tab === 'timing') {
     return `<dl class="tt-overview">

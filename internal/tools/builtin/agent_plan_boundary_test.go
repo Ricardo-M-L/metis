@@ -29,6 +29,27 @@ func planAgentForBoundaryTest(gate *permission.Gate, reg *tools.Registry) Agent 
 	return tool
 }
 
+func TestAgentChildrenCannotMutateParentPlanMode(t *testing.T) {
+	for _, mode := range []permission.Mode{permission.ModeDefault, permission.ModeAcceptEdits, permission.ModeBypassPermissions, permission.ModeFullAccess, permission.ModePlan} {
+		t.Run(string(mode), func(t *testing.T) {
+			parentGate := permission.New(mode)
+			parent := tools.NewRegistry()
+			for _, name := range []string{"Read", "EnterPlanMode", "ExitPlanMode"} {
+				parent.Register(parentGateBoundBoundaryTool{name: name, gate: parentGate})
+			}
+			child := agentChildRegistry(parent, parentGate.Clone(), mode == permission.ModePlan)
+			for _, name := range []string{"EnterPlanMode", "ExitPlanMode"} {
+				if _, ok := child.Get(name); ok {
+					t.Fatalf("child can mutate parent %s and make root revoke wait on itself", name)
+				}
+			}
+			if _, ok := child.Get("Read"); !ok {
+				t.Fatal("child lost read-only planning")
+			}
+		})
+	}
+}
+
 func TestAgentPlanBoundaryRejectsPermissionEscalation(t *testing.T) {
 	for _, mode := range []string{"default", "acceptEdits", "dontAsk", "bypassPermissions", "fullAccess"} {
 		t.Run(mode, func(t *testing.T) {

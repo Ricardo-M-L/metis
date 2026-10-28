@@ -626,22 +626,24 @@ function renderStatusSnapshot(d) {
     if (!chip) return;
     const dict = DESKTOP_I18N[document.documentElement.lang] || DESKTOP_I18N['zh-CN'];
     const selectedSessionId = String(currentSessionId || '');
+    if (typeof syncSubAgentCatalog === 'function') syncSubAgentCatalog();
     const roster = statusRosterForSelectedSession(d);
     const n = roster ? Number(roster.subAgents) || 0 : 0;
     const m = roster ? Number(roster.backgroundTasks) || 0 : 0;
-    const visibleAgents = statusSubAgentsForSelectedSession(d);
+    const visibleAgents = typeof subAgentCatalogAgents === 'function' ? subAgentCatalogAgents() : statusSubAgentsForSelectedSession(d);
     if (typeof reconcileSubagentToolRows === 'function') reconcileSubagentToolRows(roster);
     if (subAgentDetailState.agentId && subAgentDetailState.ownerSessionId !== selectedSessionId) {
       closeSubAgentDetails(false);
     }
-    if (!roster || (n === 0 && m === 0 && visibleAgents.length === 0 && (!Array.isArray(roster.jobs) || roster.jobs.length === 0))) {
+    const catalogError = typeof subAgentCatalogState !== 'undefined' && subAgentCatalogState.owner === selectedSessionId && subAgentCatalogState.error;
+    if (!catalogError && n === 0 && m === 0 && visibleAgents.length === 0 && (!roster || !Array.isArray(roster.jobs) || roster.jobs.length === 0)) {
       chip.style.display = 'none';
       closeStatusPopover();
     } else {
       chip.style.display = '';
       const listedAgents = Math.max(n, visibleAgents.length);
-      chip.innerHTML = `<svg class="agent-status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.4" cy="5.2" r="2.1"/><circle cx="11.3" cy="6.4" r="1.65"/><path d="M1.9 13c.35-2.25 1.6-3.45 3.5-3.45S8.55 10.75 8.9 13M9.2 12.8c.23-1.55 1.08-2.38 2.45-2.38 1.32 0 2.1.76 2.38 2.18"/></svg><span>${listedAgents} ${escHtml(dict.subAgents)}</span><span class="agent-status-divider" aria-hidden="true"></span><span>${m} ${escHtml(dict.backgroundTasks)}</span>`;
-      const title = subAgentText('View sub-agent activity. Agent count is not execution-slot occupancy.', '查看子代理活动。子代理数量不等于执行槽占用数。');
+      chip.innerHTML = `<svg class="agent-status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.4" cy="5.2" r="2.1"/><circle cx="11.3" cy="6.4" r="1.65"/><path d="M1.9 13c.35-2.25 1.6-3.45 3.5-3.45S8.55 10.75 8.9 13M9.2 12.8c.23-1.55 1.08-2.38 2.45-2.38 1.32 0 2.1.76 2.38 2.18"/></svg><span>${listedAgents} ${escHtml(dict.subAgents)}</span>${m ? `<span class="agent-status-divider" aria-hidden="true"></span><span>${m} ${escHtml(dict.backgroundTasks)}</span>` : ''}`;
+      const title = subAgentText('View agent conversations', '查看子代理会话');
       chip.title = title;
       chip.setAttribute('aria-label', title + ': ' + listedAgents + ' ' + dict.subAgents + ', ' + m + ' ' + dict.backgroundTasks);
     }
@@ -690,10 +692,14 @@ function toggleStatusPopover(e) {
   if (open && typeof closeDesktopTransientPopovers === 'function') closeDesktopTransientPopovers('agent-status');
   pop.style.display = open ? 'block' : 'none';
   chip.setAttribute('aria-expanded', open ? 'true' : 'false');
-  if (open) renderStatusPopover();
+  if (open) {
+    renderStatusPopover();
+    if (typeof startSubAgentCatalogClock === 'function') startSubAgentCatalogClock();
+  }
 }
 
 function closeStatusPopover() {
+  if (typeof stopSubAgentCatalogClock === 'function') stopSubAgentCatalogClock();
   const pop = document.getElementById('statusPopover');
   const chip = document.getElementById('statusChip');
   if (!pop || !chip) return;
@@ -759,46 +765,43 @@ function statusSubAgentsForSelectedSession(snapshot) {
 function renderStatusPopover() {
   const pop = document.getElementById('statusPopover');
   if (!pop) return;
-  const d = lastStatusSnapshot || {};
-  const roster = statusRosterForSelectedSession(d);
-  const agents = statusSubAgentsForSelectedSession(d);
-  const jobs = roster && Array.isArray(roster.jobs) ? roster.jobs.filter(job =>
-    !job.sessionId || String(job.sessionId) === String(currentSessionId || '')) : [];
+  const roster = statusRosterForSelectedSession(lastStatusSnapshot || {});
+  const agents = typeof subAgentCatalogAgents === 'function' ? subAgentCatalogAgents() : statusSubAgentsForSelectedSession(lastStatusSnapshot || {});
+  const jobs = roster && Array.isArray(roster.jobs) ? roster.jobs.filter(job => !job.sessionId || String(job.sessionId) === String(currentSessionId || '')) : [];
+  const tokenLabel = usage => typeof subAgentUsageLabel === 'function' ? subAgentUsageLabel(usage) : '—';
+  const elapsed = agent => typeof subAgentElapsedLabel === 'function' ? subAgentElapsedLabel(subAgentElapsedMilliseconds(agent)) : '';
   const rows = [];
-  const slots = roster && roster.executionSlots;
-  if (slots && Number.isInteger(slots.held) && Number.isInteger(slots.total) &&
-      slots.held >= 0 && slots.total > 0 && slots.held <= slots.total) {
-    rows.push('<div class="status-popover-label" title="' + escAttr(subAgentText(
-      'Sampled Desktop scheduler occupancy; background processes are not counted.',
-      'Desktop 调度器占用的采样值；后台进程不计入。')) + '">' +
-      escHtml(subAgentText('Execution slots (sampled)', '执行槽（采样）')) + ' · ' +
-      slots.held + ' / ' + slots.total + '</div>');
-  }
-  if (roster && Number.isInteger(roster.heldExecutionSlots) && roster.heldExecutionSlots >= 0) {
-    rows.push('<div class="status-popover-label">' +
-      escHtml(subAgentText('Child slots in this session', '当前会话子代理占用')) + ' · ' +
-      roster.heldExecutionSlots + '</div>');
-  }
-  if (agents.length) {
-    rows.push('<div class="status-popover-label">' + escHtml(subAgentText('Sub-agents', '子代理')) + '</div>');
-    agents.forEach(a => {
-      const agentID = String(a.agentId || '');
-      const canOpen = !!agentID;
-      rows.push('<button type="button" class="status-popover-row status-agent-row"' +
-        (canOpen ? ' data-subagent-id="' + escAttr(agentID) + '" data-subagent-session-id="' + escAttr(currentSessionId) + '"' : ' disabled') +
-        (canOpen ? ' title="' + escAttr(subAgentText('Open sub-agent details', '查看子代理详情')) + '"' : '') + '>' +
-        '<span class="status-dot ' + subAgentStatusClass(a.status || '') + '"></span>' +
-        '<span class="status-agent-name"><strong>' + escHtml(a.name || a.agentId || 'agent') + '</strong><small>' + escHtml(a.status === 'queued' ? subAgentText('Waiting to start · Open details', '等待执行 · 查看详情') : a.status === 'running' ? subAgentText('Open live output', '打开实时输出') : subAgentText('Open output', '查看输出')) + '</small></span>' +
-        '<span class="status-agent-state">' + escHtml(subAgentLifecycleAndPhaseLabel(a)) + '</span>' +
-      '</button>');
-    });
+  agents.forEach(agent => {
+    const id = String(agent.agentId || '');
+    const status = subAgentLifecycleAndPhaseLabel(agent);
+    const summary = [agent.task || '', status].filter(Boolean).join(' · ');
+    const knownUsage = agent.usage && agent.usage.available === true;
+    rows.push('<button type="button" class="status-popover-row status-agent-row" data-subagent-id="' + escAttr(id) + '" data-subagent-session-id="' + escAttr(currentSessionId) + '" title="' + escAttr(subAgentText('Open agent conversation', '打开子代理会话') + ' · ' + status) + '">' +
+      '<span class="status-dot ' + subAgentStatusClass(agent.status || '') + '"></span>' +
+      '<span class="status-agent-name"><strong>' + escHtml(agent.name || id) + '</strong><small class="status-agent-task">' + escHtml(summary) + '</small></span>' +
+      '<span class="status-agent-metrics" title="' + escAttr(knownUsage ? subAgentText('Provider-reported tokens', '供应商已回报的用量') : subAgentText('No provider receipt yet', '尚无供应商用量回执')) + '"><span>' + escHtml(tokenLabel(agent.usage)) + '</span><small>' + escHtml(elapsed(agent)) + '</small></span>' +
+      '<svg class="status-agent-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg></button>');
+  });
+  if (typeof subAgentCatalogState !== 'undefined' && subAgentCatalogState.owner === String(currentSessionId || '')) {
+    const state = subAgentCatalogState;
+    if (state.error) rows.push('<div class="status-popover-empty">' + escHtml(state.error) + '<button type="button" data-agent-retry>' + escHtml(subAgentText('Retry', '重试')) + '</button></div>');
+    if (state.nextCursor) rows.push('<button type="button" class="subagent-load-earlier" data-agent-more' + (state.loading ? ' disabled' : '') + '>' + escHtml(subAgentText('Load more agents', '加载更多子代理')) + '</button>');
   }
   if (jobs.length) {
     rows.push('<div class="status-popover-label">' + escHtml(subAgentText('Background tasks', '后台任务')) + '</div>');
-    jobs.forEach(j => rows.push('<div class="status-popover-row"><span class="status-dot ' + subAgentStatusClass(j.status || '') + '"></span><span>' + escHtml(j.description || j.id || 'task') + '</span><small>' + escHtml(subAgentStatusLabel(j.status || '')) + '</small></div>'));
+    jobs.forEach(job => rows.push('<div class="status-popover-row"><span class="status-dot ' + subAgentStatusClass(job.status || '') + '"></span><span>' + escHtml(job.description || job.id || 'task') + '</span><small>' + escHtml(subAgentStatusLabel(job.status || '')) + '</small></div>'));
   }
-  pop.innerHTML = rows.join('') || '<div class="status-popover-empty">' + escHtml(subAgentText('No active agents or tasks', '没有正在运行的子代理或后台任务')) + '</div>';
-  pop.querySelectorAll('[data-subagent-id]').forEach(row => row.addEventListener('click', () => openSubAgentDetails(row.dataset.subagentId, row, row.dataset.subagentSessionId)));
+  const slots = roster && roster.executionSlots;
+  if (slots && Number.isInteger(slots.held) && Number.isInteger(slots.total) && slots.held >= 0 && slots.total > 0 && slots.held <= slots.total) {
+    rows.push('<details class="status-scheduler-details"><summary>' + escHtml(subAgentText('Scheduling details', '调度详情')) + '</summary><div class="status-popover-label">' + escHtml(subAgentText('Execution slots (sampled)', '执行槽（采样）')) + ' · ' + slots.held + ' / ' + slots.total + '</div>' +
+      (Number.isInteger(roster.heldExecutionSlots) && roster.heldExecutionSlots >= 0 ? '<div class="status-popover-label">' + escHtml(subAgentText('Child slots in this session', '当前会话子代理占用')) + ' · ' + roster.heldExecutionSlots + '</div>' : '') + '</details>');
+  }
+  const selected = pop.querySelector?.(':focus')?.dataset?.subagentId;
+  pop.innerHTML = rows.join('') || '<div class="status-popover-empty">' + escHtml(subAgentText('No agents in this conversation', '当前会话还没有子代理')) + '</div>';
+  pop.querySelectorAll('[data-subagent-id]').forEach(row => row.addEventListener('click', event => openSubAgentDetails(row.dataset.subagentId, row, row.dataset.subagentSessionId, event.altKey ? 'side' : 'page')));
+  pop.querySelector?.('[data-agent-more]')?.addEventListener('click', () => void refreshSubAgentCatalog(true));
+  pop.querySelector?.('[data-agent-retry]')?.addEventListener('click', () => void refreshSubAgentCatalog());
+  if (selected) [...pop.querySelectorAll('[data-subagent-id]')].find(row => row.dataset.subagentId === selected)?.focus();
 }
 
 document.addEventListener('click', e => {
@@ -826,7 +829,7 @@ function initSubAgentDetails() {
 // instead derives it from the currently selected session's status snapshot.
 // The server repeats this check against the child's persisted parent before
 // returning output; an agent ID alone is never an ownership credential.
-function openSubAgentDetails(agentID, trigger, ownerSessionID) {
+function openSubAgentDetails(agentID, trigger, ownerSessionID, presentation = 'page') {
   agentID = String(agentID || '').trim();
   const selectedSessionID = String(currentSessionId || '');
   const explicitOwner = String(ownerSessionID || '');
@@ -845,17 +848,25 @@ function openSubAgentDetails(agentID, trigger, ownerSessionID) {
   subAgentDetailState.stopping = false;
   subAgentDetailState.stopGeneration = (subAgentDetailState.stopGeneration || 0) + 1;
   if (!sameAgent) subAgentDetailState.data = null;
+  overlay.dataset.presentation = presentation === 'side' ? 'side' : 'page';
+  if (typeof beginSubAgentConversationView === 'function') beginSubAgentConversationView(sameAgent);
   overlay.hidden = false;
   document.body.classList.add('subagent-detail-open');
   closeStatusPopover();
   renderSubAgentDetails();
   const dialog = overlay.querySelector('.subagent-detail-dialog');
-  requestAnimationFrame(() => dialog && dialog.focus());
+  const focusGeneration = subAgentDetailState.stopGeneration;
+  requestAnimationFrame(() => {
+    if (!overlay.hidden && subAgentDetailState.agentId === agentID &&
+        subAgentDetailState.ownerSessionId === owner && String(currentSessionId || '') === owner &&
+        subAgentDetailState.stopGeneration === focusGeneration) dialog?.focus();
+  });
   startSubAgentDetailStream(agentID);
   return true;
 }
 
 function closeSubAgentDetails(restoreFocus = true) {
+  if (typeof cancelSubAgentConversationView === 'function') cancelSubAgentConversationView();
   stopSubAgentElapsedTimer();
   const overlay = document.getElementById('subAgentDetailOverlay');
   if (overlay) overlay.hidden = true;
@@ -870,7 +881,10 @@ function closeSubAgentDetails(restoreFocus = true) {
   subAgentDetailState.stopping = false;
   subAgentDetailState.stopGeneration = (subAgentDetailState.stopGeneration || 0) + 1;
   stopSubAgentDetailStream();
-  if (restoreFocus && trigger && typeof trigger.focus === 'function') trigger.focus();
+  if (restoreFocus) {
+    const target = trigger && trigger.isConnected !== false ? trigger : document.getElementById('statusChip');
+    if (target && typeof target.focus === 'function') target.focus();
+  }
 }
 
 function stopSubAgentDetailStream() {
@@ -898,6 +912,7 @@ function applySubAgentStreamSnapshot(agentID, generation, source, payload) {
   if (String(next.agentId || '') !== agentID) return;
   if (String(next.sessionId || '') !== subAgentDetailState.ownerSessionId) return;
   subAgentDetailState.data = next;
+  if (typeof scheduleSubAgentConversationFetch === 'function') scheduleSubAgentConversationFetch(next.conversationRevision || '', !subAgentConversationState?.loaded);
   subAgentDetailState.loading = false;
   subAgentDetailState.error = '';
   renderSubAgentDetails();
@@ -912,6 +927,7 @@ function applySubAgentStreamDelta(agentID, generation, source, payload) {
   delete next.delta;
   next.output = String(current.output || '') + String(payload.delta || '');
   subAgentDetailState.data = next;
+  if (typeof scheduleSubAgentConversationFetch === 'function') scheduleSubAgentConversationFetch(next.conversationRevision || '', !subAgentConversationState?.loaded);
   subAgentDetailState.loading = false;
   subAgentDetailState.error = '';
   renderSubAgentDetails();
@@ -1027,6 +1043,7 @@ function subAgentDetailHeading(agent) {
 }
 
 function updateSubAgentDetailExecutionPhase() {
+  if (typeof updateSubAgentConversationChrome === 'function' && typeof subAgentConversationState !== 'undefined' && subAgentConversationState) { updateSubAgentConversationChrome(); return; }
   const agent = subAgentDetailState.data;
   if (!agent || subAgentDetailState.ownerSessionId !== String(currentSessionId || '')) return;
   const phase = subAgentExecutionPhaseLabel(subAgentDetailExecutionPhase(agent));
@@ -1097,116 +1114,14 @@ async function stopSubAgent() {
 
 function renderSubAgentDetails() {
   const overlay = document.getElementById('subAgentDetailOverlay');
-  const title = document.getElementById('subAgentDetailTitle');
-  const subtitle = document.getElementById('subAgentDetailDescription');
-  const body = document.getElementById('subAgentDetailBody');
-  if (!overlay || overlay.hidden || !title || !subtitle || !body) {
+  if (!overlay || overlay.hidden || subAgentDetailState.ownerSessionId !== String(currentSessionId || '')) {
     stopSubAgentElapsedTimer();
     return;
   }
-  const state = subAgentDetailState;
-  if (state.ownerSessionId !== String(currentSessionId || '')) {
-    closeSubAgentDetails(false);
-    return;
-  }
-  body.setAttribute('aria-busy', state.loading ? 'true' : 'false');
-  if (!state.data) stopSubAgentElapsedTimer();
-  if (state.loading && !state.data) {
-    title.textContent = subAgentText('Sub-agent details', '子代理详情');
-    subtitle.textContent = subAgentText('Loading live activity…', '正在读取实时活动…');
-    body.innerHTML = '<div class="subagent-detail-loading"><span class="subagent-detail-spinner" aria-hidden="true"></span>' + escHtml(subAgentText('Reading the current output…', '正在读取当前输出…')) + '</div>';
-    return;
-  }
-  if (!state.data) {
-    title.textContent = subAgentText('Sub-agent details', '子代理详情');
-    subtitle.textContent = state.error || subAgentText('This sub-agent is no longer retained.', '这个子代理已不再保留。');
-    body.innerHTML = '<div class="subagent-detail-error" role="alert">' + escHtml(subtitle.textContent) + '</div>';
-    return;
-  }
-
-  const agent = state.data;
-  const status = subAgentStatusClass(String(agent.status || ''));
-  const cancelled = subAgentWasCancelled(agent);
-  const statusLabel = subAgentDetailStatusLabel(agent);
-  const phaseLabel = subAgentExecutionPhaseLabel(subAgentDetailExecutionPhase(agent));
-  const elapsedLabel = subAgentElapsedLabel(subAgentElapsedMilliseconds(agent));
-  title.textContent = agent.name || agent.agentId || subAgentText('Sub-agent', '子代理');
-  subtitle.textContent = subAgentDetailHeading(agent) + ' · ' + elapsedLabel;
-  const mode = agent.background ? subAgentText('Background', '后台执行') : subAgentText('Foreground', '前台执行');
-  body.innerHTML = '<div class="subagent-detail-summary">' +
-    '<span class="status-dot ' + (cancelled ? 'unknown' : status) + '"></span><strong>' + escHtml(statusLabel) + '</strong>' +
-    '<span id="subAgentDetailPhase" class="status-agent-state"' + (!phaseLabel || phaseLabel === statusLabel ? ' hidden' : '') + '>' + escHtml(phaseLabel) + '</span>' +
-    '<span class="subagent-detail-mode">' + escHtml(mode) + '</span>' +
-    '</div><dl class="subagent-detail-meta">' +
-      '<div><dt>' + escHtml(subAgentText('Agent ID', '代理 ID')) + '</dt><dd><code>' + escHtml(agent.agentId || '—') + '</code></dd></div>' +
-      '<div><dt>' + escHtml(status === 'queued' ? subAgentText('Waiting', '已等待') : subAgentText('Elapsed', '用时')) + '</dt><dd id="subAgentDetailElapsed">' + escHtml(elapsedLabel) + '</dd></div>' +
-      (agent.stopHint ? '<div><dt>' + escHtml(subAgentText('Stop reason', '停止原因')) + '</dt><dd>' + escHtml(cancelled ? subAgentText('Cancelled by request', '已按请求取消') : agent.stopHint) + '</dd></div>' : '') +
-    '</dl>';
-
-  if (['queued', 'running'].includes(status)) {
-    const stop = document.createElement('button');
-    stop.type = 'button';
-    stop.className = 'subagent-detail-stop';
-    stop.disabled = !!state.stopping;
-    stop.textContent = state.stopping
-      ? subAgentText('Stopping…', '正在停止…')
-      : status === 'queued' ? subAgentText('Cancel queued agent', '取消排队') : subAgentText('Stop sub-agent', '停止子代理');
-    stop.addEventListener('click', stopSubAgent);
-    body.appendChild(stop);
-  }
-
-  const appendOutput = (heading, value, extraClass) => {
-    const section = document.createElement('section');
-    section.className = 'subagent-detail-output' + (extraClass ? ' ' + extraClass : '');
-    const h3 = document.createElement('h3');
-    h3.textContent = heading;
-    const pre = document.createElement('pre');
-    pre.textContent = value;
-    section.append(h3, pre);
-    body.appendChild(section);
-  };
-  const output = String(agent.output || '');
-  if (output) appendOutput(subAgentText('Live output', '实时输出'), output);
-  else {
-    const waiting = document.createElement('div');
-    waiting.className = 'subagent-detail-empty-output';
-    waiting.textContent = status === 'queued'
-      ? subAgentText('Waiting for an execution slot. This sub-agent has not started yet; you can cancel it while it is queued.', '正在等待执行名额。这个子代理尚未开始执行，排队期间可以取消。')
-      : status === 'running'
-      ? subAgentText('No text output yet. The sub-agent may still be inspecting files or using tools.', '暂时还没有文字输出。子代理可能仍在读取文件或调用工具。')
-      : subAgentText('This sub-agent did not produce text output.', '这个子代理没有产生文字输出。');
-    body.appendChild(waiting);
-  }
-  if (agent.outputTruncated) {
-    const note = document.createElement('p');
-    note.className = 'subagent-detail-note';
-    note.textContent = subAgentText('The middle of this unusually large output is omitted here.', '这段输出过长，中间部分未在此展示。');
-    body.appendChild(note);
-  }
-  if (agent.result && agent.result !== agent.output) appendOutput(subAgentText('Final result', '最终结果'), String(agent.result));
-  if (cancelled) {
-    const note = document.createElement('p');
-    note.className = 'subagent-detail-note';
-    note.textContent = subAgentText('This sub-agent was cancelled.', '这个子代理已取消。');
-    body.appendChild(note);
-  } else if (agent.exitError) {
-    const error = document.createElement('div');
-    error.className = 'subagent-detail-error';
-    error.setAttribute('role', 'alert');
-    error.textContent = subAgentText('Error: ', '错误：') + agent.exitError;
-    body.appendChild(error);
-  }
-  if (state.error) {
-    const stale = document.createElement('p');
-    stale.className = 'subagent-detail-note';
-    stale.textContent = state.error;
-    body.appendChild(stale);
-  }
-  if (['queued', 'running'].includes(status)) {
-    if (state.elapsedTimer == null) state.elapsedTimer = setInterval(updateSubAgentElapsedTime, 1000);
-  } else {
-    stopSubAgentElapsedTimer();
-  }
+  if (typeof renderSubAgentConversationView === 'function') renderSubAgentConversationView();
+  const active = subAgentDetailState.data && ['queued', 'running'].includes(subAgentDetailState.data.status);
+  if (active && subAgentDetailState.elapsedTimer == null) subAgentDetailState.elapsedTimer = setInterval(updateSubAgentElapsedTime, 1000);
+  else if (!active) stopSubAgentElapsedTimer();
 }
 
 // ============================================================

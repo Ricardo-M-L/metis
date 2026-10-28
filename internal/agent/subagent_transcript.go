@@ -45,10 +45,10 @@ import (
 // uses it to check parent-session ownership without scanning a growing child
 // transcript on every live detail request.
 func LoadSubAgentHeader(sessionDir, agentID string) (pubsess.Header, error) {
-	if sessionDir == "" || agentID == "" {
-		return pubsess.Header{}, fmt.Errorf("subagent transcript: sessionDir + agentID both required")
+	path, err := subAgentTranscriptPath(sessionDir, agentID)
+	if err != nil {
+		return pubsess.Header{}, err
 	}
-	path := filepath.Join(sessionDir, SubAgentTranscriptDirname, agentID+".jsonl")
 	f, err := os.Open(path)
 	if err != nil {
 		return pubsess.Header{}, err
@@ -460,10 +460,10 @@ func (t *SubAgentTranscript) writeEntryLocked(e subagentEntry) error {
 // On clean read returns a SubAgentSnapshot the caller can hand
 // to agent.NewLoop + sub.Restore for a warm-start resume.
 func LoadSubAgentSnapshot(sessionDir, agentID string) (*SubAgentSnapshot, error) {
-	if sessionDir == "" || agentID == "" {
-		return nil, fmt.Errorf("subagent transcript: sessionDir + agentID both required")
+	path, err := subAgentTranscriptPath(sessionDir, agentID)
+	if err != nil {
+		return nil, err
 	}
-	path := filepath.Join(sessionDir, SubAgentTranscriptDirname, agentID+".jsonl")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read subagent transcript %s: %w", path, err)

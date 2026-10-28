@@ -24,6 +24,9 @@ type fakeCLICall struct {
 }
 
 func TestMain(m *testing.M) {
+	if desktopTrialTestProcess() {
+		return
+	}
 	if os.Getenv("GO_WANT_METIS_WEBUI_START_HELPER") == "1" {
 		os.Exit(runWebUIStartHelper(os.Args))
 	}
@@ -1078,7 +1081,7 @@ func TestStartInstallUpdateAndRestartPublishesLiveProgress(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		progress = app.GetUpdateProgress()
-		if progress.Done {
+		if progress.Phase == "restarting" {
 			break
 		}
 		select {
@@ -1087,7 +1090,7 @@ func TestStartInstallUpdateAndRestartPublishesLiveProgress(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	if progress.Phase != "restarting" || progress.Percent != 100 || progress.Failed {
+	if progress.Phase != "restarting" || progress.Percent != 98 || progress.Done || progress.Failed {
 		t.Fatalf("final update progress = %+v, want successful restart", progress)
 	}
 }

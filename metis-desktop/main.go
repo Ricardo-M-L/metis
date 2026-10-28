@@ -10,6 +10,14 @@ import (
 )
 
 func main() {
+	if handled, err := desktopUpdateHelperCommand(os.Args); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if handled, err := desktopRuntimeCheckCommand(os.Args, os.Stdout, nil, nil); handled {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Metis Desktop runtime check:", err)

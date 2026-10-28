@@ -150,6 +150,14 @@ func agentChildRegistry(src *tools.Registry, childGate *permission.Gate, planLoc
 		return dst
 	}
 	for _, inner := range src.All() {
+		// These concrete tools capture the root Gate. Letting a child call
+		// either one would change the parent's policy and, on entering Plan,
+		// make the root's lifecycle drain wait for the calling child itself.
+		// Children can inspect and propose plans directly; only the root owns
+		// the user approval boundary and global permission transitions.
+		if inner.Name() == "EnterPlanMode" || inner.Name() == "ExitPlanMode" {
+			continue
+		}
 		if planLocked && planChildBlockedTool(inner.Name()) {
 			continue
 		}

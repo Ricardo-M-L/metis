@@ -237,6 +237,7 @@ func writeGlobFile(t *testing.T, root, file string) {
 
 func assertGlobPaths(t *testing.T, output string, want []string) {
 	t.Helper()
+	output, _, _ = strings.Cut(output, "\n[Glob search incomplete:")
 	got := strings.Split(strings.TrimSpace(output), "\n")
 	sort.Strings(got)
 	sort.Strings(want)

@@ -58,7 +58,7 @@ func (p ProjectCoordinator) WithPrincipalResolver(resolver func(context.Context,
 
 func (ProjectCoordinator) Name() string { return "ProjectCoordinator" }
 func (ProjectCoordinator) Description() string {
-	return "Manage a durable project work graph across METIS sessions and workers. Claims return a lease token; renew it during long external work and pass it to complete/fail. Record concrete evidence, deliverables, failure and recovery. Verification requires host acceptance commands configured by the user through coordinator create/configure --check; model-written PASS text cannot replace those checks."
+	return "Manage a durable project work graph when work must survive sessions, separate workers or restarts. For ordinary session-local read-only research or sub-agent UI checks, use Agent and Task tools instead. Claims return a lease token; renew it during long external work and pass it to complete/fail. Record concrete evidence, deliverables, failure and recovery. Inspect host_acceptance before dispatch: missing means verification cannot complete until the host configures trusted commands through coordinator create/configure --check, not an argument error to retry. Configured checks still must pass; model-written PASS text cannot replace them."
 }
 func (ProjectCoordinator) InputSchema() map[string]any {
 	return map[string]any{
@@ -222,7 +222,12 @@ func (p ProjectCoordinator) Execute(ctx context.Context, input map[string]any) (
 		if err != nil {
 			return nil, err
 		}
-		return projectCoordinatorResult(map[string]any{"item": compactProjectItem(item), "worker_prompt": projectcoord.BuildWorkerPrompt(run, item)})
+		return projectCoordinatorResult(map[string]any{
+			"item":             compactProjectItem(item),
+			"worker_prompt":    projectcoord.BuildWorkerPrompt(run, item),
+			"host_check_count": len(run.CheckCommands),
+			"host_acceptance":  projectcoord.HostAcceptanceReadiness(run),
+		})
 	case "renew":
 		runID, itemID, err := projectRunAndItem(input)
 		if err != nil {
@@ -374,17 +379,18 @@ func projectStringSlice(value any) []string {
 // coordinator context.  Full evidence remains durable in the state file and
 // the direct prerequisite excerpt is supplied only when claim_next needs it.
 type projectRunView struct {
-	ID             string                 `json:"id"`
-	Workspace      string                 `json:"workspace"`
-	Goal           string                 `json:"goal"`
-	Status         projectcoord.RunStatus `json:"status"`
-	Environment    projectEnvironmentView `json:"environment"`
-	Items          []projectWorkItemView  `json:"items"`
-	UpdatedAt      time.Time              `json:"updated_at"`
-	DeadlineAt     time.Time              `json:"deadline_at,omitempty"`
-	MaxBudgetUSD   float64                `json:"max_budget_usd,omitempty"`
-	SpentUSD       float64                `json:"spent_usd,omitempty"`
-	HostCheckCount int                    `json:"host_check_count"`
+	ID             string                           `json:"id"`
+	Workspace      string                           `json:"workspace"`
+	Goal           string                           `json:"goal"`
+	Status         projectcoord.RunStatus           `json:"status"`
+	Environment    projectEnvironmentView           `json:"environment"`
+	Items          []projectWorkItemView            `json:"items"`
+	UpdatedAt      time.Time                        `json:"updated_at"`
+	DeadlineAt     time.Time                        `json:"deadline_at,omitempty"`
+	MaxBudgetUSD   float64                          `json:"max_budget_usd,omitempty"`
+	SpentUSD       float64                          `json:"spent_usd,omitempty"`
+	HostCheckCount int                              `json:"host_check_count"`
+	HostAcceptance projectcoord.AcceptanceReadiness `json:"host_acceptance"`
 }
 
 type projectEnvironmentView struct {
@@ -431,6 +437,7 @@ func compactProjectRun(run projectcoord.Run) projectRunView {
 		MaxBudgetUSD:   run.MaxBudgetUSD,
 		SpentUSD:       run.SpentUSD,
 		HostCheckCount: len(run.CheckCommands),
+		HostAcceptance: projectcoord.HostAcceptanceReadiness(run),
 		Items:          make([]projectWorkItemView, 0, len(run.Items)),
 	}
 	if run.Environment.LastFailure != nil {

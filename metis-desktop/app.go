@@ -43,6 +43,8 @@ type App struct {
 	installDesktopUpdateWithProgress  func(context.Context, string, string, desktopUpdateReporter) (DesktopUpdateStatus, error)
 	desktopPath                       func() (string, error)
 	restartDesktop                    func(path, workspace, metisBin string) error
+	prepareUpdateHandoff              func(path, workspace, metisBin string) (func(string) error, func(), error)
+	updateTrialPath                   string
 	resolveUpdatedMetis               func(current string) (string, error)
 	scheduleRestart                   func(func())
 	quit                              func(context.Context)
@@ -85,6 +87,8 @@ func NewApp() *App {
 		checkDesktopUpdate:                updater.Check,
 		desktopPath:                       currentDesktopPath,
 		restartDesktop:                    restartDesktopProcess,
+		prepareUpdateHandoff:              prepareDesktopUpdateHandoff,
+		updateTrialPath:                   desktopUpdateArg(os.Args, desktopTrialFlag),
 		resolveUpdatedMetis:               resolveStableMetisBinary,
 		scheduleRestart: func(fn func()) {
 			go func() {
@@ -311,11 +315,27 @@ func (b *processLogBuffer) String() string {
 	return string(b.data)
 }
 
-func (a *App) StartWebUI() (string, error) {
+func (a *App) StartWebUI() (result string, resultErr error) {
+	defer func() {
+		if resultErr != nil && a.updateTrialPath != "" {
+			if t, err := loadDesktopTransaction(a.updateTrialPath); err == nil {
+				_ = desktopTrialWrite(filepath.Join(filepath.Dir(a.updateTrialPath), "failure.json"), desktopTrialResult{ID: t.ID, State: "candidate-failed"})
+			}
+		}
+	}()
 	a.webuiMu.Lock()
 	defer a.webuiMu.Unlock()
 	if a.webuiUpdating {
 		return "", errors.New("Desktop is preparing an update; wait for it to restart")
+	}
+	if a.webuiCmd == nil && a.updateTrialPath == "" && a.desktopPath != nil {
+		if appPath, err := a.desktopPath(); err == nil {
+			if _, err = os.Lstat(desktopTrialMarker(appPath)); err == nil {
+				if err := a.recoverStoppedDesktopTrial(appPath); err != nil {
+					return "", err
+				}
+			}
+		}
 	}
 	if strings.TrimSpace(a.workDir) == "" {
 		return "", errors.New("Desktop workspace is unavailable; launch with --workspace or restore the user home directory")
@@ -386,6 +406,12 @@ func (a *App) startWebUIAttemptWithRuntime(selected desktopRuntimeSelection) (st
 		a.webuiMu.Unlock()
 	}()
 
+	if err := a.desktopTrialClaim(selected); err != nil {
+		stopWebUIProcessWithPolicy(cmd, done, port, frameToken, defaultWebUIStopPolicy)
+		a.clearWebUIAttempt(cmd)
+		return "", err
+	}
+
 	// Wait for the backend to answer its health probe before the webview
 	// navigates, otherwise the first paint is a connection error.
 	baseURL := a.webUIBaseURL()
@@ -406,6 +432,11 @@ func (a *App) startWebUIAttemptWithRuntime(selected desktopRuntimeSelection) (st
 		if probeErr == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
+				if err := a.confirmDesktopTrial(); err != nil {
+					stopWebUIProcessWithPolicy(cmd, done, port, frameToken, defaultWebUIStopPolicy)
+					a.clearWebUIAttempt(cmd)
+					return "", err
+				}
 				return a.webUIURL(), nil
 			}
 			lastProbe = fmt.Sprintf("HTTP %d", resp.StatusCode)
@@ -474,7 +505,7 @@ func freePort() (int, error) {
 }
 
 func (a *App) GetVersion() string {
-	return "0.4.99"
+	return "0.4.100"
 }
 
 // ChooseWorkspaceDirectory is the native half of the iframe bridge. The web
@@ -722,6 +753,17 @@ func (a *App) installUpdateAndRestart(report desktopUpdateReporter) (DesktopUpda
 		}
 		return status, updateErr
 	}
+	var handoff func(string) error
+	if a.prepareUpdateHandoff != nil {
+		var cleanup func()
+		handoff, cleanup, err = a.prepareUpdateHandoff(appPath, a.workDir, binary)
+		if err != nil {
+			return status, fmt.Errorf("prepare trusted Desktop health supervisor: %w", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+	}
 	installCtx, installCancel := context.WithTimeout(base, 10*time.Minute)
 	if a.installDesktopUpdateWithProgress != nil {
 		status, err = a.installDesktopUpdateWithProgress(installCtx, a.GetVersion(), appPath, report)
@@ -732,11 +774,21 @@ func (a *App) installUpdateAndRestart(report desktopUpdateReporter) (DesktopUpda
 	if err != nil {
 		return recoverFailedUpdate(err)
 	}
-	if err := a.restartDesktop(appPath, a.workDir, binary); err != nil {
+	if handoff != nil {
+		err = handoff(status.LatestVersion)
+	} else {
+		err = a.restartDesktop(appPath, a.workDir, binary)
+	}
+	if err != nil {
+		if handoff != nil {
+			if rollbackErr := rollbackDesktopActivation(appPath, runtime.GOOS); rollbackErr != nil {
+				return status, fmt.Errorf("start health supervisor: %v; restore previous application: %w", err, rollbackErr)
+			}
+		}
 		return recoverFailedUpdate(fmt.Errorf("restart updated Desktop: %w", err))
 	}
 	status.Restarting = true
-	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "restarting", Message: "Restarting METIS…", Percent: 100, Done: true})
+	reportDesktopUpdateProgress(report, DesktopUpdateProgress{Phase: "restarting", Message: "Starting METIS and confirming its health…", Percent: 98})
 	a.scheduleRestart(func() { a.quit(base) })
 	return status, nil
 }

@@ -8,6 +8,38 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 
+## [0.4.100] - 2026-10-28
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG continue the
+established ad-hoc signing channel without Apple notarization.
+
+### Fixed
+
+- Reject unfinished Chat tool calls when the stream closes without an explicit
+  finish reason, including arguments that already look like valid JSON.
+- Keep ordinary read-only coordination inside the session instead of creating
+  an unrelated implementation and host-verification project.
+- Show host acceptance configuration before work starts, while still requiring
+  real successful host checks before verification can complete.
+- Keep plan permissions closed during fallback, worker restoration and shutdown,
+  and prevent background work from retaining broader permissions.
+- Resolve explicit Glob roots and relative paths consistently and show useful
+  directory results in the CLI and Desktop trace.
+- Preserve Desktop update ownership, recovery and bundled runtime selection
+  across restart, failed replacement and interrupted health handoff.
+- Validate the newly installed Linux embedded CLI through its native runtime
+  check instead of applying macOS bundle paths to a Linux executable.
+
+### Improved
+
+- Add a compact Desktop sub-agent directory with names, status, elapsed time and
+  reported usage; open complete read-only conversations and tool results.
+- Accept Chinese and other Unicode teammate names while retaining character,
+  length and routing validation.
+- Persist sub-agent transcripts, activity and usage so history remains available
+  after reload, and remove those records with their owning session.
+
+
 ## [0.4.99] - 2026-10-27
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG continue the

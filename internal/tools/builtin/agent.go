@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/execution"
@@ -20,6 +22,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	bashbuiltin "github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 	worktreepkg "github.com/Ricardo-M-L/metis/internal/worktree"
+	pubsess "github.com/Ricardo-M-L/metis/pkg/session"
 )
 
 // anonAgentID returns the AgentID string we stamp on each Roster
@@ -34,32 +37,31 @@ func anonAgentID() string {
 
 // validateTeammateName enforces the G.3 naming rules:
 //   - Empty string is fine (caller wants anonymous, Roster auto-assigns).
-//   - Must start with a letter so it can't be confused with the
+//   - Must start with a Unicode letter so it can't be confused with the
 //     `_anon-<hex>` namespace the Roster reserves for anonymous spawns.
-//   - Only [a-zA-Z0-9._-] allowed — what slugSegmentRE accepts in the
-//     worktree package, kept in lockstep so a teammate name can
-//     double as a worktree slug if a future caller wants that.
-//   - Max 32 chars — short enough to fit in /agents list output
-//     comfortably; claude-code's roster picks a similar bound.
+//   - Remaining characters are Unicode letters/digits or ASCII . _ -.
+//     Whitespace, control characters and path separators are never names.
+//   - Max 32 Unicode characters, not UTF-8 bytes. Names are exact identities;
+//     they are not normalized or converted into filesystem/worktree slugs.
 func validateTeammateName(name string) error {
 	if name == "" {
 		return nil
 	}
-	if len(name) > 32 {
+	if !utf8.ValidString(name) {
+		return errors.New("teammate name must be valid UTF-8")
+	}
+	if utf8.RuneCountInString(name) > 32 {
 		return fmt.Errorf("teammate name %q exceeds 32 chars", name)
 	}
-	first := name[0]
-	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')) {
-		return fmt.Errorf("teammate name %q must start with a letter (anonymous slot is reserved for `_anon-<hex>`)", name)
-	}
-	for i := 1; i < len(name); i++ {
-		c := name[i]
-		ok := (c >= 'a' && c <= 'z') ||
-			(c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') ||
-			c == '.' || c == '_' || c == '-'
-		if !ok {
-			return fmt.Errorf("teammate name %q contains invalid char %q (allowed: letters, digits, . _ -)", name, c)
+	for i, c := range name {
+		if i == 0 {
+			if !unicode.IsLetter(c) {
+				return fmt.Errorf("teammate name %q must start with a letter, including Chinese (anonymous slot is reserved for `_anon-<hex>`)", name)
+			}
+			continue
+		}
+		if !unicode.IsLetter(c) && !unicode.IsDigit(c) && c != '.' && c != '_' && c != '-' {
+			return fmt.Errorf("teammate name %q contains invalid char %q (allowed: Unicode letters, digits, . _ -)", name, c)
 		}
 	}
 	return nil
@@ -493,7 +495,8 @@ func (a Agent) InputSchema() map[string]any {
 			},
 			"name": map[string]any{
 				"type":        "string",
-				"description": "Optional team identity for this sub-agent. Named teammates show up in /agents list and can be addressed by MessageTeammate({to: name, body: ...}) from other sub-agents. Must start with a letter; only [a-zA-Z0-9._-] allowed; max 32 chars. Same-name collisions auto-suffix (alice → alice-2 → alice-3 ...). NOTE: `name` is the LABEL; use `subagent_type` to pick the profile/role.",
+				"maxLength":   32,
+				"description": "Optional team identity for this sub-agent. Named teammates show up in /agents list and can be addressed by MessageTeammate({to: name, body: ...}) from other sub-agents. Must start with a Unicode letter (Chinese names such as 界面布局 are supported); remaining characters may be Unicode letters, decimal digits, . _ or -. Maximum 32 Unicode characters, not bytes; no spaces, controls or path separators. Names are matched exactly. Same-name collisions auto-suffix (审阅 → 审阅-2 → 审阅-3 ...). NOTE: `name` is the LABEL; use `subagent_type` to pick the profile/role.",
 			},
 			"subagent_type": map[string]any{
 				"type":        "string",
@@ -1005,6 +1008,8 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// their stable mailbox. Consumers only forward events in this mode. Legacy
 	// children retain advisory per-turn persistence for compatibility.
 	var transcript *agent.SubAgentTranscript
+	var usageRecorder *agent.SubAgentUsageRecorder
+	var activityRecorder *agent.SubAgentActivityRecorder
 	persistedOnDisk := 0
 	durableChild := handoffStore != nil && teammate != nil && !teammate.Anonymous
 	if durableChild && a.sessionDir == "" {
@@ -1050,6 +1055,12 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		}
 		if err == nil {
 			transcript = t
+			var previousHeader *pubsess.Header
+			if resumedSnapshot != nil {
+				previousHeader = &resumedSnapshot.Header
+			}
+			usageRecorder, _ = agent.NewSubAgentUsageRecorder(a.sessionDir, teammate.AgentID, previousHeader)
+			activityRecorder, _ = agent.NewSubAgentActivityRecorder(a.sessionDir, teammate.AgentID)
 			// On resume, rewrite the recovered messages immediately so
 			// the file isn't a stub-with-header-only if the sub-agent
 			// errors before producing new output.
@@ -1058,6 +1069,12 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 					_ = transcript.AppendMessage(m)
 				}
 				persistedOnDisk = len(resumedSnapshot.Messages)
+			}
+			// Make the actual task readable while the child is queued or still
+			// streaming its first response. Subsequent turn checkpoints start
+			// after this initial history and never append the prompt twice.
+			if !durableChild {
+				persistedOnDisk = persistNewMessages(transcript, sub, persistedOnDisk)
 			}
 		}
 	}
@@ -1068,6 +1085,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	transcriptCleanupOwnedByExecute := transcript != nil
 	defer func() {
 		if transcriptCleanupOwnedByExecute {
+			_ = activityRecorder.Close()
 			_ = transcript.Close()
 		}
 	}()
@@ -1116,6 +1134,8 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		agent.WithCwd(context.WithValue(ctx, agentDepthKey{}, depth+1), subCwd),
 		nil,
 	)
+	baseCtx = agent.WithSubAgentUsageRecorder(baseCtx, usageRecorder)
+	baseCtx = agent.WithSubAgentActivityRecorder(baseCtx, activityRecorder)
 	// A child loop owns an internal events channel, but it has no human reply
 	// consumer. Mark that distinction explicitly: EventOut != nil alone only
 	// means the loop can stream progress, not that AskUser can safely block.
@@ -1603,6 +1623,7 @@ func (a Agent) executeForeground(
 	defer transcript.Close()
 	defer agent.TraceInvocationEnded(childCtx)
 	defer recordSubAgentTerminal(transcript, parentOut, parentToolUseID, teammate, parentTraceCallID, parentTraceInvocationID)
+	defer agent.CloseSubAgentActivity(childCtx)
 	defer finalize()
 	// G.15 (2026-05-12) — panic recovery for the foreground path.
 	// The background path already handles this; the foreground was
@@ -1666,6 +1687,7 @@ drainLoop:
 			if !ok {
 				break drainLoop
 			}
+			_ = agent.ObserveSubAgentActivity(childCtx, ev)
 			forwardSubAgentEvent(parentOut, parentToolUseID, ev)
 			switch ev.Kind {
 			case agent.EventTextDelta:
@@ -1803,6 +1825,7 @@ func (a Agent) executeBackground(
 		var terminalOnce sync.Once
 		publishTerminal := func() {
 			terminalOnce.Do(func() {
+				_ = agent.CloseSubAgentActivity(childCtx)
 				recordSubAgentTerminal(transcript, parentOut, parentToolUseID, teammate, parentTraceCallID, parentTraceInvocationID)
 			})
 		}
@@ -1846,6 +1869,7 @@ func (a Agent) executeBackground(
 		persistedMsgCount := persistedOnDisk
 		var eventErr error
 		for ev := range events {
+			_ = agent.ObserveSubAgentActivity(childCtx, ev)
 			forwardSubAgentEvent(parentOut, parentToolUseID, ev)
 			switch ev.Kind {
 			case agent.EventTextDelta:

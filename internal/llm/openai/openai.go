@@ -1546,6 +1546,13 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 		frame, err := s.sse.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if len(s.calls) > 0 {
+					// A socket close does not finalize function-call arguments,
+					// even when the received prefix already parses as an object.
+					// Keep this a retryable stream failure so the agent discards
+					// the draft instead of validating or executing its tools.
+					return StreamEvent{Type: "error", Err: io.ErrUnexpectedEOF}, io.ErrUnexpectedEOF
+				}
 				return StreamEvent{Type: "message_stop"}, io.EOF
 			}
 			safeErr := redactChatError(err, s.exactValues...)
@@ -1556,8 +1563,11 @@ func (s *openAIStream) Recv() (StreamEvent, error) {
 			fmt.Fprintf(os.Stderr, "[oai] raw=%s\n", security.RedactValues(payload, s.exactValues...))
 		}
 		if payload == "[DONE]" {
-			// flush any pending tool_use_stop, then enqueue message_stop.
-			s.flushToolStops()
+			if len(s.calls) > 0 {
+				// [DONE] closes the SSE envelope. Only a choice's explicit
+				// finish_reason authorizes finalizing that choice's tools.
+				return StreamEvent{Type: "error", Err: io.ErrUnexpectedEOF}, io.ErrUnexpectedEOF
+			}
 			s.pending = append(s.pending, StreamEvent{Type: "message_stop"})
 			return s.popPending()
 		}

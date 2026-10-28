@@ -10,15 +10,12 @@ package openai
 
 import "testing"
 
-func TestMaxContextTokens_VendorPublishedDefaults(t *testing.T) {
-	// Disable the models.dev background fetch — these tests pin the
-	// hardcoded prefix table + suffix parser behaviour. With catalog
-	// enabled the background warm-up races in and serves whatever
-	// models.dev publishes today, which can drift from the static
-	// fixtures here. The Default() singleton checks this env at first
-	// call; setting it before the first provider construction is
-	// enough because Go's `go test` starts each package fresh.
-	t.Setenv("METIS_CATALOG_DISABLE", "1")
+func TestFallbackContextWindow_VendorDefaults(t *testing.T) {
+	// Pin the static prefix table and suffix parser directly. MaxContextTokens
+	// also consults a shared catalog singleton, which may already contain the
+	// user's cache or have been initialized by another test. Setting an env var
+	// here cannot retroactively disable that singleton. Catalog precedence is
+	// exercised separately by the context-capability tests.
 	cases := []struct {
 		model string
 		want  int
@@ -91,9 +88,9 @@ func TestMaxContextTokens_VendorPublishedDefaults(t *testing.T) {
 	}
 	for _, c := range cases {
 		o := &OpenAI{Model: c.model}
-		got := o.MaxContextTokens()
+		got := o.fallbackContextWindow()
 		if got != c.want {
-			t.Errorf("MaxContextTokens(%q) = %d; want %d (vendor-published)", c.model, got, c.want)
+			t.Errorf("fallbackContextWindow(%q) = %d; want %d", c.model, got, c.want)
 		}
 	}
 }

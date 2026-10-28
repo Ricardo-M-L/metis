@@ -194,7 +194,11 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 		Mode: agent.SubPromptFork,
 		Base: snap.System,
 	})
-	sub := agent.NewLoop(f.provider, f.registry, f.gate, agent.NewHookRegistry(), subSystem, maxIter)
+	// Root permission controls capture the root Gate and must not be invoked
+	// through a child PlanController. Like cold Agent children, Fork can return
+	// a proposed plan as text while the root owns approval and mode transitions.
+	childRegistry := agentChildRegistry(f.registry, f.gate, f.gate != nil && f.gate.Mode() == permission.ModePlan)
+	sub := agent.NewLoop(f.provider, childRegistry, f.gate, agent.NewHookRegistry(), subSystem, maxIter)
 	if snap.Model != "" {
 		sub.Model = snap.Model
 	}
@@ -227,7 +231,12 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// mid-fork.
 	sub.AppendUser(buildForkDirective(directive))
 
-	childCtx := context.WithValue(ctx, forkDepthKey{}, depth+1)
+	childCtx, cancelChild := context.WithCancel(context.WithValue(ctx, forkDepthKey{}, depth+1))
+	// Fork has no persisted agent identity; keep its direct usage/activity out
+	// of an enclosing Agent child's recorded conversation and token receipts.
+	childCtx = agent.WithSubAgentUsageRecorder(childCtx, nil)
+	childCtx = agent.WithSubAgentActivityRecorder(childCtx, nil)
+	defer cancelChild()
 	// Like a cold Agent child, a fork owns an internal progress channel but no
 	// human reply consumer. Without this explicit boundary fullAccess would let
 	// AskUser execute and block forever waiting on the fork's private event loop.
@@ -240,17 +249,17 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() {
-		// Execute returns as soon as it consumes EventError, but Loop.Run may
-		// still be unwinding hooks and deferred cleanup on this goroutine. Keep
-		// the trace owner alive for that actual child lifetime so terminal child
-		// events cannot be orphaned behind an already-finished Fork result.
+		// Close the stream only after child cleanup and trace ownership have
+		// joined. A failure is not permission to leave an old producer running
+		// into the parent's next (possibly Plan-only) tool batch.
+		defer close(events)
 		defer agent.TraceInvocationEnded(childCtx)
 		done <- sub.Run(childCtx, events)
-		close(events)
 	}()
 
 	parentOut := agent.EventOutFromContext(ctx)
 	var output strings.Builder
+	var childErr error
 	stopReason := ""
 	for ev := range events {
 		// Forward selected sub-events upstream so the user sees
@@ -288,11 +297,18 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 			stopReason = ev.StopReason
 		case agent.EventError:
 			if ev.Err != nil {
-				return &tools.Result{Output: ev.Err.Error(), IsError: true}, nil
+				childErr = errors.Join(childErr, ev.Err)
+				cancelChild()
+				if parentOut != nil {
+					select {
+					case parentOut <- agent.Event{Kind: agent.EventInfo, Info: "Fork child failed; waiting for its work to stop."}:
+					default:
+					}
+				}
 			}
 		}
 	}
-	if err := <-done; err != nil {
+	if err := errors.Join(childErr, <-done); err != nil {
 		return &tools.Result{Output: err.Error(), IsError: true}, nil
 	}
 

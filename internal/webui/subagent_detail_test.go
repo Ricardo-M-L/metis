@@ -2,13 +2,11 @@ package webui
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -368,122 +366,27 @@ func TestDesktopSubAgentPanelLivesInHeaderAndLoadsOutput(t *testing.T) {
 	if strings.Contains(page[statusStart:inputStart], `id="statusChip"`) {
 		t.Fatal("sub-agent status trigger is still mounted above the composer")
 	}
-	for _, want := range []string{`id="subAgentDetailOverlay"`, `id="subAgentDetailBody"`, `aria-modal="true"`} {
-		if !strings.Contains(page, want) {
-			t.Fatalf("sub-agent detail markup missing %q", want)
+	readerStart := strings.Index(page, `<div class="subagent-detail-overlay"`)
+	if readerStart < 0 {
+		t.Fatal("sub-agent conversation reader is missing")
+	}
+	readerEnd := strings.Index(page[readerStart:], "</section>")
+	if readerEnd < 0 {
+		t.Fatal("sub-agent conversation region is incomplete")
+	}
+	reader := page[readerStart : readerStart+readerEnd]
+	for _, want := range []string{`id="subAgentDetailOverlay"`, `data-presentation="page"`, `role="region"`, `id="subAgentDetailBody"`, `tabindex="0"`, `aria-live="off"`, `id="subAgentBack"`, `id="subAgentDetailMetrics"`, `id="subAgentDetailInfo"`, `id="subAgentDetailFooterActions"`} {
+		if !strings.Contains(reader, want) {
+			t.Fatalf("sub-agent reader markup missing %q", want)
 		}
 	}
-
-	source, err := staticFS.ReadFile("static/app.js")
-	if err != nil {
-		t.Fatal(err)
+	if strings.Contains(reader, `aria-modal=`) || strings.Contains(reader, `role="dialog"`) {
+		t.Fatal("read-only child page must not inherit modal semantics")
 	}
-	js := string(source)
-	for _, want := range []string{"new window.EventSource('/api/subagents/'", "addEventListener('delta'", "subAgentDetailStream"} {
-		if !strings.Contains(js, want) {
-			t.Fatalf("sub-agent live stream wiring missing %q", want)
-		}
+	chatScript := strings.Index(page, `<script src="chat.js`)
+	readerScript := strings.Index(page, `<script src="subagent_view.js`)
+	if chatScript < 0 || readerScript <= chatScript {
+		t.Fatal("sub-agent reader must load after its production Markdown formatter")
 	}
-	start := strings.Index(js, "function renderStatusSnapshot(d)")
-	endOffset := -1
-	if start >= 0 {
-		endOffset = strings.Index(js[start:], "// ============================================================\n// Layout")
-	}
-	end := start + endOffset
-	if start < 0 || end <= start {
-		t.Fatal("cannot isolate sub-agent Desktop interaction code")
-	}
-
-	node, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node is not installed")
-	}
-	// Execute the real panel code with a small browser-shaped harness. This
-	// proves that selecting a roster row opens the dialog and requests the
-	// live output endpoint, rather than merely asserting source strings.
-	const harness = `
-const assert = require('node:assert/strict');
-const vm = require('node:vm');
-const source = require('node:fs').readFileSync(0, 'utf8');
-class Element {
-  constructor(){ this.style={display:'none'}; this.dataset={}; this.attrs={}; this.hidden=true; this.textContent=''; this.innerHTML=''; this.children=[]; this.listeners={}; this.classList={add(){},remove(){},toggle(){}}; }
-  setAttribute(k,v){ this.attrs[k]=String(v); }
-  appendChild(v){ this.children.push(v); return v; }
-  append(...vs){ this.children.push(...vs); }
-  addEventListener(k,fn){ (this.listeners[k] ||= []).push(fn); }
-  querySelector(){ return this.dialog ||= new Element(); }
-  querySelectorAll(){ return []; }
-  focus(){ this.focused=true; }
-}
-const byId = new Map();
-for (const id of ['statusPopover','statusChip','subAgentDetailOverlay','subAgentDetailTitle','subAgentDetailDescription','subAgentDetailBody']) byId.set(id,new Element());
-const overlay = byId.get('subAgentDetailOverlay'); overlay.dialog = new Element();
-const requested = [];
-const c = {
-  console, Promise, Map, Set, encodeURIComponent, requestAnimationFrame: fn => fn(), setInterval:()=>1, clearInterval(){},
-  currentSessionId:'session-a', lastStatusSnapshot:null,
-  DESKTOP_I18N:{'zh-CN':{subAgents:'子代理',backgroundTasks:'后台任务'},en:{subAgents:'sub-agents',backgroundTasks:'background tasks'}},
-  subAgentDetailState:{agentId:'',ownerSessionId:'',trigger:null,data:null,loading:false,error:'',requestGeneration:0},
-  subAgentDetailStream:null, subAgentDetailStreamGeneration:0,
-  document:{documentElement:{lang:'zh-CN'}, body:new Element(), getElementById:id=>byId.get(id)||null, createElement:()=>new Element(), addEventListener(){}},
-  uiText:(en,zh)=>zh, escHtml:v=>String(v), escAttr:v=>String(v),
-  renderContextMeter(){},
-  fetch:async url=>{requested.push(url);return {ok:true,json:async()=>({agent:{name:'transport',agentId:'agt-transport',sessionId:'session-a',status:'completed',background:true,elapsedMs:2400,output:'正在读取 transport.go'}})};},
-};
-c.window=c; vm.createContext(c); vm.runInContext(source.replace('} catch (_) { /* status is best-effort */ }', '} catch (error) { throw error; }'),c);
-(async()=>{
-  const status = {activeSessionId:'session-a',subAgents:0,backgroundTasks:0,agents:[],jobs:[],
-    viewRoster:{sessionId:'session-a',subAgents:0,backgroundTasks:0,
-      agents:[{agentId:'agt-transport',sessionId:'session-a',name:'transport',status:'completed'}],jobs:[]}};
-  c.lastStatusSnapshot=status;
-  c.renderStatusSnapshot(status);
-  assert.equal(byId.get('statusChip').style.display,'','completed sub-agent remains discoverable');
-  c.renderStatusPopover();
-  assert.match(byId.get('statusPopover').innerHTML,/data-subagent-session-id="session-a"/);
-  assert.match(byId.get('statusPopover').innerHTML,/查看输出/);
-  c.openSubAgentDetails('agt-transport', byId.get('statusChip'), 'session-a');
-  await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(requested.at(-1),'/api/subagents/agt-transport?sessionId=session-a');
-  assert.equal(overlay.hidden,false);
-  assert.equal(byId.get('subAgentDetailTitle').textContent,'transport');
-  assert.match(byId.get('subAgentDetailDescription').textContent,/已完成/);
-  assert.match(byId.get('subAgentDetailBody').children.at(-1).children.at(-1).textContent,/transport.go/);
-  c.closeSubAgentDetails();
-  const before = requested.length;
-  c.currentSessionId='session-b';
-  c.openSubAgentDetails('agt-transport', byId.get('statusChip'), 'session-a');
-  assert.equal(requested.length,before,'cross-session direct entry must not fetch');
-  assert.equal(overlay.hidden,true,'cross-session direct entry must not open');
-  c.renderStatusSnapshot(status);
-  assert.equal(byId.get('statusChip').style.display,'none','other session must not show this roster');
-  c.renderStatusPopover();
-  assert.doesNotMatch(byId.get('statusPopover').innerHTML,/agt-transport/,'other session must not list this agent');
-  const streams=[];
-  c.EventSource=class {
-    constructor(url){ this.url=url; this.listeners={}; this.closed=false; streams.push(this); }
-    addEventListener(name,fn){ this.listeners[name]=fn; }
-    close(){ this.closed=true; }
-    emit(name,payload){ this.listeners[name]({data:JSON.stringify(payload)}); }
-  };
-  c.currentSessionId='session-a';
-  c.openSubAgentDetails('agt-transport', byId.get('statusChip'), 'session-a');
-  assert.equal(streams.at(-1).url,'/api/subagents/agt-transport/events?sessionId=session-a');
-  const stream=streams.at(-1);
-  stream.emit('snapshot',{agent:{agentId:'agt-transport',sessionId:'session-b',status:'running',output:'wrong session output'}});
-  assert.equal(c.subAgentDetailState.data,null,'foreign snapshot must not enter dialog');
-  stream.emit('snapshot',{agent:{agentId:'agt-transport',sessionId:'session-a',status:'running',output:'owned output'}});
-  assert.equal(c.subAgentDetailState.data.output,'owned output');
-  stream.emit('delta',{agentId:'agt-transport',sessionId:'session-b',delta:' foreign delta'});
-  assert.equal(c.subAgentDetailState.data.output,'owned output','foreign delta must not append');
-  c.currentSessionId='session-b';
-  c.renderStatusSnapshot(status);
-  assert.equal(overlay.hidden,true,'session switch closes previous child dialog');
-  assert.equal(stream.closed,true,'session switch closes child output stream');
-})().catch(error=>{console.error(error);process.exitCode=1;});
-`
-	cmd := exec.Command(node, "-e", harness)
-	cmd.Stdin = bytes.NewBufferString(strings.ReplaceAll(js[start:end], "setInterval(pollStatus, 3000);\npollStatus();", ""))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("sub-agent Desktop interaction: %v\n%s", err, out)
-	}
+	runSubagentConversationUI(t, "panel_lifecycle")
 }

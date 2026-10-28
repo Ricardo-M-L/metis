@@ -54,6 +54,8 @@ func (u *usageTotals) applyStreamEvent(event llm.StreamEvent) error {
 // state lock; that simplifies reasoning about deadlocks since this is the
 // longest-running phase of a turn.
 func (l *Loop) consumeStream(ctx context.Context, s llm.StreamReader, out chan<- Event) ([]llm.ContentBlock, string, *usageTotals, error) {
+	s = observeSubAgentUsageStream(ctx, s)
+	defer finishSubAgentUsageStream(s)
 	var (
 		blocks       []llm.ContentBlock
 		curText      string

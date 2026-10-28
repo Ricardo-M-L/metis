@@ -146,6 +146,21 @@ func (s *Store) deleteSubagentTranscripts(id string) error {
 		if !matches {
 			continue
 		}
+		// Display receipts follow the current transcript's verified owner. An
+		// agent resumed under another parent must retain its new sidecars when
+		// the old parent is deleted. Remove these before the ownership header so
+		// a failed removal remains discoverable and retryable.
+		var sidecarErr error
+		for _, sidecarDir := range []string{"subagent-usage", "subagent-activity"} {
+			sidecarPath := filepath.Join(s.Dir, sidecarDir, entry.Name())
+			if err := os.Remove(sidecarPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				sidecarErr = errors.Join(sidecarErr, fmt.Errorf("delete session %s %q: %w", sidecarDir, entry.Name(), err))
+			}
+		}
+		if sidecarErr != nil {
+			joined = errors.Join(joined, sidecarErr)
+			continue
+		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			joined = errors.Join(joined, fmt.Errorf("delete session subagent %q: %w", entry.Name(), err))
 		}
