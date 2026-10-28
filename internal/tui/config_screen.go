@@ -53,6 +53,7 @@ func (m *Model) configSettingsSnapshot() []screen.ConfigSetting {
 		{Key: "ui.performance.reduced_motion", Label: "Reduced motion", Description: "Reduce animation and redraw frequency", Value: strconv.FormatBool(running.UI.Performance.ReducedMotion), EffectiveValue: strconv.FormatBool(running.UI.Performance.ReducedMotion), Options: []string{"false", "true"}},
 		{Key: "ui.performance.mouse_wheel_lines", Label: "Mouse wheel lines", Description: "Transcript lines per wheel event", Value: strconv.Itoa(running.UI.Performance.MouseWheelLines), EffectiveValue: strconv.Itoa(running.UI.Performance.MouseWheelLines)},
 		{Key: "ui.performance.max_mounted_items", Label: "Mounted item limit", Description: "Bound rendered transcript items (0 unlimited)", Value: strconv.Itoa(running.UI.Performance.MaxMountedItems), EffectiveValue: strconv.Itoa(running.UI.Performance.MaxMountedItems)},
+		{Key: "ui.prompt_suggestions", Label: "Prompt suggestions", Description: "Suggest a next message with one short model request; Tab accepts", Value: strconv.FormatBool(running.UI.PromptSuggestions), EffectiveValue: strconv.FormatBool(running.UI.PromptSuggestions), Options: []string{"false", "true"}},
 	}
 	for i := range settings {
 		source, err := config.UserSettingOverrideSource(settings[i].Key)
@@ -170,6 +171,10 @@ func (m *Model) applyLiveConfigChanges(candidate *config.Config, changes []scree
 		case "ui.thinking_display":
 			m.cfg.UI.ThinkingDisplay = candidate.UI.ThinkingDisplay
 			m.thinkingDisplay = configuredThinkingDisplay(candidate)
+			live++
+		case "ui.prompt_suggestions":
+			m.cfg.UI.PromptSuggestions = candidate.UI.PromptSuggestions
+			m.clearPromptSuggestion()
 			live++
 		case "ui.performance.reduced_motion":
 			m.cfg.UI.Performance.ReducedMotion = candidate.UI.Performance.ReducedMotion

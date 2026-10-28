@@ -246,6 +246,7 @@ var editableUserSettings = map[string]userSettingSpec{
 	"ui.markdown":                         {table: "ui", field: "markdown", kind: userSettingBool},
 	"ui.show_tokens":                      {table: "ui", field: "show_tokens", kind: userSettingBool},
 	"ui.show_tool_json":                   {table: "ui", field: "show_tool_json", kind: userSettingBool},
+	"ui.prompt_suggestions":               {table: "ui", field: "prompt_suggestions", kind: userSettingBool},
 	"ui.thinking_display":                 {table: "ui", field: "thinking_display", kind: userSettingString, validate: oneOf("show", "auto", "hide")},
 	"ui.streamlined_output":               {table: "ui", field: "streamlined_output", kind: userSettingBool},
 	"ui.permission_timeout_seconds":       {table: "ui", field: "permission_timeout_seconds", kind: userSettingInt, validate: intRange(0, 86400)},
@@ -534,6 +535,8 @@ func effectiveUserSettingValue(cfg *Config, key string) (string, bool) {
 		return strconv.FormatBool(cfg.UI.ShowTokens), true
 	case "ui.show_tool_json":
 		return strconv.FormatBool(cfg.UI.ShowToolJSON), true
+	case "ui.prompt_suggestions":
+		return strconv.FormatBool(cfg.UI.PromptSuggestions), true
 	case "ui.thinking_display":
 		return cfg.UI.ThinkingDisplay, true
 	case "ui.streamlined_output":

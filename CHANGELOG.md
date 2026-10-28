@@ -7,6 +7,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- Offer optional gray next-turn prompt suggestions in the terminal and Desktop
+  after a completed response. Tab accepts the suggestion as editable text without
+  sending it; typing, cancellation, session changes and stale responses cannot
+  overwrite an existing draft.
+- Add the live `ui.prompt_suggestions` setting. Suggestions use one short,
+  cancellable, tool-free request through the session's configured provider/model,
+  preserve conversation history and silently skip failures or irrelevant output.
 
 ## [0.4.100] - 2026-10-28
 

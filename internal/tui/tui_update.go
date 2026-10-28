@@ -134,6 +134,11 @@ func (m *Model) Init() tea.Cmd {
 }
 
 func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
+	defer m.reconcilePromptSuggestion()
+	if result, ok := msg.(promptSuggestionResultMsg); ok {
+		m.applyPromptSuggestion(result)
+		return m, nil
+	}
 	// Snapshot before either event-drain below. The welcome, idle, requesting,
 	// and live response frames have different row geometry. Ultraviolet's
 	// fullscreen hard-scroll optimizer can transform those changes with
@@ -371,6 +376,7 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case tea.PasteMsg:
+		m.clearPromptSuggestion()
 		// Bracketed paste: terminal wraps cmd+V'd content with
 		// \x1b[200~ … \x1b[201~ and bubbletea v2 reports it as a
 		// single PasteMsg (instead of streaming each char as a
@@ -843,7 +849,8 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		}
 		// A readiness message may have arrived while turnActive was still true.
 		// Recheck after finalization so that edge cannot be lost.
-		return m, m.resumeForBackgroundJob()
+		resume := m.resumeForBackgroundJob()
+		return m, tea.Batch(resume, m.startPromptSuggestion())
 
 	case tick:
 		return m, tickCmd
@@ -1121,6 +1128,9 @@ func (m *Model) finalizeTurn(err error) {
 			// read the updated input value.
 			m.queuePending = true
 		}
+	}
+	if err == nil && persistErr == nil && !m.turnCancelledByUser {
+		m.queuePromptSuggestion()
 	}
 }
 

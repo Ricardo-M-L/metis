@@ -93,6 +93,9 @@ func (m *Model) expandableToolEventIDs() []string {
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() != "tab" {
+		m.clearPromptSuggestion()
+	}
 	// Ctrl-C copies a composer selection before it acquires any cancellation
 	// meaning. Keep this check ahead of both OAuth and foreground-turn handling
 	// so selecting text never accidentally stops background work.
@@ -681,7 +684,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "tab":
-		m.doAutocomplete()
+		if !m.acceptPromptSuggestion() {
+			m.doAutocomplete()
+		}
 		return m, nil
 
 	case "shift+tab":

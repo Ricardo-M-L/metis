@@ -689,6 +689,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/turns", s.handleTurn)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/settings", s.handleSettings)
+	mux.HandleFunc("/api/prompt-suggestion", s.handlePromptSuggestion)
 	mux.HandleFunc("/api/computer-use", s.handleComputerUse)
 	mux.HandleFunc("/api/commands/session", s.handleSessionCommand)
 	mux.HandleFunc("/api/checkpoint", s.handleCheckpointControl)
@@ -4802,6 +4803,7 @@ var allowedWebSettings = map[string]bool{
 	"permission.mode":                     true,
 	"ui.theme":                            true,
 	"ui.thinking_display":                 true,
+	"ui.prompt_suggestions":               true,
 	"session.auto_compact_threshold":      true,
 	"session.auto_compact_minimum_tokens": true,
 	"session.max_iterations":              true,
@@ -4854,6 +4856,8 @@ func (s *Server) listSettings(w http.ResponseWriter) {
 			Value: strconv.Itoa(cfg.Session.MaxIterations), RestartRequired: true},
 		{Key: "loop_detection.disabled", Label: "Loop detection disabled", Description: "Repeated-tool loop detection", Type: "bool",
 			Value: strconv.FormatBool(cfg.LoopDetection.Disabled), RestartRequired: true},
+		{Key: "ui.prompt_suggestions", Label: "Prompt suggestions", Description: "Suggest a next message with one short model request; Tab accepts", Type: "bool",
+			Value: strconv.FormatBool(cfg.UI.PromptSuggestions)},
 	}
 	for i := range items {
 		if source, serr := config.UserSettingOverrideSource(items[i].Key); serr != nil {
@@ -5022,8 +5026,8 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 			} else {
 				restart = append(restart, c.Key)
 			}
-		case "ui.theme":
-			// Persisted now; the browser swaps the palette client-side.
+		case "ui.theme", "ui.prompt_suggestions":
+			// Persisted now; the browser applies the presentation change.
 			live = append(live, c.Key)
 		default:
 			restart = append(restart, c.Key)
@@ -5048,7 +5052,7 @@ func validWebSettingValue(key, value string) bool {
 		return allowedWebThemes[value]
 	case "ui.thinking_display":
 		return value == "show" || value == "hide" || value == "auto"
-	case "loop_detection.disabled":
+	case "loop_detection.disabled", "ui.prompt_suggestions":
 		_, err := strconv.ParseBool(value)
 		return err == nil
 	case "session.auto_compact_threshold":

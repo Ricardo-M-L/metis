@@ -427,6 +427,8 @@ type UI struct {
 	Markdown     bool   `toml:"markdown"`
 	ShowTokens   bool   `toml:"show_tokens"`
 	ShowToolJSON bool   `toml:"show_tool_json"`
+	// PromptSuggestions makes one short, tool-free request after a completed turn.
+	PromptSuggestions bool `toml:"prompt_suggestions"`
 	// ThinkingDisplay controls provider-visible reasoning in the TUI:
 	// "show" renders the full trace, "auto" keeps a compact live/history
 	// preview, and "hide" suppresses it. This never invents hidden model
@@ -729,11 +731,12 @@ func defaults() *Config {
 			Mode: "default",
 		},
 		UI: UI{
-			Theme:           "auto",
-			Markdown:        true,
-			ShowTokens:      true,
-			ShowToolJSON:    false,
-			ThinkingDisplay: "auto",
+			Theme:             "auto",
+			Markdown:          true,
+			ShowTokens:        true,
+			ShowToolJSON:      false,
+			ThinkingDisplay:   "auto",
+			PromptSuggestions: true,
 			Performance: UIPerformance{
 				TickMs:          40,
 				EventBufferSize: 256,

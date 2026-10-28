@@ -294,6 +294,7 @@ A later source wins when two skills have the same name.
 
 | Key | What |
 |------|------|
+| `Tab` | accept a visible next-turn suggestion into the draft without sending; otherwise keep command/file completion |
 | `Shift+Tab` | cycle permission mode (default → acceptEdits → plan → bypassPermissions → fullAccess) |
 | `Ctrl+T` | toggle todo overlay |
 | `Ctrl+O` | expand the last tool result |
@@ -340,6 +341,20 @@ With capture disabled, Metis does not receive wheel, click, drag, or link-click
 events: use `PgUp`/`PgDn` and `Home`/`End` to navigate, `Ctrl+Y` or
 `Ctrl+Shift+Y` to copy replies, and `Ctrl+S` for native selection (including
 copying a URL to open manually).
+
+### Next-turn prompt suggestions
+
+After a successful response, the terminal and Desktop can show a dim suggested
+next message in an empty composer. Press **Tab** to turn it into editable text;
+press Enter only after accepting or typing a real draft to send it. Enter on an
+unaccepted suggestion does not submit it. Typing or Escape dismisses it, and
+session changes, queued work, attachments and existing drafts take precedence.
+
+Suggestions are enabled by default and use one additional short, cancellable
+request through that session's configured provider/model. They cannot run tools
+or change conversation history. Failure, timeout, or no useful follow-up simply
+means no suggestion. Disable **Prompt suggestions** in terminal `/config` or
+Desktop settings, or set `ui.prompt_suggestions = false` in `config.toml`.
 
 ## Configuration
 
@@ -448,6 +463,7 @@ theme = "auto"
 markdown = true
 show_tokens = true
 thinking_display = "auto"   # show=full provider reasoning; auto=compact; hide=off
+prompt_suggestions = true    # one short next-turn request; Tab accepts, never auto-sends
 
 [ui.performance]
 tick_ms = 40                  # 25fps default; 16=60fps, 100=10fps

@@ -278,7 +278,8 @@ type Model struct {
 	// textinput) lets the user paste multi-line code and split prompts
 	// across rows with Alt+Enter / Ctrl+J. Enter still submits — handleKey
 	// intercepts KeyEnter before it reaches textarea.
-	input textarea.Model
+	input            textarea.Model
+	promptSuggestion promptSuggestionState
 	// effortPicker is the inline /effort selector rendered immediately below
 	// the input. It intentionally does not use activeScreen: opening the effort
 	// dial must preserve the visible transcript instead of replacing the chat
@@ -763,7 +764,7 @@ const ctrlCQuitWindow = 600 * time.Millisecond
 
 func newComposer() textarea.Model {
 	ti := textarea.New()
-	ti.Placeholder = "type a message · /commands · alt+enter newline"
+	ti.Placeholder = defaultInputPlaceholder
 	ti.Focus()
 	ti.CharLimit = 8192
 	ti.SetWidth(80)

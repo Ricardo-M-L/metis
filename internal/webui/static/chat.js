@@ -122,6 +122,7 @@ function connectEvents() {
     if (runningTurnIncompleteReason) showToast(incompleteTurnMessage(runningTurnIncompleteReason));
     const state = stopped ? 'stopped' : (d.incomplete ? 'incomplete' : 'completed');
     finishUserTurn(state, d.stopReason || '');
+    if (typeof markComposerPromptSuggestion === 'function') markComposerPromptSuggestion(state, currentSessionId, activityCurrentTurnId);
   });
   onLive('agent_error', d => {
     showToast('Agent error: ' + (d.message || 'request failed'));
@@ -1847,12 +1848,14 @@ function setTurnRunning(running, sessionId) {
   syncTurnControls();
   renderSessions();
   renderTodoPlan();
+  if (!running && typeof refreshComposerPromptSuggestion === 'function') refreshComposerPromptSuggestion();
 }
 
 // Detach transient DOM state when the user views another transcript. The
 // agent turn remains alive and tracked by runningSessionId; only its old live
 // rendering pointers are discarded so completion cannot write into session B.
 function detachRunningTurnView() {
+  if (typeof clearComposerPromptSuggestion === 'function') clearComposerPromptSuggestion();
   if (typeof virtualHistoryDetach === 'function') virtualHistoryDetach();
   cancelStreamingRender();
   cancelChatScroll();
@@ -2063,6 +2066,7 @@ function finishUserTurn() {
 
 // Called at the start of each user turn to reset per-turn stream state.
 function beginUserTurn() {
+  if (typeof clearComposerPromptSuggestion === 'function') clearComposerPromptSuggestion();
   if (typeof virtualHistoryRefreshGeneration !== 'undefined') virtualHistoryRefreshGeneration++;
   streamedTextThisTurn = false;
   runningTurnIncompleteReason = '';
@@ -2080,6 +2084,7 @@ function beginUserTurn() {
 // new chat, and SSE reconnect so nothing from a previous session leaks
 // into the next (timer, pending question, tool details, thinking row).
 function resetTurnState() {
+  if (typeof clearComposerPromptSuggestion === 'function') clearComposerPromptSuggestion();
   if (typeof virtualHistoryDetach === 'function') virtualHistoryDetach();
   cancelStreamingRender();
   cancelChatScroll();
@@ -5643,6 +5648,7 @@ document.addEventListener('keydown', event => {
 });
 
 function onComposerInput(el) {
+  if (typeof clearComposerPromptSuggestion === 'function') clearComposerPromptSuggestion();
   autoResize(el);
   updateCommandMenu(el.value);
 }
@@ -6290,6 +6296,7 @@ function handleKeydown(e) {
   // WebKit can report keyCode 229 while an IME candidate is being committed.
   // Let the input method consume Enter and navigation keys without sending.
   if (e.isComposing || e.keyCode === 229) return;
+  if (typeof composerPromptSuggestions !== 'undefined' && composerPromptSuggestions && composerPromptSuggestions.handleKey(e)) return;
 
   const menuOpen = commandMatches.length > 0 && document.getElementById('commandMenu').style.display !== 'none';
   if (menuOpen && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
@@ -6362,6 +6369,7 @@ function updateSendBtn() {
   button.title = label;
   button.setAttribute('aria-label', label);
   button.disabled = selectingWorkspace || !!(typeof pendingSessionId !== 'undefined' && pendingSessionId) || !val && !attachments.length && !resuming;
+  if (typeof refreshComposerPromptSuggestion === 'function') refreshComposerPromptSuggestion();
 }
 
 // --- Model ---
@@ -6419,6 +6427,7 @@ function modelMenuKeydown(event) {
 }
 
 async function switchModel(provider, model) {
+  if (typeof clearComposerPromptSuggestion === 'function') clearComposerPromptSuggestion();
   document.getElementById('modelMenu').style.display = 'none';
   modelMenuOpen = false;
   document.getElementById('modelBtn')?.setAttribute('aria-expanded', 'false');
@@ -6590,6 +6599,7 @@ let settingsTab = 'general';
 let themeMedia = null;
 
 async function openSettings(tab = settingsTab, fromNavigation = false) {
+  if (typeof clearComposerPromptSuggestion === 'function') clearComposerPromptSuggestion();
   if (!fromNavigation && window.metisNavigation) {
     return window.metisNavigation.navigate({ page: 'settings', tab });
   }
@@ -8119,6 +8129,7 @@ async function saveSettingValue(key, value) {
     const st = settingByKey(key);
     if (st) st.value = String(value);
     if (key === 'ui.theme') applyTheme(value);
+    if (key === 'ui.prompt_suggestions' && typeof setComposerPromptSuggestionsEnabled === 'function') setComposerPromptSuggestionsEnabled(value);
     const live = (data.liveApplied || []).includes(key);
     showToast(live ? 'Saved: ' + key + ' (applied immediately)' : 'Saved: ' + key + ' (applies after restart)');
   } catch (e) {
