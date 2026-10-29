@@ -515,13 +515,6 @@ func renderStatusBar(m *Model) string {
 	// claude-code doesn't ship one either; the spinner row already
 	// surfaces per-turn duration when it matters.
 	var leftParts []string
-	if m.checkpointState != nil && m.loop.CheckpointManager() == m.checkpointManager {
-		label := "检查点：关"
-		if m.checkpointState.Enabled {
-			label = "检查点：开"
-		}
-		leftParts = append(leftParts, label)
-	}
 	if m.loop != nil {
 		effort := m.loop.EffortValue()
 		if g := effortGlyph(effort); g != "" {

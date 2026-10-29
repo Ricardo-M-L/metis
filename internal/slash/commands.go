@@ -436,7 +436,7 @@ func RegisterAll(r *Registry, cfg *config.Config) {
 		// Display is empty — the runtime renders the screen directly.
 		return "", SignalHistory
 	}})
-	r.Register(Cmd{Name: "checkpoint", Description: "查看、开启或关闭代码检查点；主目录可指定项目范围", ArgumentHint: "[status|on [项目目录…]|off]", Category: "session", Handler: func(_ string) (string, Signal) {
+	r.Register(Cmd{Name: "checkpoint", Description: "查看、开启或关闭当前会话的代码检查点", ArgumentHint: "[status|on|off]", Category: "session", Handler: func(_ string) (string, Signal) {
 		return "", SignalCheckpoint
 	}})
 	r.Register(Cmd{Name: "save", Description: "fsync the current session to disk", Handler: func(_ string) (string, Signal) {

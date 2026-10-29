@@ -171,7 +171,7 @@ func readControl(sessionID, workspace string) (controlSettings, string, error) {
 	if state.Roots, err = normalizeRoots(cwd, state.Roots, false); err != nil {
 		return state, path, err
 	}
-	if state.Enabled && len(state.Roots) == 0 {
+	if state.Enabled && len(state.Roots) == 0 && !isUnsafeCheckpointRoot(cwd) {
 		return state, path, errors.New("checkpoint: enabled settings require project scope")
 	}
 	return state, path, nil
@@ -349,13 +349,17 @@ func (m *Manager) applyControlLocked(state controlSettings) bool {
 	changed := m.controlRevision != state.Revision
 	m.controlRevision = state.Revision
 	m.scopeRoots = append([]string(nil), state.Roots...)
+	m.sparse.Store(isUnsafeCheckpointRoot(m.cwd) && len(state.Roots) == 0)
 	key := strings.Join(state.Roots, "\x00")
 	if len(state.Roots) == 1 && state.Roots[0] == "." {
 		key = ""
 	}
+	if m.Sparse() {
+		key = "session-files"
+	}
 	m.scopeKey.Store(key)
 	m.automaticOff.Store(!state.Enabled)
-	m.disabledByPolicy.Store(isUnsafeCheckpointRoot(m.cwd) && len(state.Roots) == 0)
+	m.disabledByPolicy.Store(m.Sparse() && !state.Enabled && state.Revision == "auto")
 	m.disabled = m.initErr != nil || m.disabledByPolicy.Load()
 	m.controlErr = nil
 	if changed {
@@ -370,7 +374,15 @@ func (m *Manager) refreshControlLocked() (bool, error) {
 		m.automaticOff.Store(true)
 		return false, err
 	}
-	return m.applyControlLocked(state), nil
+	changed := m.applyControlLocked(state)
+	if m.Sparse() {
+		if err := m.loadSparsePathsLocked(); err != nil {
+			m.controlErr = err
+			m.automaticOff.Store(true)
+			return changed, err
+		}
+	}
+	return changed, nil
 }
 
 // A shared session lease keeps settings stable through the whole model turn,
@@ -405,6 +417,9 @@ func (m *Manager) ScopeKey() string {
 	return ""
 }
 func (m *Manager) scopeContains(rel string) bool {
+	if m.Sparse() {
+		return m.sparsePaths[rel]
+	}
 	for _, root := range m.scopeRoots {
 		if root == "." || rel == root || strings.HasPrefix(rel, root+"/") {
 			return true
@@ -480,7 +495,7 @@ func (m *Manager) ControlStatus() ControlStatus {
 		if status.Mode == "off" {
 			status.Reason = "已手动关闭；已有快照保留"
 		} else {
-			status.Reason = "请在项目工作区中开启"
+			status.Reason = "当前会话的检查点已关闭"
 		}
 	}
 	return status
@@ -513,9 +528,6 @@ func (m *Manager) Command(ctx context.Context, args string) (ControlStatus, erro
 	if err != nil {
 		return ControlStatus{}, err
 	}
-	if action == "on" && len(paths) == 0 && isUnsafeCheckpointRoot(old.Workspace) {
-		return ControlStatus{}, errors.New("请在项目工作区中开启")
-	}
 	next := old
 	next.Enabled = action == "on"
 	next.Revision = fmt.Sprintf("%d", time.Now().UnixNano())
@@ -526,9 +538,7 @@ func (m *Manager) Command(ctx context.Context, args string) (ControlStatus, erro
 				paths = []string{"."}
 			}
 		}
-		if len(paths) == 0 {
-			return ControlStatus{}, errors.New("checkpoint: 请指定项目目录，例如 /checkpoint on Documents/project")
-		}
+
 		next.Roots, err = normalizeRoots(old.Workspace, paths, true)
 		if err != nil {
 			return ControlStatus{}, err
@@ -540,8 +550,11 @@ func (m *Manager) Command(ctx context.Context, args string) (ControlStatus, erro
 		m.initialized = false
 	}
 	m.applyControlLocked(next)
+	if action == "on" && m.Sparse() {
+		err = m.loadSparsePathsLocked()
+	}
 	m.mu.Unlock()
-	if action == "on" {
+	if err == nil && action == "on" && !m.Sparse() {
 		baselineCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		_, err = m.BaselineContext(baselineCtx, "checkpoint", "", "manual enable baseline")
 		cancel()

@@ -29,6 +29,9 @@ type liveTree struct {
 // also rejects a directory exchanged for an in-root symlink to a skipped tree.
 func (m *Manager) inventoryTree(ctx context.Context, root *os.Root, observer *scanObserver) (liveTree, error) {
 	observer.stage("inventory")
+	if m.Sparse() {
+		return m.inventorySparseTree(ctx, root, observer)
+	}
 	var tree liveTree
 	if _, err := normalizeRoots(m.cwd, m.scopeRoots, false); err != nil {
 		return tree, err

@@ -101,8 +101,8 @@ const watchdog=setTimeout(()=>{console.error('checkpoint switch did not settle')
  }
  {
   const f=fixture();f.c.renderCheckpointControl(state('A',false));const switching=f.c.toggleCheckpointControl();
-  f.reply(0,{error:'请在项目工作区中开启'},400);await tick();
-  assert.equal(f.toasts[0],'请在项目工作区中开启');
+  f.reply(0,{error:'checkpoint: settings file changed'},400);await tick();
+  assert.equal(f.toasts[0],'settings file changed');
   if(f.calls.length>1)f.reply(1,state('A',false));await switching;
   assert.equal(f.nodes.checkpointBtn.textContent,'检查点：关');assert.equal(f.nodes.checkpointBtn.disabled,false);
  }

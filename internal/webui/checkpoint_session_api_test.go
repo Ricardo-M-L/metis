@@ -70,7 +70,7 @@ func TestCheckpointSessionAPIIsolationAndBoundOwner(t *testing.T) {
 	}
 }
 
-func TestCheckpointFreshStatusIsReadOnlyAndHomeEnableIsExplicit(t *testing.T) {
+func TestCheckpointFreshStatusIsReadOnlyAndHomeEnableIsSessionLocal(t *testing.T) {
 	home, workspace, metisHome := t.TempDir(), t.TempDir(), t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -108,8 +108,20 @@ func TestCheckpointFreshStatusIsReadOnlyAndHomeEnableIsExplicit(t *testing.T) {
 	data, _ := json.Marshal(map[string]string{"sessionId": "checkpoint-home", "command": "on"})
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/checkpoint", bytes.NewReader(data)))
-	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "请在项目工作区中开启") || strings.Contains(rr.Body.String(), "/checkpoint on") {
-		t.Fatalf("home toggle must refuse clearly without range-selection UI: %d %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"enabled":true`) || strings.Contains(rr.Body.String(), "请在项目工作区中开启") {
+		t.Fatalf("home toggle must enable this session without range selection: %d %s", rr.Code, rr.Body.String())
+	}
+	cli := checkpoint.NewManager("checkpoint-home", home, "")
+	if !cli.ControlStatus().Enabled || cli.AutomaticDisabled() || checkpoint.NewManager("other-home", home, "").ControlStatus().Enabled {
+		t.Fatal("home switch is not session-local or CLI/Desktop disagree")
+	}
+	if _, err := cli.Command(t.Context(), "off"); err != nil {
+		t.Fatal(err)
+	}
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/checkpoint?sessionId=checkpoint-home", nil))
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"enabled":false`) {
+		t.Fatalf("Desktop did not read CLI off state: %d %s", rr.Code, rr.Body.String())
 	}
 	if _, err := os.Stat(filepath.Join(metisHome, "checkpoints", "checkpoint-home")); !os.IsNotExist(err) {
 		t.Errorf("home toggle created a full-home snapshot: %v", err)

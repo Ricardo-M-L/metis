@@ -28,12 +28,18 @@ on disk but is not broadcast into new or resumed sessions.
 
 A new-chat preview only reads defaults; it never writes a workspace preference.
 Desktop creates a durable session before changing the switch. Project workspaces
-default to enabled. The bare user home and filesystem root default to disabled,
-and enabling there without a narrower scope is rejected with a request to use a
-project workspace. Desktop does not offer a project-scope picker. This avoids
-quietly scanning the entire home directory. Existing explicitly scoped CLI
+default to enabled. The bare user home and filesystem root default to disabled.
+Enabling a session there uses file checkpoints: each direct file tool saves its
+target before editing, without recursively scanning the home directory. Repeated
+edits and later targets retain their original pre-edit state. Arbitrary shell
+commands have no reliable file target in this mode, so the affected turn is
+marked incomplete for code rewind; conversation rewind remains available.
+Desktop does not offer a project-scope picker. Existing explicitly scoped CLI
 commands remain compatible for advanced callers, but are not part of the
 Desktop switch or its command help.
+
+The CLI footer does not display checkpoint status. Use `/checkpoint status` to
+inspect it; the Desktop composer keeps its current-session switch.
 
 The shadow repository stores raw file bytes. Its own highest-priority attributes
 disable text, encoding, ident and clean-filter transformations, and its local

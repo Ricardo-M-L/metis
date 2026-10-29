@@ -125,8 +125,8 @@ async function runCheckpointControl(input) {
   } catch (error) {
     if (!checkpointTargetIsCurrent(target) || request !== checkpointRequestGeneration) return;
     showToast(checkpointShortError(error));
-    // A new saved ID may now exist even when enabling was rejected (for
-    // example in the home directory). Refresh that session's actual state.
+    // A new saved ID may now exist even when the change failed. Refresh that
+    // session's actual state rather than displaying an unconfirmed toggle.
     try { await checkpointReadStatus(target, request, false); } catch (_) { /* later polling retries */ }
   } finally {
     checkpointControlGeneration++;

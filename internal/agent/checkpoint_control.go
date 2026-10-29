@@ -47,7 +47,7 @@ func (l *Loop) CheckpointCommandFor(ctx context.Context, args string, manager *c
 
 func checkpointScopeMatches(stack []ckptEntry, turn int, scope string) bool {
 	for _, entry := range stack {
-		if entry.restoreToTurns >= turn-1 && entry.scope != scope {
+		if entry.restoreToTurns >= turn-1 && !entry.incomplete && entry.scope != scope {
 			return false
 		}
 	}

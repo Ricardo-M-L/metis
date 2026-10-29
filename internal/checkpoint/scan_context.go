@@ -106,8 +106,15 @@ func (m *Manager) initShadowRepoContext(ctx context.Context) error {
 }
 
 func (m *Manager) gitOutputBytesContext(ctx context.Context, args ...string) ([]byte, error) {
+	return m.gitOutputBytesEnvContext(ctx, nil, args...)
+}
+
+func (m *Manager) gitOutputBytesEnvContext(ctx context.Context, env []string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = m.shadowDir
+	if env != nil {
+		cmd.Env = env
+	}
 	// Git filters/hooks can spawn descendants. The isolated process group and
 	// bounded pipe join prevent them from retaining a cancelled scan forever.
 	jobs.ApplyProcessGroup(cmd)
@@ -158,6 +165,10 @@ func (m *Manager) snapshotContext(ctx context.Context, toolName, argsHash, messa
 	}
 	defer m.mu.Unlock()
 	defer func() { m.lastScan, err = observer.finish(err) }()
+	return m.snapshotLocked(ctx, observer, toolName, argsHash, message, baseline)
+}
+
+func (m *Manager) snapshotLocked(ctx context.Context, observer *scanObserver, toolName, argsHash, message string, baseline bool) (string, error) {
 	if m.automaticOff.Load() && !m.disabled {
 		return "", ErrDisabledByUser
 	}

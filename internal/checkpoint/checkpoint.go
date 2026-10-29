@@ -52,6 +52,8 @@ type Manager struct {
 	disabledByPolicy  atomic.Bool
 	automaticOff      atomic.Bool
 	scopeRoots        []string
+	sparse            atomic.Bool
+	sparsePaths       map[string]bool
 	scopeKey          atomic.Value
 	controlRevision   string
 	controlErr        error
@@ -77,14 +79,8 @@ func NewManager(sessionID, cwd, shadowRoot string) *Manager {
 		shadowDir: filepath.Join(shadowRoot, sessionID),
 		cwd:       cwd,
 	}
-	// Disable checkpointing when cwd is too broad to snapshot — the home
-	// directory or the filesystem root. Checkpoint exists to undo edits
-	// inside a PROJECT working tree; snapshotting the entire home tree
-	// is never the intent, produces a huge shadow copy, and that copy
-	// then slows down later `find ~`-style commands (and, pre-v0.2.1,
-	// recursed into itself). Running metis from ~ is a misuse; fail the
-	// checkpoint quietly rather than mirroring the whole home dir.
-	// 2026-06-14.
+	// Broad workspaces default off. An explicit per-session switch may enable
+	// sparse file checkpoints there without ever mirroring the home/root tree.
 	if isUnsafeCheckpointRoot(cwd) {
 		m.disabled = true
 		m.disabledByPolicy.Store(true)
@@ -100,7 +96,7 @@ func NewManager(sessionID, cwd, shadowRoot string) *Manager {
 // isUnsafeCheckpointRoot reports whether cwd is too broad to checkpoint:
 // the filesystem root or the user's home directory itself. Sub-dirs of
 // home (e.g. ~/Documents/project) are fine — only the bare roots are
-// rejected.
+// considered broad; an explicit session switch uses sparse targets instead.
 func isUnsafeCheckpointRoot(cwd string) bool {
 	if cwd == "" {
 		return true
@@ -369,6 +365,10 @@ func (m *Manager) pathState(rel string) (string, error) {
 }
 
 func (m *Manager) managedRelativePath(path string) (string, bool) {
+	return m.relativePath(path, true)
+}
+
+func (m *Manager) relativePath(path string, requireScope bool) (string, bool) {
 	if path == "" {
 		return "", false
 	}
@@ -399,8 +399,8 @@ func (m *Manager) managedRelativePath(path string) (string, bool) {
 			return "", false
 		}
 	}
-	normalized, ok := m.validRelativePath(rel)
-	if !ok {
+	normalized, ok := safeRelativePath(rel)
+	if !ok || (requireScope && !m.scopeContains(normalized)) {
 		return "", false
 	}
 	// Lexical containment is insufficient: cwd/link/file can point outside the
@@ -669,6 +669,21 @@ type restoreBackupFile struct {
 }
 
 func (m *Manager) restorePathStatesLocked(hash string, states map[string]string) error {
+	if m.Sparse() {
+		if !validObjectID(hash) {
+			return ErrSnapshotMissing
+		}
+		captured, err := m.readSparseBaselineLocked(context.Background(), hash)
+		if err != nil {
+			return fmt.Errorf("checkpoint restore: session baseline metadata: %w", err)
+		}
+		for path := range states {
+			rel, ok := m.managedRelativePath(path)
+			if !ok || !captured[rel] {
+				return errors.New("checkpoint restore: file was not captured at this session baseline")
+			}
+		}
+	}
 	targetPaths, err := m.treePaths(hash)
 	if err != nil {
 		return fmt.Errorf("checkpoint restore: %w", err)

@@ -24,8 +24,8 @@ func TestControlHomeScopePersistsAndDoesNotCaptureSiblings(t *testing.T) {
 		}
 	}
 	m := NewManager("scoped", home, "")
-	if _, err := m.Command(context.Background(), "on"); err == nil {
-		t.Fatal("home enabled without explicit scope")
+	if state, err := m.Command(context.Background(), "on"); err != nil || !state.Enabled || !m.Sparse() {
+		t.Fatalf("home session switch: %+v %v", state, err)
 	}
 	state, err := m.Command(context.Background(), `on "project with spaces"`)
 	if err != nil || !state.Enabled || len(state.Roots) != 1 {

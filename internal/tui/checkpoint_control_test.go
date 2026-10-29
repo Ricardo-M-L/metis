@@ -8,7 +8,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/checkpoint"
 )
 
-func TestCheckpointStatusPollRendersLiveSwitchAndRejectsStaleWorkspace(t *testing.T) {
+func TestCheckpointStatusPollKeepsSessionStateWithoutFooterLabel(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())
 	model := minimalModel(200000)
 	model.sessionID = "current"
@@ -16,8 +16,11 @@ func TestCheckpointStatusPollRendersLiveSwitchAndRejectsStaleWorkspace(t *testin
 	model.loop.SetCheckpointer(manager)
 	state := manager.ControlStatus()
 	model.Update(checkpointStatusMsg{manager: manager, sessionID: "current", state: state})
-	if !strings.Contains(stripANSI(renderStatusBar(model)), "检查点：开") {
-		t.Fatal("CLI status does not show on")
+	if model.checkpointState == nil || !model.checkpointState.Enabled {
+		t.Fatal("CLI did not retain the shared on state")
+	}
+	if bar := stripANSI(renderStatusBar(model)); strings.Contains(bar, "检查点") || !strings.Contains(bar, "❉ curren") {
+		t.Fatalf("footer must omit checkpoint status and retain session identity: %s", bar)
 	}
 	state.Enabled = false
 	model.Update(checkpointStatusMsg{manager: manager, sessionID: "old-session", state: state})
@@ -25,8 +28,11 @@ func TestCheckpointStatusPollRendersLiveSwitchAndRejectsStaleWorkspace(t *testin
 		t.Fatal("stale session changed checkpoint status")
 	}
 	model.Update(checkpointStatusMsg{manager: manager, sessionID: "current", state: state})
-	if !strings.Contains(stripANSI(renderStatusBar(model)), "检查点：关") {
-		t.Fatal("CLI status did not reflect shared off state")
+	if model.checkpointState.Enabled {
+		t.Fatal("CLI did not retain the shared off state")
+	}
+	if bar := stripANSI(renderStatusBar(model)); strings.Contains(bar, "检查点") || !strings.Contains(bar, "❉ curren") {
+		t.Fatalf("off footer must omit checkpoint status and retain session identity: %s", bar)
 	}
 }
 

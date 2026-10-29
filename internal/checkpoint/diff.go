@@ -90,6 +90,14 @@ func (w *cappedDiffOutput) Write(p []byte) (int, error) {
 }
 
 func (m *Manager) readOnlyGitDiffContext(ctx context.Context, workTree string, maxBytes int, revisions ...string) (string, error) {
+	if m.Sparse() && len(m.sparsePaths) == 0 {
+		return "", nil
+	}
+	if m.Sparse() && workTree != "" {
+		if err := m.checkSparseLiveTypesLocked(); err != nil {
+			return "", err
+		}
+	}
 	args := []string{"--no-pager"}
 	if workTree != "" {
 		args = append(args, "--work-tree="+workTree)
@@ -97,7 +105,7 @@ func (m *Manager) readOnlyGitDiffContext(ctx context.Context, workTree string, m
 	args = append(args, "diff", "--no-color", "--no-ext-diff")
 	args = append(args, revisions...)
 	args = append(args, "--")
-	args = append(args, m.scopeRoots...)
+	args = append(args, m.diffPathspecs()...)
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = m.shadowDir
 	if maxBytes <= 0 {
@@ -132,19 +140,46 @@ func (m *Manager) untrackedWorkingTreeDiffs() (string, error) {
 }
 
 func (m *Manager) untrackedWorkingTreeDiffsContext(ctx context.Context, maxBytes int) (string, error) {
-	args := []string{"--work-tree=" + m.cwd, "ls-files", "--others", "--exclude-standard", "-z", "--"}
-	args = append(args, m.scopeRoots...)
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = m.shadowDir
-	out, err := cmd.Output()
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
+	if m.Sparse() && len(m.sparsePaths) == 0 {
+		return "", nil
+	}
+	var candidates []string
+	if m.Sparse() {
+		if err := m.checkSparseLiveTypesLocked(); err != nil {
+			return "", err
 		}
-		return "", err
+		// An exact pathspec can still enumerate descendants if a registered file
+		// became a directory. Derive candidates from the finite registry and the
+		// shadow index, never Git's live untracked-directory walker.
+		out, err := m.gitOutputBytesContext(ctx, "ls-files", "--cached", "-z")
+		if err != nil {
+			return "", err
+		}
+		cached := make(map[string]bool)
+		for _, path := range strings.Split(string(out), "\x00") {
+			cached[path] = true
+		}
+		for _, path := range sortedSparsePaths(m.sparsePaths) {
+			if !cached[path] {
+				candidates = append(candidates, path)
+			}
+		}
+	} else {
+		args := []string{"--work-tree=" + m.cwd, "ls-files", "--others", "--exclude-standard", "-z", "--"}
+		args = append(args, m.diffPathspecs()...)
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = m.shadowDir
+		out, err := cmd.Output()
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
+			return "", err
+		}
+		candidates = strings.Split(string(out), "\x00")
 	}
 	var patches strings.Builder
-	for _, path := range strings.Split(string(out), "\x00") {
+	for _, path := range candidates {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return patches.String(), ctxErr
 		}
@@ -206,4 +241,15 @@ func validObjectID(hash string) bool {
 		}
 	}
 	return true
+}
+
+func (m *Manager) diffPathspecs() []string {
+	if !m.Sparse() {
+		return m.scopeRoots
+	}
+	paths := sortedSparsePaths(m.sparsePaths)
+	for i, path := range paths {
+		paths[i] = ":(top,literal)" + path
+	}
+	return paths
 }

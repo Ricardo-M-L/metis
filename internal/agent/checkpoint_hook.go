@@ -65,6 +65,9 @@ func (l *Loop) snapPreEditContext(ctx context.Context, toolName string, input ma
 	if l.Checkpointer == nil || !mutatingTools[toolName] || l.Checkpointer.AutomaticDisabled() {
 		return nil
 	}
+	if l.Checkpointer.Sparse() {
+		return l.snapSparsePreEditContext(ctx, toolName, input)
+	}
 	turns := l.CountTurns()
 	l.ckptMu.Lock()
 	already := l.ckptSnappedAt == turns
@@ -91,6 +94,60 @@ func (l *Loop) snapPreEditContext(ctx context.Context, toolName string, input ma
 		})
 	}
 	l.ckptMu.Unlock()
+	return nil
+}
+
+// A session opened at home protects only explicit file targets. Each new
+// target's preimage also extends earlier sparse baselines: a file first edited
+// in a later turn must not look like a newly created file when rewinding an
+// earlier turn. The manager captures once, then applies the same bytes to all
+// baselines without replacing any already-captured preimage (including absence).
+func (l *Loop) snapSparsePreEditContext(ctx context.Context, toolName string, input map[string]any) error {
+	if toolName == "Bash" {
+		return errors.New("主目录文件检查点无法确定此 Shell 命令的写入范围；该轮仅支持会话回退")
+	}
+	var path string
+	for _, key := range []string{"path", "file_path"} {
+		if path, _ = input[key].(string); path != "" {
+			break
+		}
+	}
+	if path == "" {
+		return errors.New("checkpoint: 文件工具没有提供可保护的路径")
+	}
+	turns := l.CountTurns()
+	l.ckptMu.Lock()
+	defer l.ckptMu.Unlock()
+	var indices []int
+	var baselines []string
+	current := -1
+	for i, entry := range l.ckptStack {
+		if entry.restoreToTurns == turns-1 {
+			if entry.incomplete {
+				return ErrCheckpointIncomplete
+			}
+			current = i
+		}
+		if !entry.incomplete && entry.hash != "" && entry.scope == l.Checkpointer.ScopeKey() {
+			indices = append(indices, i)
+			baselines = append(baselines, entry.hash)
+		}
+	}
+	if current < 0 {
+		baselines = append(baselines, "")
+	}
+	hashes, err := l.Checkpointer.ExtendBaselinePathsContext(ctx, []string{path}, baselines, toolName, argsHash(input), fmt.Sprintf("before turn %d", turns))
+	if err != nil {
+		return err
+	}
+	for i, index := range indices {
+		l.ckptStack[index].hash = hashes[i]
+	}
+	if current < 0 {
+		l.ckptStack = append(l.ckptStack, ckptEntry{hash: hashes[len(hashes)-1], restoreToTurns: turns - 1,
+			label: fmt.Sprintf("before turn %d", turns), scope: l.Checkpointer.ScopeKey()})
+	}
+	l.ckptSnappedAt = turns
 	return nil
 }
 
@@ -717,7 +774,8 @@ func (l *Loop) recordCheckpointMutationContext(ctx context.Context, toolName str
 	}
 	l.ckptMu.Lock()
 	defer l.ckptMu.Unlock()
-	if entryIndex >= len(l.ckptStack) || l.ckptStack[entryIndex].hash != entry.hash {
+	if entryIndex >= len(l.ckptStack) || l.ckptStack[entryIndex].restoreToTurns != entry.restoreToTurns ||
+		(l.ckptStack[entryIndex].hash != entry.hash && !l.Checkpointer.Sparse()) {
 		return nil
 	}
 	if l.ckptStack[entryIndex].managedPaths == nil {
