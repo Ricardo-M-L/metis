@@ -7,7 +7,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-## [0.4.103] - 2026-10-29
+## [0.4.104] - 2026-10-29
 
 Full CLI and Desktop release with the macOS system-theme and application-icon
 repairs. macOS distribution retains Developer ID signing, Apple notarization,
@@ -22,6 +22,10 @@ stapling and Gatekeeper verification.
 - Replace the extra white application-icon backplate with a clean transparent
   mark in the macOS and Windows icon assets.
 - Show a localized theme-save confirmation, including “主题已保存” in Chinese.
+
+## [0.4.103] (unpublished; superseded by 0.4.104) - 2026-10-29
+
+The build candidate did not pass the Desktop Go 1.23 compatibility gate.
 
 ## [0.4.102] - 2026-10-29
 

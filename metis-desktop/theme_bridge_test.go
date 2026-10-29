@@ -31,7 +31,7 @@ func TestDesktopThemeBridgePreservesSystemPreference(t *testing.T) {
 	if err != nil {
 		t.Skip("node unavailable")
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, node, "-e", `
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
