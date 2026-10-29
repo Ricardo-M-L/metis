@@ -7,6 +7,24 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.105] - 2026-10-29
+
+Full CLI and Desktop release combining terminal transcript improvements with
+the latest Desktop system-theme and icon fixes. macOS distribution requires
+Developer ID signing, Apple notarization, stapling and Gatekeeper verification.
+
+### Improved
+
+- Show descriptive Bash titles, remove repeated output summaries, and combine
+  command and output details into one entry while preserving raw evidence.
+- Use consistent theme-aware prose and inline-code colors, align continuation
+  lines and nested lists, and keep short identifiers together across wraps.
+- Reveal complete long output, diagnostics, file previews and diffs when expanded,
+  using terminal cell widths for Chinese text and combined emoji.
+- Make Ctrl+O expand or collapse the selected tool; use Alt+Up/Down to select
+  previous or next details, keep the selected block visible, and preserve the
+  input draft and conversation history.
+
 ## [0.4.104] - 2026-10-29
 
 Full CLI and Desktop release with the macOS system-theme and application-icon
