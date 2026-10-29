@@ -90,6 +90,8 @@ Ctrl+O reveals a Bash command hidden by the preview or viewport width as an
 indented, width-wrapped block, alongside the existing expanded result. It
 toggles the selected tool, defaulting to the latest call. Alt+Up / Alt+Down
 selects previous / next tool details while retaining the expanded or collapsed
-state. A local marker identifies the selected block and scrolls into view.
+state. A small marker in the tool leader identifies the selected block and
+scrolls into view. Only that block shows dim shortcuts, sharing its auxiliary
+row when space permits; selection does not add a separate heading.
 Restored calls follow the same rule. Selection never writes transcript messages
 or modifies the executed input, permission preview, or stored tool event.

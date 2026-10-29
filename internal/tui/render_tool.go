@@ -50,6 +50,27 @@ func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
 // Minimal/streamlined mode has no body or details viewer, so it needs the
 // original command preview and standalone summary instead of the rich layout.
 func renderToolEventPresentation(te ToolEvent, expanded bool, width int, showBody bool) string {
+	if te.SubAgentParentID == "" {
+		return renderToolEventBlock(te, expanded, width, showBody)
+	}
+	// Nest the entire block, including commands, diagnostics, diffs and
+	// detail hints. Rendering at the remaining width prevents the viewport
+	// from clipping evidence after the extra indentation is applied.
+	const indent = "    "
+	te.ToolName = strings.TrimPrefix(te.ToolName, "sub: ")
+	if width > 0 {
+		width = max(1, width-len(indent))
+	}
+	rows := strings.Split(renderToolEventBlock(te, expanded, width, showBody), "\n")
+	for i, row := range rows {
+		if row != "" {
+			rows[i] = indent + row
+		}
+	}
+	return strings.Join(rows, "\n")
+}
+
+func renderToolEventBlock(te ToolEvent, expanded bool, width int, showBody bool) string {
 	var s strings.Builder
 	baseName := strings.TrimPrefix(te.ToolName, "sub: ")
 	partialRecovery := completedBeforeTimeout(te)
@@ -94,23 +115,8 @@ func renderToolEventPresentation(te ToolEvent, expanded bool, width int, showBod
 			leaderColor = styleSuccess
 		}
 	}
-	// Sub-agent tool calls (forwarded from a child Agent loop, carrying
-	// a SubAgentParentID + a "sub: " name prefix) render INDENTED under
-	// their parent agent row, so the transcript reads as a tree —
-	// "agent(x)" then indented "glob", "grep" — instead of a flat
-	// "agent(x)" followed by top-level "sub: glob". The extra indent
-	// (+4) on both the leader and result rows is the visual nesting;
-	// the "sub: " prefix is then redundant and stripped, since the
-	// indentation already says "this came from the sub-agent above".
-	// Mirrors claude-code's nested sub-agent display.
-	isSub := te.SubAgentParentID != ""
 	leadIndent, resultIndent := "  ", "    "
-	displayName := te.ToolName
-	if isSub {
-		leadIndent, resultIndent = "      ", "        "
-		displayName = strings.TrimPrefix(displayName, "sub: ")
-	}
-	displayTool := displayToolName(displayName)
+	displayTool := displayToolName(te.ToolName)
 	args := toolHeaderPreview(te.ToolName, te.Input)
 	if !showBody {
 		args = toolArgsFirstLine(toolArgsPreview(te.ToolName, te.Input))
@@ -154,6 +160,7 @@ func renderToolEventPresentation(te ToolEvent, expanded bool, width int, showBod
 	s.WriteString("\n")
 	command, _ := te.Input["command"].(string)
 	hiddenCommand := baseName == "Bash" && command != "" && command != args
+	quietSuccess := baseName == "Bash" && !te.IsError && te.Output == ""
 	if expanded && hiddenCommand {
 		s.WriteString(renderExpandedToolCommand(command, args, resultIndent+"   ", width))
 	}
@@ -198,20 +205,36 @@ func renderToolEventPresentation(te ToolEvent, expanded bool, width int, showBod
 		// Bash output/diagnostics are already visible below. Keep the
 		// first-line summary for exports and minimal mode, but do not echo a
 		// truncated copy above the original diagnostic in the rich UI.
-		s.WriteString(styleDim.Render(formatElapsed(te.Duration)))
+		summary := styleDim.Render(formatElapsed(te.Duration))
 		if te.IsError {
-			s.WriteString(" · Failed")
+			summary += " · Failed"
 			if te.Output == "" {
-				s.WriteString(" (no diagnostic output)")
+				summary += " (no diagnostic output)"
 			}
-		} else if te.Output == "" {
-			s.WriteString(" · No output")
+			if width > 0 {
+				// Even a failure without captured stderr must remain explicit
+				// in a narrow, nested block after the viewport clamps its rows.
+				indent := strings.Repeat(" ", xansi.StringWidth(resultIndent+glyphTreeLeaf+"  ✗ "))
+				summary = strings.ReplaceAll(xansi.Wrap(summary, max(1, width-len(indent)), ""), "\n", "\n"+indent)
+			}
 		}
+		s.WriteString(summary)
 	} else {
 		s.WriteString(renderToolSummary(summarizeNormalizedToolResult(te), formatElapsed(te.Duration)))
 	}
 	if !showBody {
 		// Compact items cannot be expanded; do not advertise hidden detail.
+	} else if quietSuccess && hiddenCommand && !expanded {
+		// An empty successful command needs only its duration and one entry
+		// to the original command. Keep both on one row whenever they fit.
+		const shortcut = "(ctrl+O to expand)"
+		rowWidth := xansi.StringWidth(resultIndent + glyphTreeLeaf + "  " + formatElapsed(te.Duration))
+		if width <= 0 || rowWidth+1+len(shortcut) <= width {
+			s.WriteString(styleMuted.Render(" " + shortcut))
+		} else {
+			indent := strings.Repeat(" ", min(7, max(0, width-len(shortcut))))
+			s.WriteString("\n" + styleMuted.Render(indent+shortcut))
+		}
 	} else if !expanded && hiddenCommand && neutralNoMatch {
 		// A complete diagnostic does not imply the command is fully visible.
 		s.WriteString(styleMuted.Render(" (ctrl+O to inspect command)"))
@@ -254,18 +277,12 @@ func renderToolEventPresentation(te ToolEvent, expanded bool, width int, showBod
 			s.WriteString(renderNormalizedErrorBodyWithDetails(te.Output, expanded, hiddenCommand, width))
 		}
 	} else {
-		// Strip the forwarded-sub-agent "sub: " prefix when routing
-		// to tool-specific renderers. Pre-2026-05-21 the switch
-		// matched exact "Edit" / "Write" / "TodoWrite", so any
-		// "sub: Edit" / "sub: Write" from a child agent fell through
-		// to the bare-Output default and the user saw "wrote
-		// /path/to/file" instead of the red/green diff or content
-		// preview (image #49 repro). The display name above keeps
-		// the "sub: " prefix so the user still sees it came from a
-		// sub-agent; only the renderer dispatch uses the base name.
+		// Name-only forwarded events also use the structured tool renderer.
 		switch baseName {
 		case "Bash":
-			s.WriteString(renderNormalizedToolOutputPreviewWithDetails(te.ToolName, te.Output, expanded, hiddenCommand, width))
+			if !quietSuccess {
+				s.WriteString(renderNormalizedToolOutputPreviewWithDetails(te.ToolName, te.Output, expanded, hiddenCommand, width))
+			}
 		case "Edit":
 			s.WriteString(renderEditDiffAtWidth(te.Input, expanded, width))
 		case "Write":

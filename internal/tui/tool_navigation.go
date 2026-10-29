@@ -149,15 +149,11 @@ var renderedToolShortcut = regexp.MustCompile(` ?\(ctrl\+O to [^)\n]+\)`)
 
 // Rewrite only UI-owned muted spans. Plain command/output text that happens
 // to mention the same shortcut is evidence and must remain byte-for-byte.
-func toolNavigationHints(rendered string, selected bool) string {
+func toolNavigationHints(rendered string) string {
 	styled := styleMuted.Render("tool-hint-sentinel")
 	prefix, suffix, ok := strings.Cut(styled, "tool-hint-sentinel")
 	if !ok || prefix == "" || suffix == "" {
 		return rendered
-	}
-	replacement := " (Alt+↑/↓)"
-	if selected {
-		replacement = ""
 	}
 	lines := strings.Split(rendered, "\n")
 	out := make([]string, 0, len(lines))
@@ -175,7 +171,7 @@ func toolNavigationHints(rendered string, selected bool) string {
 				rewritten.WriteString(prefix + rest)
 				break
 			}
-			updated := renderedToolShortcut.ReplaceAllString(span, replacement)
+			updated := renderedToolShortcut.ReplaceAllString(span, "")
 			changed = changed || updated != span
 			rewritten.WriteString(prefix + updated + suffix)
 			remaining = tail
@@ -193,30 +189,102 @@ func (v toolNavigationVisual) render(body string, width int) string {
 	if !v.enabled {
 		return body
 	}
-	body = toolNavigationHints(body, v.selected)
+	body = toolNavigationHints(body)
 	if !v.selected {
 		return body
 	}
-	action := "(ctrl+O to expand)"
-	if v.expanded {
-		action = "(ctrl+O to collapse)"
-	}
-	parts := []string{"> Selected tool", action, "Alt+↑/↓"}
 	if width <= 0 {
 		width = 80
 	}
+	rows := strings.Split(body, "\n")
+	if len(rows) == 0 || strings.TrimSpace(xansi.Strip(rows[0])) == "" {
+		return body
+	}
+	// Consume the existing two-cell leader padding. The success/error glyph,
+	// its colour, the tool title, and nested-tool indentation keep their slots.
+	header := rows[0]
+	plain := xansi.Strip(header)
+	padding := len(plain) - len(strings.TrimLeft(plain, " "))
+	if padding >= 2 {
+		markerAt := padding - 2
+		rows[0] = xansi.Cut(header, 0, markerAt) + styleAccent.Render("› ") +
+			xansi.Cut(header, padding, xansi.StringWidth(header))
+	}
+
+	// Prefer the existing result/elapsed row. An expanded command may place
+	// that row far below the header; in that case keep the shortcut reachable
+	// beside the header instead of behind many screens of command text.
+	auxiliary := -1
+	for index := 1; index < len(rows) && index <= 2; index++ {
+		if toolNavigationAuxiliaryRow(rows[index]) {
+			// A failed summary can continue over several physical rows. Keep
+			// that explanation contiguous instead of guessing where its text
+			// ends from indentation, which real output can also contain.
+			if strings.Contains(xansi.Strip(rows[index]), "✗ ") {
+				break
+			}
+			auxiliary = index
+			break
+		}
+	}
+	insertAt, auxiliaryText := 1, ""
+	if auxiliary >= 0 {
+		insertAt, auxiliaryText = auxiliary, rows[auxiliary]
+	}
+	controls := toolNavigationControlRows(auxiliaryText, width, padding+5, v.expanded)
+	end := insertAt
+	if auxiliary >= 0 {
+		end++
+	}
+	out := make([]string, 0, len(rows)+len(controls))
+	out = append(out, rows[:insertAt]...)
+	out = append(out, controls...)
+	out = append(out, rows[end:]...)
+	return strings.Join(out, "\n")
+}
+
+// The renderer owns this dim tree prefix. Do not identify auxiliary rows from
+// plain text alone: actual tool output can contain the same glyph or wording.
+func toolNavigationAuxiliaryRow(row string) bool {
+	styled := styleDim.Render("tool-aux-sentinel")
+	prefix, suffix, ok := strings.Cut(styled, "tool-aux-sentinel")
+	if !ok || prefix == "" || suffix == "" {
+		return false
+	}
+	row = strings.TrimLeft(row, " ") // outer indentation of a sub-agent block
+	span, ok := strings.CutPrefix(row, prefix)
+	if !ok {
+		return false
+	}
+	span, _, closed := strings.Cut(span, suffix)
+	return closed && strings.HasPrefix(strings.TrimLeft(span, " "), glyphTreeLeaf)
+}
+
+func toolNavigationControlRows(auxiliary string, width, indent int, expanded bool) []string {
+	action := "ctrl+O expand"
+	if expanded {
+		action = "ctrl+O collapse"
+	}
+	parts := []string{action, "Alt+↑/↓"}
+	indent = min(indent, max(0, width-xansi.StringWidth(action)))
+	padding := strings.Repeat(" ", indent)
 	var rows []string
-	row := ""
+	row := auxiliary
 	for _, part := range parts {
-		if row != "" && xansi.StringWidth(row+" · "+part) <= width {
-			row += " · " + part
+		if row != "" && xansi.StringWidth(row)+3+xansi.StringWidth(part) <= width {
+			row += styleMuted.Render(" · " + part)
 			continue
 		}
 		if row != "" {
 			rows = append(rows, row)
 		}
-		row = part
+		// Hardwrap matters only below the supported 24-column narrow view.
+		// Never clip a key name or consume any of the original output bytes.
+		wrapped := xansi.Hardwrap(part, max(1, width-indent), true)
+		row = styleMuted.Render(padding + strings.ReplaceAll(wrapped, "\n", "\n"+padding))
 	}
-	rows = append(rows, row)
-	return styleAccent.Render(strings.Join(rows, "\n")) + "\n" + body
+	if row != "" {
+		rows = append(rows, row)
+	}
+	return rows
 }

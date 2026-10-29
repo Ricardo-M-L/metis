@@ -27,10 +27,13 @@ func TestBuildChatItems_GroupsConsecutiveExplorationTools(t *testing.T) {
 		t.Fatalf("item[0] = %T, want explorationGroupItem", items[0])
 	}
 	compact := group.Render(100)
-	for _, want := range []string{"Read 2 files", "Searched 2 patterns", "Alt+↑/↓"} {
+	for _, want := range []string{"Read 2 files", "Searched 2 patterns"} {
 		if !strings.Contains(compact, want) {
 			t.Errorf("compact group missing %q:\n%s", want, compact)
 		}
+	}
+	if strings.Contains(compact, "ctrl+O") || strings.Contains(compact, "Alt+↑/↓") {
+		t.Errorf("unselected group repeats selection controls:\n%s", compact)
 	}
 	if strings.Contains(compact, "Listed") {
 		t.Errorf("Glob is a search and must not be described as a directory listing:\n%s", compact)

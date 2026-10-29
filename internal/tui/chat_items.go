@@ -686,20 +686,25 @@ func (it *inProgressStreamingItem) Render(width int) string {
 	// assistant rows. Otherwise the list counts it as one row while the
 	// terminal paints/truncates it at the right edge, which desynchronizes
 	// frame geometry during long, frequently repainted conversations.
-	bodyW := width - 4
-	if bodyW < 20 {
-		bodyW = 20
+	bodyW := assistantBodyWidth(width)
+	prefix := assistantReplyPrefix(it.text, true)
+	if width > 0 && width < 6 {
+		// A normal four-cell gutter would leave no room for CJK/emoji.
+		// Narrow only the decoration; keep every body row in the same column.
+		prefix = xansi.Truncate(prefix, max(0, width-2), "")
+		bodyW = max(1, width-xansi.StringWidth(prefix))
 	}
-	wrapped := xansi.Wrap(it.text, bodyW, " /-_.")
+	indent := strings.Repeat(" ", xansi.StringWidth(prefix))
+	wrapped := xansi.Wrap(it.text, bodyW, "")
 
 	var sb strings.Builder
-	sb.WriteString(styleAsst.Render("  " + glyphBullet + " "))
+	sb.WriteString(prefix)
 	lines := strings.Split(wrapped, "\n")
 	if len(lines) > 0 {
-		sb.WriteString(styleText.Render(lines[0]))
+		sb.WriteString(styleText.Render(clampLine(lines[0], bodyW)))
 		for _, ln := range lines[1:] {
-			sb.WriteString("\n  ")
-			sb.WriteString(styleText.Render(ln))
+			sb.WriteString("\n" + indent)
+			sb.WriteString(styleText.Render(clampLine(ln, bodyW)))
 		}
 	}
 	sb.WriteString("\n")

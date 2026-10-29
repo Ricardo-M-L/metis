@@ -39,8 +39,8 @@ type Theme struct {
 	TextMuted     color.Color // labels, separators, gutters
 
 	// Accents
-	AccentBlue   color.Color // primary (links, selection)
-	AccentGreen  color.Color // assistant, success
+	AccentBlue   color.Color // primary emphasis (purple); legacy field name
+	AccentGreen  color.Color // success (cyan in the color-blind theme)
 	AccentOrange color.Color // tool, warning
 	AccentRed    color.Color // error, deny
 	AccentCyan   color.Color // user input
@@ -70,7 +70,7 @@ var darkTheme = Theme{
 	// at #a0a0a0 for "dim but informational" rows (tool summary line).
 	TextSecondary: lipgloss.Color("#a0a0a0"),
 	TextMuted:     lipgloss.Color("#787878"),
-	AccentBlue:    lipgloss.Color("#64b5f6"),
+	AccentBlue:    lipgloss.Color("#b39ddb"),
 	AccentGreen:   lipgloss.Color("#81c784"),
 	AccentOrange:  lipgloss.Color("#ffb74d"),
 	AccentRed:     lipgloss.Color("#e57373"),
@@ -95,7 +95,7 @@ var lightTheme = Theme{
 	TextPrimary:   lipgloss.Color("#1a1a1a"),
 	TextSecondary: lipgloss.Color("#555555"),
 	TextMuted:     lipgloss.Color("#909090"),
-	AccentBlue:    lipgloss.Color("#1976d2"),
+	AccentBlue:    lipgloss.Color("#6f42c1"),
 	AccentGreen:   lipgloss.Color("#388e3c"),
 	AccentOrange:  lipgloss.Color("#e65100"),
 	AccentRed:     lipgloss.Color("#c62828"),
@@ -117,8 +117,8 @@ var darkDaltonizedTheme = Theme{
 	TextPrimary:   lipgloss.Color("#e8e8e8"),
 	TextSecondary: lipgloss.Color("#a0a0a0"),
 	TextMuted:     lipgloss.Color("#787878"),
-	AccentBlue:    lipgloss.Color("#64b5f6"),
-	AccentGreen:   lipgloss.Color("#4dd0e1"), // cyan stand-in for assistant/success
+	AccentBlue:    lipgloss.Color("#b39ddb"),
+	AccentGreen:   lipgloss.Color("#4dd0e1"), // cyan stand-in for success
 	AccentOrange:  lipgloss.Color("#ffb74d"),
 	AccentRed:     lipgloss.Color("#e91e63"), // magenta stand-in for error
 	AccentCyan:    lipgloss.Color("#80deea"),
@@ -138,7 +138,7 @@ var nordTheme = Theme{
 	TextPrimary:   lipgloss.Color("#eceff4"),
 	TextSecondary: lipgloss.Color("#d8dee9"),
 	TextMuted:     lipgloss.Color("#868f9c"),
-	AccentBlue:    lipgloss.Color("#81a1c1"),
+	AccentBlue:    lipgloss.Color("#c3a6cf"),
 	AccentGreen:   lipgloss.Color("#a3be8c"),
 	AccentOrange:  lipgloss.Color("#d08770"),
 	AccentRed:     lipgloss.Color("#bf616a"),
@@ -158,7 +158,7 @@ var solarizedDarkTheme = Theme{
 	TextPrimary:   lipgloss.Color("#eee8d5"),
 	TextSecondary: lipgloss.Color("#b58900"),
 	TextMuted:     lipgloss.Color("#6c71c4"),
-	AccentBlue:    lipgloss.Color("#268bd2"),
+	AccentBlue:    lipgloss.Color("#a59be7"),
 	AccentGreen:   lipgloss.Color("#859900"),
 	AccentOrange:  lipgloss.Color("#cb4b16"),
 	AccentRed:     lipgloss.Color("#dc322f"),

@@ -14,7 +14,7 @@ import "github.com/Ricardo-M-L/metis/internal/tui/screen"
 var themeSwatchHex = map[string][]string{
 	"dark": {
 		"#4dd0e1", // user / cyan
-		"#64b5f6", // accent / blue
+		"#b39ddb", // primary / purple
 		"#81c784", // success / green
 		"#ffb74d", // warn / orange
 		"#e57373", // error / red
@@ -22,7 +22,7 @@ var themeSwatchHex = map[string][]string{
 	},
 	"light": {
 		"#0097a7",
-		"#1976d2",
+		"#6f42c1",
 		"#388e3c",
 		"#e65100",
 		"#c62828",
@@ -30,7 +30,7 @@ var themeSwatchHex = map[string][]string{
 	},
 	"dark-daltonized": {
 		"#80deea",
-		"#64b5f6",
+		"#b39ddb",
 		"#4dd0e1", // green stand-in (cyan)
 		"#ffb74d",
 		"#e91e63", // red stand-in (magenta)
@@ -38,7 +38,7 @@ var themeSwatchHex = map[string][]string{
 	},
 	"nord": {
 		"#88c0d0", // user / cyan
-		"#81a1c1", // accent / blue
+		"#c3a6cf", // primary / purple
 		"#a3be8c", // success / green
 		"#d08770", // warn / orange
 		"#bf616a", // error / red
@@ -46,7 +46,7 @@ var themeSwatchHex = map[string][]string{
 	},
 	"solarized-dark": {
 		"#2aa198", // user / cyan
-		"#268bd2", // accent / blue
+		"#a59be7", // primary / purple
 		"#859900", // success / green
 		"#cb4b16", // warn / orange
 		"#dc322f", // error / red

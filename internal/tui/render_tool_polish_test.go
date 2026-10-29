@@ -98,12 +98,12 @@ func TestToolPolishLegacyQuietCommandHasNoSpuriousDetails(t *testing.T) {
 	te := ToolEvent{ID: "legacy-quiet", Kind: "end", ToolName: "Bash",
 		Input: map[string]any{"command": "true"}, Duration: 65 * time.Millisecond}
 	out := stripANSI(renderToolEventAtWidth(te, false, 80))
-	for _, want := range []string{"bash(true)", "65ms", "No output"} {
+	for _, want := range []string{"bash(true)", "65ms"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("legacy quiet command lost %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "ctrl+O") || strings.Contains(out, "✓") {
+	if strings.Contains(out, "ctrl+O") || strings.Contains(out, "✓") || strings.Contains(out, "No output") {
 		t.Fatalf("quiet command has no hidden command or output to advertise:\n%s", out)
 	}
 	m := &Model{width: 82, toolEvents: []ToolEvent{te}}

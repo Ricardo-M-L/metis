@@ -75,8 +75,7 @@ func renderMessagePlain(msg Message, width int, expand bool) string {
 	wrapped := xansi.Wrap(msg.Content, bodyW, "")
 	lines := strings.Split(wrapped, "\n")
 	var out strings.Builder
-	out.WriteString("  ")
-	out.WriteString(styleAsst.Render(glyphBullet + " "))
+	out.WriteString(assistantReplyPrefix(msg.Content, false))
 	if len(lines) > 0 {
 		out.WriteString(styleText.Render(lines[0]))
 		for _, line := range lines[1:] {
@@ -175,8 +174,7 @@ func renderMessage(msg Message, width int, expand bool) string {
 		// any further indentation for lists, quotes, and code blocks.
 		body := renderAssistantBody(msg.Content, width)
 		bodyLines := strings.Split(body, "\n")
-		s.WriteString("  ")
-		s.WriteString(styleAsst.Render(glyphBullet + " "))
+		s.WriteString(assistantReplyPrefix(msg.Content, true))
 		if len(bodyLines) > 0 {
 			s.WriteString(bodyLines[0])
 			for _, ln := range bodyLines[1:] {
@@ -467,6 +465,17 @@ func metisCodeBlockStyle() ansi.StyleConfig {
 	code.BackgroundColor = nil
 	code.Prefix, code.Suffix = " ", " "
 	cfg.Code = code
+	// Explicit emphasis uses the same accent as inline code and selection.
+	// Glamour's stock heading/link greens must not look like success states.
+	cfg.Heading.Color = &codeColor
+	cfg.H1.Color = &codeColor
+	cfg.H1.BackgroundColor = nil
+	cfg.H6.Color = &codeColor
+	cfg.Strong.Color = &codeColor
+	cfg.Emph.Color = &codeColor
+	cfg.Link.Color = &codeColor
+	cfg.LinkText.Color = &codeColor
+	cfg.Image.Color = &codeColor
 
 	chroma := *cfg.CodeBlock.Chroma
 	zero := ansi.StylePrimitive{}
@@ -518,6 +527,32 @@ func assistantBodyWidth(width int) int {
 	}
 	return max(1, width-4)
 }
+
+// A leading Markdown list already has its own item marker. Keep the same
+// four-column message gutter without adding a second bullet beside it. Parse
+// the block so fenced code, quoted lists, and literal markers keep their role
+// marker; minimal output intentionally leaves Markdown as literal text.
+func assistantReplyPrefix(content string, lists bool) string {
+	if lists {
+		// Only the opening nonblank line decides whether this starts a list.
+		// Do not parse a growing, potentially huge stream on every frame.
+		for _, line := range strings.Split(content, "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			if markdownOpeningList.MatchString(strings.TrimLeft(line, " \t")) {
+				document := goldmark.DefaultParser().Parse(text.NewReader([]byte(line + "\n")))
+				if _, ok := document.FirstChild().(*ast.List); ok {
+					return "    "
+				}
+			}
+			break
+		}
+	}
+	return "  " + styleAsst.Render(glyphBullet+" ")
+}
+
+var markdownOpeningList = regexp.MustCompile(`^(?:[-+*](?:[ \t]|$)|[0-9]{1,9}[.)](?:[ \t]|$))`)
 
 // trimMarkdownBlankLines removes renderer padding without stripping authored
 // indentation from the first code block or the first nested list.
