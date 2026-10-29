@@ -34,7 +34,7 @@ func TestLightThemeKeepsDesktopChromeReadableAndSyncsNativeWindow(t *testing.T) 
 	chat := get("/chat.js")
 	for _, want := range []string{
 		`requestNative('set-theme'`,
-		`theme: resolved`,
+		`theme: nativeTheme`,
 		`document.documentElement.dataset.theme = resolved`,
 	} {
 		if !strings.Contains(chat, want) {

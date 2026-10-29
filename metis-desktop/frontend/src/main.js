@@ -36,6 +36,7 @@ window.addEventListener('load', async () => {
       'get-computer-use-permission-status': () => window['go']['main']['App']['GetComputerUsePermissionStatus'](),
       'set-theme': payload => {
         const theme = String(payload && payload.theme || 'auto');
+        document.documentElement.dataset.theme = theme;
         return SetNativeTheme(theme);
       },
     };

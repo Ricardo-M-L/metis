@@ -22,8 +22,15 @@ static void metis_set_native_theme(const char *theme) {
 				appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
 			}
 		}
-		for (NSWindow *window in [NSApp windows]) {
-			[window setAppearance:appearance];
+		if (@available(macOS 10.14, *)) {
+			[NSApp setAppearance:appearance];
+			for (NSWindow *window in [NSApp windows]) {
+				[window setAppearance:nil];
+			}
+		} else {
+			for (NSWindow *window in [NSApp windows]) {
+				[window setAppearance:appearance];
+			}
 		}
 		free(theme_copy);
 	});

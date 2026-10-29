@@ -5,17 +5,23 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <title>Metis</title>
     <style>
-        html, body { margin: 0; height: 100%; background: #151517; overflow: hidden; }
+        :root { color-scheme: light dark; --boot-bg: #f6f7fa; --boot-fg: #555c6e; }
+        @media (prefers-color-scheme: dark) {
+            :root { --boot-bg: #151517; --boot-fg: #adb2b8; }
+        }
+        :root[data-theme="light"] { color-scheme: light; --boot-bg: #f6f7fa; --boot-fg: #555c6e; }
+        :root[data-theme="dark"] { color-scheme: dark; --boot-bg: #151517; --boot-fg: #adb2b8; }
+        html, body { margin: 0; height: 100%; background: var(--boot-bg); overflow: hidden; }
         #boot {
             height: 100%;
             display: flex;
             align-items: center;
             justify-content: center;
-            color: #adb2b8;
+            color: var(--boot-fg);
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif;
             font-size: 14px;
         }
-        #metis-frame { display: none; width: 100%; height: 100%; border: 0; background: #151517; }
+        #metis-frame { display: none; width: 100%; height: 100%; border: 0; background: var(--boot-bg); }
     </style>
 </head>
 <body>

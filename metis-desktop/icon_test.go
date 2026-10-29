@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestAppIconHasOneCanonicalPureWhiteBackgroundAsset(t *testing.T) {
+func TestAppIconHasTransparentMarginWithoutBackplate(t *testing.T) {
 	for _, obsolete := range []string{
 		"build/appicon-generated-source.png",
 		"build/appicon-previous.png",
@@ -31,10 +31,10 @@ func TestAppIconHasOneCanonicalPureWhiteBackgroundAsset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertPureWhiteIcon(t, icon)
+	assertBorderlessIcon(t, icon)
 }
 
-func TestWindowsIconUsesTheSamePureWhiteBackground(t *testing.T) {
+func TestWindowsIconUsesTheSameBorderlessMark(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("build", "windows", "icon.ico"))
 	if err != nil {
 		t.Fatal(err)
@@ -51,38 +51,33 @@ func TestWindowsIconUsesTheSamePureWhiteBackground(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode embedded Windows icon: %v", err)
 	}
-	assertPureWhiteIcon(t, icon)
+	assertBorderlessIcon(t, icon)
 }
 
-func assertPureWhiteIcon(t *testing.T, icon image.Image) {
+func assertBorderlessIcon(t *testing.T, icon image.Image) {
 	t.Helper()
 	bounds := icon.Bounds()
-	points := [][2]float64{
-		{0.50, 0.10}, {0.15, 0.15}, {0.85, 0.15},
-		{0.10, 0.35}, {0.90, 0.35}, {0.10, 0.50},
-		{0.15, 0.85}, {0.85, 0.85},
-		{0.30, 0.88}, {0.70, 0.88}, {0.50, 0.95},
+	if bounds.Dx() != bounds.Dy() || bounds.Dx() < 256 {
+		t.Fatalf("icon must be a square of at least 256 pixels: %v", bounds)
 	}
-	for _, point := range points {
-		x := bounds.Min.X + int(point[0]*float64(bounds.Dx()-1))
-		y := bounds.Min.Y + int(point[1]*float64(bounds.Dy()-1))
-		r, g, b, a := icon.At(x, y).RGBA()
-		if a != 0xffff || r != 0xffff || g != 0xffff || b != 0xffff {
-			t.Fatalf("app icon background at (%d,%d) is not opaque pure white: rgba16=(%d,%d,%d,%d)", x, y, r, g, b, a)
-		}
-	}
-	// The plate is intentionally flat white. A neutral non-white pixel would
-	// reintroduce the gray bevel/shadow that becomes especially visible after
-	// macOS scales the icon down in the Dock. Colored pixels belong to the mark.
+	margin := bounds.Dx() / 16
+	colored := 0
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			pixel := color.NRGBAModel.Convert(icon.At(x, y)).(color.NRGBA)
-			// Colored antialiasing at the mark edge may be very pale cyan or
-			// purple; only exactly neutral non-white pixels belong to a gray
-			// background, bevel or shadow.
-			if pixel.A != 0 && pixel.R == pixel.G && pixel.G == pixel.B && pixel.R != 0xff {
-				t.Fatalf("app icon contains neutral gray at (%d,%d): nrgba8=%v", x, y, pixel)
+			if pixel.A == 0 {
+				continue
 			}
+			if x < bounds.Min.X+margin || x >= bounds.Max.X-margin || y < bounds.Min.Y+margin || y >= bounds.Max.Y-margin {
+				t.Fatalf("icon perimeter must be transparent, found pixel at (%d,%d)", x, y)
+			}
+			if pixel.A > 200 && pixel.R == pixel.G && pixel.G == pixel.B {
+				t.Fatalf("icon contains an opaque neutral backplate or rim at (%d,%d): %v", x, y, pixel)
+			}
+			colored++
 		}
+	}
+	if colored < bounds.Dx()*bounds.Dy()/10 {
+		t.Fatal("icon mark is missing or too small")
 	}
 }

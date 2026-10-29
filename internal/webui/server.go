@@ -670,7 +670,12 @@ func (s *Server) handler() http.Handler {
 				writeError(w, http.StatusInternalServerError, "index unavailable")
 				return
 			}
-			_, _ = w.Write([]byte(strings.ReplaceAll(string(data), "__BUILD__", s.buildVersion)))
+			theme := "auto"
+			if cfg, _, err := config.Load(); err == nil && cfg != nil && allowedWebThemes[cfg.UI.Theme] {
+				theme = cfg.UI.Theme
+			}
+			page := strings.ReplaceAll(string(data), "__BUILD__", s.buildVersion)
+			_, _ = w.Write([]byte(strings.ReplaceAll(page, "__THEME__", theme)))
 			return
 		}
 		staticHandler.ServeHTTP(w, r)

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="monogram" x1="280" y1="220" x2="740" y2="810" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#075BFF"/>
+      <stop offset="1" stop-color="#0648EE"/>
+    </linearGradient>
+    <linearGradient id="orbit-color" x1="130" y1="700" x2="895" y2="500" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#00BCEB"/>
+      <stop offset=".42" stop-color="#0664FF"/>
+      <stop offset="1" stop-color="#7436F6"/>
+    </linearGradient>
+    <linearGradient id="sparkle" x1="610" y1="180" x2="738" y2="305" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#00BCEB"/>
+      <stop offset=".45" stop-color="#1266FF"/>
+      <stop offset="1" stop-color="#7835F5"/>
+    </linearGradient>
+    <path id="orbit" d="M213 546C104 615 57 701 102 750C181 838 463 819 713 686C936 568 1030 382 794 360V382C971 406 872 534 691 632C478 749 240 775 165 731C119 704 157 652 213 611V546Z"/>
+    <mask id="clear-orbit" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+      <path fill="#fff" d="M0 0H1024V1024H0Z"/>
+      <use href="#orbit" fill="#000" stroke="#000" stroke-width="26" stroke-linejoin="round"/>
+    </mask>
+  </defs>
+  <g transform="translate(25 15) scale(.95)">
+    <g fill="url(#monogram)" mask="url(#clear-orbit)">
+      <path d="M240 276C240 259 251 251 266 263L530 473L742 311C756 300 766 310 766 326V557L648 627V560L533 644C524 651 518 651 507 644L384 553V707C338 721 286 723 240 716V276Z"/>
+      <path d="M648 704L766 634V780C766 798 754 808 738 796L662 743C651 735 648 727 648 716V704Z"/>
+    </g>
+    <path fill="url(#sparkle)" d="M677 168C686 168 683 211 708 225C727 236 754 235 754 244C754 254 720 255 704 273C687 292 689 318 678 318C667 318 670 287 650 271C631 256 601 254 601 244C601 234 635 234 653 219C669 205 668 168 677 168Z"/>
+    <use href="#orbit" fill="url(#orbit-color)"/>
+  </g>
+</svg>

@@ -6656,13 +6656,14 @@ function settingByKey(key) {
 
 function currentThemeSetting() {
   const t = settingByKey('ui.theme');
-  return t ? t.value : 'auto';
+  return t ? t.value : document.documentElement.dataset.themePreference || 'auto';
 }
 
 // Resolve the config value (auto follows the OS) onto the root element;
 // the palettes live in style.css as [data-theme=...] variable sets.
 function applyTheme(theme) {
-  let resolved = theme || 'auto';
+  const preference = theme || 'auto';
+  let resolved = preference;
   if (resolved === 'auto') {
     if (!themeMedia) {
       themeMedia = window.matchMedia('(prefers-color-scheme: light)');
@@ -6672,18 +6673,22 @@ function applyTheme(theme) {
     }
     resolved = themeMedia.matches ? 'light' : 'dark';
   }
+  document.documentElement.dataset.themePreference = preference;
   document.documentElement.dataset.theme = resolved;
+  document.documentElement.style.colorScheme = resolved === 'light' ? 'light' : 'dark';
   // The browser UI is embedded in the native Wails shell for Desktop. Keep
   // the native macOS titlebar appearance in step with the iframe palette;
   // standalone browser sessions simply ignore this bridge request.
   if (typeof requestNative === 'function') {
-    requestNative('set-theme', { theme: resolved }).catch(() => {});
+    const nativeTheme = preference === 'auto' ? 'auto' : resolved === 'light' ? 'light' : 'dark';
+    requestNative('set-theme', { theme: nativeTheme }).catch(() => {});
   }
 }
 
 // Boot hook: fetch settings once so the persisted theme applies on page
 // load (openSettings reuses the same cache).
 async function initTheme() {
+  applyTheme(currentThemeSetting());
   try {
     const res = await fetch('/api/settings');
     const data = await res.json();
@@ -6693,7 +6698,7 @@ async function initTheme() {
       // Global settings may describe a different session. The owned status
       // snapshot is the only boot-time authority for the composer mode.
     }
-  } catch (_) { /* fall back to the default dark palette */ }
+  } catch (_) { /* The initial saved preference or system theme remains active. */ }
 }
 
 function renderSettingsTab() {
@@ -6847,7 +6852,7 @@ function syncApprovalChip(mode) {
   if (approvalMenuOpen) paintApprovalMenu();
 }
 const THEME_LABELS = {
-  auto: 'Auto', dark: 'Dark', light: 'Light',
+  auto: 'System', dark: 'Dark', light: 'Light',
   'dark-daltonized': 'Dark (Colorblind)', nord: 'Nord', 'solarized-dark': 'Solarized Dark',
 };
 const THEME_DESCS = {
@@ -6859,7 +6864,7 @@ const THEME_DESCS = {
   'solarized-dark': 'Warm amber and green tones',
 };
 const THEME_LABELS_ZH = {
-  auto: '自动', dark: '深色', light: '浅色', 'dark-daltonized': '深色（色觉优化）', nord: 'Nord', 'solarized-dark': 'Solarized 深色',
+  auto: '跟随系统', dark: '深色', light: '浅色', 'dark-daltonized': '深色（色觉优化）', nord: 'Nord', 'solarized-dark': 'Solarized 深色',
 };
 const THEME_DESCS_ZH = {
   auto: '跟随系统深色/浅色设置', dark: '默认深色配色', light: '适合白天的明亮配色',
@@ -8131,7 +8136,7 @@ async function saveSettingValue(key, value) {
     if (key === 'ui.theme') applyTheme(value);
     if (key === 'ui.prompt_suggestions' && typeof setComposerPromptSuggestionsEnabled === 'function') setComposerPromptSuggestionsEnabled(value);
     const live = (data.liveApplied || []).includes(key);
-    showToast(live ? 'Saved: ' + key + ' (applied immediately)' : 'Saved: ' + key + ' (applies after restart)');
+    showToast(key === 'ui.theme' ? uiText('Theme saved', '主题已保存') : (live ? 'Saved: ' + key + ' (applied immediately)' : 'Saved: ' + key + ' (applies after restart)'));
   } catch (e) {
     showToast('Save failed: ' + e.message);
     renderSettingsTab(); // restore UI to server truth
