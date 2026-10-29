@@ -43,11 +43,17 @@ func TestStaticAssetsServed(t *testing.T) {
 		t.Fatalf("artifacts.css: code=%d type=%q", code, ctype)
 	}
 
+	code, ctype, body = get("/rewind.css")
+	if code != 200 || !strings.Contains(ctype, "css") || !strings.Contains(body, ".rewind-dialog") {
+		t.Fatalf("rewind.css: code=%d type=%q", code, ctype)
+	}
+
 	// scripts, each carrying its own domain content
 	scriptChecks := map[string][]string{
 		"app.js":       {"escHtml", "escAttr", "DOMContentLoaded", "detectProject", "contextMeter", "initDesktopPreferences", "renderStatusPopover", "renderStatusSnapshot", "openRailSearch", "applyLanguage", "data-i18n-label", "data-i18n-title", "syncApprovalChip(approvalMode)", "requestNative", "checkDesktopUpdate", "openDesktopUpdateDialog", "installDesktopUpdate", "paintDesktopUpdateProgress", "start-install-update", "get-update-progress", "update-progress-fill", "From idea to done", "从想法，到完成", "METIS Desktop"},
 		"sessions.js":  {"loadSessions", "loadMoreSessions", "renderSessions", "resumeSession", "archiveSession", "restoreSession", "openSessionDeleteDialog", "confirmSessionDeletion", "closeSessionDeleteDialog", `role="alertdialog"`, "requestAnimationFrame(() => cancel.focus())", "method: 'DELETE'", "setSessionPreference", "workspaceLabel", "sessionItemKeydown", "loadWorkspaces", "addWorkspace", "requestNative('choose-workspace')", "openWorkspace", "renameWorkspace", "removeWorkspace", "moveWorkspace", "moveSession", "showSessionDetail", "Plan session completed"},
 		"chat.js":      {"connectEvents", "acceptLiveEvent", "sendMessage", "handleTextDelta", "showReconnectBanner", "endStreamingMessage", "openAttachmentPicker", "initAttachmentDrop", "pasteClipboardFilePaths", "pasteAllClipboardFilePaths", "/api/clipboard/files", "selectionStart", "COMPOSER_COMMANDS", "COMPOSER_ADD_ACTIONS", "toggleComposerAddMenu", "getBoundingClientRect().top - 12", "runComposerAddAction", "openComposerActionDialog", "toggleApproval", "paintApprovalMenu", "closeApprovalMenu", "menuitemradio", "permission.mode", "/api/compact", "/api/goals", "/api/feedback", "submitBusyInput", "drainQueuedTurns", "filterSettings", "loadProviders", "saveCustomProvider", "deleteProvider", "validateProvider", "probeProvider", "loadEffort", "loadPresets", "loadPlugins", "loadPluginCatalog", "refreshPluginCatalog", "installPlugin", "removePlugin", "openPluginActionDialog", "pluginEcosystemGrid", "choosePluginEcosystem", "renderPluginEcosystems", "Ecosystem compatibility", "生态兼容层", "/api/plugins/catalog", "/api/plugins/install", "/api/plugins/remove", "loadRouting", "chooseLanguage", "ROUTING_ZH", "appendThinkingRow", "thinkRowKeydown", "REDACTED_THINKING_PLACEHOLDER", "MESSAGE_ACTION_ICONS", "messageActionsMarkup", "restoreHistoryMessageMetadata", "turnMetrics", "msg-metrics"},
+		"rewind.js":    {"openRewindDialog", "confirmRewind", "/api/rewind", "revision", "codeAvailable", "syncRewindView"},
 		"trace.js":     {"loadTrace", "renderTrace", "switchView", "selectTraceRow", "renderTraceInspector", "toggleFoldTurns", "coalesceTraceToolArguments", "mergeTraceEvents", "traceNextCursor", "closeTraceInspector(false)", "thinking_redacted", "k-thinking"},
 		"artifacts.js": {"renderArtifactPresentation", "loadArtifactsForSession", "openArtifactsPanel", "previewArtifactByID", "safeArtifactURL", "confirmArtifactDeletion", "/api/artifacts"},
 	}
@@ -341,8 +347,8 @@ func TestComposerAddMenuPreservesAttachmentAndKeepsSlashCommandsIndependent(t *t
 	if addStart < 0 || addEnd < 0 {
 		t.Fatal("cannot locate compact composer add catalog")
 	}
-	if got := strings.Count(chat[addStart:addStart+addEnd], " action: '"); got != 6 {
-		t.Fatalf("composer add menu has %d actions, want six focused entries", got)
+	if got := strings.Count(chat[addStart:addStart+addEnd], " action: '"); got != 7 {
+		t.Fatalf("composer add menu has %d actions, want seven focused entries including rewind", got)
 	}
 }
 

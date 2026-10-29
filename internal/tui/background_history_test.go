@@ -51,7 +51,6 @@ func TestBackgroundCompletionDoesNotReviveReplacedHistory(t *testing.T) {
 			case "rewind_conversation":
 				picker := screen.NewRewindScreen([]screen.RewindEntry{{Turn: 2, Prompt: "second prompt"}})
 				picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-				picker.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 				picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 				m.applyScreenResult(picker)
 				if m.loop.CountTurns() != 1 || m.input.Value() != "second prompt" {

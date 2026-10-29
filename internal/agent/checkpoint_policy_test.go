@@ -18,7 +18,7 @@ func TestCheckpointPolicySkipsAutomaticStagesWithoutProtectionGap(t *testing.T) 
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	shadow := t.TempDir()
-	l := &Loop{Checkpointer: checkpoint.NewManager("policy", home, shadow), ckptSnappedAt: -1}
+	l := &Loop{Checkpointer: checkpoint.NewManager("policy", filepath.VolumeName(home)+string(filepath.Separator), shadow), ckptSnappedAt: -1}
 	out := make(chan Event, 20)
 	called := 0
 	for range 2 {
@@ -79,7 +79,7 @@ func TestCheckpointPolicyPreservesConversationRewindAndExplainsCodeRewind(t *tes
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	l := &Loop{Checkpointer: checkpoint.NewManager("policy-rewind", home, t.TempDir()), ckptSnappedAt: -1,
+	l := &Loop{Checkpointer: checkpoint.NewManager("policy-rewind", filepath.VolumeName(home)+string(filepath.Separator), t.TempDir()), ckptSnappedAt: -1,
 		Messages: []llm.Message{msg(llm.RoleUser, "first"), msg(llm.RoleAssistant, "done"), msg(llm.RoleUser, "second")}}
 	before := l.History()
 	for _, scope := range []RewindScope{RewindCode, RewindCodeAndConversation} {
@@ -108,7 +108,7 @@ func TestCheckpointPolicyNoticeResetsOnWorkspaceRebind(t *testing.T) {
 	l := &Loop{Messages: []llm.Message{msg(llm.RoleUser, "one")}}
 	out := make(chan Event, 5)
 	for range 2 {
-		l.SetCheckpointer(checkpoint.NewManager("rebind", home, t.TempDir()))
+		l.SetCheckpointer(checkpoint.NewManager("rebind", filepath.VolumeName(home)+string(filepath.Separator), t.TempDir()))
 		l.runCheckpointStage(context.Background(), out, "before tool", "Bash", func(context.Context) error {
 			t.Fatal("policy ran snapshot callback after rebind")
 			return nil

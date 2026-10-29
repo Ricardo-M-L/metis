@@ -25,10 +25,11 @@ const (
 )
 
 type RewindEntry struct {
-	Turn              int
-	Prompt            string
-	HasCodeCheckpoint bool
-	LatestEdit        bool
+	Turn                  int
+	Prompt                string
+	HasCodeCheckpoint     bool
+	CodeUnavailableReason string
+	LatestEdit            bool
 }
 
 type rewindStage uint8
@@ -112,7 +113,12 @@ func (s *RewindScreen) scrollToCursor() {
 func (s *RewindScreen) move(delta int) {
 	if s.stage == rewindStageAction {
 		const actionCount = 5
-		s.actionCursor = (s.actionCursor + delta + actionCount) % actionCount
+		for step := 0; step < actionCount; step++ {
+			s.actionCursor = (s.actionCursor + delta + actionCount) % actionCount
+			if s.actionAvailable(s.actionCursor) {
+				break
+			}
+		}
 		return
 	}
 	if count := len(s.entries); count > 0 {
@@ -129,11 +135,21 @@ func (s *RewindScreen) selectCurrentPoint() {
 	s.selectedTurn = s.entries[s.pointCursor].Turn
 	s.stage = rewindStageAction
 	s.actionCursor = 0
+	if !s.actionAvailable(s.actionCursor) {
+		s.actionCursor = 1
+	}
+}
+
+func (s *RewindScreen) actionAvailable(index int) bool {
+	if index != 0 && index != 2 {
+		return true
+	}
+	return s.selectedEntry >= 0 && s.selectedEntry < len(s.entries) && s.entries[s.selectedEntry].HasCodeCheckpoint
 }
 
 func (s *RewindScreen) quickLatestEdit() {
 	for index, entry := range s.entries {
-		if !entry.LatestEdit {
+		if !entry.LatestEdit || !entry.HasCodeCheckpoint {
 			continue
 		}
 		s.selectedEntry = index
@@ -153,6 +169,9 @@ func (s *RewindScreen) selectCurrentAction() {
 		RewindActionCancel,
 	}
 	if s.actionCursor < 0 || s.actionCursor >= len(actions) {
+		return
+	}
+	if !s.actionAvailable(s.actionCursor) {
 		return
 	}
 	s.action = actions[s.actionCursor]
@@ -351,6 +370,7 @@ func (s *RewindScreen) viewActions() string {
 	for index, row := range rewindActionRows {
 		marker := "  "
 		style := rewindIdleStyle
+		available := s.actionAvailable(index)
 		if index == s.actionCursor {
 			marker = rewindCursorStyle.Render("▸ ")
 			style = rewindActiveStyle
@@ -358,8 +378,17 @@ func (s *RewindScreen) viewActions() string {
 		out.WriteString("  ")
 		out.WriteString(marker)
 		out.WriteString(style.Render(row.name))
+		if !available {
+			out.WriteString(rewindDetailStyle.Render(" (unavailable)"))
+		}
 		out.WriteString("\n      ")
-		if index == 3 {
+		if !available {
+			reason := "No complete code snapshot is available for this point."
+			if s.selectedEntry >= 0 && s.selectedEntry < len(s.entries) && s.entries[s.selectedEntry].CodeUnavailableReason != "" {
+				reason = rewindPromptPreview(s.entries[s.selectedEntry].CodeUnavailableReason, 96)
+			}
+			out.WriteString(rewindDetailStyle.Render(reason))
+		} else if index == 3 {
 			out.WriteString(rewindSummaryStyle.Render(row.description))
 		} else {
 			out.WriteString(rewindDetailStyle.Render(row.description))

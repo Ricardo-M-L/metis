@@ -52,9 +52,9 @@ func (s *rewindSummaryStream) Recv() (llm.StreamEvent, error) {
 func rewindSummaryPicker() *screen.RewindScreen {
 	picker := screen.NewRewindScreen([]screen.RewindEntry{{Turn: 2, Prompt: "second prompt"}})
 	picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	for range 3 {
-		picker.Update(tea.KeyPressMsg{Code: tea.KeyDown})
-	}
+	// With no code snapshot, conversation is selected and the next available
+	// action is summarize (code-only is skipped).
+	picker.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	picker.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	return picker
 }
@@ -92,10 +92,9 @@ func TestRewindSlashOpensMessagePickerAndRestoresConversationOnly(t *testing.T) 
 	if _, ok := m.activeScreen.(*screen.RewindScreen); !ok {
 		t.Fatalf("/rewind activeScreen=%T, want *screen.RewindScreen", m.activeScreen)
 	}
-	// Newest prompt (turn 2) is selected. Enter opens the action page;
-	// Down chooses conversation-only; Enter applies it through Model.Update.
+	// Newest prompt (turn 2) is selected. Without a complete file snapshot,
+	// conversation-only is the default; Enter applies it through Model.Update.
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if m.activeScreen != nil {

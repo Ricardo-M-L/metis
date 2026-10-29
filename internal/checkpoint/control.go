@@ -134,8 +134,8 @@ func readControl(sessionID, workspace string) (controlSettings, string, error) {
 	if err != nil {
 		return controlSettings{}, "", err
 	}
-	state := controlSettings{Version: 2, SessionID: sessionID, Workspace: cwd, Enabled: !isUnsafeCheckpointRoot(cwd), Revision: "auto"}
-	if state.Enabled {
+	state := controlSettings{Version: 2, SessionID: sessionID, Workspace: cwd, Enabled: !isFilesystemCheckpointRoot(cwd), Revision: "auto"}
+	if state.Enabled && !isUnsafeCheckpointRoot(cwd) {
 		state.Roots = []string{"."}
 	}
 	if sessionID == "" {

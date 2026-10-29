@@ -16,7 +16,8 @@ import (
 const sparsePathsFilename = "metis-sparse-paths.json"
 const maxSparsePaths = 8192
 
-// Sparse is the explicit session switch for a broad workspace. Its snapshots
+// Sparse is target-only protection for a broad workspace (automatic at home).
+// Its snapshots
 // contain only targets registered before direct file edits, never the home tree.
 func (m *Manager) Sparse() bool { return m.sparse.Load() }
 

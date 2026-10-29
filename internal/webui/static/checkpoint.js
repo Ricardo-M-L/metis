@@ -50,6 +50,7 @@ function renderCheckpointControl(state) {
     typeof state.sessionId === 'string' && state.sessionId === String(currentSessionId || '');
   if (valid) checkpointSnapshot = state;
   checkpointPaintSwitch();
+  if (typeof syncRewindView === 'function') syncRewindView();
   return valid;
 }
 

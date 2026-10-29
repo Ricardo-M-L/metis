@@ -3732,6 +3732,18 @@ async function sendMessage(busyBehavior) {
     await executeComposerCommand(text, owner);
     return;
   }
+  if (/^\/(?:rewind|checkpoint)(?:\s|$)/i.test(text)) {
+    if (attachments.length) {
+      showToast(uiText('Keep attachments in the draft and run this command without them.', '请保留附件草稿，不带附件执行此命令。'));
+      return;
+    }
+    const owner = currentSessionId;
+    input.value = '';
+    autoResize(input);
+    closeCommandMenu();
+    await executeComposerCommand(text, owner);
+    return;
+  }
   if (pendingAsk) {
     input.value = '';
     autoResize(input);
@@ -4152,6 +4164,19 @@ async function runTurnItem(item) {
         renderQueuedTurns();
       }
       showToast(uiText('Remove attachments from the queued rename before continuing.', '请移除排队重命名中的附件后继续。'));
+      return false;
+    }
+    await executeComposerCommand(item.text, currentSessionId);
+    return true;
+  }
+  // Legacy queued restore/control commands remain local after an upgrade.
+  if (!item.resume && /^\/(?:rewind|checkpoint)(?:\s|$)/i.test(String(item.text || '').trim())) {
+    if (Array.isArray(item.images) && item.images.length) {
+      if (drainingQueuedTurns && queuedSessionId === currentSessionId) {
+        queuedTurns.unshift(item);
+        renderQueuedTurns();
+      }
+      showToast(uiText('Remove attachments from the queued command before continuing.', '请移除排队命令中的附件后继续。'));
       return false;
     }
     await executeComposerCommand(item.text, currentSessionId);
@@ -5474,7 +5499,7 @@ const COMPOSER_COMMANDS = [
   { name: '/undo', label: 'Undo last turn', hint: 'Remove the latest exchange and restore its prompt', category: 'Session' },
   { name: '/edit', label: 'Edit last prompt', hint: 'Undo the latest exchange and restore its prompt', category: 'Session' },
   { name: '/save', label: 'Save session', hint: 'Flush the current transcript to disk', category: 'Session' },
-  { name: '/checkpoint', label: '代码检查点', hint: 'status · on · off；仅切换当前会话', category: 'Session' },
+  { name: '/rewind', label: '回退', hint: '选择时间点，恢复代码、对话或两者', category: 'Session' },
   { name: '/compact', label: 'Compact history', hint: 'Summarize older context now', category: 'Session' },
   { name: '/export', label: 'Export session log', hint: 'Write the current transcript to a file', category: 'Session' },
   { name: '/feedback', label: 'Record feedback', hint: 'Save a private log-only note', category: 'Session' },
@@ -5526,6 +5551,7 @@ const COMPOSER_ADD_ACTIONS = [
   { section: 'add', action: 'clipboard', label: 'Files and folders', labelZh: '\u6587\u4ef6\u548c\u6587\u4ef6\u5939', hint: 'Insert absolute paths copied in Finder', hintZh: '\u63d2\u5165 Finder \u4e2d\u5df2\u590d\u5236\u9879\u76ee\u7684\u7edd\u5bf9\u8def\u5f84' },
   { section: 'workflow', action: 'goal', label: 'Goal', labelZh: '\u76ee\u6807', hint: 'Set or view a long-running objective', hintZh: '\u8bbe\u7f6e\u6216\u67e5\u770b\u957f\u65f6\u95f4\u4efb\u52a1\u76ee\u6807' },
   { section: 'workflow', action: 'plan', label: 'Plan mode', labelZh: '\u8ba1\u5212\u6a21\u5f0f', hint: 'Enter or leave planning mode', hintZh: '\u8fdb\u5165\u6216\u9000\u51fa\u89c4\u5212\u6a21\u5f0f' },
+  { section: 'workflow', action: 'rewind', label: 'Rewind', labelZh: '回退', hint: 'Restore code, conversation, or both', hintZh: '选择时间点，恢复代码、对话或两者' },
   { section: 'command', action: 'commands', label: 'All commands', labelZh: '\u5168\u90e8\u547d\u4ee4', hint: 'Open the independent slash-command palette', hintZh: '\u6253\u5f00\u72ec\u7acb\u7684\u659c\u6760\u547d\u4ee4\u9762\u677f' },
   { section: 'command', action: 'plugins', label: 'Skills and plugins', labelZh: '\u6280\u80fd\u4e0e\u63d2\u4ef6', hint: 'Open installed extensions and marketplace', hintZh: '\u6253\u5f00\u5df2\u5b89\u88c5\u6269\u5c55\u548c\u63d2\u4ef6\u5546\u573a' },
 ];
@@ -5541,6 +5567,7 @@ function composerActionIcon(action) {
     attachment: '<path d="M6.5 8.8 10.9 4.4a2.2 2.2 0 0 1 3.1 3.1L8.3 13.2a3.5 3.5 0 0 1-5-5l6-6"/>',
     clipboard: '<path d="M2.5 4.5h4l1.2 1.4h5.8v7.6h-11z"/><path d="M2.5 5.9h11"/>',
     goal: '<circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="2.4"/><path d="M11.8 4.2 8 8"/>',
+    rewind: '<path d="M2.5 6.5a5.5 5.5 0 1 1 0 4M2.5 2.5v4h4"/>',
     plan: '<path d="M3 4h10M3 8h7M3 12h5"/><path d="m11 11 1.2 1.2L14.5 10"/>',
     commands: '<path d="M4 5.5 2.5 8 4 10.5M7 11h5"/>',
     compact: '<path d="M5.5 2.5v3h-3M10.5 13.5v-3h3"/><path d="M3 5.5a5.5 5.5 0 0 1 9.6-1.4M13 10.5a5.5 5.5 0 0 1-9.6 1.4"/>',
@@ -5557,7 +5584,7 @@ function renderComposerAddMenu() {
   const menu = document.getElementById('composerAddMenu');
   if (!menu) return;
   let section = '';
-  menu.innerHTML = COMPOSER_ADD_ACTIONS.map(item => {
+  menu.innerHTML = COMPOSER_ADD_ACTIONS.filter(item => item.action !== 'rewind' || typeof rewindReadOnlyView !== 'function' || !rewindReadOnlyView()).map(item => {
     let divider = '';
     if (item.section !== section) {
       if (section) divider = '<div class="composer-add-divider" role="separator"></div>';
@@ -5615,6 +5642,7 @@ async function runComposerAddAction(action, trigger) {
     }
     case 'goal': openComposerActionDialog('goal', trigger); break;
     case 'plan': await executeComposerCommand('/plan'); break;
+    case 'rewind': await openRewindDialog('', document.getElementById('attachmentBtn') || trigger); break;
     case 'compact': await executeComposerCommand('/compact'); break;
     case 'export': await executeComposerCommand('/export'); break;
     case 'feedback': openComposerActionDialog('feedback', trigger); break;
@@ -5720,7 +5748,8 @@ async function executeComposerCommand(text, targetSessionId = currentSessionId) 
   if (!match) return false;
   const name = match[1].toLowerCase();
   const input = String(match[2] || '').trim();
-  if (!COMPOSER_COMMANDS.some(c => c.name.toLowerCase() === name)) return false;
+  // /checkpoint remains an advanced compatibility command, outside the everyday catalog.
+  if (name !== '/checkpoint' && !COMPOSER_COMMANDS.some(c => c.name.toLowerCase() === name)) return false;
   switch (name) {
     case '/help':
     case '/keybindings': openFullCommandCatalog(); break;
@@ -5738,6 +5767,7 @@ async function executeComposerCommand(text, targetSessionId = currentSessionId) 
     case '/retry': await runSessionCommand('retry'); break;
     case '/save': await runSessionCommand('save'); break;
     case '/checkpoint': await runCheckpointControl(input); break;
+    case '/rewind': await openRewindDialog(input); break;
     case '/settings': await openSettings(); break;
     case '/appearance': await openComposerSettingsTab('appearance', 'settingsAppearanceBtn'); break;
     case '/theme': await runThemeCommand(input); break;

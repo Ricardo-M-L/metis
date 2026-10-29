@@ -30,8 +30,8 @@ func TestSparseHomeEnableDoesNotSnapshotHomeAndIsSessionLocal(t *testing.T) {
 	if _, err := os.Stat(m.shadowDir); !os.IsNotExist(err) {
 		t.Fatalf("enable scans or initializes home: %v", err)
 	}
-	if other.ControlStatus().Enabled {
-		t.Fatal("enable leaked to another session")
+	if !other.ControlStatus().Enabled || !other.Sparse() {
+		t.Fatal("other sessions must retain the automatic sparse default")
 	}
 	reopened := NewManager("sparse-home", home, "")
 	if !reopened.ControlStatus().Enabled || reopened.AutomaticDisabled() {

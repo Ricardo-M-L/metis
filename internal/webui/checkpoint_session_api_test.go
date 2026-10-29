@@ -112,7 +112,8 @@ func TestCheckpointFreshStatusIsReadOnlyAndHomeEnableIsSessionLocal(t *testing.T
 		t.Fatalf("home toggle must enable this session without range selection: %d %s", rr.Code, rr.Body.String())
 	}
 	cli := checkpoint.NewManager("checkpoint-home", home, "")
-	if !cli.ControlStatus().Enabled || cli.AutomaticDisabled() || checkpoint.NewManager("other-home", home, "").ControlStatus().Enabled {
+	other := checkpoint.NewManager("other-home", home, "")
+	if !cli.ControlStatus().Enabled || cli.AutomaticDisabled() || !cli.Sparse() || !other.ControlStatus().Enabled || !other.Sparse() {
 		t.Fatal("home switch is not session-local or CLI/Desktop disagree")
 	}
 	if _, err := cli.Command(t.Context(), "off"); err != nil {
@@ -122,6 +123,9 @@ func TestCheckpointFreshStatusIsReadOnlyAndHomeEnableIsSessionLocal(t *testing.T
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/checkpoint?sessionId=checkpoint-home", nil))
 	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"enabled":false`) {
 		t.Fatalf("Desktop did not read CLI off state: %d %s", rr.Code, rr.Body.String())
+	}
+	if !checkpoint.NewManager("other-home", home, "").ControlStatus().Enabled || checkpoint.NewManager("checkpoint-home", home, "").ControlStatus().Enabled {
+		t.Fatal("saved off must survive recreation without disabling another HOME session")
 	}
 	if _, err := os.Stat(filepath.Join(metisHome, "checkpoints", "checkpoint-home")); !os.IsNotExist(err) {
 		t.Errorf("home toggle created a full-home snapshot: %v", err)

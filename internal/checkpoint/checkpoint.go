@@ -79,9 +79,9 @@ func NewManager(sessionID, cwd, shadowRoot string) *Manager {
 		shadowDir: filepath.Join(shadowRoot, sessionID),
 		cwd:       cwd,
 	}
-	// Broad workspaces default off. An explicit per-session switch may enable
-	// sparse file checkpoints there without ever mirroring the home/root tree.
-	if isUnsafeCheckpointRoot(cwd) {
+	// The filesystem root remains opt-in. Home sessions automatically use
+	// sparse targets so direct edits are protected without mirroring home.
+	if isFilesystemCheckpointRoot(cwd) {
 		m.disabled = true
 		m.disabledByPolicy.Store(true)
 	}
@@ -93,11 +93,9 @@ func NewManager(sessionID, cwd, shadowRoot string) *Manager {
 	return m
 }
 
-// isUnsafeCheckpointRoot reports whether cwd is too broad to checkpoint:
-// the filesystem root or the user's home directory itself. Sub-dirs of
-// home (e.g. ~/Documents/project) are fine — only the bare roots are
-// considered broad; an explicit session switch uses sparse targets instead.
-func isUnsafeCheckpointRoot(cwd string) bool {
+// isFilesystemCheckpointRoot reports an empty workspace or a filesystem root.
+// These retain their default-off policy, including a symlink to the root.
+func isFilesystemCheckpointRoot(cwd string) bool {
 	if cwd == "" {
 		return true
 	}
@@ -105,6 +103,20 @@ func isUnsafeCheckpointRoot(cwd string) bool {
 	if clean == string(filepath.Separator) || (filepath.IsAbs(clean) && filepath.Dir(clean) == clean) {
 		return true
 	}
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		return filepath.IsAbs(resolved) && filepath.Dir(resolved) == resolved
+	}
+	return false
+}
+
+// isUnsafeCheckpointRoot reports a workspace too broad for a full-tree scan:
+// the filesystem root or the user's home directory itself. Such workspaces
+// use sparse targets unless an explicit project scope was selected.
+func isUnsafeCheckpointRoot(cwd string) bool {
+	if isFilesystemCheckpointRoot(cwd) {
+		return true
+	}
+	clean := filepath.Clean(cwd)
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return false
@@ -127,12 +139,28 @@ func isUnsafeCheckpointRoot(cwd string) bool {
 }
 
 // Disabled reports whether checkpointing is off for this manager (init
-// error, or an unsafe cwd root). Lets runtime warn the user that
+// error, or a filesystem-root workspace policy). Lets runtime warn the user that
 // /rewind won't be available this session.
 func (m *Manager) Disabled() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.disabled
+}
+
+// RewindMetadataPath identifies durable turn-to-file-snapshot metadata without
+// placing it inside the mirrored working tree. Session and canonical workspace
+// identities have separate paths; callers must also validate both in the data.
+// Merely obtaining the path does not initialize storage or scan any files.
+func (m *Manager) RewindMetadataPath() string {
+	workspace := m.cwd
+	if abs, err := filepath.Abs(workspace); err == nil {
+		workspace = abs
+	}
+	if canonical, err := filepath.EvalSymlinks(workspace); err == nil {
+		workspace = canonical
+	}
+	sum := sha256.Sum256([]byte(workspace))
+	return filepath.Join(m.shadowDir, ".git", "metis-rewind-"+hex.EncodeToString(sum[:])+".json")
 }
 
 // initShadowRepo lazily creates and `git init`s the shadow dir.

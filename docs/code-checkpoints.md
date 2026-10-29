@@ -16,8 +16,14 @@ ignored by a project's `.gitignore`. Otherwise an unchanged ignored file can
 be misclassified as newly created and incorrectly selected for deletion during
 rewind. Force-staging applies only to the private shadow repository.
 
-`/checkpoint on`, `/checkpoint off`, and `/checkpoint status` control the current
-session. Desktop exposes the same session switch. The preference is stored under
+Code checkpoints run automatically in ordinary project and home sessions; the
+Desktop composer has no permanent checkpoint switch. Users choose a time point
+through Rewind and restore code, conversation, or both. Each time point reports
+whether code restoration is available and, when it is not, why; conversation
+restoration remains available. `/checkpoint on`, `/checkpoint off`, and
+`/checkpoint status` remain advanced current-session controls for compatibility
+and diagnostics. An explicitly saved `off` is respected after upgrade or resume.
+The preference is stored under
 `checkpoint-controls/sessions/`, keyed by the durable session ID and canonical
 workspace path, and verified against both identities when read. CLI and Desktop
 opening the same session see the same preference after refresh or resume;
@@ -27,19 +33,20 @@ changing its own preference. The previous workspace-wide preference is retained
 on disk but is not broadcast into new or resumed sessions.
 
 A new-chat preview only reads defaults; it never writes a workspace preference.
-Desktop creates a durable session before changing the switch. Project workspaces
-default to enabled. The bare user home and filesystem root default to disabled.
-Enabling a session there uses file checkpoints: each direct file tool saves its
+Advanced controls allocate a durable session before saving a changed preference.
+Project workspaces default to enabled, and the bare user home automatically uses
+file checkpoints: each direct file tool saves its
 target before editing, without recursively scanning the home directory. Repeated
 edits and later targets retain their original pre-edit state. Arbitrary shell
 commands have no reliable file target in this mode, so the affected turn is
 marked incomplete for code rewind; conversation rewind remains available.
-Desktop does not offer a project-scope picker. Existing explicitly scoped CLI
-commands remain compatible for advanced callers, but are not part of the
-Desktop switch or its command help.
+Filesystem roots and empty workspaces retain their default-disabled policy.
+Existing explicitly scoped CLI commands remain compatible for advanced callers;
+Desktop does not offer a project-scope picker.
 
-The CLI footer does not display checkpoint status. Use `/checkpoint status` to
-inspect it; the Desktop composer keeps its current-session switch.
+Neither the CLI footer nor Desktop composer constantly displays checkpoint
+status. Rewind shows recovery availability where it is relevant; advanced callers
+can still use `/checkpoint status` to inspect the automatic policy.
 
 The shadow repository stores raw file bytes. Its own highest-priority attributes
 disable text, encoding, ident and clean-filter transformations, and its local

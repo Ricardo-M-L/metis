@@ -6,11 +6,11 @@ import (
 )
 
 // ErrDisabledByPolicy means this workspace is intentionally excluded from
-// code checkpoints: the user's home directory, a filesystem root, or an empty
+// code checkpoints: a filesystem root or an empty
 // workspace. It does not indicate failed initialization or damaged storage.
 // Callers may skip automatic checkpoint hooks for this error while continuing
 // to expose the reason when the user explicitly asks for a code rewind.
-var ErrDisabledByPolicy = errors.New("checkpoint: disabled by workspace policy; choose a project directory instead of the home directory or filesystem root")
+var ErrDisabledByPolicy = errors.New("checkpoint: disabled by workspace policy; choose a project directory instead of the filesystem root")
 
 // DisabledByPolicy reports an intentionally excluded workspace without
 // waiting for a snapshot. Workspace controls refresh it at an idle boundary

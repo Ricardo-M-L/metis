@@ -423,11 +423,18 @@ type Loop struct {
 	// the unified /rewind — restoring BOTH file state and conversation to
 	// a chosen turn. nil disables checkpointing (best-effort feature;
 	// Snap/Restore errors are swallowed). See checkpoint_hook.go.
-	Checkpointer       *checkpoint.Manager
-	ckptMu             sync.Mutex
-	ckptStack          []ckptEntry
-	ckptSnappedAt      int  // CountTurns() value last snapped; -1 = none yet
-	ckptPolicyNotified bool // one explanation per workspace/session binding
+	Checkpointer        *checkpoint.Manager
+	ckptMu              sync.Mutex
+	ckptStack           []ckptEntry
+	ckptSnappedAt       int        // CountTurns() value last snapped; -1 = none yet
+	ckptPolicyNotified  bool       // one explanation per workspace/session binding
+	ckptPersistMu       sync.Mutex // durable rewind mappings and pending tool ownership
+	ckptLoadedPath      string
+	ckptPersistErr      error
+	ckptWriteErr        error
+	ckptCalls           map[string]rewindRecordedCall
+	ckptRestorePending  bool
+	ckptDelegateUnknown bool
 
 	// DreamNotify is the receive end of the auto-memory extractor's
 	// completion channel (G.5, 2026-05-12). When the extractor's
@@ -1268,12 +1275,20 @@ func (l *Loop) SetPrePlanMode(mode string) {
 // manager would let /rewind in the destination session restore unrelated file
 // state and conversation turns.
 func (l *Loop) SetCheckpointer(manager *checkpoint.Manager) {
+	l.ckptPersistMu.Lock()
+	defer l.ckptPersistMu.Unlock()
 	l.ckptMu.Lock()
 	defer l.ckptMu.Unlock()
 	l.Checkpointer = manager
 	l.ckptStack = nil
 	l.ckptSnappedAt = -1
 	l.ckptPolicyNotified = false
+	l.ckptLoadedPath = ""
+	l.ckptPersistErr = nil
+	l.ckptWriteErr = nil
+	l.ckptCalls = nil
+	l.ckptRestorePending = false
+	l.ckptDelegateUnknown = false
 }
 
 // Reset clears the conversation.

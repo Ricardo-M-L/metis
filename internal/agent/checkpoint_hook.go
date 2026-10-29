@@ -8,8 +8,10 @@ package agent
 // the state before that turn's edits. Mirrors claude-code's Esc-Esc
 // rewind, which restores code + transcript together.
 //
-// Best-effort: any Snap/Restore error is swallowed and leaves the loop
-// running normally (a broken shadow repo must never block real work).
+// Snapshot failures remain best-effort and produce an incomplete recovery
+// barrier. A mutating dispatch is refused only when even that durable fence
+// cannot be saved; otherwise a crash could erase evidence of an unprotected
+// write. Restore errors remain explicit and never report false completion.
 
 import (
 	"context"
@@ -37,6 +39,8 @@ type ckptEntry struct {
 	managedPaths   map[string]string // cwd-relative path -> post-tool fingerprint
 	incomplete     bool              // never claim code restore across an unverified mutation
 	scope          string            // a historical scope cannot authorize a different project set
+	prefix         string            // exact conversation prefix through this user prompt
+	pending        bool              // a tool started but its post-state is not durable yet
 }
 
 // mutatingTools are the tools whose execution can change the working
@@ -51,6 +55,16 @@ var mutatingTools = map[string]bool{
 	"Bash":         true,
 }
 
+// Delegated execution has no parent-owned file attribution. Keep a durable
+// barrier instead of claiming that an unrelated parent snapshot covers it.
+var unknownCheckpointMutationTools = map[string]bool{
+	"Agent": true, "Task": true, "Fork": true, "MessageTeammate": true,
+}
+
+func checkpointMutationTool(name string) bool {
+	return mutatingTools[name] || unknownCheckpointMutationTools[name]
+}
+
 // snapPreEdit takes a working-tree snapshot before the first mutating
 // tool of the current turn. No-op when checkpointing is disabled, the
 // tool isn't mutating, or this turn was already snapped.
@@ -59,6 +73,31 @@ func (l *Loop) snapPreEdit(toolName string, input map[string]any) {
 }
 
 func (l *Loop) snapPreEditContext(ctx context.Context, toolName string, input map[string]any) error {
+	if l == nil || l.Checkpointer == nil || !checkpointMutationTool(toolName) || l.Checkpointer.AutomaticDisabled() {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	_ = l.loadRewindState(true)
+	if unknownCheckpointMutationTools[toolName] {
+		l.ckptPersistMu.Lock()
+		l.ckptDelegateUnknown = true
+		l.ckptPersistMu.Unlock()
+		l.markCheckpointIncomplete()
+		err := errors.New("委派任务的文件修改范围未归因，该轮仅支持会话回退")
+		return errors.Join(err, l.recordRewindCall(ctx, toolName, input, false, err))
+	}
+	err := l.snapPreEditSnapshotContext(ctx, toolName, input)
+	if err != nil {
+		l.markCheckpointIncomplete()
+	}
+	// Before dispatch is allowed to execute, durably fence this exact call.
+	// A process killed between the tool's write and its post-hook leaves it pending.
+	return errors.Join(err, l.recordRewindCall(ctx, toolName, input, false, err))
+}
+
+func (l *Loop) snapPreEditSnapshotContext(ctx context.Context, toolName string, input map[string]any) error {
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
@@ -167,8 +206,21 @@ func (l *Loop) checkpointBudget(phase string) time.Duration {
 // tool invocation. Use the original turn context even for atomic tools that
 // detach their own execution from Esc. A skipped stage must not look like a
 // successfully protected rewind point to the user.
+func (l *Loop) runCheckpointStageForCall(ctx context.Context, out chan<- Event, phase, toolName, callID string, run func(context.Context) error) error {
+	l.runCheckpointStage(context.WithValue(ctx, rewindCallContextKey{}, callID), out, phase, toolName, run)
+	if phase == "before tool" && l.Checkpointer != nil && !l.Checkpointer.AutomaticDisabled() && checkpointMutationTool(toolName) {
+		l.ckptPersistMu.Lock()
+		err := l.ckptWriteErr
+		l.ckptPersistMu.Unlock()
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrRewindStateWrite, err)
+		}
+	}
+	return nil
+}
+
 func (l *Loop) runCheckpointStage(ctx context.Context, out chan<- Event, phase, toolName string, run func(context.Context) error) {
-	if l.Checkpointer == nil || !mutatingTools[toolName] {
+	if l.Checkpointer == nil || !checkpointMutationTool(toolName) {
 		return
 	}
 	// A broad workspace is intentionally excluded, not an initialization
@@ -180,6 +232,15 @@ func (l *Loop) runCheckpointStage(ctx context.Context, out chan<- Event, phase, 
 	// A first snapshot may cover a multi-project workspace. It has a larger
 	// bounded budget; subsequent scans use incremental mirror writes. Both
 	// still inherit the user's cancellation/deadline without detaching work.
+	turns := l.CountTurns()
+	priorIncomplete := false
+	l.ckptMu.Lock()
+	for _, entry := range l.ckptStack {
+		if entry.restoreToTurns == turns-1 && entry.incomplete {
+			priorIncomplete = true
+		}
+	}
+	l.ckptMu.Unlock()
 	started := time.Now()
 	stageCtx, cancel := context.WithTimeout(ctx, l.checkpointBudget(phase))
 	defer cancel()
@@ -206,7 +267,9 @@ func (l *Loop) runCheckpointStage(ctx context.Context, out chan<- Event, phase, 
 		// failure while the turn is live still permits execution, and therefore
 		// creates a real protection gap even if there is no baseline hash.
 		if phase == "after tool" || ctx.Err() == nil {
-			if !l.markCheckpointIncomplete() {
+			l.markCheckpointIncomplete()
+			_ = l.persistRewindState()
+			if priorIncomplete {
 				return // Report the original protection gap once per turn.
 			}
 		}
@@ -244,7 +307,7 @@ func (l *Loop) markCheckpointIncomplete() bool {
 
 func checkpointCompleteFromTurn(stack []ckptEntry, turn int) bool {
 	for _, entry := range stack {
-		if entry.restoreToTurns >= turn-1 && entry.incomplete {
+		if entry.restoreToTurns >= turn-1 && (entry.incomplete || entry.pending) {
 			return false
 		}
 	}
@@ -280,10 +343,11 @@ const (
 // or after this boundary. A false value can also mean that no file edit
 // happened after the point, in which case a code restore is a valid no-op.
 type RewindPoint struct {
-	Turn              int
-	Prompt            string
-	HasCodeCheckpoint bool
-	LatestEdit        bool
+	Turn                  int
+	Prompt                string
+	HasCodeCheckpoint     bool
+	LatestEdit            bool
+	CodeUnavailableReason string
 }
 
 // RewindSummaryPlan is an immutable snapshot of the conversation suffix that
@@ -315,6 +379,7 @@ func (l *Loop) RewindPoints() []RewindPoint {
 	if l == nil {
 		return nil
 	}
+	_ = l.LoadRewindState()
 	history := l.History()
 
 	l.ckptMu.Lock()
@@ -338,13 +403,25 @@ func (l *Loop) RewindPoints() []RewindPoint {
 		// code state, so code restore is an available, proven no-op. With no
 		// snapshot history at all, absence is not evidence and remains
 		// unavailable.
-		codeAvailable := l.Checkpointer != nil && !l.Checkpointer.DisabledByPolicy() && checkpointScopeMatches(stack, turn, l.Checkpointer.ScopeKey()) &&
+		codeAvailable := l.rewindPersistenceError() == nil && l.Checkpointer != nil && !l.Checkpointer.DisabledByPolicy() && checkpointScopeMatches(stack, turn, l.Checkpointer.ScopeKey()) &&
 			(hash != "" || (latestEditTurn > 0 && turn > latestEditTurn)) && checkpointCompleteFromTurn(stack, turn)
+		reason := ""
+		if !codeAvailable {
+			reason = "该时间点没有完整代码快照，仅支持会话回退"
+			if err := l.rewindPersistenceError(); err != nil {
+				reason = err.Error()
+			} else if l.Checkpointer != nil && l.Checkpointer.DisabledByPolicy() {
+				reason = "当前工作区未开启代码保护"
+			} else if !checkpointCompleteFromTurn(stack, turn) {
+				reason = "此后存在未完成或写入范围不明的操作，仅支持会话回退"
+			}
+		}
 		points = append(points, RewindPoint{
-			Turn:              turn,
-			Prompt:            prompt,
-			HasCodeCheckpoint: codeAvailable,
-			LatestEdit:        turn == latestEditTurn,
+			Turn:                  turn,
+			Prompt:                prompt,
+			HasCodeCheckpoint:     codeAvailable,
+			LatestEdit:            turn == latestEditTurn,
+			CodeUnavailableReason: reason,
 		})
 	}
 	for left, right := 0, len(points)-1; left < right; left, right = left+1, right-1 {
@@ -383,10 +460,25 @@ func (l *Loop) rewindToTurnExpected(expected []llm.Message, turn int, scope Rewi
 	return l.rewindToTurnExpectedPersist(expected, turn, scope, nil)
 }
 
-func (l *Loop) rewindToTurnExpectedPersist(expected []llm.Message, turn int, scope RewindScope, persist func([]llm.Message) error) (RewindResult, error) {
+func (l *Loop) rewindToTurnExpectedPersist(expected []llm.Message, turn int, scope RewindScope, persist func([]llm.Message) error) (resultOut RewindResult, resultErr error) {
 	if l == nil || (scope != RewindConversation && scope != RewindCode && scope != RewindCodeAndConversation) {
 		return RewindResult{}, ErrInvalidRewindScope
 	}
+	if scope&RewindConversation != 0 && !reflect.DeepEqual(l.History(), expected) {
+		return RewindResult{}, ErrConversationChanged
+	}
+	_ = l.LoadRewindState()
+	fenced, restoreAttempted, restoreCompleted := false, false, false
+	defer func() {
+		if fenced {
+			if !restoreAttempted || restoreCompleted {
+				finishErr := l.finishRewindPersistence()
+				if scope&RewindCode != 0 {
+					resultErr = errors.Join(resultErr, finishErr)
+				}
+			}
+		}
+	}()
 	if scope&RewindCode != 0 && l.Checkpointer != nil {
 		release, _, err := l.Checkpointer.BeginRun()
 		if err != nil {
@@ -435,6 +527,24 @@ func (l *Loop) rewindToTurnExpectedPersist(expected []llm.Message, turn int, sco
 		}
 	}
 
+	needsFence := scope&RewindCode != 0
+	if !needsFence && l.Checkpointer != nil {
+		l.ckptMu.Lock()
+		needsFence = len(l.ckptStack) > 0
+		l.ckptMu.Unlock()
+		needsFence = needsFence || l.rewindPersistenceError() != nil
+	}
+	if needsFence {
+		err := l.fenceRewindPersistence(expected)
+		l.ckptPersistMu.Lock()
+		writeErr := l.ckptWriteErr
+		l.ckptPersistMu.Unlock()
+		if writeErr != nil || (scope&RewindCode != 0 && err != nil) {
+			return RewindResult{}, err
+		}
+		fenced = true
+	}
+
 	if scope&RewindConversation != 0 {
 		l.mu.Lock()
 		if !reflect.DeepEqual(l.Messages, expected) {
@@ -451,6 +561,7 @@ func (l *Loop) rewindToTurnExpectedPersist(expected []llm.Message, turn int, sco
 			persisted = true
 		}
 		if scope&RewindCode != 0 && !codeNoop {
+			restoreAttempted = true
 			if err := l.Checkpointer.RestorePathStates(codeHash, codePaths); err != nil {
 				if persisted {
 					if rollbackErr := persist(expected); rollbackErr != nil {
@@ -461,8 +572,21 @@ func (l *Loop) rewindToTurnExpectedPersist(expected []llm.Message, turn int, sco
 				return RewindResult{}, err
 			}
 			result.CodeRestored = true
-			l.refreshCheckpointPathStates(codePaths)
+			if err := l.refreshCheckpointPathStates(codePaths); err != nil {
+				// Files reached the target and the durable conversation was
+				// already committed. Keep the live view aligned, report both
+				// actual effects, and leave restorePending fenced on disk.
+				l.restoreMessagesLocked(replacement)
+				l.storeContextEstimateFromHistory(estimateTokens(l.Messages))
+				l.mu.Unlock()
+				result.ConversationRestored = true
+				result.TurnsUndone = turnsBefore - (turn - 1)
+				l.discardCheckpointMappingsFrom(turn, true)
+				return result, err
+			}
+			restoreCompleted = true
 		} else if scope&RewindCode != 0 {
+			restoreCompleted = true
 			result.CodeRestored = true
 		}
 		l.restoreMessagesLocked(replacement)
@@ -470,14 +594,19 @@ func (l *Loop) rewindToTurnExpectedPersist(expected []llm.Message, turn int, sco
 		l.mu.Unlock()
 		result.ConversationRestored = true
 		result.TurnsUndone = turnsBefore - (turn - 1)
-		l.discardCheckpointMappingsFrom(turn)
+		l.discardCheckpointMappingsFrom(turn, result.CodeRestored)
 	} else if scope&RewindCode != 0 {
 		if !codeNoop {
+			restoreAttempted = true
 			if err := l.Checkpointer.RestorePathStates(codeHash, codePaths); err != nil {
 				return RewindResult{}, err
 			}
-			l.refreshCheckpointPathStates(codePaths)
+			result.CodeRestored = true
+			if err := l.refreshCheckpointPathStates(codePaths); err != nil {
+				return result, err
+			}
 		}
+		restoreCompleted = true
 		result.CodeRestored = true
 	}
 	return result, nil
@@ -655,17 +784,17 @@ func checkpointRestoreForTurn(stack []ckptEntry, turn int) (string, map[string]s
 	return hash, paths
 }
 
-func (l *Loop) refreshCheckpointPathStates(paths map[string]string) {
+func (l *Loop) refreshCheckpointPathStates(paths map[string]string) error {
 	if len(paths) == 0 || l.Checkpointer == nil {
-		return
+		return nil
 	}
 	names := make([]string, 0, len(paths))
 	for path := range paths {
 		names = append(names, path)
 	}
 	states, err := l.Checkpointer.CapturePathStates(names)
-	if err != nil {
-		return
+	if err != nil || len(states) != len(names) {
+		return errors.Join(ErrCheckpointIncomplete, err)
 	}
 	l.ckptMu.Lock()
 	defer l.ckptMu.Unlock()
@@ -676,22 +805,25 @@ func (l *Loop) refreshCheckpointPathStates(paths map[string]string) {
 			}
 		}
 	}
+	return nil
 }
 
-func (l *Loop) discardCheckpointMappingsFrom(turn int) {
+func (l *Loop) discardCheckpointMappingsFrom(turn int, restoredCode ...bool) {
 	l.ckptMu.Lock()
 	defer l.ckptMu.Unlock()
 	keep := l.ckptStack[:0]
 	discardedIncomplete := false
+	filesRestored := len(restoredCode) > 0 && restoredCode[0]
 	for _, entry := range l.ckptStack {
 		if entry.restoreToTurns < turn-1 {
 			keep = append(keep, entry)
-		} else if entry.incomplete {
+		} else if entry.incomplete || (!filesRestored && (entry.hash != "" || len(entry.managedPaths) > 0)) {
 			discardedIncomplete = true
 		}
 	}
 	// Conversation-only rewind/summary does not restore files. Do not let it
-	// erase a code-protection gap and make older checkpoints look complete.
+	// erase a code-protection gap or known discarded file effects and make
+	// older checkpoints look complete.
 	// Carry the barrier at the last retained message boundary; new later turns
 	// may still establish a fresh baseline from the actual current files.
 	if discardedIncomplete && len(keep) > 0 {
@@ -708,7 +840,27 @@ func (l *Loop) recordCheckpointMutation(toolName string, input map[string]any, r
 	_ = l.recordCheckpointMutationContext(context.Background(), toolName, input, res, err)
 }
 
-func (l *Loop) recordCheckpointMutationContext(ctx context.Context, toolName string, input map[string]any, res *tools.Result, err error) error {
+func (l *Loop) recordCheckpointMutationContext(ctx context.Context, toolName string, input map[string]any, res *tools.Result, toolErr error) error {
+	if l == nil || l.Checkpointer == nil || !checkpointMutationTool(toolName) || l.Checkpointer.AutomaticDisabled() {
+		return nil
+	}
+	var err error
+	if unknownCheckpointMutationTools[toolName] {
+		err = ErrCheckpointIncomplete
+	} else if ctx.Err() != nil {
+		err = context.Cause(ctx)
+	} else if toolErr != nil || (res != nil && res.IsError) {
+		err = ErrCheckpointIncomplete
+	} else {
+		err = l.recordCheckpointMutationStateContext(ctx, toolName, input, res, nil)
+	}
+	if err != nil {
+		l.markCheckpointIncomplete()
+	}
+	return errors.Join(err, l.recordRewindCall(ctx, toolName, input, true, err))
+}
+
+func (l *Loop) recordCheckpointMutationStateContext(ctx context.Context, toolName string, input map[string]any, res *tools.Result, err error) error {
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
@@ -817,6 +969,12 @@ func (l *Loop) RewindWithPersist(persist func([]llm.Message) error) (RewindResul
 }
 
 func (l *Loop) checkpointUnavailableReason() error {
+	if err := l.LoadRewindState(); err != nil {
+		return fmt.Errorf("%w: %w", ErrCheckpointUnavailable, err)
+	}
+	if err := l.rewindPersistenceError(); err != nil {
+		return fmt.Errorf("%w: %w", ErrCheckpointUnavailable, err)
+	}
 	if l == nil || l.Checkpointer == nil {
 		return ErrCheckpointUnavailable
 	}

@@ -698,6 +698,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/computer-use", s.handleComputerUse)
 	mux.HandleFunc("/api/commands/session", s.handleSessionCommand)
 	mux.HandleFunc("/api/checkpoint", s.handleCheckpointControl)
+	mux.HandleFunc("/api/rewind", s.handleRewind)
 	mux.HandleFunc("/api/compact", s.handleCompact)
 	mux.HandleFunc("/api/goals", s.handleGoals)
 	mux.HandleFunc("/api/preferences", s.handlePreferences)

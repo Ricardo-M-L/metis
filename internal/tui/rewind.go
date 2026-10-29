@@ -41,10 +41,11 @@ func (m *Model) openRewindScreen() {
 	entries := make([]screen.RewindEntry, 0, len(points))
 	for _, point := range points {
 		entries = append(entries, screen.RewindEntry{
-			Turn:              point.Turn,
-			Prompt:            point.Prompt,
-			HasCodeCheckpoint: point.HasCodeCheckpoint,
-			LatestEdit:        point.LatestEdit,
+			Turn:                  point.Turn,
+			Prompt:                point.Prompt,
+			HasCodeCheckpoint:     point.HasCodeCheckpoint,
+			CodeUnavailableReason: point.CodeUnavailableReason,
+			LatestEdit:            point.LatestEdit,
 		})
 	}
 	picker := screen.NewRewindScreen(entries)

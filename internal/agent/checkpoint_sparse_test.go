@@ -17,8 +17,8 @@ func TestCheckpointHomeSessionDirectEditsRewindOriginals(t *testing.T) {
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("METIS_HOME", filepath.Join(home, ".metis"))
 	l := &Loop{Checkpointer: checkpoint.NewManager("home-edits", home, ""), ckptSnappedAt: -1}
-	if _, err := l.CheckpointCommand(t.Context(), "on"); err != nil {
-		t.Fatal(err)
+	if !l.Checkpointer.ControlStatus().Enabled || !l.Checkpointer.Sparse() {
+		t.Fatal("home edits must be protected without an explicit checkpoint command")
 	}
 	a, b, created := filepath.Join(home, "a.txt"), filepath.Join(home, "b.txt"), filepath.Join(home, "new.txt")
 	for _, p := range []string{a, b} {
@@ -67,8 +67,8 @@ func TestCheckpointHomeNewTargetInLaterTurnKeepsItsOriginal(t *testing.T) {
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("METIS_HOME", filepath.Join(home, ".metis"))
 	l := &Loop{Checkpointer: checkpoint.NewManager("home-turns", home, ""), ckptSnappedAt: -1}
-	if _, err := l.CheckpointCommand(t.Context(), "on"); err != nil {
-		t.Fatal(err)
+	if !l.Checkpointer.ControlStatus().Enabled || !l.Checkpointer.Sparse() {
+		t.Fatal("home edits must be protected without an explicit checkpoint command")
 	}
 	for turn, name := range []string{"a", "b"} {
 		path := filepath.Join(home, name)
@@ -108,8 +108,8 @@ func TestCheckpointHomeShellCannotClaimCompleteProtection(t *testing.T) {
 	t.Setenv("METIS_HOME", filepath.Join(home, ".metis"))
 	l := &Loop{Checkpointer: checkpoint.NewManager("home-shell", home, ""), ckptSnappedAt: -1,
 		Messages: []llm.Message{msg(llm.RoleUser, "shell")}}
-	if _, err := l.CheckpointCommand(t.Context(), "on"); err != nil {
-		t.Fatal(err)
+	if !l.Checkpointer.ControlStatus().Enabled || !l.Checkpointer.Sparse() {
+		t.Fatal("home edits must be protected without an explicit checkpoint command")
 	}
 	out := make(chan Event, 8)
 	l.runCheckpointStage(context.Background(), out, "before tool", "Bash", func(ctx context.Context) error {

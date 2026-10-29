@@ -16,10 +16,10 @@ func TestPolicyDisabledSnapshotDoesNotPretendInitializationFailed(t *testing.T) 
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	shadow := filepath.Join(t.TempDir(), "shadow")
-	m := NewManager("policy", home, shadow)
-	_, err := m.BaselineContext(context.Background(), "Bash", "test", "home policy")
+	m := NewManager("policy", filepath.VolumeName(home)+string(filepath.Separator), shadow)
+	_, err := m.BaselineContext(context.Background(), "Bash", "test", "filesystem root policy")
 	if err == nil {
-		t.Fatal("home policy unexpectedly allowed a snapshot")
+		t.Fatal("filesystem root policy unexpectedly allowed a snapshot")
 	}
 	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
 		if strings.Contains(cause.Error(), "init error") || strings.Contains(cause.Error(), "initialization failed") {
@@ -54,7 +54,7 @@ func TestDisabledReasonIdentifiesWorkspacePolicyAcrossOperations(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	for _, cwd := range []string{home, home + string(os.PathSeparator), "/", ""} {
+	for _, cwd := range []string{filepath.VolumeName(home) + string(filepath.Separator), ""} {
 		t.Run("workspace="+cwd, func(t *testing.T) {
 			shadow := filepath.Join(t.TempDir(), "shadow")
 			m := NewManager("policy", cwd, shadow)

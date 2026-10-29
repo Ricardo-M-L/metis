@@ -2,6 +2,7 @@ package tui
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,11 +13,10 @@ import (
 )
 
 func TestPlainREPLRewindExplainsWorkspacePolicyWithoutChangingHistory(t *testing.T) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	loop := &agent.Loop{Checkpointer: checkpoint.NewManager("plain-policy", home, t.TempDir()), Messages: []llm.Message{
+	// HOME now receives automatic sparse protection. The filesystem root
+	// remains the policy-disabled workspace used by this error-path fixture.
+	root := filepath.VolumeName(t.TempDir()) + string(os.PathSeparator)
+	loop := &agent.Loop{Checkpointer: checkpoint.NewManager("plain-policy", root, t.TempDir()), Messages: []llm.Message{
 		{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "keep this prompt"}}},
 		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "text", Text: "keep this reply"}}},
 	}}

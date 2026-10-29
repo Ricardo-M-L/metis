@@ -1095,9 +1095,11 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	if allowed, reason := l.validateToolDispatchAdmission(dispatchEpoch); !allowed {
 		return emitToolDispatchDenial(ctx, out, blk, reason, traceInvocationID, traceParentInvocationID, traceCallID)
 	}
-	l.runCheckpointStage(ctx, out, "before tool", blk.ToolName, func(stageCtx context.Context) error {
+	if checkpointErr := l.runCheckpointStageForCall(ctx, out, "before tool", blk.ToolName, traceCallID, func(stageCtx context.Context) error {
 		return l.snapPreEditContext(stageCtx, blk.ToolName, blk.ToolInput)
-	})
+	}); checkpointErr != nil {
+		return emitToolDispatchDenial(ctx, out, blk, checkpointErr.Error(), traceInvocationID, traceParentInvocationID, traceCallID)
+	}
 	// A cancelled pre-checkpoint must not start a not-yet-running atomic tool
 	// using the detached context. The checkpoint itself never owns execution.
 	if ctx.Err() != nil {
@@ -1142,7 +1144,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		res = &tools.Result{Output: "tool returned no result", IsError: true}
 	}
 	execElapsed := time.Since(execStart)
-	l.runCheckpointStage(ctx, out, "after tool", blk.ToolName, func(stageCtx context.Context) error {
+	l.runCheckpointStageForCall(ctx, out, "after tool", blk.ToolName, traceCallID, func(stageCtx context.Context) error {
 		return l.recordCheckpointMutationContext(stageCtx, blk.ToolName, blk.ToolInput, res, err)
 	})
 	// Persist per-step timing to the session sidecar (best-effort). This is

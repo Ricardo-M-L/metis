@@ -8,6 +8,7 @@
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="vendor/katex/katex.min.css?v=__BUILD__">
 <link rel="stylesheet" href="style.css?v=__BUILD__">
+<link rel="stylesheet" href="rewind.css?v=__BUILD__">
 <link rel="stylesheet" href="session_status.css?v=__BUILD__">
 <link rel="stylesheet" href="artifacts.css?v=__BUILD__">
 <link rel="stylesheet" href="session_files.css?v=__BUILD__">
@@ -214,7 +215,6 @@
               <span class="approval-chip-chevron" aria-hidden="true">&#9662;</span>
             </button>
             <div class="approval-menu" id="approvalMenu" role="menu" aria-label="Permission mode" style="display:none"></div>
-            <button class="input-chip checkpoint-chip" id="checkpointBtn" type="button" role="switch" aria-checked="false" aria-label="正在确认当前会话的代码检查点" title="正在确认检查点状态" onclick="toggleCheckpointControl(event)" disabled>检查点：…</button>
             <textarea class="input-field" id="inputField" placeholder="&#25551;&#36848;&#20320;&#24819;&#35201;&#26500;&#24314;&#30340;&#20869;&#23481;" data-i18n-placeholder="composerPlaceholder" rows="1" onkeydown="handleKeydown(event)" oninput="onComposerInput(this)" aria-controls="commandMenu" aria-autocomplete="list"></textarea>
             <button type="button" id="modelBtn" class="input-chip model-chip" aria-label="Select model" aria-haspopup="menu" aria-expanded="false" aria-controls="modelMenu" onclick="event.stopPropagation();toggleModelMenu()">
               <span id="modelName">5.4</span>
@@ -441,6 +441,7 @@
 <script src="chat.js?v=__BUILD__"></script>
 <script src="subagent_view.js?v=__BUILD__"></script>
 <script src="checkpoint.js?v=__BUILD__"></script>
+<script src="rewind.js?v=__BUILD__"></script>
 <script src="prompt-suggestions.js?v=__BUILD__"></script>
 <script src="providers.js?v=__BUILD__"></script>
 <script src="artifacts.js?v=__BUILD__"></script>

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -16,12 +17,13 @@ import (
 // Keeping this small makes the invariant testable independently from Wails,
 // SSE and providers.
 type TurnCoordinator struct {
-	mu          sync.Mutex
-	maxParallel int
-	running     int
-	workspaces  map[string]struct{}
-	waiters     []*turnWaiter
-	closed      bool
+	mu             sync.Mutex
+	maxParallel    int
+	running        int
+	workspaces     map[string]struct{}
+	exclusiveTrees map[string]struct{}
+	waiters        []*turnWaiter
+	closed         bool
 }
 
 type turnWaiter struct {
@@ -46,8 +48,9 @@ func NewTurnCoordinator(maxParallel int) *TurnCoordinator {
 		maxParallel = 1
 	}
 	return &TurnCoordinator{
-		maxParallel: maxParallel,
-		workspaces:  make(map[string]struct{}),
+		maxParallel:    maxParallel,
+		workspaces:     make(map[string]struct{}),
+		exclusiveTrees: make(map[string]struct{}),
 	}
 }
 
@@ -117,12 +120,65 @@ func (c *TurnCoordinator) TryAcquire(workspace string) (*TurnLease, bool) {
 	if c.running >= c.maxParallel {
 		return nil, false
 	}
-	if _, busy := c.workspaces[workspace]; busy {
+	if c.workspaceBlockedLocked(workspace) {
 		return nil, false
 	}
 	c.running++
 	c.workspaces[workspace] = struct{}{}
 	return &TurnLease{coordinator: c, workspace: workspace}, true
+}
+
+// TryAcquireRewind reserves an entire workspace subtree for a short restore.
+// A home-scoped sparse snapshot can touch files in a separately running child
+// project, so equality-only admission is insufficient for file restoration.
+// Ordinary project turns retain their existing parallelism; only this lease
+// excludes ancestors and descendants until Release.
+func (c *TurnCoordinator) TryAcquireRewind(workspace string) (*TurnLease, bool) {
+	if c == nil {
+		return nil, false
+	}
+	workspace = canonicalTurnWorkspace(workspace)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, false
+	}
+	c.dispatchLocked()
+	if c.running >= c.maxParallel {
+		return nil, false
+	}
+	for active := range c.workspaces {
+		if turnWorkspacesOverlap(workspace, active) {
+			return nil, false
+		}
+	}
+	if c.exclusiveTrees == nil {
+		c.exclusiveTrees = make(map[string]struct{})
+	}
+	c.running++
+	c.workspaces[workspace] = struct{}{}
+	c.exclusiveTrees[workspace] = struct{}{}
+	return &TurnLease{coordinator: c, workspace: workspace}, true
+}
+
+func (c *TurnCoordinator) workspaceBlockedLocked(workspace string) bool {
+	if _, busy := c.workspaces[workspace]; busy {
+		return true
+	}
+	for tree := range c.exclusiveTrees {
+		if turnWorkspacesOverlap(tree, workspace) {
+			return true
+		}
+	}
+	return false
+}
+
+func turnWorkspacesOverlap(left, right string) bool {
+	contains := func(parent, child string) bool {
+		rel, err := filepath.Rel(parent, child)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+	}
+	return contains(left, right) || contains(right, left)
 }
 
 // Acquire waits until both a global slot and an exclusive workspace writer
@@ -182,6 +238,7 @@ func (l *TurnLease) Release() {
 			c.running--
 		}
 		delete(c.workspaces, l.workspace)
+		delete(c.exclusiveTrees, l.workspace)
 		c.dispatchLocked()
 		c.mu.Unlock()
 	})
@@ -212,7 +269,7 @@ func (c *TurnCoordinator) dispatchLocked() {
 	for c.running < c.maxParallel {
 		index := -1
 		for i, w := range c.waiters {
-			if _, busy := c.workspaces[w.workspace]; !busy {
+			if !c.workspaceBlockedLocked(w.workspace) {
 				index = i
 				break
 			}

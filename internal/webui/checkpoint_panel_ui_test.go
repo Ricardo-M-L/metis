@@ -15,14 +15,14 @@ func TestCheckpointSessionSwitchMarkup(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := string(html)
-	for _, want := range []string{`id="checkpointBtn"`, `role="switch"`, `onclick="toggleCheckpointControl(event)"`} {
-		if !strings.Contains(content, want) {
-			t.Fatalf("missing compact session switch %q", want)
+	for _, removed := range []string{`id="checkpointBtn"`, `id="checkpointPanel"`, `id="checkpointRoots"`, `id="checkpointBrowse"`, `id="checkpointEnable"`} {
+		if strings.Contains(content, removed) {
+			t.Fatalf("automatic checkpoint must not have a permanent composer switch: %s", removed)
 		}
 	}
-	for _, removed := range []string{`id="checkpointPanel"`, `id="checkpointRoots"`, `id="checkpointBrowse"`, `id="checkpointEnable"`} {
-		if strings.Contains(content, removed) {
-			t.Fatalf("project scope UI must be removed: %s", removed)
+	for _, want := range []string{`src="checkpoint.js?v=__BUILD__"`, `src="rewind.js?v=__BUILD__"`, `href="rewind.css?v=__BUILD__"`} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("rewind and advanced checkpoint compatibility support missing %q", want)
 		}
 	}
 }
