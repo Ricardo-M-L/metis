@@ -7,6 +7,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.106] - 2026-10-29
+
+Full CLI and Desktop release with consistent terminal layout and colors,
+including the latest automatic checkpoint and Desktop Rewind changes.
+macOS distribution retains Developer ID signing, Apple notarization,
+stapling and Gatekeeper verification.
+
+### Fixed
+
+- Keep streaming reply continuations aligned with completed replies, including
+  Chinese text, combined emoji and narrow terminal windows.
+- Indent the complete sub-agent tool block, including commands, output,
+  diagnostics, file previews, diffs and detail hints.
+- Remove the extra assistant marker before a leading Markdown list.
+
+### Improved
+
+- Use theme-aware body text, purple emphasis and distinct success colors.
+- Replace the separate selected-tool banner with a small marker, show controls
+  only on the selected block, and combine quiet successful command metadata.
+- Preserve complete error explanations when selection controls wrap on narrow
+  screens; tool inspection continues to preserve history and the input draft.
+
 ## [0.4.105] - 2026-10-29
 
 Full CLI and Desktop release combining terminal transcript improvements with
