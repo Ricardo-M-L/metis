@@ -7,6 +7,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.101] - 2026-10-29
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG continue the
+established ad-hoc signing channel without Apple notarization.
+
 ### Added
 
 - Offer optional gray next-turn prompt suggestions in the terminal and Desktop
