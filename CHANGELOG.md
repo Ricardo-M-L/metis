@@ -7,7 +7,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-## [0.4.101] - 2026-10-29
+## [0.4.102] - 2026-10-29
+
+Full CLI and Desktop release, including the next-turn prompt suggestions prepared
+in the unpublished 0.4.101 draft and the latest upstream checkpoint fixes.
+macOS distribution requires Developer ID signing, Apple notarization, stapling
+and Gatekeeper verification; the ad-hoc exception is not used for this version.
+
+### Added
+
+- Show an optional gray next-turn prompt in an empty terminal or Desktop composer.
+  Tab accepts editable text without sending; drafts, attachments, pending work,
+  session changes and stale replies always take precedence.
+- Provide the live `ui.prompt_suggestions` switch. Generation uses the session
+  model for one bounded, cancellable, tool-free request and does not change history.
+
+## [0.4.101] (unpublished draft; superseded by 0.4.102) - 2026-10-29
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG continue the
 established ad-hoc signing channel without Apple notarization.
