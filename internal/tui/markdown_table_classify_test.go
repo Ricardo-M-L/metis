@@ -5,45 +5,14 @@ import (
 	"testing"
 )
 
-// TestClassifyCodeSpan verifies the 2-colour inline-code policy
-// (image #8 user feedback: 5 colours was too noisy). Numbers + units
-// → cyan. Everything else (identifiers, function calls, namespaces,
-// constants, ordinary words, CJK) → orange.
+// Inline code uses one theme accent regardless of token shape.
 func TestClassifyCodeSpan(t *testing.T) {
-	const (
-		sgrOrange = "38;2;255;184;108" // Dracula orange — all non-numeric code spans
-		sgrCyan   = "38;2;139;233;253" // Dracula cyan — numeric / unit-bearing
-	)
-	cases := []struct {
-		text    string
-		wantSGR string
-		kind    string
-	}{
-		// number-ish → cyan
-		{"800ms", sgrCyan, "number"},
-		{"5xx", sgrCyan, "number"},
-		{"1.5s", sgrCyan, "number"},
-		{"64k", sgrCyan, "number"},
-		{"200", sgrCyan, "number"},
-
-		// everything else → orange
-		{"EXIT_ALT_SCREEN", sgrOrange, "constant"},
-		{"SIGKILL", sgrOrange, "constant"},
-		{"resetTerminal()", sgrOrange, "function"},
-		{"process.exit(0)", sgrOrange, "function"},
-		{"os.Exit", sgrOrange, "namespace"},
-		{"permission.Gate", sgrOrange, "namespace"},
-		{"/dev/tty", sgrOrange, "abs-path"},
-		{"hello world", sgrOrange, "phrase"},
-		{"中文短语", sgrOrange, "cjk"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.kind+"/"+tc.text, func(t *testing.T) {
-			got := classifyCodeSpan(tc.text).Render(tc.text)
-			if !strings.Contains(got, tc.wantSGR) {
-				t.Fatalf("classifyCodeSpan(%q): expected SGR %q (kind=%s) in output, got %q",
-					tc.text, tc.wantSGR, tc.kind, got)
+	accent := strings.Split(styleAccent.Render("sample"), "sample")[0]
+	for _, text := range []string{"800ms", "5xx", "1.5s", "64k", "200", "EXIT_ALT_SCREEN", "SIGKILL", "resetTerminal()", "process.exit(0)", "os.Exit", "permission.Gate", "/dev/tty", "hello world", "中文短语"} {
+		t.Run(text, func(t *testing.T) {
+			got := classifyCodeSpan(text).Render(text)
+			if !strings.Contains(got, accent) {
+				t.Fatalf("classifyCodeSpan(%q): expected theme accent in %q", text, got)
 			}
 		})
 	}
@@ -75,8 +44,9 @@ func TestInlineCodeHasForegroundWithoutBackground(t *testing.T) {
 
 func assertInlineCodeHasNoBackground(t *testing.T, path, rendered string) {
 	t.Helper()
-	if !strings.Contains(rendered, "38;5;203") {
-		t.Fatalf("%s: inline code lost its red foreground: %q", path, rendered)
+	accent := strings.Split(styleAccent.Render("sample"), "sample")[0]
+	if !strings.Contains(rendered, accent) {
+		t.Fatalf("%s: inline code lost its theme accent: %q", path, rendered)
 	}
 	if strings.Contains(rendered, "48;5;236") || strings.Contains(rendered, "48;2;48;48;48") {
 		t.Fatalf("%s: inline code still has Glamour's grey background: %q", path, rendered)

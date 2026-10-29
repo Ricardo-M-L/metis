@@ -15,7 +15,6 @@ package tui
 // while giving tables the Claude-Code look.
 
 import (
-	"regexp"
 	"strings"
 
 	"charm.land/lipgloss/v2"
@@ -165,8 +164,8 @@ func normalizeRow(row []string, n int) []string {
 // The output is sized to fit within `width` cells so it never wraps
 // in the terminal.
 func renderMetisTable(headers []string, rows [][]string, width int) string {
-	if width < 20 {
-		width = 20
+	if width < 1 {
+		width = 1
 	}
 	// Header row: bold white text only, no Background fill. The earlier
 	// #3a3a3a header band read as a "gray shadow" against the dark
@@ -177,10 +176,10 @@ func renderMetisTable(headers []string, rows [][]string, width int) string {
 	// the shaded panel.
 	headerStyle := lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#ffffff")).
+		Foreground(textPrimary).
 		Padding(0, 1)
 	// Body cells: DO NOT set Foreground. The cells already contain
-	// ANSI from renderInlineMD (red code spans, bold/italic), and a
+	// ANSI from renderInlineMD (code spans, bold/italic), and a
 	// Foreground here would override and flatten them to a single grey
 	// (image #6 user feedback 2026-05-15 — everything looked grey).
 	// Padding only for breathing room next to the │ separators.
@@ -272,13 +271,8 @@ func renderMetisTable(headers []string, rows [][]string, width int) string {
 // match a recognised opener passes through verbatim, including stray
 // `*` and backticks that aren't part of a pair.
 //
-// Code spans get *heuristic syntax-highlighting* via classifyCodeSpan
-// — Claude Code's TUI uses a single colour for all backticks (image #7
-// shows that the multi-colour look comes from a markdown viewer, not
-// from the terminal), so for metis we go beyond Claude Code and tint
-// constants / function-calls / namespaced paths / numbers each in
-// their own Dracula-palette colour. Makes table cells noticeably
-// easier to scan.
+// Code spans use the same theme accent as prose. Their colour does not
+// change when an identifier moves into a table or looks like a number.
 //
 // lipgloss measures cell width via ansi.StringWidth, which strips ANSI
 // escapes before counting, so the column arithmetic still works after
@@ -287,8 +281,8 @@ func renderMetisTable(headers []string, rows [][]string, width int) string {
 // as raw characters and there was no coloured code badge (image #6
 // user feedback).
 func renderInlineMD(s string) string {
-	boldStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#ffffff"))
-	italicStyle := lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("#bd93f9"))
+	boldStyle := lipgloss.NewStyle().Bold(true).Foreground(textPrimary)
+	italicStyle := lipgloss.NewStyle().Italic(true).Foreground(textPrimary)
 
 	var sb strings.Builder
 	runes := []rune(s)
@@ -326,31 +320,10 @@ func renderInlineMD(s string) string {
 	return sb.String()
 }
 
-// Two-colour inline-code palette (image #8 user feedback: 5 colours
-// were too noisy, restrict to 2-3). Heuristic: digits-and-units get a
-// distinct cyan so eyes can quickly find sizes / durations / status
-// codes (800ms, 64k, 5xx); everything else — identifiers, function
-// calls, paths, namespaces, constants, ordinary words — gets the
-// orange code badge. Bold / italic are separate text styles and don't
-// count towards this colour budget.
-var (
-	codeStyleCode   = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffb86c")) // all non-numeric code spans (Dracula orange)
-	codeStyleNumber = lipgloss.NewStyle().Foreground(lipgloss.Color("#8be9fd")) // 800ms, 64k, 5xx (Dracula cyan)
-
-	// Number: digit-led, optional fractional, optional unit (ms/s/k/m/g/B/x).
-	// Examples that hit: 800ms, 5xx, 64k, 1.5s, 200, 1e6
-	reNumberish = regexp.MustCompile(`^-?\d+(\.\d+)?[a-zA-Z%]*$|^\d+x{1,2}$|^\d+e\d+$`)
-)
-
-// classifyCodeSpan picks a colour for `code` based on the token shape.
-// Numbers + units get cyan; everything else gets orange. Anything more
-// fine-grained than this read as noise (user feedback on image #8).
-func classifyCodeSpan(text string) lipgloss.Style {
-	t := strings.TrimSpace(text)
-	if reNumberish.MatchString(t) {
-		return codeStyleNumber
-	}
-	return codeStyleCode
+// Read the current style on every render so a theme switch also repaints
+// table cells; never retain a hard-coded dark-theme code colour.
+func classifyCodeSpan(_ string) lipgloss.Style {
+	return styleAccent
 }
 
 func indexRune(runes []rune, from int, r rune) int {

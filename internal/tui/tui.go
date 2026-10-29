@@ -507,20 +507,13 @@ type Model struct {
 	// submission succeeds, when they become CONTEXT rows rather than USER rows.
 	queuePendingContext []string
 
-	// expandedToolID is the A1 ctrl+O mechanism: the **single** tool
-	// event currently expanded. Empty string means "nothing expanded"
-	// (default). When the user presses ctrl+O:
-	//   - with nothing selected, expand the latest row with hidden detail
-	//   - repeated presses walk backward through expandable rows, then clear
-	// Only one tool event can be expanded at a time, which keeps the
-	// viewport height bounded (BUG-A fix).
-	//
-	// 2026-08-02 P0-1: the legacy expandToolOutputs global toggle has
-	// been REMOVED. It used to live here and power ctrl+O, but the
-	// global-toggle semantics exploded the viewport on busy transcripts
-	// (every tool call suddenly rendered its full body), pushing history
-	// out of view. The one-at-a-time semantics above replace it.
-	expandedToolID string
+	// Tool navigation is transient UI state, never a transcript message.
+	// Ctrl+O toggles only selectedToolID; Alt+Up/Down selects another tool.
+	// Before an explicit choice, the newest expandable tool is the default.
+	selectedToolID       string
+	expandedToolID       string
+	toolSelectionSession string
+	pendingToolScrollID  string
 
 	// thinkingDisplay controls public Message{Role:"thinking"} rendering.
 	// Opaque redacted_thinking blocks are never displayed.

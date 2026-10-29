@@ -143,10 +143,8 @@ func TestTableCellInlineMarkdown(t *testing.T) {
 	if !strings.Contains(out, "\x1b[1") {
 		t.Fatalf("expected bold SGR in output, got:\n%s", out)
 	}
-	// `Fork()` is a function call → classifyCodeSpan picks the orange
-	// Dracula colour (255,184,108).
-	if !strings.Contains(out, "38;2;255;184;108") {
-		t.Fatalf("expected function-call code-span orange SGR in output, got:\n%s", out)
+	if !strings.Contains(out, styleAccent.Render("Fork()")) {
+		t.Fatalf("expected theme accent for inline code in output, got:\n%s", out)
 	}
 }
 
@@ -186,8 +184,8 @@ func TestTableHasFullFrame(t *testing.T) {
 	if !strings.Contains(out, "\x1b[1") {
 		t.Fatalf("expected bold SGR for header row, got:\n%s", out)
 	}
-	if !strings.Contains(out, "38;2;255;255;255") {
-		t.Fatalf("expected white header fg SGR (38;2;255;255;255), got:\n%s", out)
+	if !strings.Contains(out, styleText.Bold(true).Render("维度")) {
+		t.Fatalf("expected theme foreground for the bold header, got:\n%s", out)
 	}
 
 	// Body rows must use │ vertical separators.

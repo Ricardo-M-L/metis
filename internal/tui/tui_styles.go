@@ -68,7 +68,7 @@ func initStyles() {
 	styleUserCard = lipgloss.NewStyle().Foreground(textPrimary).Background(t.BgUserMessage)
 	styleUserCardMarker = lipgloss.NewStyle().Foreground(textSecondary).Background(t.BgUserMessage)
 	styleAsst = lipgloss.NewStyle().Foreground(accentGreen)
-	styleToolName = lipgloss.NewStyle().Foreground(accentOrange).Bold(true)
+	styleToolName = lipgloss.NewStyle().Foreground(textPrimary).Bold(true)
 	styleErr = lipgloss.NewStyle().Foreground(accentRed).Bold(true)
 	styleSuccess = lipgloss.NewStyle().Foreground(accentGreen).Bold(true)
 	styleWarn = lipgloss.NewStyle().Foreground(accentOrange).Bold(true)

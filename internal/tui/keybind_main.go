@@ -536,56 +536,15 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "ctrl+o":
-		// Keep one-at-a-time expansion, but target rows that actually advertise
-		// hidden detail. The old "latest completed event" rule could select a
-		// later one-line success while an earlier recovered/error group displayed
-		// `(ctrl+O to inspect)`, making that affordance impossible to reach.
-		// Repeated presses walk backward through expandable rows, then collapse.
-		candidates := m.expandableToolEventIDs()
-		if len(candidates) == 0 {
-			return m, nil
-		}
-		// P2-2 (2026-08-02): show an info message so the user knows
-		// ctrl+O actually did something. The previous A1 implementation
-		// silently mutated expandedToolID with no visual feedback —
-		// users pressed ctrl+O and nothing appeared to happen if the
-		// latest tool event was already at the bottom of the screen.
-		current := -1
-		for idx, id := range candidates {
-			if id == m.expandedToolID {
-				current = idx
-				break
-			}
-		}
-		var newContent string
-		switch {
-		case current == 0:
-			m.expandedToolID = ""
-			newContent = "collapse tool output"
-		case current > 0:
-			m.expandedToolID = candidates[current-1]
-			newContent = "expand tool output (previous)"
-		default:
-			m.expandedToolID = candidates[len(candidates)-1]
-			newContent = "expand tool output (latest)"
-		}
-		// REPLACE the trailing info message instead of appending a new
-		// one when the previous message is also a tool-output toggle.
-		// Otherwise rapid ctrl+O presses pile up "expand / collapse /
-		// expand / collapse" rows in the transcript.
-		if n := len(m.messages); n > 0 &&
-			m.messages[n-1].Role == "info" &&
-			(strings.HasPrefix(m.messages[n-1].Content, "expand tool output") ||
-				strings.HasPrefix(m.messages[n-1].Content, "collapse tool output")) {
-			m.messages[n-1].Content = newContent
-			m.messages[n-1].Timestamp = time.Now()
-		} else {
-			m.messages = append(m.messages, Message{
-				Role:      "info",
-				Content:   newContent,
-				Timestamp: time.Now(),
-			})
-		}
+		m.navigateToolDetails(0, true)
+		return m, nil
+
+	case "alt+up":
+		m.navigateToolDetails(-1, false)
+		return m, nil
+
+	case "alt+down":
+		m.navigateToolDetails(1, false)
 		return m, nil
 
 	case "esc":

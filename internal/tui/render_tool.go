@@ -4,7 +4,7 @@ package tui
 // claude-code-style two-row block:
 //
 //	⏺ ToolName(arg)
-//	  ⎿ 42ms ✓ summary line
+//	  ⎿ 42ms · summary line
 //	         (optional preview body — diff for Edit, first lines for Bash, …)
 //
 // Per-tool dispatch lives here. Edit/Write get structured diffs;
@@ -44,6 +44,12 @@ func renderToolEvent(te ToolEvent, expanded bool) string {
 // the final file/subcommand remain visible, matching Codex CLI's compact tool
 // rows without creating a physical soft-wrap row.
 func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
+	return renderToolEventPresentation(te, expanded, width, true)
+}
+
+// Minimal/streamlined mode has no body or details viewer, so it needs the
+// original command preview and standalone summary instead of the rich layout.
+func renderToolEventPresentation(te ToolEvent, expanded bool, width int, showBody bool) string {
 	var s strings.Builder
 	baseName := strings.TrimPrefix(te.ToolName, "sub: ")
 	partialRecovery := completedBeforeTimeout(te)
@@ -105,7 +111,10 @@ func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
 		displayName = strings.TrimPrefix(displayName, "sub: ")
 	}
 	displayTool := displayToolName(displayName)
-	args := toolArgsFirstLine(toolArgsPreview(te.ToolName, te.Input))
+	args := toolHeaderPreview(te.ToolName, te.Input)
+	if !showBody {
+		args = toolArgsFirstLine(toolArgsPreview(te.ToolName, te.Input))
+	}
 	if args != "" && width > 0 {
 		trailingWidth := 2 // parentheses
 		if te.Kind == "start" {
@@ -152,13 +161,9 @@ func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
 		return s.String()
 	}
 
-	// Result row: ⎿ Xms ✓/✗ summary
-	//
-	// The leaf glyph + ✓/✗ stay structurally subdued (dim / accent), but
-	// the summary text itself ("0.5s · Read foo.py (350 lines)") now
-	// renders at default fg — user screenshot 36 / 2026-05-17 flagged
-	// the dim grey as too low-contrast. This is the most-scanned line
-	// per tool call and it's informational, not chrome.
+	// The leader already indicates success. Keep failure/partial markers on
+	// the result row, but avoid a second success symbol. Only elapsed time is
+	// secondary; useful summaries and command output retain normal contrast.
 	if denied {
 		// Denied: keep ⎿ leaf glyph at leadIndent (flat, not nested).
 		// The earlier resultIndent (leadIndent + 4-space) made it look
@@ -175,39 +180,55 @@ func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
 			s.WriteString(styleWarn.Render("⇻ "))
 		} else if te.IsError {
 			s.WriteString(styleErr.Render("✗ "))
-		} else {
-			s.WriteString(styleAccent.Render("✓ "))
 		}
 	}
 	if denied || blocked {
 		// Row already carries "Denied"/"Blocked"; nothing else to append.
 	} else if neutralNoMatch {
-		s.WriteString(fmt.Sprintf("%s · No matches", formatElapsed(te.Duration)))
+		s.WriteString(renderToolSummary(fmt.Sprintf("%s · No matches", formatElapsed(te.Duration)), formatElapsed(te.Duration)))
 	} else if partialRecovery {
-		s.WriteString(summarizePartialToolResult(te))
+		s.WriteString(renderToolSummary(summarizePartialToolResult(te), formatElapsed(te.Duration)))
 	} else if timedOut {
 		// The timeout marker already carries the meaningful wall-clock limit.
 		// Showing the event Duration as well produced contradictory rows such as
 		// "0ms · [command exceeded timeout 20s]" when a resumed/forwarded event
 		// did not retain its start time. Render one semantic result instead.
 		s.WriteString("timed out after " + timeoutLimit)
+	} else if baseName == "Bash" && showBody {
+		// Bash output/diagnostics are already visible below. Keep the
+		// first-line summary for exports and minimal mode, but do not echo a
+		// truncated copy above the original diagnostic in the rich UI.
+		s.WriteString(styleDim.Render(formatElapsed(te.Duration)))
+		if te.IsError {
+			s.WriteString(" · Failed")
+			if te.Output == "" {
+				s.WriteString(" (no diagnostic output)")
+			}
+		} else if te.Output == "" {
+			s.WriteString(" · No output")
+		}
 	} else {
-		s.WriteString(summarizeNormalizedToolResult(te))
+		s.WriteString(renderToolSummary(summarizeNormalizedToolResult(te), formatElapsed(te.Duration)))
 	}
-	if !expanded && hiddenCommand && (denied || blocked || neutralNoMatch) {
+	if !showBody {
+		// Compact items cannot be expanded; do not advertise hidden detail.
+	} else if !expanded && hiddenCommand && neutralNoMatch {
 		// A complete diagnostic does not imply the command is fully visible.
 		s.WriteString(styleMuted.Render(" (ctrl+O to inspect command)"))
 	} else if denied || blocked {
-		// No diagnostic hint: the reason below is already the full content.
+		// The reason body owns the combined command/output detail entry.
 	} else if neutralNoMatch {
 		// A read-only search with the conventional exit code 1 means
 		// "nothing found". There is no diagnostic body to expand.
 	} else if partialRecovery && !expanded {
 		s.WriteString(styleMuted.Render(" (ctrl+O to inspect timeout)"))
-	} else if !expanded && (hiddenCommand || (!te.IsError && te.Output != "" && collapseToolBodyByDefault(baseName))) {
+	} else if !expanded && !te.IsError && te.Output != "" && collapseToolBodyByDefault(baseName) {
 		s.WriteString(styleMuted.Render(" (ctrl+O to expand)"))
 	}
 	s.WriteString("\n")
+	if !showBody {
+		return s.String()
+	}
 
 	// Body: structured diff for Edit/Write, task-list for TodoWrite,
 	// line-capped preview otherwise. On error, surface the error
@@ -218,25 +239,19 @@ func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
 			// envelope in the body. Render just the reason as muted
 			// prose (claude-code's RejectedToolUseMessage is dim
 			// text, not an error-red wall).
-			if reason := stripDenyEnvelope(te.Output); reason != "" {
-				s.WriteString(renderDenyReasonBody(reason, expanded))
-			}
+			s.WriteString(renderDenyReasonBody(stripDenyEnvelope(te.Output), expanded, hiddenCommand, width))
 		} else if blocked {
 			// Same treatment for safety blocks: strip the
 			// "[blocked] …" wrapper, show the human reason only.
-			if reason := stripBlockedEnvelope(te.Output); reason != "" {
-				s.WriteString(renderDenyReasonBody(reason, expanded))
-			}
+			s.WriteString(renderDenyReasonBody(stripBlockedEnvelope(te.Output), expanded, hiddenCommand, width))
 		} else if timedOut && !partialRecovery {
 			// Bash appends a machine-oriented timeout marker after any captured
 			// stdout/stderr. The result row above communicates that state once;
 			// keep useful pre-timeout output without echoing the marker as a red
 			// diagnostic line underneath it.
-			if timeoutBody != "" {
-				s.WriteString(renderNormalizedErrorBody(timeoutBody, expanded))
-			}
-		} else if te.Output != "" && !neutralNoMatch && (!partialRecovery || expanded) {
-			s.WriteString(renderNormalizedErrorBody(te.Output, expanded))
+			s.WriteString(renderNormalizedErrorBodyWithDetails(timeoutBody, expanded, hiddenCommand, width))
+		} else if !neutralNoMatch && (!partialRecovery || expanded) {
+			s.WriteString(renderNormalizedErrorBodyWithDetails(te.Output, expanded, hiddenCommand, width))
 		}
 	} else {
 		// Strip the forwarded-sub-agent "sub: " prefix when routing
@@ -249,10 +264,12 @@ func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
 		// the "sub: " prefix so the user still sees it came from a
 		// sub-agent; only the renderer dispatch uses the base name.
 		switch baseName {
+		case "Bash":
+			s.WriteString(renderNormalizedToolOutputPreviewWithDetails(te.ToolName, te.Output, expanded, hiddenCommand, width))
 		case "Edit":
-			s.WriteString(renderEditDiff(te.Input, expanded))
+			s.WriteString(renderEditDiffAtWidth(te.Input, expanded, width))
 		case "Write":
-			s.WriteString(renderWritePreview(te.Input, expanded))
+			s.WriteString(renderWritePreviewAtWidth(te.Input, expanded, width))
 		case "TodoWrite":
 			s.WriteString(renderTodoSnapshot())
 		case "SubAgentOutput":
@@ -264,16 +281,102 @@ func renderToolEventAtWidth(te ToolEvent, expanded bool, width int) string {
 			// text content.
 			filtered := stripSubAgentOutputEnvelope(te.Output)
 			if filtered != "" {
-				s.WriteString(renderNormalizedToolOutputPreview(te.ToolName, filtered, expanded))
+				s.WriteString(renderNormalizedToolOutputPreviewWithDetails(te.ToolName, filtered, expanded, false, width))
 			}
 		default:
 			if te.Output != "" && (expanded || !collapseToolBodyByDefault(baseName)) {
-				s.WriteString(renderNormalizedToolOutputPreview(te.ToolName, te.Output, expanded))
+				s.WriteString(renderNormalizedToolOutputPreviewWithDetails(te.ToolName, te.Output, expanded, false, width))
 			}
 		}
 	}
 	s.WriteString("\n")
 	return s.String()
+}
+
+// Render only the elapsed prefix in the secondary colour. The summary text
+// remains unstyled so file names, counts and diagnostics stay easy to read.
+func renderToolSummary(summary, elapsed string) string {
+	if rest, ok := strings.CutPrefix(summary, elapsed); ok {
+		return styleDim.Render(elapsed) + rest
+	}
+	return summary
+}
+
+// A single entry describes both kinds of hidden detail. Keep the shortcut
+// wording shared with expandableToolEventIDs, which discovers these entries.
+func renderToolDetailHint(commandHidden bool, hiddenLines int, expanded bool, width int) string {
+	return renderToolDetailHintWithClippedOutput(commandHidden, hiddenLines, false, expanded, width)
+}
+
+func renderToolDetailHintWithClippedOutput(commandHidden bool, hiddenLines int, outputClipped, expanded bool, width int) string {
+	if expanded {
+		return ""
+	}
+	var details []string
+	if commandHidden {
+		details = append(details, "command details")
+	}
+	if hiddenLines > 0 {
+		details = append(details, fmt.Sprintf("+%d output lines", hiddenLines))
+	} else if outputClipped {
+		details = append(details, "output details")
+	}
+	if len(details) == 0 {
+		return ""
+	}
+	return renderToolDetailLabel(strings.Join(details, " · "), width)
+}
+
+func renderToolDetailLabel(label string, width int) string {
+	const shortcut = "(ctrl+O to expand)"
+	indent := "       "
+	hint := indent + label + " " + shortcut
+	if width > 0 && xansi.StringWidth(hint) > width {
+		// Keep the shortcut together when the label needs a second row. The
+		// viewport clamps physical rows, so a long hint would otherwise lose
+		// the actual key while remaining selectable via the keyboard handler.
+		indent = strings.Repeat(" ", min(len(indent), max(0, width-len(shortcut))))
+		label = xansi.Hardwrap(label, max(1, width-len(indent)), true)
+		hint = indent + strings.ReplaceAll(label, "\n", "\n"+indent) + "\n" + indent + shortcut
+	}
+	return styleMuted.Render(hint) + "\n"
+}
+
+// The viewport clamps physical rows, so expanded output must wrap before that
+// boundary. Measure terminal cells (including CJK/emoji), not rune counts.
+// A continuation marker distinguishes a visual wrap from an original newline;
+// raw ToolEvent output is never changed. Width zero means an unbounded renderer.
+func renderToolOutputLine(line string, expanded bool, width int, keepTail bool) (string, bool) {
+	line = strings.ReplaceAll(line, "\t", "    ")
+	indent := "       "
+	if width <= 0 {
+		return indent + line + "\n", false
+	}
+	indent = strings.Repeat(" ", min(len(indent), max(0, width-4)))
+	available := max(1, width-len(indent))
+	if xansi.StringWidth(line) <= available {
+		return indent + line + "\n", false
+	}
+	if !expanded {
+		if keepTail {
+			line = truncateMiddleCells(line, available)
+		} else {
+			line = xansi.Truncate(line, available, "…")
+		}
+		return indent + line + "\n", true
+	}
+	const continuation = "↳ "
+	wrapped := xansi.Hardwrap(line, max(1, available-xansi.StringWidth(continuation)), true)
+	return indent + strings.ReplaceAll(wrapped, "\n", "\n"+indent+continuation) + "\n", false
+}
+
+func styleToolOutputRows(rows string, style lipgloss.Style) string {
+	var out strings.Builder
+	for _, row := range strings.Split(strings.TrimSuffix(rows, "\n"), "\n") {
+		out.WriteString(style.Render(row))
+		out.WriteByte('\n')
+	}
+	return out.String()
 }
 
 // truncateMiddleCells is the cell-width counterpart of truncateMiddle. Rune
@@ -649,8 +752,12 @@ func renderErrorBody(out string, expanded bool) string {
 }
 
 func renderNormalizedErrorBody(out string, expanded bool) string {
+	return renderNormalizedErrorBodyWithDetails(out, expanded, false, 0)
+}
+
+func renderNormalizedErrorBodyWithDetails(out string, expanded, commandHidden bool, width int) string {
 	if out == "" {
-		return ""
+		return renderToolDetailHint(commandHidden, 0, expanded, width)
 	}
 	errStyle := lipgloss.NewStyle().Foreground(accentRed)
 	lines := strings.Split(out, "\n")
@@ -658,16 +765,28 @@ func renderNormalizedErrorBody(out string, expanded bool) string {
 	show := lines
 	if !expanded && len(show) > maxPreview {
 		show = show[:maxPreview]
+		// The status row no longer repeats the selected diagnostic. Keep an
+		// actionable cause visible even when an installer prints it after the
+		// initial progress/chrome lines. Expanded output stays in full order.
+		diagnostic, actionable := selectErrorSummaryLine(out)
+		if actionable && !strings.Contains(strings.Join(show, "\n"), diagnostic) {
+			for _, line := range lines[maxPreview:] {
+				if strings.Contains(line, diagnostic) {
+					show = append([]string(nil), show...)
+					show[maxPreview-1] = line
+					break
+				}
+			}
+		}
 	}
 	var s strings.Builder
+	outputClipped := false
 	for _, ln := range show {
-		s.WriteString(errStyle.Render("       " + truncateMiddle(ln, 120)))
-		s.WriteString("\n")
+		row, clipped := renderToolOutputLine(ln, expanded, width, true)
+		outputClipped = outputClipped || clipped
+		s.WriteString(styleToolOutputRows(row, errStyle))
 	}
-	if !expanded && len(lines) > maxPreview {
-		s.WriteString(styleMuted.Render(fmt.Sprintf("       … +%d more lines (ctrl+O to expand)", len(lines)-maxPreview)))
-		s.WriteString("\n")
-	}
+	s.WriteString(renderToolDetailHintWithClippedOutput(commandHidden, len(lines)-len(show), outputClipped, expanded, width))
 	return s.String()
 }
 
@@ -707,6 +826,14 @@ func truncateMiddle(s string, maxRunes int) string {
 // end (for example, "Authentication failed ..."). Ties prefer the later line,
 // matching conventional CLI error epilogues.
 func bestErrorSummaryLine(out string) string {
+	line, _ := selectErrorSummaryLine(out)
+	return line
+}
+
+// Standalone summaries can fall back to ordinary output. Preview promotion
+// must distinguish that fallback from a recognized diagnostic so unknown
+// error text retains its original first-five-line order.
+func selectErrorSummaryLine(out string) (line string, actionable bool) {
 	best, bestScore := "", -1
 	for _, raw := range strings.Split(out, "\n") {
 		line := strings.TrimSpace(raw)
@@ -739,7 +866,7 @@ func bestErrorSummaryLine(out string) string {
 			best, bestScore = line, score
 		}
 	}
-	return best
+	return best, bestScore > 10
 }
 
 // isDeniedToolResult detects permission-policy denials — the output
@@ -806,9 +933,9 @@ func stripDenyEnvelope(out string) string {
 // claude-code parity: its RejectedToolUseMessage / InterruptedByUser
 // are dim text, not an error-red wall. The row above already says
 // "Denied"; the reason is the informational part.
-func renderDenyReasonBody(reason string, expanded bool) string {
+func renderDenyReasonBody(reason string, expanded, commandHidden bool, width int) string {
 	if reason == "" {
-		return ""
+		return renderToolDetailHint(commandHidden, 0, expanded, width)
 	}
 	lines := strings.Split(reason, "\n")
 	const maxPreview = 5
@@ -817,14 +944,13 @@ func renderDenyReasonBody(reason string, expanded bool) string {
 		show = show[:maxPreview]
 	}
 	var s strings.Builder
+	outputClipped := false
 	for _, ln := range show {
-		s.WriteString(styleDim.Render("       " + truncateMiddle(ln, 120)))
-		s.WriteString("\n")
+		row, clipped := renderToolOutputLine(ln, expanded, width, true)
+		outputClipped = outputClipped || clipped
+		s.WriteString(styleToolOutputRows(row, styleDim))
 	}
-	if !expanded && len(lines) > maxPreview {
-		s.WriteString(styleMuted.Render(fmt.Sprintf("       … +%d more lines (ctrl+O to expand)", len(lines)-maxPreview)))
-		s.WriteString("\n")
-	}
+	s.WriteString(renderToolDetailHintWithClippedOutput(commandHidden, len(lines)-len(show), outputClipped, expanded, width))
 	return s.String()
 }
 
@@ -1154,19 +1280,16 @@ func summarizeNormalizedToolResult(te ToolEvent) string {
 const maxDiffLines = 20
 
 func renderEditDiff(input map[string]any, expanded bool) string {
-	// metis's Edit tool uses `old` / `new` (see internal/tools/builtin/
-	// edit.go's InputSchema). claude-code-style external tools may pass
-	// `old_string` / `new_string`. Read both — the actual Edit-tool
-	// field name takes priority since that's what fires in 99% of
-	// turns; the longer names cover any externally-defined tool.
+	return renderEditDiffAtWidth(input, expanded, 0)
+}
+
+func renderEditDiffAtWidth(input map[string]any, expanded bool, width int) string {
+	// Accept both Metis's actual fields and external Claude-style aliases.
 	oldS, _ := input["old"].(string)
 	newS, _ := input["new"].(string)
 	if oldS == "" && newS == "" {
 		oldS, _ = input["old_string"].(string)
 		newS, _ = input["new_string"].(string)
-	}
-	if oldS == "" && newS == "" {
-		return ""
 	}
 	edits := udiff.Strings(oldS, newS)
 	if len(edits) == 0 {
@@ -1176,190 +1299,186 @@ func renderEditDiff(input map[string]any, expanded bool) string {
 	if err != nil || len(uout.Hunks) == 0 {
 		return ""
 	}
-
-	// Full-row background fill: lipgloss .Width(N) pads the rendered
-	// output with spaces so the background colour extends to column N
-	// even when the diff text is shorter. Matches claude-code / Cursor
-	// diff rendering (image #56 / #57 user feedback 2026-05-23). The
-	// per-row width is the chat surface width minus the gutter ("       %4d "
-	// = 7 + 4 + 1 = 12 chars) and the "+ "/"- " marker (2 chars). If we
-	// haven't received a WindowSizeMsg yet, fall back to 100 — a sensible
-	// "wide enough to look like a diff row" default.
-	rowWidth := lastKnownChatWidth()
-	if rowWidth <= 0 {
-		rowWidth = 100
-	}
-	innerWidth := rowWidth - 12 - 2
-	if innerWidth < 30 {
-		innerWidth = 30
-	}
-	addBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffAddBg).Width(innerWidth)
-	delBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffDelBg).Width(innerWidth)
-	addBgInline := lipgloss.NewStyle().Background(themes.Current().DiffAddBg)
-	delBgInline := lipgloss.NewStyle().Background(themes.Current().DiffDelBg)
-	addStrong := lipgloss.NewStyle().Background(themes.Current().DiffAddBg).Foreground(themes.Current().DiffAddFg).Bold(true)
-	delStrong := lipgloss.NewStyle().Background(themes.Current().DiffDelBg).Foreground(themes.Current().DiffDelFg).Bold(true)
-	gutterStyle := lipgloss.NewStyle().Foreground(textMuted)
+	width = diffPreviewWidth(width)
+	addInline := lipgloss.NewStyle().Background(themes.Current().DiffAddBg)
+	delInline := lipgloss.NewStyle().Background(themes.Current().DiffDelBg)
+	addStrong := addInline.Foreground(themes.Current().DiffAddFg).Bold(true)
+	delStrong := delInline.Foreground(themes.Current().DiffDelFg).Bold(true)
 	filename := pickLanguageFromInput(input)
-
-	// 2026-05-23: chroma highlightLine emits `\x1b[0m` (full reset)
-	// after every syntax token. When the rendered diff line has a
-	// background applied at the OUTER level, each chroma reset wipes
-	// the bg on the cells that follow — leaving visible "uncovered"
-	// gaps inside the row (user screenshot 60 feedback "中间还有
-	// 一部分肢体没有被覆盖到"). reinjectBg post-processes the body
-	// to re-establish the bg ANSI code after every `\x1b[0m` so the
-	// outer Width-padded wrapper produces a contiguous coloured row.
-	addBgAnsi := bgAnsiPrefix(themes.Current().DiffAddBg)
-	delBgAnsi := bgAnsiPrefix(themes.Current().DiffDelBg)
-
 	var s strings.Builder
-	rendered := 0
-	totalDiffLines := 0
+	rendered, totalDiffLines := 0, 0
+	clipped := false
 	for _, h := range uout.Hunks {
 		totalDiffLines += len(h.Lines)
 	}
-
 	limit := maxDiffLines
 	if expanded {
-		limit = 1 << 30
+		limit = totalDiffLines
+	}
+	writeRow := func(content string, line int, marker string, bg color.Color) {
+		row, cut := renderDiffContentLine(content, line, marker, bg, expanded, width)
+		s.WriteString(row)
+		clipped = clipped || cut
+		rendered++
 	}
 	for _, h := range uout.Hunks {
-		oldLine := h.FromLine
-		newLine := h.ToLine
-		i := 0
-		for i < len(h.Lines) {
-			if rendered >= limit {
-				break
-			}
+		oldLine, newLine := h.FromLine, h.ToLine
+		for i := 0; i < len(h.Lines) && rendered < limit; i++ {
 			ln := h.Lines[i]
-			content := truncateRunes(strings.TrimRight(ln.Content, "\n"), 100)
-
-			// Paired Delete + Insert → word-level diff.
-			var delMask, insMask []bool
-			var partner *string
-			if ln.Kind == udiff.Delete && i+1 < len(h.Lines) && h.Lines[i+1].Kind == udiff.Insert {
-				partnerContent := truncateRunes(strings.TrimRight(h.Lines[i+1].Content, "\n"), 100)
-				delMask, insMask = wordDiffMasks(content, partnerContent)
-				partner = &partnerContent
-			}
-
+			content := strings.ReplaceAll(strings.TrimRight(ln.Content, "\n"), "\t", "    ")
 			switch ln.Kind {
 			case udiff.Equal:
-				s.WriteString(gutterStyle.Render(fmt.Sprintf("       %4d   ", oldLine)))
-				s.WriteString(styleMuted.Render(content))
+				writeRow(styleMuted.Render(content), oldLine, "  ", nil)
 				oldLine++
 				newLine++
-				i++
 			case udiff.Delete:
-				s.WriteString(gutterStyle.Render(fmt.Sprintf("       %4d ", oldLine)))
-				// Build the row body (marker + content + inline
-				// strong highlights) into a single string, then wrap
-				// the entire row in delBgOnly (which has .Width set)
-				// so the background fills to chat width — matches
-				// claude-code / Cursor diff rendering.
-				var rowBody strings.Builder
-				rowBody.WriteString(delBgInline.Render("- "))
-				if delMask != nil {
-					rowBody.WriteString(applyMask(content, delMask,
-						func(s string) string { return delBgInline.Render(s) },
-						func(s string) string { return delStrong.Render(s) }))
-				} else {
-					rowBody.WriteString(delBgInline.Render(highlightLine(content, filename)))
-				}
-				s.WriteString(delBgOnly.Render(reinjectBg(rowBody.String(), delBgAnsi)))
-				oldLine++
-				i++
-				if partner != nil {
-					s.WriteString("\n")
-					rendered++
-					if rendered >= limit {
-						break
+				// Preserve word-level styling across visual wraps. The masks
+				// see the full logical line, including text after column 100.
+				if i+1 < len(h.Lines) && h.Lines[i+1].Kind == udiff.Insert {
+					partner := strings.ReplaceAll(strings.TrimRight(h.Lines[i+1].Content, "\n"), "\t", "    ")
+					delMask, insMask := wordDiffMasks(content, partner)
+					deleted := highlightLine(content, filename)
+					inserted := highlightLine(partner, filename)
+					if delMask != nil {
+						deleted = applyMask(content, delMask,
+							func(s string) string { return delInline.Render(s) },
+							func(s string) string { return delStrong.Render(s) })
+						inserted = applyMask(partner, insMask,
+							func(s string) string { return addInline.Render(s) },
+							func(s string) string { return addStrong.Render(s) })
 					}
-					s.WriteString(gutterStyle.Render(fmt.Sprintf("       %4d ", newLine)))
-					var addBody strings.Builder
-					addBody.WriteString(addBgInline.Render("+ "))
-					addBody.WriteString(applyMask(*partner, insMask,
-						func(s string) string { return addBgInline.Render(s) },
-						func(s string) string { return addStrong.Render(s) }))
-					s.WriteString(addBgOnly.Render(reinjectBg(addBody.String(), addBgAnsi)))
-					newLine++
-					i++
+					writeRow(deleted, oldLine, "- ", themes.Current().DiffDelBg)
+					oldLine++
+					if rendered < limit {
+						writeRow(inserted, newLine, "+ ", themes.Current().DiffAddBg)
+						newLine++
+						i++
+					}
+				} else {
+					writeRow(highlightLine(content, filename), oldLine, "- ", themes.Current().DiffDelBg)
+					oldLine++
 				}
 			case udiff.Insert:
-				s.WriteString(gutterStyle.Render(fmt.Sprintf("       %4d ", newLine)))
-				var addBody strings.Builder
-				addBody.WriteString(addBgInline.Render("+ "))
-				addBody.WriteString(addBgInline.Render(highlightLine(content, filename)))
-				s.WriteString(addBgOnly.Render(reinjectBg(addBody.String(), addBgAnsi)))
+				writeRow(highlightLine(content, filename), newLine, "+ ", themes.Current().DiffAddBg)
 				newLine++
-				i++
 			}
-			s.WriteString("\n")
-			rendered++
 		}
 		if rendered >= limit {
 			break
 		}
 	}
-
-	if totalDiffLines > rendered {
-		s.WriteString(styleMuted.Render(fmt.Sprintf("       … +%d more diff lines", totalDiffLines-rendered)))
-		s.WriteString("\n")
+	if !expanded {
+		if hidden := totalDiffLines - rendered; hidden > 0 {
+			s.WriteString(renderToolDetailLabel(fmt.Sprintf("… +%d more diff lines", hidden), width))
+		} else if clipped {
+			s.WriteString(renderToolDetailLabel("diff details", width))
+		}
 	}
 	return s.String()
 }
 
-// renderWritePreview shows the first lines of new file content with a
-// green `+` gutter, since Write has no "before" to diff against.
+// renderWritePreview shows new file content with a green '+' gutter.
 func renderWritePreview(input map[string]any, expanded bool) string {
-	c, _ := input["content"].(string)
-	if c == "" {
+	return renderWritePreviewAtWidth(input, expanded, 0)
+}
+
+func renderWritePreviewAtWidth(input map[string]any, expanded bool, width int) string {
+	content, _ := input["content"].(string)
+	if content == "" {
 		return ""
 	}
-	// Width-padded variant — full-row green background like Cursor /
-	// claude-code. See renderEditDiff for the rowWidth rationale.
-	rowWidth := lastKnownChatWidth()
-	if rowWidth <= 0 {
-		rowWidth = 100
-	}
-	innerWidth := rowWidth - 12 - 2
-	if innerWidth < 30 {
-		innerWidth = 30
-	}
-	addBgOnly := lipgloss.NewStyle().Background(themes.Current().DiffAddBg).Width(innerWidth)
-	addBgInline := lipgloss.NewStyle().Background(themes.Current().DiffAddBg)
-	gutterStyle := lipgloss.NewStyle().Foreground(textMuted)
+	width = diffPreviewWidth(width)
 	filename := pickLanguageFromInput(input)
-
-	lines := strings.Split(strings.TrimRight(c, "\n"), "\n")
-	const maxShow = 10
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
 	show := lines
-	if !expanded && len(show) > maxShow {
-		show = show[:maxShow]
+	if !expanded && len(show) > 10 {
+		show = show[:10]
 	}
-	// Same bg-reinject treatment as renderEditDiff — chroma's per-token
-	// `\x1b[0m` would otherwise leave uncovered cells inside the green row.
-	addBgAnsi := bgAnsiPrefix(themes.Current().DiffAddBg)
 	var s strings.Builder
-	for i, ln := range show {
-		s.WriteString(gutterStyle.Render(fmt.Sprintf("       %4d ", i+1)))
-		var rowBody strings.Builder
-		rowBody.WriteString(addBgInline.Render("+ "))
-		rowBody.WriteString(addBgInline.Render(highlightLine(truncateRunes(ln, 100), filename)))
-		s.WriteString(addBgOnly.Render(reinjectBg(rowBody.String(), addBgAnsi)))
-		s.WriteString("\n")
+	clipped := false
+	for i, line := range show {
+		line = strings.ReplaceAll(line, "\t", "    ")
+		row, cut := renderDiffContentLine(highlightLine(line, filename), i+1, "+ ", themes.Current().DiffAddBg, expanded, width)
+		s.WriteString(row)
+		clipped = clipped || cut
 	}
-	if !expanded && len(lines) > maxShow {
-		s.WriteString(styleMuted.Render(fmt.Sprintf("       … +%d more lines (ctrl+O to expand)", len(lines)-maxShow)))
-		s.WriteString("\n")
+	if !expanded {
+		if hidden := len(lines) - len(show); hidden > 0 {
+			s.WriteString(renderToolDetailLabel(fmt.Sprintf("… +%d more lines", hidden), width))
+		} else if clipped {
+			s.WriteString(renderToolDetailLabel("file details", width))
+		}
 	}
 	return s.String()
+}
+
+func diffPreviewWidth(width int) int {
+	if width <= 0 {
+		width = lastKnownChatWidth()
+	}
+	if width <= 0 {
+		width = 100
+	}
+	return width
+}
+
+var diffSGRPattern = regexp.MustCompile(`\x1b\[[0-9;:]*m`)
+
+// Wrap an already styled logical line before the viewport clamp. Every physical
+// row gets its own gutter and background; lipgloss must not create unindented
+// soft wraps. Carry SGR state across wraps to retain syntax and word-diff colors.
+func renderDiffContentLine(content string, line int, marker string, bg color.Color, expanded bool, width int) (string, bool) {
+	gutter := fmt.Sprintf("       %4d ", line)
+	continuation := "          ↳ "
+	if len(gutter) > 12 {
+		continuation = strings.Repeat(" ", len(gutter)-2) + "↳ "
+	}
+	// Leave room for the marker and a wide grapheme even on narrow surfaces.
+	gutterWidth := min(xansi.StringWidth(gutter), max(0, width-4))
+	gutter = xansi.TruncateLeft(gutter, xansi.StringWidth(gutter)-gutterWidth, "")
+	continuation = xansi.TruncateLeft(continuation, xansi.StringWidth(continuation)-gutterWidth, "")
+	bodyWidth := max(1, width-gutterWidth)
+	contentWidth := max(1, bodyWidth-xansi.StringWidth(marker))
+	clipped := !expanded && xansi.StringWidth(content) > contentWidth
+	if expanded {
+		content = xansi.Hardwrap(content, contentWidth, true)
+	} else if clipped {
+		content = xansi.Truncate(content, contentWidth, "…")
+	}
+	var s strings.Builder
+	active := ""
+	background := lipgloss.NewStyle()
+	bgANSI := ""
+	if bg != nil {
+		background = background.Background(bg)
+		bgANSI = bgAnsiPrefix(bg)
+	}
+	for i, part := range strings.Split(content, "\n") {
+		if i > 0 {
+			gutter = continuation
+		}
+		s.WriteString(styleMuted.Render(gutter))
+		body := marker + active + part + "\x1b[0m"
+		for _, sgr := range diffSGRPattern.FindAllString(part, -1) {
+			if sgr == "\x1b[0m" || sgr == "\x1b[m" {
+				active = ""
+			} else {
+				active += sgr
+			}
+		}
+		if bg != nil {
+			body += strings.Repeat(" ", max(0, bodyWidth-xansi.StringWidth(body)))
+			body = background.Render(reinjectBg(body, bgANSI))
+		}
+		s.WriteString(body)
+		s.WriteByte('\n')
+	}
+	return s.String(), clipped
 }
 
 // renderToolOutputPreview shows the first ~5 lines of any tool output
 // that doesn't have a custom renderer (Bash, Grep, WebFetch, …). Long
-// runs get a `… +N more lines (ctrl+O to expand)` tail.
+// runs get one detail entry with the number of hidden output lines.
 //
 // Color strategy mirrors claude-code (image #23 user feedback 2026-05-16):
 //
@@ -1380,8 +1499,12 @@ func renderToolOutputPreview(toolName, out string, expanded bool) string {
 }
 
 func renderNormalizedToolOutputPreview(toolName, out string, expanded bool) string {
+	return renderNormalizedToolOutputPreviewWithDetails(toolName, out, expanded, false, 0)
+}
+
+func renderNormalizedToolOutputPreviewWithDetails(toolName, out string, expanded, commandHidden bool, width int) string {
 	if out == "" {
-		return ""
+		return renderToolDetailHint(commandHidden, 0, expanded, width)
 	}
 	lines := strings.Split(out, "\n")
 	const maxPreview = 5
@@ -1390,15 +1513,13 @@ func renderNormalizedToolOutputPreview(toolName, out string, expanded bool) stri
 		show = show[:maxPreview]
 	}
 	var s strings.Builder
+	outputClipped := false
 	for _, ln := range show {
-		s.WriteString("       ")
-		s.WriteString(formatToolPreviewLine(toolName, truncateRunes(ln, 120)))
-		s.WriteString("\n")
+		row, clipped := renderToolOutputLine(formatToolPreviewLine(toolName, ln), expanded, width, false)
+		outputClipped = outputClipped || clipped
+		s.WriteString(row)
 	}
-	if !expanded && len(lines) > maxPreview {
-		s.WriteString(styleMuted.Render(fmt.Sprintf("       … +%d more lines (ctrl+O to expand)", len(lines)-maxPreview)))
-		s.WriteString("\n")
-	}
+	s.WriteString(renderToolDetailHintWithClippedOutput(commandHidden, len(lines)-len(show), outputClipped, expanded, width))
 	return s.String()
 }
 

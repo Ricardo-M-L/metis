@@ -80,13 +80,16 @@ new streamed tool event.
 
 ## Tool transcript layout
 
-Tool leaders show a single-line argument preview. Multiline arguments (including
-Bash heredocs) show their first line and an ellipsis instead of injecting raw
-newlines into the transcript. Width clipping uses terminal cells and preserves
-grapheme clusters, including CJK text and joined emoji.
+Tool leaders show a single-line argument preview. Bash prefers its existing
+description; legacy calls fall back to a command preview. Multiline arguments
+(including Bash heredocs) show their first line and an ellipsis instead of
+injecting raw newlines into the transcript. Width clipping uses terminal cells
+and preserves grapheme clusters, including CJK text and joined emoji.
 
 Ctrl+O reveals a Bash command hidden by the preview or viewport width as an
-indented, width-wrapped block, alongside the existing expanded result. Repeated
-presses walk backward through expandable calls, then collapse; restored calls
-follow the same rule. These presentation helpers never modify the executed
-input, permission preview, or stored tool event.
+indented, width-wrapped block, alongside the existing expanded result. It
+toggles the selected tool, defaulting to the latest call. Alt+Up / Alt+Down
+selects previous / next tool details while retaining the expanded or collapsed
+state. A local marker identifies the selected block and scrolls into view.
+Restored calls follow the same rule. Selection never writes transcript messages
+or modifies the executed input, permission preview, or stored tool event.

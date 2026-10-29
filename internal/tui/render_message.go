@@ -6,6 +6,8 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
+	"regexp"
 	"strings"
 	"sync"
 	"unicode"
@@ -15,6 +17,11 @@ import (
 	"charm.land/glamour/v2/styles"
 	"charm.land/lipgloss/v2"
 	xansi "github.com/charmbracelet/x/ansi"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/text"
+
+	"github.com/Ricardo-M-L/metis/internal/themes"
 )
 
 // renderMessage prints a single transcript row. Spacing convention:
@@ -64,11 +71,8 @@ func renderMessagePlain(msg Message, width int, expand bool) string {
 	if strings.TrimSpace(msg.Content) == "" {
 		return ""
 	}
-	bodyW := width - 4
-	if bodyW < 20 {
-		bodyW = 20
-	}
-	wrapped := xansi.Wrap(msg.Content, bodyW, " /-_.")
+	bodyW := assistantBodyWidth(width)
+	wrapped := xansi.Wrap(msg.Content, bodyW, "")
 	lines := strings.Split(wrapped, "\n")
 	var out strings.Builder
 	out.WriteString("  ")
@@ -76,7 +80,7 @@ func renderMessagePlain(msg Message, width int, expand bool) string {
 	if len(lines) > 0 {
 		out.WriteString(styleText.Render(lines[0]))
 		for _, line := range lines[1:] {
-			out.WriteString("\n  ")
+			out.WriteString("\n    ")
 			out.WriteString(styleText.Render(line))
 		}
 	}
@@ -166,11 +170,9 @@ func renderMessage(msg Message, width int, expand bool) string {
 		// indented bullet + body, trailing blank to separate from
 		// the next turn or follow-up tool/recap rows.
 		//
-		// renderAssistantBody returns multi-line markdown; only the
-		// first line gets the bullet, but every continuation line
-		// must keep the same 2-col left margin or the body bleeds
-		// flush against the terminal edge (image #48). Walk the
-		// body line-by-line and prefix continuations with "  ".
+		// The bullet occupies two columns after the outer gutter. Keep
+		// continuation text in that same content column; Markdown owns
+		// any further indentation for lists, quotes, and code blocks.
 		body := renderAssistantBody(msg.Content, width)
 		bodyLines := strings.Split(body, "\n")
 		s.WriteString("  ")
@@ -178,7 +180,7 @@ func renderMessage(msg Message, width int, expand bool) string {
 		if len(bodyLines) > 0 {
 			s.WriteString(bodyLines[0])
 			for _, ln := range bodyLines[1:] {
-				s.WriteString("\n  ")
+				s.WriteString("\n    ")
 				s.WriteString(ln)
 			}
 		}
@@ -360,8 +362,8 @@ func renderMessage(msg Message, width int, expand bool) string {
 // markdownRenderer is the lazily-built glamour TermRenderer used for
 // assistant-message bodies. We cache it because constructing glamour
 // is expensive (loads styles, parses templates) and the renderer is
-// stateless once built. Recreate when terminal width changes more than
-// 8 cols since glamour's word-wrap is baked at construction time.
+// stateless once built. Width and theme colours are exact cache keys:
+// even a small shrink must not leave lines wider than the viewport.
 //
 // Two flavours are cached separately, keyed by `wide`:
 //   - narrow (wide=false, cap 120): prose-friendly wrap for plain
@@ -378,6 +380,8 @@ var (
 	mdRendererNarrowForWidth int
 	mdRendererWide           *glamour.TermRenderer
 	mdRendererWideForWidth   int
+	mdRendererNarrowTheme    string
+	mdRendererWideTheme      string
 )
 
 func getMarkdownRenderer(width int, wide bool) *glamour.TermRenderer {
@@ -386,23 +390,35 @@ func getMarkdownRenderer(width int, wide bool) *glamour.TermRenderer {
 
 	cached := mdRendererNarrow
 	cachedWidth := mdRendererNarrowForWidth
+	cachedTheme := mdRendererNarrowTheme
+	theme := markdownColor(themes.Current().TextPrimary) + markdownColor(themes.Current().AccentBlue)
 	if wide {
 		cached = mdRendererWide
 		cachedWidth = mdRendererWideForWidth
+		cachedTheme = mdRendererWideTheme
 	}
-	if cached != nil && abs(width-cachedWidth) < 8 {
+	if cached != nil && width == cachedWidth && theme == cachedTheme {
 		return cached
 	}
 
 	wrap := width
-	if wrap < 40 {
-		wrap = 40
+	if wrap < 1 {
+		wrap = 1
 	}
 	if !wide && wrap > 120 {
 		wrap = 120
 	}
+	cfg := metisCodeBlockStyle()
+	// Zero-width internal markers distinguish real Markdown list items from
+	// bullet-like text inside fenced code. They are removed before display.
+	cfg.Item.BlockPrefix = markdownListMarker + cfg.Item.BlockPrefix
+	cfg.Enumeration.BlockPrefix = markdownListMarker + cfg.Enumeration.BlockPrefix
+	cfg.List.BlockPrefix = markdownListStart + cfg.List.BlockPrefix
+	cfg.List.BlockSuffix += markdownListEnd
+	cfg.CodeBlock.BlockPrefix = markdownCodeStart + cfg.CodeBlock.BlockPrefix
+	cfg.CodeBlock.BlockSuffix += markdownCodeEnd
 	r, err := glamour.NewTermRenderer(
-		glamour.WithStyles(metisCodeBlockStyle()),
+		glamour.WithStyles(cfg),
 		glamour.WithWordWrap(wrap),
 		glamour.WithTableWrap(true),
 	)
@@ -412,9 +428,11 @@ func getMarkdownRenderer(width int, wide bool) *glamour.TermRenderer {
 	if wide {
 		mdRendererWide = r
 		mdRendererWideForWidth = width
+		mdRendererWideTheme = theme
 	} else {
 		mdRendererNarrow = r
 		mdRendererNarrowForWidth = width
+		mdRendererNarrowTheme = theme
 	}
 	return r
 }
@@ -441,13 +459,13 @@ func getMarkdownRenderer(width int, wide bool) *glamour.TermRenderer {
 func metisCodeBlockStyle() ansi.StyleConfig {
 	cfg := styles.DarkStyleConfig
 
-	// Glamour's dark theme renders inline code as red text on a grey
-	// background. Metis tables render inline code with a foreground colour
-	// only, so the same backtick span otherwise changes appearance depending
-	// on which Markdown path rendered it. Keep the red foreground but clear
-	// the background so inline code is consistent everywhere.
+	// Ordinary inline code is an identifier, not an error. Use the same
+	// theme accent in prose and tables, without a background badge.
 	code := cfg.Code
+	codeColor := markdownColor(themes.Current().AccentBlue)
+	code.Color = &codeColor
 	code.BackgroundColor = nil
+	code.Prefix, code.Suffix = " ", " "
 	cfg.Code = code
 
 	chroma := *cfg.CodeBlock.Chroma
@@ -461,17 +479,14 @@ func metisCodeBlockStyle() ansi.StyleConfig {
 	chroma.CommentPreproc = zero
 	cfg.CodeBlock.Chroma = &chroma
 
-	// 2026-05-23 user screenshot 61 feedback: assistant final answer
-	// rendered too dim — looked "folded" / collapsed. Root cause:
-	// glamour's DarkStyleConfig sets Document.Color = "252" (light
-	// grey, ANSI 256), which on dark terminals reads as muted/
-	// secondary rather than primary content. claude-code shows
-	// assistant text in terminal's default fg (bright white on
-	// standard dark themes). Clear the Color so glamour stops
-	// emitting the 252-grey ANSI prefix and the terminal default fg
-	// takes over.
+	// Match plain assistant text and honour light themes. The message
+	// renderer supplies the outer gutter; an additional document margin
+	// would shift Markdown continuations relative to plain text.
 	doc := cfg.Document
-	doc.Color = nil
+	foreground := markdownColor(themes.Current().TextPrimary)
+	doc.Color = &foreground
+	zeroMargin := uint(0)
+	doc.Margin = &zeroMargin
 	cfg.Document = doc
 
 	// Force ASCII table separators. glamour DarkStyleConfig leaves
@@ -492,6 +507,166 @@ func metisCodeBlockStyle() ansi.StyleConfig {
 	return cfg
 }
 
+func markdownColor(c color.Color) string {
+	r, g, b, _ := c.RGBA()
+	return fmt.Sprintf("#%02x%02x%02x", r>>8, g>>8, b>>8)
+}
+
+func assistantBodyWidth(width int) int {
+	if width <= 0 {
+		width = 80
+	}
+	return max(1, width-4)
+}
+
+// trimMarkdownBlankLines removes renderer padding without stripping authored
+// indentation from the first code block or the first nested list.
+func trimMarkdownBlankLines(rendered string) string {
+	lines := strings.Split(rendered, "\n")
+	for len(lines) > 0 && strings.TrimSpace(xansi.Strip(lines[0])) == "" {
+		lines = lines[1:]
+	}
+	for len(lines) > 0 && strings.TrimSpace(xansi.Strip(lines[len(lines)-1])) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// protectInlineCode hides the wrap breakpoints inside parsed code spans while
+// Glamour lays out paragraphs. Equal-width placeholders keep a short UUID or
+// command together; oversized spans still hard-wrap normally. Restore the exact
+// characters afterwards. Goldmark's AST excludes fenced blocks and handles
+// escaped/multiple backticks, so code semantics are not guessed with a regex.
+func protectInlineCode(content string) (string, *strings.Replacer) {
+	if !strings.Contains(content, "`") {
+		return content, nil
+	}
+	const breakpoints = "- ,.;+|"
+	var markers []string
+	for r := rune(0xe000); r <= 0xf8ff && len(markers) < len(breakpoints); r++ {
+		if !strings.ContainsRune(content, r) {
+			markers = append(markers, string(r))
+		}
+	}
+	if len(markers) < len(breakpoints) {
+		return content, nil
+	}
+	var protectPairs, restorePairs []string
+	for i := range len(breakpoints) {
+		protectPairs = append(protectPairs, string(breakpoints[i]), markers[i])
+		restorePairs = append(restorePairs, markers[i], string(breakpoints[i]))
+	}
+	protectPairs = append(protectPairs, "\n", markers[1])
+	replace := strings.NewReplacer(protectPairs...)
+	source := []byte(content)
+	doc := goldmark.DefaultParser().Parse(text.NewReader(source))
+	var out strings.Builder
+	last := 0
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering || n.Kind() != ast.KindCodeSpan {
+			return ast.WalkContinue, nil
+		}
+		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+			segment := child.(*ast.Text).Segment
+			out.Write(source[last:segment.Start])
+			out.WriteString(replace.Replace(string(source[segment.Start:segment.Stop])))
+			last = segment.Stop
+		}
+		return ast.WalkSkipChildren, nil
+	})
+	if last == 0 {
+		return content, nil
+	}
+	out.Write(source[last:])
+	return out.String(), strings.NewReplacer(restorePairs...)
+}
+
+const (
+	markdownListMarker = "\x1b]metis-list\x07"
+	markdownListStart  = "\x1b]metis-list-start\x07"
+	markdownListEnd    = "\x1b]metis-list-end\x07"
+	markdownCodeStart  = "\x1b]metis-code-start\x07"
+	markdownCodeEnd    = "\x1b]metis-code-end\x07"
+)
+
+var (
+	markdownListPrefix = regexp.MustCompile(`^\s*(?:• |\d+\. )`)
+	markdownListScope  = regexp.MustCompile("\x1b\\]metis-list(?:-start|-end)?\x07")
+)
+
+// Glamour wraps a list block without hanging the continuation beneath the
+// item's text. Reflow only renderer-marked list continuations, keeping fenced
+// code and authored indentation intact. Code-span placeholders are still in
+// place here, so adding the hanging indent cannot split a short identifier.
+func hangMarkdownLists(rendered string, width int) string {
+	lines := strings.Split(rendered, "\n")
+	hanging, inCode := 0, false
+	var parentIndents []int
+	for i, line := range lines {
+		startsCode, endsCode := strings.Contains(line, markdownCodeStart), strings.Contains(line, markdownCodeEnd)
+		line = strings.ReplaceAll(strings.ReplaceAll(line, markdownCodeStart, ""), markdownCodeEnd, "")
+		plain := xansi.Strip(line)
+		lineHanging, isItem := hanging, false
+		// Apply scope markers in stream order. An end marker after visible
+		// content changes the next line's scope, not this last line's indent.
+		for _, at := range markdownListScope.FindAllStringIndex(line, -1) {
+			beforeText := strings.TrimSpace(xansi.Strip(line[:at[0]])) == ""
+			switch line[at[0]:at[1]] {
+			case markdownListStart:
+				parentIndents = append(parentIndents, hanging)
+			case markdownListEnd:
+				if len(parentIndents) > 0 {
+					hanging = parentIndents[len(parentIndents)-1]
+					parentIndents = parentIndents[:len(parentIndents)-1]
+				}
+			case markdownListMarker:
+				hanging = xansi.StringWidth(markdownListPrefix.FindString(plain))
+				lineHanging, isItem = hanging, true
+			}
+			if beforeText {
+				lineHanging = hanging
+			}
+		}
+		line = markdownListScope.ReplaceAllString(line, "")
+		if inCode || startsCode {
+			inCode = !endsCode
+		} else if strings.TrimSpace(plain) == "" {
+			if len(parentIndents) == 0 {
+				hanging = 0
+			}
+		} else if !isItem && lineHanging > 0 {
+			indent := len(plain) - len(strings.TrimLeft(plain, " "))
+			if indent < lineHanging {
+				end := xansi.StringWidth(strings.TrimRight(plain, " "))
+				content := xansi.Cut(line, indent, end)
+				wrapped := xansi.Wrap(content, max(1, width-lineHanging), "")
+				padding := strings.Repeat(" ", lineHanging)
+				line = padding + strings.ReplaceAll(wrapped, "\n", "\n"+padding)
+			}
+		}
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderMarkdownProse(r *glamour.TermRenderer, content string, width int) string {
+	if r == nil {
+		return styleText.Render(xansi.Wrap(content, width, ""))
+	}
+	protected, restore := protectInlineCode(content)
+	out, err := r.Render(protected)
+	if err != nil {
+		return styleText.Render(xansi.Wrap(content, width, ""))
+	}
+	out = hangMarkdownLists(out, width)
+	if restore != nil {
+		out = restore.Replace(out)
+	}
+	// Fenced code may bypass Glamour's paragraph wrap. Bound every line
+	// before the final frame clamp can discard the tail of a long code line.
+	return trimMarkdownBlankLines(xansi.Hardwrap(out, width, true))
+}
+
 // renderAssistantBody pretty-prints the assistant text with markdown
 // support — code blocks get syntax-highlighted boxes, bold/italic
 // render as ANSI styles, links get OSC-8 hyperlinks. Falls back to
@@ -502,34 +677,25 @@ func metisCodeBlockStyle() ansi.StyleConfig {
 // Width-aware: passes the available render width so glamour wraps
 // inside the chat-surface column rather than the raw terminal width.
 func renderAssistantBody(content string, width int) string {
+	bodyWidth := assistantBodyWidth(width)
 	if !looksLikeMarkdown(content) {
-		return styleAsst.Render(content)
+		return styleText.Render(xansi.Wrap(content, bodyWidth, ""))
 	}
 
 	// Fast path: no table in the message, render the whole thing
 	// through glamour as before.
 	segs, hasTable := splitMarkdownTables(content)
 	if !hasTable {
-		r := getMarkdownRenderer(width-4, false)
-		if r == nil {
-			return styleAsst.Render(content)
-		}
-		out, err := r.Render(content)
-		if err != nil {
-			return styleAsst.Render(content)
-		}
-		return strings.TrimSpace(out)
+		r := getMarkdownRenderer(bodyWidth, false)
+		return renderMarkdownProse(r, content, bodyWidth)
 	}
 
 	// Mixed path: prose segments through glamour, tables through our
 	// own lipgloss-based renderer with full ASCII frame + header band.
 	// glamour gets the narrow (prose-friendly 120 cap) renderer here
 	// because the table is rendered separately and won't be squashed.
-	r := getMarkdownRenderer(width-4, false)
-	tableWidth := width - 4
-	if tableWidth < 20 {
-		tableWidth = 20
-	}
+	r := getMarkdownRenderer(bodyWidth, false)
+	tableWidth := bodyWidth
 
 	var sb strings.Builder
 	for i, seg := range segs {
@@ -542,21 +708,12 @@ func renderAssistantBody(content string, width int) string {
 			if body == "" {
 				continue
 			}
-			if r == nil {
-				sb.WriteString(styleAsst.Render(body))
-				continue
-			}
-			out, err := r.Render(body)
-			if err != nil {
-				sb.WriteString(styleAsst.Render(body))
-				continue
-			}
-			sb.WriteString(strings.TrimSpace(out))
+			sb.WriteString(renderMarkdownProse(r, body, bodyWidth))
 		case segTable:
 			sb.WriteString(renderMetisTable(seg.headers, seg.rows, tableWidth))
 		}
 	}
-	return strings.TrimSpace(sb.String())
+	return trimMarkdownBlankLines(sb.String())
 }
 
 // containsMarkdownTable looks for a GFM-style table header — a row with

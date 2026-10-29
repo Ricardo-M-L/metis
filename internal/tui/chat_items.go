@@ -87,7 +87,7 @@ type compactToolEventItem struct {
 }
 
 func (i *compactToolEventItem) Render(width int) string {
-	full := strings.TrimRight(renderToolEventAtWidth(i.te, false, width), "\n")
+	full := strings.TrimRight(renderToolEventPresentation(i.te, false, width, false), "\n")
 	if full == "" {
 		return ""
 	}
@@ -109,9 +109,10 @@ func (i *compactToolEventItem) Render(width int) string {
 // Ctrl+O between frames, buildChatItems is called again with the new
 // flag and rebuilds the items with the new expand baked in.
 type toolEventItem struct {
-	te     ToolEvent
-	expand bool
-	cache  *renderCache
+	te         ToolEvent
+	expand     bool
+	cache      *renderCache
+	navigation toolNavigationVisual
 }
 
 // explorationGroupItem is Claude Code's collapsed Read/Search cluster. The
@@ -128,8 +129,9 @@ type toolEventItem struct {
 // indented when the whole group came from a child agent, so the
 // transcript still reads as a tree.
 type explorationGroupItem struct {
-	events []ToolEvent
-	expand bool
+	events     []ToolEvent
+	expand     bool
+	navigation toolNavigationVisual
 	// subParent is the shared SubAgentParentID across all events ("" for
 	// top-level groups). Stamped at flush time so Render can decide
 	// whether to indent without re-deriving it.
@@ -150,9 +152,14 @@ type recoveredErrorGroupItem struct {
 	subParent    string
 	partialCount int
 	retriedCount int
+	navigation   toolNavigationVisual
 }
 
 func (i *recoveredErrorGroupItem) Render(width int) string {
+	return i.navigation.render(i.render(width), width)
+}
+
+func (i *recoveredErrorGroupItem) render(width int) string {
 	if i.expand {
 		var out strings.Builder
 		for _, te := range i.events {
@@ -453,6 +460,10 @@ func boolInt(value bool) int {
 }
 
 func (i *explorationGroupItem) Render(width int) string {
+	return i.navigation.render(i.render(width), width)
+}
+
+func (i *explorationGroupItem) render(width int) string {
 	_ = width
 	if i.expand {
 		var out strings.Builder
@@ -534,6 +545,10 @@ func groupableExplorationEvent(te ToolEvent) bool {
 // renderToolEvent doesn't take a width — its lipgloss styling uses
 // terminal default. Reserved for future width-aware tool rendering.
 func (i *toolEventItem) Render(width int) string {
+	return i.navigation.render(i.render(width), width)
+}
+
+func (i *toolEventItem) render(width int) string {
 	if i.cache != nil {
 		if cached, ok := i.cache.GetTool(i.te, i.expand, width); ok {
 			return normalizeChatItemBoundary(cached)
@@ -704,6 +719,7 @@ func (it *inProgressStreamingItem) Render(width int) string {
 // tool events) still hits the cache normally — only the tail is
 // re-rendered per frame.
 func (m *Model) buildChatItems() []list.Item {
+	m.reconcileToolSelectionSession()
 	merged := m.timeline()
 	// Recovery grouping is historical state, not animation state. Cache it so
 	// spinner-only redraws still update elapsed time smoothly without rescanning
@@ -854,6 +870,7 @@ func (m *Model) buildChatItems() []list.Item {
 	if m.spinnerActive {
 		out = append(out, &staticItem{rendered: renderSpinnerStatus(m)})
 	}
+	m.decorateToolNavigation(out)
 	return out
 }
 

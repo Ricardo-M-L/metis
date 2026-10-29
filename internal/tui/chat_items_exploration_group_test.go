@@ -27,7 +27,7 @@ func TestBuildChatItems_GroupsConsecutiveExplorationTools(t *testing.T) {
 		t.Fatalf("item[0] = %T, want explorationGroupItem", items[0])
 	}
 	compact := group.Render(100)
-	for _, want := range []string{"Read 2 files", "Searched 2 patterns", "ctrl+O to expand"} {
+	for _, want := range []string{"Read 2 files", "Searched 2 patterns", "Alt+↑/↓"} {
 		if !strings.Contains(compact, want) {
 			t.Errorf("compact group missing %q:\n%s", want, compact)
 		}
@@ -39,10 +39,8 @@ func TestBuildChatItems_GroupsConsecutiveExplorationTools(t *testing.T) {
 		t.Errorf("compact group leaked per-file rows:\n%s", compact)
 	}
 
-	// P0-1 (2026-08-02): the legacy expandToolOutputs toggle is gone;
-	// explorationGroupItem's expand flag is now driven exclusively by
-	// the construction site (always false in production). Test the
-	// expand=true render path directly by constructing the item by hand.
+	// The selected group can reveal every original event; cover its renderer
+	// directly here and its keyboard reachability in tool_navigation_test.go.
 	directGroup := &explorationGroupItem{events: m.toolEvents, expand: true}
 	expanded := directGroup.Render(100)
 	for _, want := range []string{"a.go", "b.go", "TODO", "**/*.go"} {
@@ -118,12 +116,16 @@ func TestBuildChatItems_RecoveredErrorStaysInPlaceAcrossAssistantCommentary(t *t
 		t.Fatalf("unexpected compact recovered row:\n%s", compact)
 	}
 
-	// Drive the real keyboard path. The later successful Bash result is the
-	// newest completed event, but it has no hidden body; Ctrl+O must target the
-	// older recovered row that actually advertises inspection.
+	// The successful retry has a descriptive title, so its original command
+	// is now hidden detail too. Ctrl+O opens it; Alt+Up moves to the older
+	// error while retaining the expanded state.
 	m.Update(tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl})
+	if m.expandedToolID != "query-ok" {
+		t.Fatalf("Ctrl+O selected %q, want latest command detail", m.expandedToolID)
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModAlt})
 	if m.expandedToolID != "query-failed" {
-		t.Fatalf("Ctrl+O selected %q, want historical recovered event", m.expandedToolID)
+		t.Fatalf("Alt+Up selected %q, want historical recovered event", m.expandedToolID)
 	}
 	for _, item := range m.buildChatItems() {
 		if expanded, ok := item.(*recoveredErrorGroupItem); ok {

@@ -41,11 +41,7 @@ func TestToolCallHeader_ArgsDefaultFg(t *testing.T) {
 	}
 }
 
-// TestToolResultHeader_SummaryDefaultFg — the "✓ 0s · Read X (N lines)"
-// summary text after the ✓/✗ glyph must render at default fg, not
-// styleDim. User screenshot 36 / 2026-05-17 flagged the prior dim
-// rendering as too low-contrast on the most-scanned line per tool
-// call. The leaf glyph + ✓/✗ keep their structural colors.
+// Keep useful summary text at default fg while the elapsed prefix is dim.
 func TestToolResultHeader_SummaryDefaultFg(t *testing.T) {
 	te := ToolEvent{
 		Kind:     "result",
@@ -57,9 +53,14 @@ func TestToolResultHeader_SummaryDefaultFg(t *testing.T) {
 
 	const dimSGR = "38;2;160;160;160"
 	summary := summarizeToolResult(te)
-	if summary == "" {
-		t.Skip("summarizeToolResult returned empty — nothing to assert against")
+	if !strings.Contains(stripANSI(out), summary) {
+		t.Fatalf("summary %q missing from output:\n%s", summary, out)
 	}
+	elapsed := formatElapsed(te.Duration)
+	if !strings.Contains(out, styleDim.Render(elapsed)) {
+		t.Fatalf("elapsed time should be secondary:\n%s", out)
+	}
+	summary = strings.TrimPrefix(summary, elapsed+" · ")
 	// Locate the summary text and confirm it doesn't open with the dim
 	// SGR escape. We accept dim escapes elsewhere in the output (leaf
 	// glyph, gutter prefix in the body preview), but the summary itself
@@ -69,8 +70,7 @@ func TestToolResultHeader_SummaryDefaultFg(t *testing.T) {
 		t.Fatalf("summary %q missing from output:\n%s", summary, out)
 	}
 	// Walk backwards to the nearest ANSI sequence; assert it's not
-	// the dim color. styleAccent (✓) closes its style before the
-	// summary, so the byte directly before should NOT be dim.
+	// the dim color. The elapsed style must close before the summary.
 	before := out[:idx]
 	if last := strings.LastIndex(before, dimSGR); last >= 0 {
 		// Acceptable only if a SGR reset closes it before the summary.

@@ -33,6 +33,20 @@ func toolArgsFirstLine(value string) string {
 	return line
 }
 
+// toolHeaderPreview uses a shell call's supplied purpose in the compact
+// transcript. Keep toolArgsPreview unchanged: permission and inspection views
+// still need the actual command, and older events may have no description.
+func toolHeaderPreview(toolName string, input map[string]any) string {
+	if strings.TrimPrefix(toolName, "sub: ") == "Bash" {
+		description, _ := input["description"].(string)
+		description = strings.Join(strings.Fields(toolArgsDisplayText(description)), " ")
+		if description != "" {
+			return xansi.Truncate(description, toolArgsPreviewMaxRunes, "…")
+		}
+	}
+	return toolArgsFirstLine(toolArgsPreview(toolName, input))
+}
+
 // Expanded transcript mode reveals the command hidden by the compact leader,
 // preserving its line structure and indenting every physical continuation row.
 func renderExpandedToolCommand(command, preview, indent string, width int) string {

@@ -476,6 +476,7 @@ func (m *Model) View() tea.View {
 	if m.stickyBottom && wasAtBottom {
 		m.chatList.ScrollToBottom()
 	}
+	m.scrollToSelectedTool()
 
 	// 2026-05-24: now that chatList is sized, compute the strip's actual
 	// Y in the final View output. Layout: listView (desiredVp lines) +
