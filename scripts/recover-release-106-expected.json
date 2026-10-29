@@ -1,0 +1,81 @@
+{
+  "repository": "Ricardo-M-L/metis",
+  "repository_id": 1225472872,
+  "tag": "v0.4.106",
+  "source_sha": "3be8647f9d5e5c04e7005e474f1c956058b0d79f",
+  "original_run_id": 40897704651,
+  "original_run_attempt": 3,
+  "workflow_id": 269081357,
+  "workflow_path": ".github/workflows/release.yml",
+  "mac_job_id": 123557003578,
+  "success_jobs": {
+    "Build pinned Computer Use helper": 123557005501,
+    "Smoke verified Linux artifact": 123557005958,
+    "Validate and build all platforms": 123557062738,
+    "Smoke verified Windows artifact": 123557068324,
+    "Desktop linux-amd64": 123557084773,
+    "Desktop windows-amd64": 123557107146
+  },
+  "artifacts": [
+    {
+      "id": 12910865160,
+      "name": "metis-desktop-windows-amd64-v0.4.106",
+      "size_in_bytes": 18931022,
+      "digest": "sha256:1430812a26cc34882ebfe5b5af0273210ce068214f429909dfb0500a0c64a7bd",
+      "created_at": "2026-10-29T15:34:40Z",
+      "updated_at": "2026-10-29T15:34:40Z",
+      "workflow_run": {
+        "id": 40897704651,
+        "repository_id": 1225472872,
+        "head_repository_id": 1225472872,
+        "head_branch": "v0.4.106",
+        "head_sha": "3be8647f9d5e5c04e7005e474f1c956058b0d79f"
+      }
+    },
+    {
+      "id": 12910630313,
+      "name": "metis-release-v0.4.106",
+      "size_in_bytes": 79773869,
+      "digest": "sha256:6dab8f003c53e96f1849225d77025715fa1e389ef52f410a3e037efb56e92488",
+      "created_at": "2026-10-29T15:30:45Z",
+      "updated_at": "2026-10-29T15:30:45Z",
+      "workflow_run": {
+        "id": 40897704651,
+        "repository_id": 1225472872,
+        "head_repository_id": 1225472872,
+        "head_branch": "v0.4.106",
+        "head_sha": "3be8647f9d5e5c04e7005e474f1c956058b0d79f"
+      }
+    },
+    {
+      "id": 12909517839,
+      "name": "metis-desktop-linux-amd64-v0.4.106",
+      "size_in_bytes": 18070906,
+      "digest": "sha256:c074cc5715f694dd550d532a4adf9ca29fa96bc904673cc59a52881bce7122be",
+      "created_at": "2026-10-29T15:35:31Z",
+      "updated_at": "2026-10-29T15:35:31Z",
+      "workflow_run": {
+        "id": 40897704651,
+        "repository_id": 1225472872,
+        "head_repository_id": 1225472872,
+        "head_branch": "v0.4.106",
+        "head_sha": "3be8647f9d5e5c04e7005e474f1c956058b0d79f"
+      }
+    },
+    {
+      "id": 12909242013,
+      "name": "metis-computer-use-v0.4.106",
+      "size_in_bytes": 17444823,
+      "digest": "sha256:7add538f65d72316e3c5a3816f54b95975354061919e4d74e2ac3037b72f0e2d",
+      "created_at": "2026-10-29T15:22:50Z",
+      "updated_at": "2026-10-29T15:22:50Z",
+      "workflow_run": {
+        "id": 40897704651,
+        "repository_id": 1225472872,
+        "head_repository_id": 1225472872,
+        "head_branch": "v0.4.106",
+        "head_sha": "3be8647f9d5e5c04e7005e474f1c956058b0d79f"
+      }
+    }
+  ]
+}

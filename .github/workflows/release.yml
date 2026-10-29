@@ -1,380 +1,55 @@
+# PREPARED RECOVERY ONLY: install as existing .github/workflows/release.yml
+# on a reviewed tooling branch. Never merge into main or move v0.4.106.
 name: Release
-
 on:
-  push:
-    # GitHub tag filters are globs, so the build job performs the authoritative
-    # stable-semver check before any source is built or published.
-    tags:
-      - 'v*'
-  # Rebuild an existing version-consistent tag with the current release
-  # tooling. Existing public releases are immutable; only drafts may be updated.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing vX.Y.Z tag to (re)build; only registered tags may be CLI-only releases'
+        description: Exact source tag (only v0.4.106 is accepted)
         required: true
         type: string
-
+      tooling_sha:
+        description: Reviewed full tooling commit SHA (must equal this dispatch commit)
+        required: true
+        type: string
 permissions:
   contents: read
-
+  actions: read
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-v0.4.106
   cancel-in-progress: false
-
 jobs:
-  prepare-computer-use:
-    name: Build pinned Computer Use helper
-    runs-on: macos-latest
-    outputs:
-      tag: ${{ steps.ref.outputs.tag }}
-      channel: ${{ steps.channel.outputs.channel }}
-    steps:
-      - name: Resolve and validate target tag
-        id: ref
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.tag }}
-          PUSH_REF: ${{ github.ref }}
-        run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            tag=$INPUT_TAG
-          else
-            tag=${PUSH_REF#refs/tags/}
-          fi
-          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "invalid release tag (expected stable vX.Y.Z): $tag" >&2
-            exit 1
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Check out release tooling
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: release-tools
-
-      - name: Check out release source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.ref.outputs.tag }}
-          path: source
-          fetch-depth: 0
-
-      - name: Resolve trusted release channel
-        id: channel
-        env:
-          TAG: ${{ steps.ref.outputs.tag }}
-        run: |
-          python3 release-tools/scripts/release_contract.py plan --tag "$TAG" > release-plan.json
-          channel=$(jq -r .channel release-plan.json)
-          if [ "$channel" != stable ]; then
-            python3 release-tools/scripts/release_contract.py plan --tag "$TAG" \
-              --registry source/.github/cli-only-releases.json > source-plan.json
-            cmp release-plan.json source-plan.json
-          fi
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-
-      - name: Check out pinned Computer Use source
-        if: steps.channel.outputs.channel == 'stable'
-        working-directory: source
-        run: |
-          set -euo pipefail
-          repository=$(jq -er .repository .github/computer-use-release.json)
-          commit=$(jq -er .commit .github/computer-use-release.json)
-          expected_version=$(jq -r '.version // empty' .github/computer-use-release.json)
-          [[ "$repository" =~ ^https://github\.com/[^/]+/[^/]+\.git$ ]]
-          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          if [ -n "$expected_version" ]; then
-            [[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-            echo "CU_EXPECTED_VERSION=$expected_version" >> "$GITHUB_ENV"
-          fi
-          git clone --filter=blob:none --no-checkout "$repository" "$RUNNER_TEMP/metis-cu-source"
-          git -C "$RUNNER_TEMP/metis-cu-source" fetch --depth=1 origin "$commit"
-          git -C "$RUNNER_TEMP/metis-cu-source" checkout --detach "$commit"
-
-      - uses: actions/setup-go@v5
-        if: steps.channel.outputs.channel == 'stable'
-        with:
-          go-version-file: ${{ runner.temp }}/metis-cu-source/go.mod
-          cache: true
-          cache-dependency-path: ${{ runner.temp }}/metis-cu-source/go.sum
-
-      - name: Test and build both Computer Use targets
-        if: steps.channel.outputs.channel == 'stable'
-        working-directory: ${{ runner.temp }}/metis-cu-source
-        run: |
-          set -euo pipefail
-          go vet ./...
-          host_arch=$(go env GOARCH)
-          case "$host_arch" in
-            arm64|amd64) ;;
-            *) echo "unsupported macOS runner architecture: $host_arch" >&2; exit 1 ;;
-          esac
-          CGO_ENABLED=1 GOOS=darwin GOARCH="$host_arch" go build -trimpath -o "$RUNNER_TEMP/metis-cu-host" .
-          version=$($RUNNER_TEMP/metis-cu-host --version | awk 'NR == 1 { print $2 }')
-          if [ -n "${CU_EXPECTED_VERSION:-}" ]; then
-            test "$version" = "$CU_EXPECTED_VERSION"
-            validator="$GITHUB_WORKSPACE/release-tools/scripts/validate-computer-use-helper.py"
-          else
-            # Historical draft rebuilds retain the validator shipped by the
-            # source tag. Older helpers did not expose a status resource.
-            validator="$GITHUB_WORKSPACE/source/scripts/validate-computer-use-helper.py"
-          fi
-          python3 "$validator" \
-            --binary "$RUNNER_TEMP/metis-cu-host" \
-            --target "darwin-$host_arch" \
-            --version "$version"
-          # Keep the upstream suite as a release gate after the managed
-          # protocol check. Incompatible plain MCP servers fail with the
-          # actionable descriptor error above instead of a less useful test
-          # or packaging failure.
-          go test ./...
-          mkdir -p "$RUNNER_TEMP/metis-cu-input"
-          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -trimpath -o "$RUNNER_TEMP/metis-cu-input/metis-cu-darwin-arm64" .
-          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -trimpath -o "$RUNNER_TEMP/metis-cu-input/metis-cu-darwin-amd64" .
-          version_arm64=$("$RUNNER_TEMP/metis-cu-input/metis-cu-darwin-arm64" --version | awk 'NR == 1 { print $2 }')
-          version_amd64=$("$RUNNER_TEMP/metis-cu-input/metis-cu-darwin-amd64" --version | awk 'NR == 1 { print $2 }')
-          test -n "$version_arm64" && test "$version_arm64" = "$version_amd64"
-          test "$version_arm64" = "$version"
-          echo "version=$version" >> "$GITHUB_ENV"
-
-      - name: Package and pin Computer Use release
-        if: steps.channel.outputs.channel == 'stable'
-        env:
-          TAG: ${{ steps.ref.outputs.tag }}
-          GITHUB_SERVER_URL: ${{ github.server_url }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          mkdir -p computer-use-artifact
-          python3 release-tools/scripts/build-computer-use-release.py \
-            --input-dir "$RUNNER_TEMP/metis-cu-input" \
-            --output-dir computer-use-artifact \
-            --catalog computer-use-artifact/releases.json \
-            --version "$version" \
-            --base-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG"
-
-      - name: Upload verified Computer Use artifact
-        if: steps.channel.outputs.channel == 'stable'
-        uses: actions/upload-artifact@v4
-        with:
-          name: metis-computer-use-${{ steps.ref.outputs.tag }}
-          path: computer-use-artifact/*
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
-
-  build:
-    name: Validate and build all platforms
-    needs: prepare-computer-use
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.ref.outputs.tag }}
-      channel: ${{ steps.channel.outputs.channel }}
-    steps:
-      - name: Resolve and validate target tag
-        id: ref
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.tag }}
-          PUSH_REF: ${{ github.ref }}
-        run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            tag=$INPUT_TAG
-          else
-            tag=${PUSH_REF#refs/tags/}
-          fi
-          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "invalid release tag (expected stable vX.Y.Z): $tag" >&2
-            exit 1
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      # For workflow_dispatch, release-tools is the current default-branch
-      # workflow commit while source is the historical tag being backfilled.
-      # On a tag push both checkouts resolve to the tagged commit.
-      - name: Check out release tooling
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: release-tools
-
-      - name: Check out release source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.ref.outputs.tag }}
-          path: source
-          fetch-depth: 0
-
-      - name: Resolve trusted release channel
-        id: channel
-        env:
-          TAG: ${{ steps.ref.outputs.tag }}
-        run: |
-          python3 release-tools/scripts/release_contract.py plan --tag "$TAG" > release-plan.json
-          channel=$(jq -r .channel release-plan.json)
-          if [ "$channel" != stable ]; then
-            # The tagged source must opt in to the identical registry entry;
-            # dispatching newer tooling cannot downgrade a historical stable.
-            python3 release-tools/scripts/release_contract.py plan --tag "$TAG" \
-              --registry source/.github/cli-only-releases.json > source-plan.json
-            cmp release-plan.json source-plan.json
-          fi
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-
-      - name: Download verified Computer Use catalog
-        if: steps.channel.outputs.channel == 'stable'
-        uses: actions/download-artifact@v4
-        with:
-          name: metis-computer-use-${{ steps.ref.outputs.tag }}
-          path: computer-use-artifact
-
-      - name: Embed verified Computer Use catalog
-        if: steps.channel.outputs.channel == 'stable'
-        run: |
-          set -euo pipefail
-          test -s computer-use-artifact/releases.json
-          mkdir -p source/internal/computeruse
-          cp computer-use-artifact/releases.json source/internal/computeruse/releases.json
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: source/go.mod
-          cache: true
-          cache-dependency-path: source/go.sum
-
-      - name: Install Linux sandbox test dependency
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          if sysctl kernel.unprivileged_userns_clone >/dev/null 2>&1; then
-            sudo sysctl -w kernel.unprivileged_userns_clone=1
-          fi
-          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          bwrap --die-with-parent --new-session --unshare-pid --ro-bind / / --proc /proc --dev /dev --unshare-net -- /bin/true
-
-      - name: Run root release gates
-        working-directory: source
-        run: |
-          ../release-tools/scripts/verify-release-policy.sh
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "gofmt found unformatted files:" >&2
-            echo "$unformatted" >&2
-            exit 1
-          fi
-          go vet ./...
-          go build ./...
-          go test -count=1 -timeout 180s ./...
-
-      - name: Vet and race-test patched Bubble Tea
-        working-directory: source/vendor-patches/bubbletea-v2
-        run: |
-          go vet ./...
-          go test -race -count=1 ./...
-
-      - name: Vet and race-test patched Ultraviolet
-        working-directory: source/vendor-patches/ultraviolet
-        run: |
-          go vet ./...
-          go test -race -count=1 ./...
-
-      - name: Cross-compile and verify release set
-        working-directory: source
-        env:
-          TAG: ${{ steps.ref.outputs.tag }}
-        run: make -f ../release-tools/Makefile verify-dist TAG="$TAG"
-
-      - name: Upload verified workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: metis-release-${{ steps.ref.outputs.tag }}
-          path: source/dist/*
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
-
-  smoke-unix-artifact:
-    name: Smoke verified Linux artifact
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: metis-release-${{ needs.build.outputs.tag }}
-          path: dist
-
-      - name: Checksum, extract, and run
-        env:
-          TAG: ${{ needs.build.outputs.tag }}
-        run: |
-          cd dist
-          shasum -a 256 -c metis-linux-amd64.tar.gz.sha256
-          mkdir smoke
-          tar -xzf metis-linux-amd64.tar.gz -C smoke
-          reported=$(smoke/metis-linux-amd64 version | awk 'NR == 1 { print $1 }')
-          test "$reported" = "$TAG"
-
-  smoke-windows-artifact:
-    name: Smoke verified Windows artifact
-    needs: build
-    runs-on: windows-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: metis-release-${{ needs.build.outputs.tag }}
-          path: dist
-
-      - name: Checksum, extract, and run
-        shell: pwsh
-        env:
-          TAG: ${{ needs.build.outputs.tag }}
-        run: |
-          $archive = Join-Path $PWD "dist/metis-windows-amd64.zip"
-          $expected = ((Get-Content "$archive.sha256") -split '\s+')[0].ToLowerInvariant()
-          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) { throw "Windows archive checksum mismatch" }
-          $smokeDir = Join-Path $env:RUNNER_TEMP "metis-smoke"
-          Expand-Archive -LiteralPath $archive -DestinationPath $smokeDir
-          $output = @(& (Join-Path $smokeDir "metis.exe") version)
-          if ($LASTEXITCODE -ne 0) { throw "metis.exe version failed" }
-          $reported = ($output[0] -split '\s+')[0]
-          if ($reported -ne $env:TAG) {
-            throw "metis.exe reports $reported instead of $env:TAG"
-          }
-
   desktop-build:
     name: Desktop ${{ matrix.asset }}
-    if: github.event_name == 'push' && needs.build.outputs.channel == 'stable'
-    needs: [build, prepare-computer-use]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            platform: linux/amd64
-            asset: linux-amd64
-          - os: windows-latest
-            platform: windows/amd64
-            asset: windows-amd64
-          - os: macos-latest
+          - os: macos-15-intel
             platform: darwin/universal
             asset: darwin-universal
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.build.outputs.tag }}
+          ref: 3be8647f9d5e5c04e7005e474f1c956058b0d79f
+          fetch-depth: 0
 
-      - name: Download verified Computer Use artifact
-        if: runner.os == 'macOS'
-        uses: actions/download-artifact@v4
+      - name: Check out reviewed recovery tooling
+        uses: actions/checkout@v4
         with:
-          name: metis-computer-use-${{ needs.build.outputs.tag }}
-          path: computer-use-artifact
+          ref: ${{ github.sha }}
+          path: release-tools
+
+      - name: Verify terminal infrastructure failure and download exact original CU
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_TAG: ${{ inputs.tag }}
+          TOOLING_SHA: ${{ inputs.tooling_sha }}
+        run: |
+          python3 -B release-tools/scripts/recover-release-106.py download \
+            --tag "$TARGET_TAG" --tooling-sha "$TOOLING_SHA" --source . \
+            --scope cu --dist computer-use-artifact --evidence recovery-mac-evidence
 
       - name: Stage Computer Use catalog and archives for Desktop
         if: runner.os == 'macOS'
@@ -567,7 +242,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: metis-desktop-${{ matrix.asset }}-${{ needs.build.outputs.tag }}
+          name: metis-desktop-${{ matrix.asset }}-v0.4.106
           path: metis-desktop/release-dist/*
           if-no-files-found: error
           compression-level: 0
@@ -575,75 +250,41 @@ jobs:
 
   stage-draft:
     name: Stage immutable release draft
-    if: >-
-      always() &&
-      needs.build.result == 'success' &&
-      needs.smoke-unix-artifact.result == 'success' &&
-      needs.smoke-windows-artifact.result == 'success' &&
-      (needs.build.outputs.channel != 'stable' || github.event_name != 'push' || needs.desktop-build.result == 'success')
-    needs: [build, prepare-computer-use, smoke-unix-artifact, smoke-windows-artifact, desktop-build]
+    needs: desktop-build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           path: release-tools
-
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          name: metis-release-${{ needs.build.outputs.tag }}
-          path: dist
-
-      # The macOS runner artifact is an ad-hoc-signed CI smoke artifact only.
-      # Official macOS ZIP/DMG assets must be Developer ID signed, notarized,
-      # and stapled locally before the draft is made public, so never stage the
-      # runner-produced macOS archive in the GitHub Release.
-      - name: Download Linux Desktop artifact
-        if: github.event_name == 'push' && needs.build.outputs.channel == 'stable'
-        uses: actions/download-artifact@v4
-        with:
-          name: metis-desktop-linux-amd64-${{ needs.build.outputs.tag }}
-          path: dist
-
-      - name: Download Windows Desktop artifact
-        if: github.event_name == 'push' && needs.build.outputs.channel == 'stable'
-        uses: actions/download-artifact@v4
-        with:
-          name: metis-desktop-windows-amd64-${{ needs.build.outputs.tag }}
-          path: dist
-
-      - name: Download official Computer Use assets
-        if: github.event_name == 'push' && needs.build.outputs.channel == 'stable'
-        uses: actions/download-artifact@v4
-        with:
-          name: metis-computer-use-${{ needs.build.outputs.tag }}
-          path: computer-use-artifact
-
-      - name: Stage official Computer Use assets
-        if: github.event_name == 'push' && needs.build.outputs.channel == 'stable'
+          ref: 3be8647f9d5e5c04e7005e474f1c956058b0d79f
+          path: source
+          fetch-depth: 0
+      - name: Verify six original gates and download exact original twenty assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_TAG: ${{ inputs.tag }}
+          TOOLING_SHA: ${{ inputs.tooling_sha }}
         run: |
-          set -euo pipefail
-          for asset in \
-            metis-cu-darwin-arm64.tar.gz \
-            metis-cu-darwin-amd64.tar.gz \
-            metis-cu-darwin-arm64.tar.gz.sha256 \
-            metis-cu-darwin-amd64.tar.gz.sha256; do
-            cp "computer-use-artifact/$asset" "dist/$asset"
-          done
+          python3 -B release-tools/scripts/recover-release-106.py download \
+            --tag "$TARGET_TAG" --tooling-sha "$TOOLING_SHA" --source source \
+            --scope all --dist dist --evidence recovery-download
 
       - name: Require a draft and stage verified non-macOS assets
         env:
-          EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.build.outputs.tag }}
-          CHANNEL: ${{ needs.build.outputs.channel }}
+          TAG: v0.4.106
+          CHANNEL: stable
+          TOOLING_SHA: ${{ inputs.tooling_sha }}
         run: |
           set -euo pipefail
           mapfile -t assets < <(find dist -mindepth 1 -maxdepth 1 -type f -print | sort)
-          expected=12
-          if [ "$EVENT_NAME" = "push" ] && [ "$CHANNEL" = "stable" ]; then expected=20; fi
+          expected=20
           if [ "${#assets[@]}" -ne "$expected" ]; then
             echo "expected exactly $expected verified assets, found ${#assets[@]}" >&2
             exit 1
@@ -676,7 +317,18 @@ jobs:
           # gh release upload/download share its draft-aware FetchRelease. Bind
           # that resolution to the ID already validated before allowing writes.
           test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)" = "$release_id"
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+          python3 -B release-tools/scripts/recover-release-106.py check \
+            --tag "$TAG" --tooling-sha "$TOOLING_SHA" --source source \
+            --evidence recovery-before-upload
+          existing_count=$(jq '.assets | length' release.json)
+          if [ "$existing_count" = 0 ]; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "${assets[@]}"
+          elif [ "$existing_count" = 20 ]; then
+            echo "Existing 20-asset draft: preserve all asset identities and verify exact bytes below."
+          else
+            echo "Refusing to modify a non-empty partial/full draft ($existing_count assets)." >&2
+            exit 1
+          fi
           gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > release.json
           gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-after.json
           verification_flags=(--allow-partial-draft)
@@ -686,8 +338,8 @@ jobs:
 
       - name: Record finalization gate
         env:
-          TAG: ${{ needs.build.outputs.tag }}
-          CHANNEL: ${{ needs.build.outputs.channel }}
+          TAG: v0.4.106
+          CHANNEL: stable
         run: |
           {
             echo "### Draft staged for $TAG"
@@ -700,3 +352,21 @@ jobs:
               echo "Add the Developer ID signed, notarized, stapled ZIP/DMG and their SHA-256 sidecars, verify all 24 assets, then publish the draft exactly once."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify staged bytes against original immutable artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_TAG: ${{ inputs.tag }}
+          TOOLING_SHA: ${{ inputs.tooling_sha }}
+        run: |
+          python3 -B release-tools/scripts/recover-release-106.py verify-stage \
+            --tag "$TARGET_TAG" --tooling-sha "$TOOLING_SHA" --source source \
+            --dist dist --download-evidence recovery-download --evidence recovery-final
+
+      - name: Upload exact-source recovery evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: metis-recovery-evidence-v0.4.106
+          path: recovery-final/*.json
+          if-no-files-found: error
+          retention-days: 7

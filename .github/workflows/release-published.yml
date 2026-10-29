@@ -178,7 +178,7 @@ jobs:
     name: Verify macOS signing, notarization, and Gatekeeper
     needs: inventory
     if: needs.inventory.outputs.channel == 'stable' && needs.inventory.outputs.unsigned_macos != 'true'
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
         with:
