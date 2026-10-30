@@ -46,7 +46,7 @@ func runSubagentConversationUI(t *testing.T, scenario string) {
 }
 
 func TestSubagentConversationReader(t *testing.T) {
-	for _, scenario := range []string{"messages_tools_safe", "tool_pairing_boundaries", "owner_generation", "paused_updates", "pagination_anchor", "directory_usage", "catalog_pagination_refresh", "reopen_paused_canonical", "reopen_chrome_latest", "late_fetch_keeps_delta", "pagination_cursor_advances", "live_preview_boundaries", "keyboard_presentation"} {
+	for _, scenario := range []string{"messages_tools_safe", "tool_pairing_boundaries", "owner_generation", "paused_updates", "pagination_anchor", "directory_usage", "catalog_pagination_refresh", "reopen_paused_canonical", "reopen_chrome_latest", "late_fetch_keeps_delta", "pagination_cursor_advances", "live_preview_boundaries", "keyboard_presentation", "parent_owned_capability"} {
 		t.Run(scenario, func(t *testing.T) { runSubagentConversationUI(t, scenario) })
 	}
 }
@@ -131,11 +131,11 @@ function parseHTML(html,parent){
 }
 const root=new Element('body'),frames=new Map(),timers=new Map(),intervals=new Map(),requests=[],streams=[];
 let nextTimer=0,now=Date.parse('2026-10-28T00:00:00Z');
-const ids=['statusPopover','statusChip','subAgentDetailOverlay','subAgentDetailTitle','subAgentDetailDescription','subAgentDetailBody','subAgentDetailMetrics','subAgentDetailInfo','subAgentDetailFooterActions','subAgentDetailClose','subAgentInfoToggle','subAgentPresentationToggle','subAgentBack','chatArea'];
+const ids=['statusPopover','statusChip','subAgentDetailOverlay','subAgentDetailTitle','subAgentDetailDescription','subAgentDetailBody','subAgentDetailMetrics','subAgentDetailInfo','subAgentDetailFooterActions','subAgentDetailClose','subAgentInfoToggle','subAgentPresentationToggle','subAgentBack','subAgentReadOnlyLabel','chatArea'];
 for(const id of ids){const el=new Element();el.id=id;root.appendChild(el);}
 const el=id=>root.querySelector('#'+id),body=el('subAgentDetailBody'),overlay=el('subAgentDetailOverlay');
 overlay.hidden=true;overlay.dataset.presentation='page';const dialog=new Element('section');dialog.className='subagent-detail-dialog';overlay.appendChild(dialog);
-const agent={agentId:'child',sessionId:'A',name:'reviewer',task:'Review transport',status:'running',startedAt:new Date(now-90000).toISOString(),elapsedMs:90000,output:'',conversationRevision:1};
+const agent={ownership:'parent',parentSessionId:'A',canAcceptDirectInput:false,directInputBlockedReason:'parent_owned',agentId:'child',sessionId:'A',name:'reviewer',task:'Review transport',status:'running',startedAt:new Date(now-90000).toISOString(),elapsedMs:90000,output:'',conversationRevision:1};
 let conversation={agent:{...agent},messages:[],startIndex:0,totalMessages:0,hasMore:false,nextBefore:0,revision:1,completeness:{state:'recorded',contextResets:0,liveTailAvailable:false},segments:[],usage:{available:false,totalTokens:null}};
 let respond=async(url,options)=>({ok:true,json:async()=>url.includes('/conversation')?conversation:url.startsWith('/api/subagents?')?{sessionId:'A',agents:[{...agent}],hasMore:false}:options?.method==='POST'?{agent:{...agent}}:{agent:{...agent}}});
 c={console,Promise,Map,Set,Array,AbortController,URL,URLSearchParams,encodeURIComponent,performance:{now:()=>now},
@@ -172,7 +172,20 @@ async function show(messages,extra={}){
 const message=(role,text)=>({role,content:[{type:'text',text}]});
 const stopButton=()=>{const button=el('subAgentDetailFooterActions').querySelector('.subagent-detail-stop');return button&&!button.hidden?button:null;};
 async function run(){
-  if(scenario==='panel_lifecycle'){
+  if(scenario==='parent_owned_capability'){
+    await show([message('user','Inspect the project'),message('assistant','Done')]);
+    assert.equal(el('subAgentReadOnlyLabel').textContent,'Managed by parent agent');
+    assert.match(el('subAgentReadOnlyLabel').title,/parent conversation/);
+    assert.equal(root.querySelector('textarea'),null,'child reader must not create an independent composer');
+    assert.equal(stopButton()?.textContent,'Stop agent','parent-managed live child remains stoppable');
+    snapshot({status:'completed'});await settle();
+    assert.equal(el('subAgentReadOnlyLabel').textContent,'Managed by parent agent');
+    assert.equal(stopButton(),null,'completed child has no stop action');
+    c.document.documentElement.lang='zh-CN';c.renderSubAgentConversationView();flushFrames();
+    assert.equal(el('subAgentReadOnlyLabel').textContent,'由主代理管理');
+    assert.match(el('subAgentReadOnlyLabel').title,/主对话/);
+    c.closeSubAgentDetails(false);
+  }else if(scenario==='panel_lifecycle'){
     const content='# Transport review\n\nReading **transport.go**';
     await show([message('user','Review transport'),message('assistant',content)]);
     assert.equal(overlay.hidden,false);assert.equal(el('subAgentDetailTitle').textContent,'reviewer');

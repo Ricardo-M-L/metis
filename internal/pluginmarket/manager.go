@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/Ricardo-M-L/metis/internal/pluginmanifest"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	pubplugin "github.com/Ricardo-M-L/metis/pkg/plugin"
 )
@@ -29,6 +30,7 @@ var (
 	ErrNotFound         = errors.New("plugin not found")
 	ErrAlreadyInstalled = errors.New("plugin already installed")
 	ErrNotInstallable   = errors.New("plugin source is not installable")
+	ErrInvalidManifest  = errors.New("invalid plugin manifest")
 )
 
 const (
@@ -263,8 +265,42 @@ func catalogPlugin(marketplace string, item marketplacePluginEntry, sourcePath, 
 		reason = "This package uses Cordis services or client slots and stays in the DeepSeek Harness runtime"
 	}
 	if hasNativeManifest {
-		compatibility = "native"
-		reason = ""
+		// A native manifest is authoritative about supported capabilities. Do not
+		// treat its mere presence (or marketplace branding) as proof it can load.
+		manifest, err := pluginmanifest.Read(sourcePath, item.Name)
+		item.Capabilities = nil
+		item.Components = nil
+		item.Skills = nil
+		if err != nil {
+			installable = false
+			compatibility = "invalid"
+			reason = err.Error()
+		} else {
+			compatibility = "native"
+			reason = ""
+			item.Version = manifest.Version
+			if manifest.Description != "" {
+				item.Description = manifest.Description
+			}
+			item.Skills = append([]string(nil), manifest.Skills...)
+			if len(manifest.Skills) > 0 {
+				item.Capabilities = append(item.Capabilities, "Skills")
+				item.Components = append(item.Components, PluginComponent{Kind: "skills", Support: "native", Detail: "Validated SKILL.md files"})
+			}
+			mcpCount := 0
+			if manifest.MCPServer != nil && !manifest.MCPServer.Disabled {
+				mcpCount++
+			}
+			for _, server := range manifest.MCPServers {
+				if !server.Disabled {
+					mcpCount++
+				}
+			}
+			if mcpCount > 0 {
+				item.Capabilities = append(item.Capabilities, "MCP")
+				item.Components = append(item.Components, PluginComponent{Kind: "mcp", Support: "native", Detail: fmt.Sprintf("%d enabled MCP server(s); connection checked at startup", mcpCount)})
+			}
+		}
 	} else if len(item.Skills) > 0 || len(item.MCPServers) > 0 {
 		compatibility = "skills"
 		if len(item.MCPServers) > 0 {
@@ -1004,6 +1040,12 @@ func (m *Manager) installFromPath(name, marketplace, sourcePath string, selected
 		_ = os.RemoveAll(staging)
 		return InstallResult{}, err
 	}
+	// Validate both native and translated bundles before publishing the staged
+	// directory. This is static inspection only: no subprocesses or MCP requests.
+	if _, err := pluginmanifest.Read(staging, name); err != nil {
+		_ = os.RemoveAll(staging)
+		return InstallResult{}, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
+	}
 	if err := os.Rename(staging, destination); err != nil {
 		_ = os.RemoveAll(staging)
 		return InstallResult{}, err
@@ -1375,13 +1417,8 @@ func copyTree(source, destination string) error {
 func ensurePluginManifest(root string, entry marketplacePluginEntry) error {
 	manifestPath := filepath.Join(root, "plugin.toml")
 	if _, err := os.Stat(manifestPath); err == nil {
-		var manifest pubplugin.Manifest
-		if _, err := toml.DecodeFile(manifestPath, &manifest); err != nil {
-			return fmt.Errorf("installed manifest unreadable: %w", err)
-		}
-		if manifest.Name != entry.Name {
-			return fmt.Errorf("installed manifest name %q does not match %q", manifest.Name, entry.Name)
-		}
+		// The caller applies the same strict validator to this manifest and to
+		// generated manifests, before the staged directory becomes installed.
 		return nil
 	} else if !os.IsNotExist(err) {
 		return err

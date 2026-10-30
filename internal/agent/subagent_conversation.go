@@ -115,6 +115,8 @@ func loadSubAgentConversation(sessionDir, agentID string, afterHeader func()) (*
 	reader := bufio.NewReader(io.LimitReader(f, info.Size()))
 	headerSeen, currentLength := false, 0
 	var initialHeader pubsess.Header
+	var execution *SubAgentExecutionConfig
+	var followups subAgentFollowupReplay
 	for lineNumber := 1; ; lineNumber++ {
 		line, readErr := reader.ReadBytes('\n')
 		if readErr != nil {
@@ -168,6 +170,7 @@ func loadSubAgentConversation(sessionDir, agentID string, afterHeader func()) (*
 				return nil, fmt.Errorf("subagent transcript line %d: checkpoint offset %d differs from history length %d", lineNumber, checkpoint.Offset, currentLength)
 			}
 			conversation.Messages = append(conversation.Messages, checkpoint.Messages...)
+			followups.pending = pendingSubAgentFollowups(checkpoint.Messages, followups.pending)
 			currentLength += len(checkpoint.Messages)
 			conversation.Terminal = nil
 		case "terminal":
@@ -179,6 +182,20 @@ func loadSubAgentConversation(sessionDir, agentID string, afterHeader func()) (*
 		case "handoff":
 			if entry.Handoff == nil || entry.Handoff.Scope == "" || entry.Handoff.Recipient == "" {
 				return nil, fmt.Errorf("subagent transcript line %d: invalid handoff", lineNumber)
+			}
+		case "execution":
+			var err error
+			execution, err = readSubAgentExecution(execution, entry.Execution)
+			if err != nil {
+				return nil, fmt.Errorf("subagent transcript line %d: %w", lineNumber, err)
+			}
+		case "followup":
+			if err := followups.enqueue(entry.Followup); err != nil {
+				return nil, fmt.Errorf("subagent transcript line %d: %w", lineNumber, err)
+			}
+		case "followup_ack":
+			if err := followups.acknowledge(entry.FollowupAck); err != nil {
+				return nil, fmt.Errorf("subagent transcript line %d: %w", lineNumber, err)
 			}
 		default:
 			return nil, fmt.Errorf("subagent transcript line %d: unknown entry type %q", lineNumber, entry.Type)

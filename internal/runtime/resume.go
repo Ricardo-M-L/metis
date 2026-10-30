@@ -42,6 +42,9 @@ func PrepareResume(store *session.Store, sessionID string) (*PreparedResume, err
 	if !validResumeSessionID(sessionID) {
 		return nil, fmt.Errorf("resume: invalid session id %q", sessionID)
 	}
+	if child, childErr := agent.LoadSubAgentHeader(store.Dir, sessionID); childErr == nil && child.SubAgentOf != "" {
+		return nil, parentOwnedResumeError(&child)
+	}
 	if _, err := os.Stat(filepath.Join(store.Dir, sessionID+".jsonl")); err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("resume: no session matches %q (tip: `metis sessions list` to see ids, or `metis -r` to pick interactively)", sessionID)
@@ -57,6 +60,9 @@ func PrepareResume(store *session.Store, sessionID string) (*PreparedResume, err
 	hdr, msgs, err := store.Load(sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("resume %s: %w", sessionID, err)
+	}
+	if err := parentOwnedResumeError(hdr); err != nil {
+		return nil, err
 	}
 	// Apply the context-economics limit only after Load has replayed every
 	// history_replace. A compacted session with a large audit ledger therefore
@@ -113,6 +119,9 @@ func ApplyPreparedResume(prepared *PreparedResume, loop *agent.Loop,
 	if prepared == nil {
 		return nil, fmt.Errorf("resume: nil prepared session")
 	}
+	if err := parentOwnedResumeError(prepared.Header); err != nil {
+		return nil, err
+	}
 	if warnOut == nil {
 		warnOut = os.Stderr
 	}
@@ -159,6 +168,13 @@ func ApplyPreparedResume(prepared *PreparedResume, loop *agent.Loop,
 	}
 	loop.Restore(prepared.messages)
 	return &ResumeResult{SessionID: prepared.SessionID}, nil
+}
+
+func parentOwnedResumeError(header *session.Header) error {
+	if header == nil || header.SubAgentOf == "" {
+		return nil
+	}
+	return fmt.Errorf("resume: sub-agent %q is managed by parent session %q; continue in that parent conversation so it can delegate with Agent(resume_from), rather than starting this child as a main session", header.ID, header.SubAgentOf)
 }
 
 // validResumeSessionID keeps the raw Stat path and Store.Load path identical.

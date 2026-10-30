@@ -7676,9 +7676,10 @@ function paintPlugins() {
   if (count) count.textContent = String((pluginsCache || []).length);
   list.innerHTML = (pluginsCache || []).map(p => `<article class="plugin-card installed-card">
     <div class="plugin-card-top"><div class="plugin-title-wrap"><h4 title="${escAttr(p.name || p.id)}">${escHtml(p.name || p.id)}</h4>${p.version ? '<span class="plugin-version">' + escHtml(p.version) + '</span>' : ''}</div>
-      <span class="plugin-state ${p.loaded ? 'ready' : (p.error ? 'error' : 'pending')}">${p.loaded ? uiText('Loaded', '已加载') : (p.error ? uiText('Invalid', '无效') : uiText('Restart required', '需要重启'))}</span></div>
-    <p class="plugin-description">${escHtml(p.description || p.error || uiText('No description provided.', '暂无插件说明。'))}</p>
-    <div class="plugin-meta">${escHtml((p.capabilities || []).join(' · ') || uiText('Manifest only', '仅清单'))}</div>
+      <span class="plugin-state ${p.error ? 'error' : (p.loaded ? 'ready' : 'pending')}">${p.error ? uiText('Invalid', '无效') : (p.loaded ? uiText('Loaded', '已加载') : uiText('Restart required', '需要重启'))}</span></div>
+    <p class="plugin-description">${escHtml(p.description || uiText('No description provided.', '暂无插件说明。'))}</p>
+    ${p.error ? '<p class="plugin-validation-error" role="alert">' + escHtml(p.error) + '</p>' : ''}
+    <div class="plugin-meta">${escHtml((p.capabilities || []).join(' · ') || (p.error ? uiText('Unavailable', '不可用') : uiText('No active capabilities', '没有启用的能力')))}</div>
     <div class="plugin-card-footer"><code title="${escAttr(p.source || '')}">${escHtml(p.source || '')}</code><button type="button" class="plugin-remove" onclick="removePlugin('${escOnclick(p.id)}', this)">${uiText('Remove', '移除')}</button></div>
   </article>`).join('') || '<div class="plugin-empty">' + uiText('No plugins installed yet. Browse the marketplace to add one.', '尚未安装插件，可前往插件商场选择安装。') + '</div>';
 }
@@ -7955,7 +7956,7 @@ function openPluginActionDialog(action, name, marketplace, trigger) {
     ? uiText('METIS will import the compatible skill files only. This plugin references Codex apps or runtime tools, so some workflows may remain unavailable after restart.', 'METIS 只会导入兼容的 Skill 文件。该插件引用了 Codex App 或专用运行时工具，重启后仍可能有部分流程不可用。')
     : (remote
       ? uiText('METIS will fetch the pinned HTTPS Git source, inspect it, reject unsafe paths or symlinks, and install only if it contains a native manifest or compatible skills.', 'METIS 将获取已锁定的 HTTPS Git 源，检查内容并拒绝越界路径或符号链接；只有包含原生清单或兼容 Skills 时才会安装。')
-      : uiText('METIS will copy this extension from the registered marketplace. Review the source before enabling it; installed plugins may add tools, skills, hooks, or subprocesses after restart.', 'METIS 将从已注册商场复制此扩展。启用前请确认来源；重启后，插件可能增加工具、技能、钩子或子进程。'));
+      : uiText('METIS will validate and copy this extension from the registered marketplace. Plugins can add MCP tools and Skills after restart; Hooks, schedules, themes, and UI extensions are not supported.', 'METIS 将校验并复制此扩展。重启后可增加 MCP 工具和 Skills；暂不支持 Hooks、定时任务、主题和界面扩展声明。'));
   const overlay = document.createElement('div');
   overlay.className = 'plugin-action-overlay';
   overlay.innerHTML = `<div class="plugin-action-dialog" role="alertdialog" aria-modal="true" aria-labelledby="pluginActionTitle" aria-describedby="pluginActionDescription">

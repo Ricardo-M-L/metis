@@ -77,6 +77,18 @@ func TestRebindAgentPromptsUpdatesFullAndMinimalSystems(t *testing.T) {
 	}
 }
 
+func TestSessionOnlyRebindPreservesConfiguredProviderIdentity(t *testing.T) {
+	reg := tools.NewRegistry()
+	provider := rebindProvider{name: "openai", model: "saved-model", cap: 100}
+	reg.Register(NewAgent(permission.New(permission.ModeDontAsk), provider, reg, "saved-model", "system"))
+	RebindAgentPrompts(reg, "system", "minimal", AgentRuntimePromptState{ProviderName: "custom-configured-provider"})
+	RebindProviderTools(reg, provider, "saved-model", "system", "new-parent-session")
+	tool, _ := reg.Get("Agent")
+	if got := tool.(Agent).executionProviderName(); got != "custom-configured-provider" {
+		t.Fatalf("session rebind replaced configured provider identity with transport name: %q", got)
+	}
+}
+
 func TestRebindProviderToolsRebuildsMinimalPromptFromRuntimeState(t *testing.T) {
 	reg := tools.NewRegistry()
 	gate := permission.New(permission.ModeAsk)

@@ -5798,6 +5798,13 @@ a.tc-web-title:focus-visible,
   overflow-wrap: anywhere;
 }
 .plugin-meta { color: var(--fg-faint); font-size: 10.5px; line-height: 16px; }
+.plugin-validation-error {
+  margin: 0;
+  color: var(--error);
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
 .plugin-component-mini-row { min-height: 18px; margin-top: 6px; }
 .plugin-mini-component { padding: 1px 5px; border: 1px solid var(--border-faint); border-radius: 999px; color: var(--fg-dim); font: 9.5px/14px var(--font-ui); }
 .plugin-mini-component.native,

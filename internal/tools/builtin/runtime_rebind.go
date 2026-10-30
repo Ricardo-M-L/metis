@@ -1,6 +1,8 @@
 package builtin
 
 import (
+	"reflect"
+
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
@@ -53,6 +55,9 @@ func RebindProviderTools(reg *tools.Registry, provider llm.Provider, model, syst
 }
 
 func rebindAgentProvider(a *Agent, reg *tools.Registry, provider llm.Provider, model, system, parentSessionID string, promptState []AgentRuntimePromptState) {
+	previousName := a.promptProviderName
+	providerType := reflect.TypeOf(provider)
+	sameProvider := providerType != nil && providerType == reflect.TypeOf(a.provider) && providerType.Comparable() && a.provider == provider
 	a.provider = provider
 	a.model = model
 	a.system = system
@@ -66,6 +71,12 @@ func rebindAgentProvider(a *Agent, reg *tools.Registry, provider llm.Provider, m
 	a.promptProviderName = ""
 	if provider != nil {
 		a.promptProviderName = provider.Name()
+		// Session-only rebinds do not carry a new provider selection. Retain
+		// its configured identity rather than replacing it with e.g. "openai".
+		// Explicit provider switches supply ProviderName below.
+		if previousName != "" && sameProvider {
+			a.promptProviderName = previousName
+		}
 	}
 	applyAgentRuntimePromptState(a, promptState)
 	if a.minimalPromptBuilder != nil {
@@ -86,6 +97,15 @@ func applyAgentRuntimePromptState(a *Agent, promptState []AgentRuntimePromptStat
 	}
 	if state.MinimalPromptBuilder != nil {
 		a.minimalPromptBuilder = state.MinimalPromptBuilder
+	}
+	if state.ResolveProvider != nil {
+		a.resolveProvider = state.ResolveProvider
+	}
+	if state.Effort != nil {
+		a.effort = state.Effort
+	}
+	if state.Fast != nil {
+		a.fast = state.Fast
 	}
 }
 

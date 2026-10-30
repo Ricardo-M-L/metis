@@ -200,7 +200,7 @@ func ecosystemViews(claudeCount int, codexCount int, codexErr error, dshCount in
 			Components: []EcosystemComponent{
 				{Kind: "skills", Support: "native", Detail: "Namespaced SKILL.md loading"},
 				{Kind: "mcp", Support: "native", Detail: "Multiple stdio or HTTP MCP servers"},
-				{Kind: "hooks", Support: "native", Detail: "METIS lifecycle hook declarations"},
+				{Kind: "hooks", Support: "unsupported", Detail: "Plugin hook execution is not implemented; native hook declarations are rejected"},
 			},
 		},
 		{

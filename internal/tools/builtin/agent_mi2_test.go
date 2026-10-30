@@ -51,11 +51,8 @@ func TestAgentExecute_ResumeFromLiveAgent_Refused(t *testing.T) {
 	if !res.IsError {
 		t.Fatalf("expected IsError on live-agent resume; got success: %s", res.Output)
 	}
-	if !strings.Contains(res.Output, "still RUNNING") {
-		t.Errorf("error should mention RUNNING status; got %q", res.Output)
-	}
-	if !strings.Contains(res.Output, "SubAgentStop") {
-		t.Errorf("error should hint at SubAgentStop; got %q", res.Output)
+	if !strings.Contains(res.Output, "original direct parent") {
+		t.Errorf("unbound live child must reject continuation without creating another runner; got %q", res.Output)
 	}
 }
 

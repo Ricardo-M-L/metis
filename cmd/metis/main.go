@@ -1942,12 +1942,6 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 		childSystem, _ := rtpkg.AssembleMinimalSubAgentPrompt(childCtx)
 		return childSystem
 	}
-	builtin.RebindAgentPrompts(reg, system, minimalSystem, builtin.AgentRuntimePromptState{
-		ProviderName:         provName,
-		WorkingDirectory:     promptCtx.WorkingDirectory,
-		MinimalPromptBuilder: minimalPromptBuilder,
-	})
-
 	maxIter := flags.maxIter
 	if maxIter == 0 {
 		maxIter = cfg.Session.MaxIterations
@@ -1998,6 +1992,11 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	if flags.fast {
 		loop.SetFast(true)
 	}
+	childRuntime := agentContinuationRuntime(cfg, loop)
+	childRuntime.ProviderName = provName
+	childRuntime.WorkingDirectory = promptCtx.WorkingDirectory
+	childRuntime.MinimalPromptBuilder = minimalPromptBuilder
+	builtin.RebindAgentPrompts(reg, system, minimalSystem, childRuntime)
 
 	// Gate→Loop mode bridge — 2026-05-18 fix for the plan-mode deny
 	// storm. Two state variables (Gate.Mode and Loop.PlanMode) used
@@ -2189,7 +2188,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	}
 	// Fresh-session IDs are allocated after the registry is built. Bind Agent's
 	// durable child transcripts and parent metadata before any tool invocation.
-	builtin.RebindProviderTools(reg, prov, model, system, rt.sessionID)
+	builtin.RebindProviderTools(reg, prov, model, system, rt.sessionID, childRuntime)
 	// Wire the same id into the LLM transport layer so dump-prompts
 	// (METIS_DUMP_PROMPTS=1) lands in dump-prompts/<sid>.jsonl
 	// instead of dump-prompts/default.jsonl.
@@ -5001,10 +5000,7 @@ func formatAgentsCommand(roster *agent.Roster, arg string) string {
 		if len(parts) < 2 {
 			return "(agents resume: usage: /agents resume <agent_id>)"
 		}
-		return fmt.Sprintf(
-			"(agents resume: type into chat — `Agent({ resume_from: %q, prompt: \"continue\" })`. The resume_from path needs a live provider, which the slash handler doesn't hold.)",
-			parts[1],
-		)
+		return fmt.Sprintf("(agents resume: sub-agent %s is managed by its parent. In the parent conversation, ask to continue this agent with the follow-up task; the parent uses Agent(resume_from) to deliver or resume it.)", parts[1])
 	default:
 		return fmt.Sprintf("(agents: unknown subcommand %q — try: list | status <id> | kill <id> | resume <id>)", sub)
 	}

@@ -6,20 +6,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
-	"github.com/BurntSushi/toml"
-
+	"github.com/Ricardo-M-L/metis/internal/pluginmanifest"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
-	pubplugin "github.com/Ricardo-M-L/metis/pkg/plugin"
 )
 
 // cmdPlugin handles `metis plugin <subcommand>`.
 //
-// Today: list, info, remove. install/reload deferred to a follow-up
-// (install needs git-clone path discovery, reload needs hot-reload
-// machinery; both are non-trivial). For now users install plugins by
-// hand-creating ~/.metis/plugins/<name>/plugin.toml + the bundled files.
+// Listing and inspecting plugins use the same static validation as installation
+// and runtime loading, without starting any plugin process.
 func cmdPlugin(ctx context.Context, args []string) error {
 	sub := "list"
 	rest := []string{}
@@ -132,16 +129,20 @@ func cmdPluginList(ctx context.Context) error {
 		if e.Name() == "marketplaces" {
 			continue
 		}
-		manifestPath := filepath.Join(dir, e.Name(), "plugin.toml")
-		var m pubplugin.Manifest
-		if _, err := toml.DecodeFile(manifestPath, &m); err != nil {
-			fmt.Printf("  %-20s  ⚠ unreadable manifest: %v\n", e.Name(), err)
+		m, err := pluginmanifest.Read(filepath.Join(dir, e.Name()), e.Name())
+		if err != nil {
+			fmt.Printf("  %-20s  ⚠ invalid manifest: %v\n", e.Name(), err)
 			count++
 			continue
 		}
 		mcpStatus := ""
-		mcpCount := len(m.MCPServers)
-		if m.MCPServer != nil {
+		mcpCount := 0
+		for _, server := range m.MCPServers {
+			if !server.Disabled {
+				mcpCount++
+			}
+		}
+		if m.MCPServer != nil && !m.MCPServer.Disabled {
 			mcpCount++
 		}
 		if mcpCount > 0 {
@@ -158,9 +159,8 @@ func cmdPluginList(ctx context.Context) error {
 }
 
 func cmdPluginInfo(ctx context.Context, name string) error {
-	manifestPath := filepath.Join(rtpkg.PluginsDir(), name, "plugin.toml")
-	var m pubplugin.Manifest
-	if _, err := toml.DecodeFile(manifestPath, &m); err != nil {
+	m, err := pluginmanifest.Read(filepath.Join(rtpkg.PluginsDir(), name), name)
+	if err != nil {
 		return fmt.Errorf("plugin %s: %w", name, err)
 	}
 	fmt.Printf("name:        %s\n", m.Name)
@@ -176,10 +176,13 @@ func cmdPluginInfo(ctx context.Context, name string) error {
 		fmt.Println("mcp_server:")
 		fmt.Printf("  command:   %s\n", m.MCPServer.Command)
 		if len(m.MCPServer.Args) > 0 {
-			fmt.Printf("  args:      %v\n", m.MCPServer.Args)
+			fmt.Printf("  args:      %d configured (values hidden)\n", len(m.MCPServer.Args))
 		}
 		if len(m.MCPServer.Env) > 0 {
-			fmt.Printf("  env:       %v\n", m.MCPServer.Env)
+			fmt.Printf("  env keys:  %v\n", pluginEnvKeys(m.MCPServer.Env))
+		}
+		if m.MCPServer.URL != "" {
+			fmt.Println("  url:       configured (value hidden)")
 		}
 	}
 	for _, server := range m.MCPServers {
@@ -188,10 +191,13 @@ func cmdPluginInfo(ctx context.Context, name string) error {
 			fmt.Printf("  command:   %s\n", server.Command)
 		}
 		if server.URL != "" {
-			fmt.Printf("  url:       %s\n", server.URL)
+			fmt.Println("  url:       configured (value hidden)")
 		}
 		if len(server.Args) > 0 {
-			fmt.Printf("  args:      %v\n", server.Args)
+			fmt.Printf("  args:      %d configured (values hidden)\n", len(server.Args))
+		}
+		if len(server.Env) > 0 {
+			fmt.Printf("  env keys:  %v\n", pluginEnvKeys(server.Env))
 		}
 		if server.WorkingDir != "" {
 			fmt.Printf("  cwd:       %s\n", server.WorkingDir)
@@ -200,11 +206,17 @@ func cmdPluginInfo(ctx context.Context, name string) error {
 	if len(m.Skills) > 0 {
 		fmt.Printf("skills:      %v\n", m.Skills)
 	}
-	if len(m.Hooks) > 0 {
-		fmt.Printf("hooks:       %d declared\n", len(m.Hooks))
-	}
 	_ = ctx
 	return nil
+}
+
+func pluginEnvKeys(env map[string]string) []string {
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func cmdPluginRemove(name string, yes bool) error {

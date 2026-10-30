@@ -2,16 +2,18 @@
 //
 // A plugin is a directory under ~/.metis/plugins/<name>/ containing a
 // `plugin.toml` manifest. The plugin contributes to the runtime through
-// any of three optional channels:
+// either supported channel:
 //
 //  1. **MCP server** (most common): a stdio subprocess implementing the
 //     Model Context Protocol; its tools become available to the agent
-//     namespaced as `plugin__<name>__<tool>`.
+//     namespaced with a stable identifier derived from the plugin and server.
 //  2. **Skill files**: Markdown files (with YAML frontmatter) that the
 //     skill loader picks up at the "plugin" priority layer.
-//  3. **Hook subprocesses** (advanced): long-lived stdio processes that
-//     receive PreToolUse / PostToolUse JSON events and can rewrite or
-//     short-circuit them.
+//
+// Hooks retain their schema below for compatibility, but this runtime does not
+// execute plugin hooks. Manifests declaring them are rejected rather than
+// presented as successfully loaded. Schedules, themes, and UI extensions also
+// have no native manifest contract in this version.
 //
 // Plugin authors write the manifest, ship the directory (git repo /
 // tarball / npm package), and end users `metis plugin install <ref>`.
@@ -24,7 +26,8 @@
 package plugin
 
 // Manifest is the on-disk schema for `plugin.toml`. Validate via
-// ValidateManifest before launching anything the manifest declares.
+// the shared internal/pluginmanifest reader before advertising or launching
+// anything the manifest declares.
 type Manifest struct {
 	// ManifestVersion locks compatibility. v1 is the only version
 	// recognized today; bumping breaks old plugins, so do it sparingly.
@@ -37,8 +40,8 @@ type Manifest struct {
 	Homepage    string `toml:"homepage,omitempty"`
 
 	// MCPServer, when non-nil, declares a stdio MCP subprocess to spawn.
-	// Tools the server exposes get registered as
-	// `plugin__<plugin-name>__<tool-name>`.
+	// Tools the server exposes use a stable, portable namespace derived from
+	// the plugin name and server name, followed by the original tool name.
 	MCPServer *MCPServerSpec `toml:"mcp_server,omitempty"`
 
 	// MCPServers is the multi-server form used by ecosystem adapters. It maps
@@ -53,9 +56,8 @@ type Manifest struct {
 	// `<plugin-name>:<skill-name>`.
 	Skills []string `toml:"skills,omitempty"`
 
-	// Hooks are long-lived subprocess hooks. Each spec spawns one stdio
-	// process that receives JSON-line events on stdin and can write
-	// modifications back. ADVANCED — most plugins won't need this.
+	// Hooks preserves the declaration format for future compatibility.
+	// Nonempty declarations are currently unsupported and rejected.
 	Hooks []HookSpec `toml:"hooks,omitempty"`
 }
 
@@ -75,8 +77,8 @@ type MCPServerSpec struct {
 	Disabled      bool              `toml:"disabled,omitempty"`
 }
 
-// HookSpec declares a subprocess hook subscribed to a set of events.
-// The runtime spawns it on plugin load and pipes JSON-line events.
+// HookSpec describes the reserved subprocess hook format. The current runtime
+// does not spawn these hooks and rejects nonempty Hooks declarations.
 //
 //   - Events: subset of {"PreToolUse", "PostToolUse", "SessionStart",
 //     "SessionEnd", "TurnStart", "TurnEnd", "LoopEnd", "Error"}.
