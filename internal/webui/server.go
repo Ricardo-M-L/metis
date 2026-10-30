@@ -1155,6 +1155,19 @@ type sessionItem struct {
 	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
+// sessionUpdatedAt uses the same persisted activity clock as Store.List.
+// Loading or selecting a session must not manufacture a new activity time,
+// and an absent timestamp must not serialize as Go's year-one zero date.
+func (s *Server) sessionUpdatedAt(id string, createdAt time.Time) time.Time {
+	if s != nil && s.store != nil {
+		path := filepath.Join(s.store.Dir, filepath.Base(id)+".jsonl")
+		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && !info.ModTime().IsZero() {
+			return info.ModTime()
+		}
+	}
+	return createdAt
+}
+
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		writeError(w, http.StatusServiceUnavailable, "session store unavailable")
@@ -1319,7 +1332,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	payload := map[string]any{"session": sessionItem{
 		ID: id, Title: hdr.Title, Model: hdr.Model, WorkDir: workspace.Path, WorkspaceID: workspace.ID, Mode: hdr.Mode,
 		Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status,
-		Archived: s.store.IsArchived(id), CreatedAt: hdr.CreatedAt,
+		Archived: s.store.IsArchived(id), CreatedAt: hdr.CreatedAt, UpdatedAt: s.sessionUpdatedAt(id, hdr.CreatedAt),
 	}, "messages": agent.PresentationHistory(messages), "workspace": workspace}
 	s.addPermissionStatus(payload, id)
 	item := payload["session"].(sessionItem)
@@ -1660,7 +1673,7 @@ func (s *Server) handleSessionActivate(w http.ResponseWriter, r *http.Request) {
 	workspace := s.sessionWorkspaceView(hdr, selectedWorkDir)
 	payload := map[string]any{"session": sessionItem{
 		ID: body.ID, Title: hdr.Title, Model: hdr.Model, WorkDir: workspace.Path, WorkspaceID: workspace.ID,
-		Mode: hdr.Mode, Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status, Archived: s.store.IsArchived(body.ID), CreatedAt: hdr.CreatedAt,
+		Mode: hdr.Mode, Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status, Archived: s.store.IsArchived(body.ID), CreatedAt: hdr.CreatedAt, UpdatedAt: s.sessionUpdatedAt(body.ID, hdr.CreatedAt),
 	}, "messages": agent.PresentationHistory(history), "workspace": workspace}
 	s.addPermissionStatus(payload, body.ID)
 	item := payload["session"].(sessionItem)
