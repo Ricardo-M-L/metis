@@ -24,6 +24,11 @@
        section, session tree, settings row at the foot) -->
 
   <aside class="sidebar">
+    <div class="sb-native-chrome" data-native-window-drag>
+      <button type="button" class="sb-collapse-btn" id="nativeSidebarCollapseBtn" title="收起侧栏" aria-label="收起侧栏" aria-expanded="true" aria-controls="sessionList" onclick="toggleSidebar()">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="2"/><path d="M6 2.5v11"/></svg>
+      </button>
+    </div>
     <div class="sb-brand-row" title="&#26032;&#20250;&#35805;" data-i18n-title="newSession" onclick="newChat()">
       <span class="sb-brand-mark">M</span>
       <span class="sb-brand-text">metis</span>
@@ -92,7 +97,7 @@
 
   <!-- Main Content -->
   <main class="main" data-page="session">
-    <header class="navigation-header" id="navigationHeader" aria-label="页面导航" data-i18n-label="pageNavigation">
+    <header class="navigation-header" id="navigationHeader" aria-label="页面导航" data-i18n-label="pageNavigation" data-native-window-drag>
       <button class="navigation-button" id="navigationBack" type="button" title="后退（Alt+←）" aria-label="后退" disabled onclick="metisNavigation.back()">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
       </button>
@@ -101,7 +106,7 @@
       </button>
       <span class="navigation-title" id="navigationTitle" aria-live="polite">新对话</span>
     </header>
-    <div class="view-tabs" id="viewTabs">
+    <div class="view-tabs" id="viewTabs" data-native-window-drag>
       <button class="view-tab active" id="tabChat" data-i18n="chat" onclick="switchView('chat')">&#23545;&#35805;</button>
       <button class="view-tab" id="tabTrace" data-i18n="trajectory" onclick="switchView('trace')">&#36712;&#36857;</button>
       <button class="view-tab artifact-tab" id="tabArtifacts" type="button" aria-controls="artifactsPanel" onclick="openArtifactsPanel()">
@@ -372,7 +377,7 @@
 
   <aside id="sessionFilePanel" class="session-file-panel" hidden aria-label="会话文件预览" onkeydown="sessionFilePanelKeydown(event)">
     <div id="sessionFileResize" class="sf-resize" role="separator" tabindex="0" aria-label="调整文件预览宽度" aria-orientation="vertical" aria-valuemin="340" aria-valuenow="600" aria-valuemax="1200" onpointerdown="startSessionFileResize(event)" onkeydown="sessionFileResizeKeydown(event)"></div>
-    <header class="session-file-header">
+    <header class="session-file-header" data-native-window-drag>
       <span id="sessionFileTitle" class="sf-sr-only">会话文件</span>
       <div id="sessionFileTabs" class="sf-tabs" role="tablist" aria-label="已打开文件"></div>
       <button id="sessionFileAdd" class="sf-icon-button" type="button" title="打开会话文件" aria-label="打开会话文件" aria-expanded="false" aria-controls="sessionFilePicker" onclick="toggleSessionFilePicker()"><span class="sf-icon sf-icon-plus" aria-hidden="true"></span></button>
@@ -403,7 +408,7 @@
   <!-- Details column (DSH parity): structured inspection of the selected
        tool row in the chat flow. -->
   <div class="details-col" id="detailsCol">
-    <div class="details-head"><span data-i18n="details">&#35814;&#24773;</span><button class="details-close" type="button" title="Close details" aria-label="Close details" onclick="closeToolDetail()">&#10005;</button></div>
+    <div class="details-head" data-native-window-drag><span data-i18n="details">&#35814;&#24773;</span><button class="details-close" type="button" title="Close details" aria-label="Close details" onclick="closeToolDetail()">&#10005;</button></div>
     <div class="details-placeholder" id="detailsPlaceholder" data-i18n="detailsPlaceholder">&#28857;&#20987;&#28040;&#24687;&#27969;&#20013;&#30340;&#24037;&#20855;&#34892;&#26597;&#30475;&#35814;&#24773;</div>
     <div class="details-tabs" id="detailsTabs" style="display:none">
       <button class="detail-tab active" onclick="switchDetailTab('summary', this)">&#25688;&#35201;</button>

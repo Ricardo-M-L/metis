@@ -7214,3 +7214,93 @@ html[data-presentation-mode='compact'] .think-row:not(.redacted):not([data-runni
 .history-virtual-spacer { flex: 0 0 auto; min-height: 0; padding: 0; margin: 0; pointer-events: none; overflow: hidden; }
 .chat-area > [data-virtual-turn-key] { flex-shrink: 0; }
 .chat-area > [data-virtual-history="true"] { animation: none; }
+
+/* Native macOS chrome is enabled only by the host handshake. The sidebar
+   and content own the top row; there is no additional full-window strip. */
+.sb-native-chrome { display: none; }
+.native-mac-chrome {
+  --native-titlebar-height: 48px;
+  --native-traffic-light-inset: 96px;
+}
+.native-mac-chrome .app { --native-main-inset: 0px; }
+.native-mac-chrome .sidebar { padding-top: 0; }
+.native-mac-chrome .sb-brand-row { display: none; }
+.native-mac-chrome .sb-native-chrome {
+  display: flex;
+  position: relative;
+  z-index: 3;
+  flex: 0 0 var(--native-titlebar-height);
+  height: var(--native-titlebar-height);
+  margin: 0 -12px 8px;
+  align-items: center;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.native-mac-chrome .sb-native-chrome .sb-collapse-btn {
+  position: absolute;
+  left: max(12px, var(--native-traffic-light-inset));
+  margin: 0;
+  width: 28px;
+  height: 28px;
+  color: var(--fg-mid);
+}
+.native-mac-chrome .sb-native-chrome .sb-collapse-btn svg {
+  width: 16px;
+  height: 16px;
+  transform: none;
+}
+.native-mac-chrome .sb-native-chrome .sb-collapse-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.native-mac-chrome .app.sb-rail {
+  /* The 56px rail is narrower than the native controls. Its toggle extends
+     into the content header; reserve that space in the navigation row. */
+  --native-main-inset: max(0px, calc(var(--native-traffic-light-inset) + 40px - 56px));
+}
+.native-mac-chrome .app[data-page='settings'] {
+  --native-main-inset: var(--native-traffic-light-inset);
+}
+.native-mac-chrome .main > .navigation-header,
+.native-mac-chrome .main[data-page='session'].empty > .navigation-header,
+.native-mac-chrome .main[data-page='session']:not(.empty) > .navigation-header {
+  box-sizing: border-box;
+  height: var(--native-titlebar-height);
+  min-height: var(--native-titlebar-height);
+  flex-basis: var(--native-titlebar-height);
+  padding-left: calc(14px + var(--native-main-inset));
+  border-bottom: 0;
+}
+.native-mac-chrome .main[data-page='session'] {
+  --session-nav-width: calc(clamp(190px, 30%, 290px) + var(--native-main-inset));
+}
+.native-mac-chrome .main[data-page='session'] > .view-tabs {
+  height: var(--native-titlebar-height);
+  min-height: var(--native-titlebar-height);
+  flex-basis: var(--native-titlebar-height);
+  border-bottom: 0;
+}
+.native-mac-chrome .details-head,
+.native-mac-chrome .session-file-header {
+  box-sizing: border-box;
+  height: var(--native-titlebar-height);
+  min-height: var(--native-titlebar-height);
+  flex-basis: var(--native-titlebar-height);
+}
+.native-mac-chrome .session-file-header { padding-top: 0; padding-bottom: 0; }
+.native-mac-chrome .session-file-panel.is-maximized .session-file-header {
+  padding-left: max(12px, var(--native-traffic-light-inset));
+}
+.native-mac-chrome [data-native-window-drag] {
+  user-select: none;
+  -webkit-user-select: none;
+}
+@container session-main (max-width: 640px) {
+  /* Narrow columns keep the existing two-row navigation, while its first
+     row remains aligned with the sidebar and native traffic lights. */
+  .native-mac-chrome .main[data-page='session'] > .view-tabs {
+    height: 34px;
+    min-height: 34px;
+    flex-basis: 34px;
+  }
+}

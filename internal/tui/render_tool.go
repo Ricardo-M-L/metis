@@ -23,11 +23,12 @@ import (
 	xansi "github.com/charmbracelet/x/ansi"
 
 	"github.com/Ricardo-M-L/metis/internal/themes"
+	"github.com/Ricardo-M-L/metis/internal/tui/i18n"
 )
 
 // renderToolEvent prints one tool call. Leader row repeats whether
-// we're mid-flight or done; for in-flight calls we end the leader with
-// " …" and skip the result row entirely. Each tool gets its own summary
+// we're mid-flight or done; in-flight calls show a short running label
+// and skip the result row entirely. Each tool gets its own summary
 // phrasing via summarizeToolResult so the transcript reads
 // "Read foo.py (350 lines)" instead of dumping 350 lines.
 //
@@ -117,15 +118,21 @@ func renderToolEventBlock(te ToolEvent, expanded bool, width int, showBody bool)
 	}
 	leadIndent, resultIndent := "  ", "    "
 	displayTool := displayToolName(te.ToolName)
+	runningStatus := ""
+	if te.Kind == "start" {
+		runningStatus = " · " + i18n.T("tool.running")
+		if width > 0 {
+			// Reserve the state first, including inside a nested tool block.
+			// An ellipsis then indicates genuinely clipped text, not activity.
+			displayTool = truncateMiddleCells(displayTool, width-xansi.StringWidth(leadIndent+glyphBullet+" "+runningStatus))
+		}
+	}
 	args := toolHeaderPreview(te.ToolName, te.Input)
 	if !showBody {
 		args = toolArgsFirstLine(toolArgsPreview(te.ToolName, te.Input))
 	}
 	if args != "" && width > 0 {
-		trailingWidth := 2 // parentheses
-		if te.Kind == "start" {
-			trailingWidth += 2 // " …"
-		}
+		trailingWidth := 2 + xansi.StringWidth(runningStatus) // parentheses and running label
 		fixedWidth := xansi.StringWidth(leadIndent+glyphBullet+" "+displayTool) + trailingWidth
 		args = truncateMiddleCells(args, width-fixedWidth)
 	}
@@ -154,8 +161,8 @@ func renderToolEventBlock(te ToolEvent, expanded bool, width int, showBody bool)
 		}
 		s.WriteString(styleMuted.Render(")"))
 	}
-	if te.Kind == "start" {
-		s.WriteString(styleMuted.Render(" …"))
+	if runningStatus != "" {
+		s.WriteString(styleDim.Render(runningStatus))
 	}
 	s.WriteString("\n")
 	command, _ := te.Input["command"].(string)
@@ -167,6 +174,9 @@ func renderToolEventBlock(te ToolEvent, expanded bool, width int, showBody bool)
 	if te.Kind == "start" {
 		return s.String()
 	}
+	confirmation := showBody && taskConfirmationDuplicatesSummary(te)
+	confirmationInSummary := confirmation && (width <= 0 || xansi.StringWidth(
+		resultIndent+glyphTreeLeaf+"  "+summarizeNormalizedToolResult(te)) <= width)
 
 	// The leader already indicates success. Keep failure/partial markers on
 	// the result row, but avoid a second success symbol. Only elapsed time is
@@ -201,6 +211,11 @@ func renderToolEventBlock(te ToolEvent, expanded bool, width int, showBody bool)
 		// "0ms · [command exceeded timeout 20s]" when a resumed/forwarded event
 		// did not retain its start time. Render one semantic result instead.
 		s.WriteString("timed out after " + timeoutLimit)
+	} else if confirmation && !confirmationInSummary {
+		// The confirmation does not fit beside the duration. Show its full
+		// content through the width-aware body instead of repeating a clipped
+		// summary above it; expanded mode keeps every original character.
+		s.WriteString(styleDim.Render(formatElapsed(te.Duration)))
 	} else if baseName == "Bash" && showBody {
 		// Bash output/diagnostics are already visible below. Keep the
 		// first-line summary for exports and minimal mode, but do not echo a
@@ -301,13 +316,30 @@ func renderToolEventBlock(te ToolEvent, expanded bool, width int, showBody bool)
 				s.WriteString(renderNormalizedToolOutputPreviewWithDetails(te.ToolName, filtered, expanded, false, width))
 			}
 		default:
-			if te.Output != "" && (expanded || !collapseToolBodyByDefault(baseName)) {
+			if !confirmationInSummary && te.Output != "" && (expanded || !collapseToolBodyByDefault(baseName)) {
 				s.WriteString(renderNormalizedToolOutputPreviewWithDetails(te.ToolName, te.Output, expanded, false, width))
 			}
 		}
 	}
 	s.WriteString("\n")
 	return s.String()
+}
+
+// Task tools normally return a short acknowledgement, so their generic summary
+// already contains the complete body. Deduplicate only that exact, successful,
+// single-line case. Details, verifier nudges and errors retain their body; tools
+// with dedicated structured renderers (such as TodoWrite) are not affected.
+func taskConfirmationDuplicatesSummary(te ToolEvent) bool {
+	if te.IsError || te.Output == "" || strings.Contains(te.Output, "\n") {
+		return false
+	}
+	switch strings.TrimPrefix(te.ToolName, "sub: ") {
+	case "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TodoRead",
+		"GoalCreate", "GoalUpdate", "GoalList", "GoalDelete":
+		return summarizeNormalizedToolResult(te) == formatElapsed(te.Duration)+" · "+te.Output
+	default:
+		return false
+	}
 }
 
 // Render only the elapsed prefix in the secondary colour. The summary text

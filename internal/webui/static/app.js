@@ -21,16 +21,29 @@ let subAgentDetailStream = null;
 let subAgentDetailStreamGeneration = 0;
 
 // The browser UI lives in a loopback iframe inside the Wails shell. This
-// narrow request bridge intentionally exposes three named native actions;
+// narrow request bridge intentionally exposes named native actions;
 // arbitrary commands, paths, or Wails bindings never cross the frame.
 let nativeRequestSequence = 0;
 const nativeRequests = new Map();
+let nativeParentOrigin = null;
+let nativeWindowChrome = null;
+let nativeWindowDragPending = false;
 
 window.addEventListener('message', event => {
   const response = event.data || {};
-  if (event.source !== window.parent || response.channel !== 'metis-native' || response.kind !== 'response') return;
+  if (window.parent === window || event.source !== window.parent || response.channel !== 'metis-native') return;
+  if (nativeParentOrigin !== null && event.origin !== nativeParentOrigin) return;
+  if (response.kind === 'window-chrome') {
+    // Unsolicited state cannot activate native mode before the handshake.
+    if (nativeParentOrigin !== null) applyNativeWindowChrome(response.value);
+    return;
+  }
+  if (response.kind !== 'response') return;
   const pending = nativeRequests.get(response.id);
   if (!pending) return;
+  if (pending.action === 'window-chrome' && !response.error && typeof event.origin === 'string') {
+    nativeParentOrigin = event.origin;
+  }
   nativeRequests.delete(response.id);
   clearTimeout(pending.timer);
   if (response.error) pending.reject(new Error(response.error));
@@ -45,13 +58,72 @@ function requestNative(action, payload = {}, timeoutMs = 30000) {
       nativeRequests.delete(id);
       reject(new Error('The native Desktop action timed out.'));
     }, timeoutMs);
-    nativeRequests.set(id, { resolve, reject, timer });
-    window.parent.postMessage({ channel: 'metis-native', kind: 'request', id, action, payload }, '*');
+    nativeRequests.set(id, { resolve, reject, timer, action });
+    // Opaque native origins require '*' for sending; incoming messages stay
+    // pinned to the parent Window and its exact origin string.
+    const targetOrigin = nativeParentOrigin && nativeParentOrigin !== 'null' ? nativeParentOrigin : '*';
+    window.parent.postMessage({ channel: 'metis-native', kind: 'request', id, action, payload }, targetOrigin);
   });
+}
+
+function applyNativeWindowChrome(value) {
+  const enabled = !!value && value.platform === 'darwin' && value.overlay === true;
+  nativeWindowChrome = enabled ? value : null;
+  nativeWindowDragPending = false;
+  const root = document.documentElement;
+  root.classList.toggle('native-mac-chrome', enabled);
+  root.classList.toggle('native-window-fullscreen', enabled && value.fullscreen === true);
+  if (!enabled) {
+    root.style.removeProperty('--native-titlebar-height');
+    root.style.removeProperty('--native-traffic-light-inset');
+    return;
+  }
+  const height = Number.isFinite(value.titlebarHeight) && value.titlebarHeight >= 36 && value.titlebarHeight <= 80 ? value.titlebarHeight : 48;
+  const inset = value.fullscreen === true ? 0 : (Number.isFinite(value.trafficLightInset) && value.trafficLightInset >= 80 && value.trafficLightInset <= 160 ? value.trafficLightInset : 96);
+  root.style.setProperty('--native-titlebar-height', height + 'px');
+  root.style.setProperty('--native-traffic-light-inset', inset + 'px');
+}
+
+function nativeWindowGesture(event) {
+  if (event.type === 'mousedown') nativeWindowDragPending = false;
+  if (!nativeWindowChrome || nativeWindowChrome.fullscreen === true || event.button !== 0) return;
+  const target = event.target;
+  if (!target || typeof target.closest !== 'function' || !target.closest('[data-native-window-drag]')) return;
+  // Exclude controls and their SVG descendants, preserving clicks and focus.
+  if (target.closest('button, a, input, select, textarea, summary, [contenteditable], [role="button"], [role="tab"], [role="menuitem"], [tabindex], [onclick], .col-handle, .sf-resize')) return;
+  if (event.type === 'mousedown' && event.detail === 1 && event.buttons === 1) {
+    // Like the native host, defer dragging until movement so a simple click
+    // or double-click is not swallowed by the native window drag loop.
+    nativeWindowDragPending = true;
+    event.preventDefault();
+  } else if (event.type === 'dblclick' && event.detail === 2) {
+    nativeWindowDragPending = false;
+    event.preventDefault();
+    void requestNative('window-toggle-maximise', { button: 0, detail: 2 }).catch(() => {});
+  }
+}
+
+function continueNativeWindowDrag(event) {
+  if (!nativeWindowDragPending) return;
+  nativeWindowDragPending = false;
+  if (!nativeWindowChrome || nativeWindowChrome.fullscreen === true || event.buttons !== 1) return;
+  event.preventDefault();
+  void requestNative('window-drag', { button: 0, buttons: 1, detail: 1 }).catch(() => {});
+}
+
+function initNativeWindowChrome() {
+  if (window.parent === window) return;
+  document.addEventListener('mousedown', nativeWindowGesture);
+  document.addEventListener('mousemove', continueNativeWindowDrag);
+  document.addEventListener('mouseup', () => { nativeWindowDragPending = false; });
+  document.addEventListener('dblclick', nativeWindowGesture);
+  window.addEventListener('blur', () => { nativeWindowDragPending = false; });
+  void requestNative('window-chrome', {}, 3000).then(applyNativeWindowChrome).catch(() => {});
 }
 
 // --- Init ---
 document.addEventListener('DOMContentLoaded', () => {
+  initNativeWindowChrome();
   initDesktopPreferences().then(loadWorkspaces).finally(loadSessions);
   detectProject();
   connectEvents();
@@ -1183,12 +1255,14 @@ function applyLayout() {
     app.style.setProperty('--sb-w', layoutState.sidebar + 'px');
   }
   app.style.setProperty('--dt-w', layoutState.details + 'px');
-  const btn = document.getElementById('sidebarCollapseBtn');
-  if (btn) {
+  for (const id of ['sidebarCollapseBtn', 'nativeSidebarCollapseBtn']) {
+    const btn = document.getElementById(id);
+    if (!btn) continue;
     const dict = DESKTOP_I18N[document.documentElement.lang] || DESKTOP_I18N['zh-CN'];
     const label = effectiveCollapsed() ? dict.expandSidebar : dict.collapseSidebar;
     btn.title = label;
     btn.setAttribute('aria-label', label);
+    btn.setAttribute('aria-expanded', String(!effectiveCollapsed()));
   }
 }
 
