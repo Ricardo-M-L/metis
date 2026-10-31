@@ -123,6 +123,7 @@ func parseMetisBinArg(args []string) string {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	installNativeDockIcon()
 }
 
 // shutdown is registered with Wails' explicit OnShutdown hook. The startup

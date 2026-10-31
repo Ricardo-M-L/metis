@@ -9,10 +9,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"time"
 
-	"github.com/BurntSushi/toml"
+	"github.com/Ricardo-M-L/metis/internal/pluginmanifest"
 	"github.com/Ricardo-M-L/metis/internal/pluginmarket"
 	rtpkg "github.com/Ricardo-M-L/metis/internal/runtime"
 	pubplugin "github.com/Ricardo-M-L/metis/pkg/plugin"
@@ -36,11 +37,11 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	loaded := map[string]bool{}
+	loaded := map[string]pubplugin.Manifest{}
 	if s.plugins != nil {
 		for _, plugin := range s.plugins.All() {
 			if plugin != nil {
-				loaded[plugin.Manifest.Name] = true
+				loaded[plugin.Manifest.Name] = plugin.Manifest
 			}
 		}
 	}
@@ -55,15 +56,21 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 		if !entry.IsDir() || entry.Name() == "marketplaces" {
 			continue
 		}
-		path := filepath.Join(dir, entry.Name(), "plugin.toml")
-		var manifest pubplugin.Manifest
-		if _, err := toml.DecodeFile(path, &manifest); err != nil {
-			views = append(views, pluginView{ID: entry.Name(), Name: entry.Name(), Source: path, Error: "manifest unreadable", RestartRequired: true})
+		root := filepath.Join(dir, entry.Name())
+		path := filepath.Join(root, "plugin.toml")
+		manifest, err := pluginmanifest.Read(root, entry.Name())
+		if err != nil {
+			views = append(views, pluginView{ID: entry.Name(), Name: entry.Name(), Source: path, Error: err.Error()})
 			continue
 		}
-		caps := make([]string, 0, 3)
-		mcpCount := len(manifest.MCPServers)
-		if manifest.MCPServer != nil {
+		caps := make([]string, 0, 2)
+		mcpCount := 0
+		for _, server := range manifest.MCPServers {
+			if !server.Disabled {
+				mcpCount++
+			}
+		}
+		if manifest.MCPServer != nil && !manifest.MCPServer.Disabled {
 			mcpCount++
 		}
 		if mcpCount > 0 {
@@ -76,16 +83,15 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 		if len(manifest.Skills) > 0 {
 			caps = append(caps, "Skills")
 		}
-		if len(manifest.Hooks) > 0 {
-			caps = append(caps, "Hooks")
-		}
 		name := manifest.Name
 		if name == "" {
 			name = entry.Name()
 		}
+		activeManifest, exists := loaded[name]
+		isLoaded := exists && reflect.DeepEqual(activeManifest, *manifest)
 		views = append(views, pluginView{
 			ID: entry.Name(), Name: name, Version: manifest.Version, Description: manifest.Description,
-			Source: path, Loaded: loaded[name], Capabilities: caps, RestartRequired: !loaded[name],
+			Source: path, Loaded: isLoaded, Capabilities: caps, RestartRequired: !isLoaded,
 		})
 	}
 	sort.Slice(views, func(i, j int) bool { return views[i].Name < views[j].Name })
@@ -224,6 +230,8 @@ func writePluginActionError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "plugin not found in this marketplace")
 	case errors.Is(err, pluginmarket.ErrAlreadyInstalled):
 		writeError(w, http.StatusConflict, "plugin is already installed")
+	case errors.Is(err, pluginmarket.ErrInvalidManifest):
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
 	case errors.Is(err, pluginmarket.ErrNotInstallable):
 		writeError(w, http.StatusUnprocessableEntity, "this plugin source is not installable yet")
 	default:

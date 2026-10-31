@@ -28,8 +28,40 @@ const composerDraftsByView = new Map();
 function mergeServerSessionMetadata(session) {
   if (!session || !session.id) return;
   const cached = sessions.find(item => item.id === session.id);
-  const latest = { ...(cached || {}), ...session };
+  const latest = normalizeSessionTimes({ ...(cached || {}), ...session }, cached);
   sessions = cached ? sessions.map(item => item.id === session.id ? latest : item) : [latest, ...sessions];
+}
+
+function sessionTimeValue(value) {
+  // Go's zero time parses as a finite JavaScript date, but is not a saved
+  // session timestamp. Reject it before it can replace a valid cached date.
+  if (typeof value === 'string') {
+    if (!value.trim()) return null;
+  } else if (typeof value !== 'number') return null;
+  const date = new Date(value);
+  const timestamp = date.getTime();
+  return Number.isFinite(timestamp) && date.getUTCFullYear() > 1 ? timestamp : null;
+}
+
+function normalizeSessionTimes(session, cached) {
+  const normalized = { ...session };
+  for (const field of ['createdAt', 'updatedAt']) {
+    if (sessionTimeValue(normalized[field]) !== null) continue;
+    if (cached && sessionTimeValue(cached[field]) !== null) normalized[field] = cached[field];
+    else delete normalized[field];
+  }
+  return normalized;
+}
+
+function sessionActivityTimestamp(session) {
+  return sessionTimeValue(session && session.updatedAt) ?? sessionTimeValue(session && session.createdAt);
+}
+
+function compareSessionActivity(a, b) {
+  const left = sessionActivityTimestamp(a), right = sessionActivityTimestamp(b);
+  if (left === null) return right === null ? 0 : 1;
+  if (right === null) return -1;
+  return right - left;
 }
 
 function isWorkspaceSelectionPending() {
@@ -569,7 +601,8 @@ async function loadSessions(append) {
     if (!res.ok) throw new Error(`sessions: ${res.status}`);
     const data = await res.json();
 	if (generation !== sessionsLoadGeneration || requestedFilter !== sessionFilter || requestedArchived !== showArchivedSessions) return;
-	const page = data.sessions || [];
+	const cached = new Map(sessions.map(session => [session.id, session]));
+	const page = (data.sessions || []).map(session => normalizeSessionTimes(session, cached.get(session.id)));
 	if (append) {
 	  const merged = new Map(sessions.map(s => [s.id, s]));
 	  page.forEach(s => merged.set(s.id, s));
@@ -1267,8 +1300,9 @@ function sessionMatches(s) {
 }
 
 function relativeTime(ts) {
-  const diff = Date.now() - new Date(ts).getTime();
-  if (!Number.isFinite(diff)) return '';
+  const timestamp = sessionTimeValue(ts);
+  if (timestamp === null) return '';
+  const diff = Math.max(0, Date.now() - timestamp);
   if (diff < 60000) return uiText('just now', '\u521A\u521A');
   if (diff < 3600000) {
     const n = Math.floor(diff / 60000);
@@ -1292,13 +1326,13 @@ function sortSessionItems(items) {
 		const ai = positions.has(a.id) ? positions.get(a.id) : Number.MAX_SAFE_INTEGER;
 		const bi = positions.has(b.id) ? positions.get(b.id) : Number.MAX_SAFE_INTEGER;
 		if (ai !== bi) return ai - bi;
-		return new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt);
+		return compareSessionActivity(a, b);
 	  });
 	}
   if (desktopPreferences.sidebarSort === 'name') {
     return out.sort((a, b) => String(a.title || '').localeCompare(String(b.title || ''), undefined, { sensitivity: 'base' }));
   }
-  return out.sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt));
+  return out.sort(compareSessionActivity);
 }
 
 function workspaceLabel(workDir) {
@@ -1405,10 +1439,12 @@ function sessionItemKeydown(e, id) {
 }
 
 function renderSessionItem(s) {
-  const time = relativeTime(s.updatedAt || s.createdAt);
+  const timestamp = sessionActivityTimestamp(s);
+  const time = relativeTime(timestamp);
+  const detailTime = timestamp === null ? '' : new Date(timestamp).toLocaleString();
   const state = sessionState(s);
   const title = sessionDisplayTitle(s);
-  const detail = `data-detail-title="${escAttr(title)}" data-detail-path="${escAttr(s.workDir || '')}" data-detail-model="${escAttr(s.model || '')}" data-detail-meta="${escAttr([state.label, s.preset || uiText('standard', '\u6807\u51c6'), s.mode || '', s.effort || uiText('default effort', '\u9ed8\u8ba4\u63a8\u7406\u5f3a\u5ea6'), new Date(s.updatedAt || s.createdAt).toLocaleString()].filter(Boolean).join(' · '))}"`;
+  const detail = `data-detail-title="${escAttr(title)}" data-detail-path="${escAttr(s.workDir || '')}" data-detail-model="${escAttr(s.model || '')}" data-detail-meta="${escAttr([state.label, s.preset || uiText('standard', '\u6807\u51c6'), s.mode || '', s.effort || uiText('default effort', '\u9ed8\u8ba4\u63a8\u7406\u5f3a\u5ea6'), detailTime].filter(Boolean).join(' · '))}"`;
   if (showArchivedSessions) {
 	return `<div class="session-item archived" ${detail} role="group" aria-label="${escAttr(title + ' — ' + state.label)}" tabindex="0">
       ${sessionStatusIcon(state)}

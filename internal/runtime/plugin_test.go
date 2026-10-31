@@ -128,13 +128,20 @@ skills = ["../../../etc/passwd"]
 func TestLoadPlugins_AutoUpgradesV0Manifest(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())
 	// manifest_version=0 (unset) should be coerced to v1 silently.
-	writePluginManifest(t, "noversion", `name = "noversion"
+	dir := writePluginManifest(t, "noversion", `name = "noversion"
 version = "0.1.0"
 description = "no manifest_version field"
+skills = ["SKILL.md"]
 `)
-	_, errs := LoadPlugins(context.Background(), tools.NewRegistry())
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("valid legacy skill"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg, errs := LoadPlugins(context.Background(), tools.NewRegistry())
 	if len(errs) != 0 {
 		t.Errorf("v0 manifest should auto-upgrade; got %v", errs)
+	}
+	if all := reg.All(); len(all) != 1 || all[0].Manifest.ManifestVersion != 1 {
+		t.Fatalf("legacy manifest not upgraded and loaded: %#v", all)
 	}
 }
 
@@ -210,10 +217,14 @@ url = "https://example.invalid/mcp"
 	if capturedManager != manager {
 		t.Fatalf("plugin MCP sandbox = %p, want shared manager %p", capturedManager, manager)
 	}
-	if captured[0].Name != "plugin:codex-bridge:alpha" || captured[0].WorkingDir != dir || !strings.HasSuffix(captured[0].Command, filepath.Join("bin", "server-a")) {
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured[0].Name != pluginMCPServerName("codex-bridge", "alpha") || captured[0].WorkingDir != resolvedDir || !strings.HasSuffix(captured[0].Command, filepath.Join("bin", "server-a")) {
 		t.Fatalf("stdio entry = %+v", captured[0])
 	}
-	if captured[1].Name != "plugin:codex-bridge:beta" || captured[1].URL != "https://example.invalid/mcp" {
+	if captured[1].Name != pluginMCPServerName("codex-bridge", "beta") || captured[1].URL != "https://example.invalid/mcp" {
 		t.Fatalf("http entry = %+v", captured[1])
 	}
 }
@@ -288,17 +299,21 @@ command = "second-server"
 	assertPartialLoadServerReleased(t, first, toolRegistry, &spawnCalls)
 }
 
-func TestLoadPluginsClosesPartialMCPServersWhenSkillLoadFails(t *testing.T) {
+func TestLoadPluginsClosesPartialMCPServersWhenSkillDisappearsAfterPreflight(t *testing.T) {
 	t.Setenv("METIS_HOME", t.TempDir())
-	writePluginManifest(t, "partial-skill", `manifest_version = 1
+	dir := writePluginManifest(t, "partial-skill", `manifest_version = 1
 name = "partial-skill"
 version = "0.1.0"
 description = "skill load failure after MCP launch"
-skills = ["missing.md"]
+skills = ["vanishing.md"]
 
 [mcp_server]
 command = "first-server"
 `)
+	skillPath := filepath.Join(dir, "vanishing.md")
+	if err := os.WriteFile(skillPath, []byte("valid before MCP startup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	toolRegistry := tools.NewRegistry()
 	var started *mcptools.Server
@@ -306,13 +321,16 @@ command = "first-server"
 	original := launchPluginMCPServer
 	launchPluginMCPServer = func(_ context.Context, entry mcp.ServerEntry, registry *tools.Registry, _ *sandbox.Manager) (*mcptools.Server, error) {
 		started = newPartialLoadTestServer(entry.Name, registry, &spawnCalls)
+		if err := os.Remove(skillPath); err != nil {
+			t.Fatal(err)
+		}
 		return started, nil
 	}
 	t.Cleanup(func() { launchPluginMCPServer = original })
 
 	plugins, errs := LoadPlugins(context.Background(), toolRegistry)
-	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "missing.md") {
-		t.Fatalf("load errors = %v, want missing skill failure", errs)
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "vanishing.md") {
+		t.Fatalf("load errors = %v, want disappeared skill failure", errs)
 	}
 	if got := len(plugins.All()); got != 0 {
 		t.Fatalf("loaded plugins = %d, want 0", got)
@@ -349,6 +367,71 @@ command = "partial-server"
 		t.Fatalf("loaded plugins = %d, want 0", got)
 	}
 	assertPartialLoadServerReleased(t, partial, toolRegistry, &spawnCalls)
+}
+
+func TestLoadPluginsCleansPortableAliasesWhenLaterLaunchFails(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	writePluginManifest(t, "alias-cleanup", `name = "alias-cleanup"
+[[mcp_servers]]
+name = "first"
+command = "first-server"
+[[mcp_servers]]
+name = "second"
+command = "second-server"
+`)
+	registry := tools.NewRegistry()
+	var retained tools.Tool
+	var first *mcptools.Server
+	launches, spawns := 0, 0
+	original := launchPluginMCPServer
+	launchPluginMCPServer = func(_ context.Context, entry mcp.ServerEntry, staging *tools.Registry, _ *sandbox.Manager) (*mcptools.Server, error) {
+		launches++
+		if launches == 2 {
+			published := registry.All()
+			if len(published) != 1 || len(published[0].Name()) > 64 {
+				t.Fatalf("first server did not publish a portable alias: %#v", published)
+			}
+			retained = published[0]
+			return nil, errors.New("second launch failed")
+		}
+		first = mcptools.NewLazyServer(entry.Name, []mcpsdk.Tool{{Name: strings.Repeat("long-name", 20)}}, func(context.Context) (*mcpsdk.Client, error) {
+			spawns++
+			return nil, errors.New("unexpected spawn")
+		})
+		for _, tool := range first.Tools() {
+			staging.Register(tool)
+		}
+		return first, nil
+	}
+	t.Cleanup(func() { launchPluginMCPServer = original })
+	plugins, errs := LoadPlugins(context.Background(), registry)
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "second launch failed") || len(plugins.All()) != 0 || len(registry.All()) != 0 || retained == nil {
+		t.Fatalf("partial aliases survived: errors=%v plugins=%d tools=%d", errs, len(plugins.All()), len(registry.All()))
+	}
+	result, err := retained.Execute(context.Background(), map[string]any{})
+	if err != nil || result == nil || !result.IsError || !strings.Contains(result.Output, "MCP server is closed") || spawns != 0 {
+		t.Fatalf("partial aliased server not closed: result=%#v err=%v spawns=%d", result, err, spawns)
+	}
+}
+
+func TestLoadPluginsPreservesExistingToolsOnNamespaceCollision(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	writePluginManifest(t, "namespace-collision", "name = \"namespace-collision\"\n[mcp_server]\ncommand = \"probe\"\n")
+	registry := tools.NewRegistry()
+	spawns := 0
+	existing := newPartialLoadTestServer(pluginMCPServerName("namespace-collision", "default"), registry, &spawns)
+	t.Cleanup(func() { _ = existing.Close() })
+	launches := 0
+	original := launchPluginMCPServer
+	launchPluginMCPServer = func(context.Context, mcp.ServerEntry, *tools.Registry, *sandbox.Manager) (*mcptools.Server, error) {
+		launches++
+		return nil, nil
+	}
+	t.Cleanup(func() { launchPluginMCPServer = original })
+	plugins, errs := LoadPlugins(context.Background(), registry)
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "collision") || len(plugins.All()) != 0 || len(registry.All()) != 1 || launches != 0 {
+		t.Fatalf("namespace collision lost ownership: errors=%v plugins=%d tools=%d launches=%d", errs, len(plugins.All()), len(registry.All()), launches)
+	}
 }
 
 func newPartialLoadTestServer(name string, registry *tools.Registry, spawnCalls *int) *mcptools.Server {

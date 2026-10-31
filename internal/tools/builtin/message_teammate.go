@@ -202,6 +202,15 @@ func (m MessageTeammate) Execute(ctx context.Context, in map[string]any) (*tools
 			IsError: true,
 		}, nil
 	}
+	// ID lookup intentionally includes finished generations for output readers.
+	// They are not live peer-mailbox recipients, even when the old channel is
+	// still buffered and could otherwise accept an unread message.
+	if snap := t.Snapshot(); !snap.Status.IsActive() {
+		return &tools.Result{
+			Output:  fmt.Sprintf("%q already finished and is no longer reachable; use Agent({resume_from: %q, prompt: ...}) to continue it through its parent", snap.Name, snap.AgentID),
+			IsError: true,
+		}, nil
+	}
 
 	// 2026-05-16: hard refuse anonymous sub-agents at the type level.
 	// Anonymous teammates have Mailbox == nil (set in Roster.Register)

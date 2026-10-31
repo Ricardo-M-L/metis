@@ -247,9 +247,8 @@ func (s SubAgentStop) Execute(_ context.Context, in map[string]any) (*tools.Resu
 
 // ---------------------------------------------------------------------------
 
-// lookupTeammate is the shared agent_id-or-name resolver. Used by all
-// three SubAgent* reader tools so the error messaging stays
-// consistent regardless of which tool the model picked.
+// lookupTeammate resolves reader/stop targets from live or recently finished
+// generations. Peer-message delivery deliberately uses live-only Lookup.
 func lookupTeammate(r *agent.Roster, in map[string]any) (*agent.Teammate, error) {
 	id, _ := in["agent_id"].(string)
 	name, _ := in["name"].(string)
@@ -265,7 +264,10 @@ func lookupTeammate(r *agent.Roster, in map[string]any) (*agent.Teammate, error)
 	}
 	t, ok := r.Lookup(name)
 	if !ok {
-		return nil, fmt.Errorf("no sub-agent with name=%s (it may have finished; try SubAgentList)", name)
+		t, _, ok = r.LookupRecentlyFinished(name)
+		if !ok {
+			return nil, fmt.Errorf("no sub-agent with name=%s (it may have finished and been GC'd; try SubAgentList)", name)
+		}
 	}
 	return t, nil
 }

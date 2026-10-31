@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -119,6 +120,11 @@ type AgentRuntimePromptState struct {
 	ProviderName         string
 	WorkingDirectory     string
 	MinimalPromptBuilder AgentMinimalPromptBuilder
+	// ResolveProvider rebuilds a saved provider/model using current credential
+	// configuration. Persisted child execution never contains credentials.
+	ResolveProvider func(providerName, model string) (llm.Provider, error)
+	Effort          func() llm.Effort
+	Fast            func() bool
 }
 
 // bundledProfileSlugs is the back-compat fallback set: when the
@@ -190,6 +196,9 @@ type Agent struct {
 	minimalPromptBuilder AgentMinimalPromptBuilder
 	promptProviderName   string
 	promptWorkDir        string
+	resolveProvider      func(providerName, model string) (llm.Provider, error)
+	effort               func() llm.Effort
+	fast                 func() bool
 	defaultTimeout       time.Duration
 	// sessionDir is the on-disk directory where sub-agent transcripts
 	// are persisted for `/agents resume` + the `resume_from` schema
@@ -374,6 +383,8 @@ func (Agent) Description() string {
 
 Spawn a COLD sub-agent — a fresh agent loop with its own message history (no shared context with the parent), the same tool set, and a fresh permission gate cloned from yours. Use this for self-contained, isolated work. For sub-tasks that need the parent's full conversation history — "based on everything we've discussed, draft X" — use Fork instead, which inherits the parent's context.
 
+CONTINUE YOUR CHILD: pass resume_from with the original agent_id and a follow-up prompt. A queued/running child receives durable input without a second producer; a completed child restores its original ID, history, model, directory, tools, and permission boundary. Only the original direct parent can continue it. Omit execution overrides; create a new child to change its execution settings.
+
 Use Agent for:
   - Deep codebase surveys: "find every place we instantiate a Logger and explain the constructor patterns" — the sub-agent can fan out 10+ Grep/Read calls without bloating your context.
   - Multi-file refactor scouting: "list every Go file that imports the old package path" before you start editing.
@@ -504,7 +515,7 @@ func (a Agent) InputSchema() map[string]any {
 			},
 			"resume_from": map[string]any{
 				"type":        "string",
-				"description": "Resume a previously-paused sub-agent by its agent_id (e.g. \"agt-d3a91b07\"). The on-disk transcript is replayed and a fresh sub-loop continues from the last turn. The `prompt` field is used as a follow-up turn appended to the recovered history. Use with care: a sub-agent that's still alive somewhere else WILL cause undefined behavior — resume only after the original sub-agent's run has fully ended (SubAgentList shows it gone, or you killed it via SubAgentStop).",
+				"description": "Continue a sub-agent owned by this direct parent session. A running or queued child receives the prompt durably without starting a duplicate; an ended child restores the same ID, history, model, directory, tools, and permission boundary. Omit execution overrides; create a new child to change settings.",
 			},
 			"permission_mode": map[string]any{
 				"type":        "string",
@@ -616,6 +627,45 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		return &tools.Result{Output: err.Error(), IsError: true}, nil
 	}
 
+	resumeFrom, _ := in["resume_from"].(string)
+	var resumedSnapshot *agent.SubAgentSnapshot
+	if resumeFrom != "" {
+		if !agent.ValidSubAgentID(resumeFrom) {
+			return &tools.Result{Output: "resume_from requires a valid sub-agent ID", IsError: true}, nil
+		}
+		if a.sessionDir == "" {
+			return &tools.Result{Output: "resume_from requires session persistence to be wired", IsError: true}, nil
+		}
+		if a.roster == nil {
+			return &tools.Result{Output: "resume_from requires the owning parent roster; a headless copy cannot safely acquire the child runtime", IsError: true}, nil
+		}
+		if a.roster != nil {
+			if existing, ok := a.roster.LookupByAgentID(resumeFrom); ok && existing.Snapshot().Status.IsActive() {
+				result, err := a.continueLiveSubAgent(ctx, in, existing, prompt)
+				return decorateAgentSubAgentResult(result, a.parentSessionID, agent.ParentToolUseIDFromContext(ctx), existing), err
+			}
+		}
+		snapshot, loadErr := agent.LoadSubAgentSnapshot(a.sessionDir, resumeFrom)
+		if loadErr != nil {
+			return &tools.Result{Output: fmt.Sprintf("resume_from=%s failed: %v", resumeFrom, loadErr), IsError: true}, nil
+		}
+		if snapshot.Header.SubAgentOf != a.parentSessionID {
+			return &tools.Result{Output: "resume_from refused: only the original direct parent session can continue this sub-agent", IsError: true}, nil
+		}
+		if binding := snapshot.Handoff; binding != nil {
+			store, scope := a.roster.HandoffBinding()
+			name, _ := in["name"].(string)
+			if store == nil || scope != binding.Scope || snapshot.Header.TeammateName != binding.Recipient || (name != "" && name != binding.Recipient) {
+				return &tools.Result{Output: "resume_from refused: durable sub-agent transcript requires its original mailbox scope and teammate name", IsError: true}, nil
+			}
+		}
+		if setupErr := a.restoreSubAgentExecution(snapshot, in); setupErr != nil {
+			return &tools.Result{Output: fmt.Sprintf("resume_from=%s refused: %v", resumeFrom, setupErr), IsError: true}, nil
+		}
+		resumedSnapshot = snapshot
+		in = continuationInput(in, snapshot)
+	}
+
 	// G.2 — resolve per-invocation isolation/cwd BEFORE registering
 	// the teammate so we can refuse the spawn without polluting the
 	// Roster on bad inputs. Returns the effective cwd to thread
@@ -655,52 +705,6 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		return &tools.Result{Output: err.Error(), IsError: true}, nil
 	}
 
-	// G.4 (2026-05-12) — `resume_from` field for sub-agent resume.
-	// Load the on-disk snapshot now so we can fail fast (file not
-	// found / corrupted) before consuming a Roster slot. The loaded
-	// snapshot's AgentID becomes the new teammate's AgentID so the
-	// transcript file is appended to, not overwritten.
-	resumeFrom, _ := in["resume_from"].(string)
-	var resumedSnapshot *agent.SubAgentSnapshot
-	if resumeFrom != "" {
-		if a.sessionDir == "" {
-			return &tools.Result{
-				Output:  "resume_from requires session persistence to be wired; this code path (likely a test or `metis tools` listing) has no session dir.",
-				IsError: true,
-			}, nil
-		}
-		// Mi2 (2026-05-18) — refuse if the source agent_id is still
-		// LIVE. Two parallel sub-loops sharing the same AgentID would
-		// race on the transcript file and produce undefined behavior.
-		// Roster.LookupByAgentID scans live first, then recentlyFinished;
-		// liveness check separates the two by also reading the live map
-		// directly. (recentlyFinished hits are safe — the original
-		// runner has exited.)
-		if a.roster != nil {
-			if existing, ok := a.roster.LookupByAgentID(resumeFrom); ok {
-				snap := existing.Snapshot()
-				if snap.Status.IsActive() {
-					return &tools.Result{
-						Output: fmt.Sprintf(
-							"resume_from=%s refused: sub-agent is still RUNNING or QUEUED (name=%s, started=%s). "+
-								"Stop it first with SubAgentStop({agent_id: %q}) and wait for it to finish, "+
-								"then re-issue the resume.",
-							resumeFrom, snap.Name, snap.Started.Format("15:04:05"), resumeFrom,
-						),
-						IsError: true,
-					}, nil
-				}
-			}
-		}
-		snap, err := agent.LoadSubAgentSnapshot(a.sessionDir, resumeFrom)
-		if err != nil {
-			return &tools.Result{
-				Output:  fmt.Sprintf("resume_from=%s failed: %v", resumeFrom, err),
-				IsError: true,
-			}, nil
-		}
-		resumedSnapshot = snap
-	}
 	handoffStore, handoffScope := a.roster.HandoffBinding()
 	if resumedSnapshot != nil && resumedSnapshot.Handoff != nil {
 		binding := resumedSnapshot.Handoff
@@ -734,7 +738,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 				_ = worktreepkg.Cleanup(worktreeInfo)
 				worktreeCleanupOwnedByExecute = false
 			}
-			if teammate.Snapshot().Status == agent.StatusQueued {
+			if teammate.Snapshot().Status.IsActive() {
 				teammate.Finish(agent.StatusFailed, "", errors.New("sub-agent setup did not complete"), "setup_failed")
 			}
 			a.roster.UnregisterTeammate(teammate)
@@ -838,7 +842,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		}
 	}
 	var profile *AgentProfileSpec
-	if subagentType != "" {
+	if subagentType != "" && (resumedSnapshot == nil || resumedSnapshot.Execution == nil) {
 		if a.profileLoader == nil {
 			return &tools.Result{
 				Output:  fmt.Sprintf("subagent_type=%q requires profile loading, which isn't wired in this build (likely a headless test path).", subagentType),
@@ -876,6 +880,9 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	} else if hasRequestedMode {
 		subGate.SetMode(requestedMode)
 	}
+	if resumedSnapshot != nil && resumedSnapshot.Execution != nil && !parentWasPlan {
+		subGate.SetMode(permission.CanonicalMode(resumedSnapshot.Execution.PermissionMode))
+	}
 
 	// G.14 (2026-05-12) — per-invocation tool filter. The schema
 	// fields `allowed_tools` (allowlist) and `disallowed_tools`
@@ -898,8 +905,11 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		disallowedTools = unionStrings(profile.DisallowedTools, disallowedTools)
 	}
 	filteredRegistry := a.registry
+	if resumedSnapshot != nil && resumedSnapshot.Execution != nil {
+		filteredRegistry = exactChildToolRegistry(a.registry, resumedSnapshot.Execution.Tools)
+	}
 	if len(allowedTools) > 0 || len(disallowedTools) > 0 {
-		filteredRegistry = filterRegistry(a.registry, allowedTools, disallowedTools)
+		filteredRegistry = filterRegistry(filteredRegistry, allowedTools, disallowedTools)
 	}
 	planLocked := subGate.Mode() == permission.ModePlan
 	// Always build a distinct, child-gated registry. Merely cloning Gate is
@@ -929,6 +939,13 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	if promptWorkDir == "" {
 		promptWorkDir = agent.CwdFromContext(ctx)
 	}
+	if promptWorkDir == "" {
+		promptWorkDir = a.promptWorkDir
+	}
+	if promptWorkDir == "" {
+		promptWorkDir, _ = os.Getwd()
+	}
+	subCwd = promptWorkDir
 	base := a.minimalPromptFor(subRegistry, promptWorkDir)
 	// 2026-05-15 fix — profile body goes into ProfileSystemPrompt,
 	// NOT replacing base. Pre-fix the profile fully replaced base,
@@ -950,13 +967,25 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		TeammateName:        teammateName,
 		ProfileSystemPrompt: profileBody,
 	})
+	if resumedSnapshot != nil && resumedSnapshot.Execution != nil {
+		subSystem = resumedSnapshot.Execution.System
+	}
 	if planLocked {
 		subSystem += "\n\n<plan_subagent_boundary>\nYou are a read-only planning and investigation sub-agent. Inspect with the available read-only tools, then return your findings or proposed plan directly to the parent. Do not implement changes and do not attempt to call EnterPlanMode or ExitPlanMode; only the parent can request plan approval and begin a fresh implementation turn.\n</plan_subagent_boundary>"
 	}
 
 	sub := agent.NewLoop(a.provider, subRegistry, subGate, agent.NewHookRegistry(), subSystem, maxIter)
 	sub.Model = a.model
+	if a.effort != nil {
+		sub.SetEffort(a.effort())
+	}
+	if a.fast != nil {
+		sub.SetFast(a.fast())
+	}
 	sub.RecoverTextToolCalls = true
+	if teammate != nil {
+		rebindNestedChildAgent(subRegistry, teammate.AgentID, subGate, a.provider, a.executionProviderName(), a.model, subSystem, subCwd, sub.EffortValue, sub.FastEnabled)
+	}
 	if childJobs != nil {
 		sub.JobNotify = childJobs.Notify()
 		sub.Jobs = childJobs
@@ -991,8 +1020,13 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// behavior). Mirrors claude-code's Task tool where the profile's
 	// `initial_prompt` block frames the directive.
 	effectivePrompt := prompt
-	if profile != nil && profile.InitialPrompt != "" {
+	if resumedSnapshot == nil && profile != nil && profile.InitialPrompt != "" {
 		effectivePrompt = profile.InitialPrompt + "\n\n" + prompt
+	}
+	if resumedSnapshot != nil {
+		for _, pending := range resumedSnapshot.PendingFollowups {
+			sub.AppendUser(pending.UserText())
+		}
 	}
 	sub.AppendUser(effectivePrompt)
 	// G.3 — wire the teammate's Mailbox to the sub-loop's PeerInbox so
@@ -1027,9 +1061,11 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			// `/agents resume` rebuilds the same posture.
 			string(subGate.Mode()),
 		)
+		hdr.Provider = a.executionProviderName()
+		hdr.Effort = string(sub.EffortValue())
 		var t *agent.SubAgentTranscript
 		var err error
-		if durableChild && resumedSnapshot != nil {
+		if resumedSnapshot != nil {
 			t, err = agent.ResumeSubAgentTranscript(a.sessionDir, teammate.AgentID)
 			if err == nil {
 				// The earlier pre-admission snapshot can become stale while a
@@ -1039,18 +1075,22 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 				if loadErr != nil {
 					_ = t.Close()
 					err = loadErr
+				} else if latest.Header.SubAgentOf != a.parentSessionID || !reflect.DeepEqual(latest.Execution, resumedSnapshot.Execution) {
+					_ = t.Close()
+					err = errors.New("sub-agent execution identity changed before the writer lease was acquired")
 				} else {
 					resumedSnapshot = latest
 					sub.Restore(latest.Messages)
+					for _, pending := range latest.PendingFollowups {
+						sub.AppendUser(pending.UserText())
+					}
 					sub.AppendUser(effectivePrompt)
 				}
 			}
-		} else if durableChild {
-			t, err = agent.NewDurableSubAgentTranscript(a.sessionDir, teammate.AgentID, hdr)
 		} else {
-			t, err = agent.NewSubAgentTranscript(a.sessionDir, teammate.AgentID, hdr)
+			t, err = agent.NewDurableSubAgentTranscript(a.sessionDir, teammate.AgentID, hdr)
 		}
-		if err != nil && durableChild {
+		if err != nil {
 			return &tools.Result{Output: fmt.Sprintf("durable sub-agent transcript setup failed: %v", err), IsError: true}, nil
 		}
 		if err == nil {
@@ -1061,20 +1101,20 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			}
 			usageRecorder, _ = agent.NewSubAgentUsageRecorder(a.sessionDir, teammate.AgentID, previousHeader)
 			activityRecorder, _ = agent.NewSubAgentActivityRecorder(a.sessionDir, teammate.AgentID)
-			// On resume, rewrite the recovered messages immediately so
-			// the file isn't a stub-with-header-only if the sub-agent
-			// errors before producing new output.
-			if resumedSnapshot != nil && !durableChild {
-				for _, m := range resumedSnapshot.Messages {
-					_ = transcript.AppendMessage(m)
+			if resumedSnapshot == nil || resumedSnapshot.Execution == nil {
+				execution := a.subAgentExecution(sub, subCwd, subSystem, subagentType, subRegistry, subGate)
+				execution.LegacyMigration = resumedSnapshot != nil && resumedSnapshot.Handoff != nil
+				if err := transcript.AppendExecution(execution); err != nil {
+					_ = transcript.Close()
+					_ = activityRecorder.Close()
+					return &tools.Result{Output: fmt.Sprintf("sub-agent execution identity could not be persisted: %v", err), IsError: true}, nil
 				}
-				persistedOnDisk = len(resumedSnapshot.Messages)
 			}
-			// Make the actual task readable while the child is queued or still
-			// streaming its first response. Subsequent turn checkpoints start
-			// after this initial history and never append the prompt twice.
-			if !durableChild {
-				persistedOnDisk = persistNewMessages(transcript, sub, persistedOnDisk)
+			sub.HistoryCheckpoint = transcript.Checkpoint
+			if err := sub.HistoryCheckpoint(sub.History()); err != nil {
+				_ = transcript.Close()
+				_ = activityRecorder.Close()
+				return &tools.Result{Output: fmt.Sprintf("sub-agent initial checkpoint failed: %v", err), IsError: true}, nil
 			}
 		}
 	}
@@ -1101,6 +1141,12 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		sub.DurablePeer = inbox
 		if err := sub.HistoryCheckpoint(sub.History()); err != nil {
 			return &tools.Result{Output: fmt.Sprintf("durable sub-agent initial checkpoint failed: %v", err), IsError: true}, nil
+		}
+	}
+
+	if teammate != nil && transcript != nil {
+		if err := teammate.BindContinuation(a.parentSessionID, sub, transcript); err != nil {
+			return &tools.Result{Output: fmt.Sprintf("sub-agent continuation setup failed: %v", err), IsError: true}, nil
 		}
 	}
 
@@ -1293,12 +1339,12 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 				transcriptCleanupOwnedByExecute = false
 			},
 		)
-		return decorateAgentSubAgentResult(decorateAgentExecutionRecovery(result, recovery), a.parentSessionID, parentToolUseID, teammate), err
+		return decorateAgentSubAgentResult(decorateAgentLegacyMigration(decorateAgentExecutionRecovery(result, recovery), resumedSnapshot), a.parentSessionID, parentToolUseID, teammate), err
 	}
 	runnerCleanupOwnedByExecute = false
 	transcriptCleanupOwnedByExecute = false
 	result, err := a.executeForeground(sub, childCtx, finalize, parentOut, parentToolUseID, parentTraceCallID, parentTraceInvocationID, teammate, timeout, transcript, persistedOnDisk)
-	return decorateAgentSubAgentResult(decorateAgentExecutionRecovery(result, recovery), a.parentSessionID, parentToolUseID, teammate), err
+	return decorateAgentSubAgentResult(decorateAgentLegacyMigration(decorateAgentExecutionRecovery(result, recovery), resumedSnapshot), a.parentSessionID, parentToolUseID, teammate), err
 }
 
 // decorateAgentSubAgentResult is presentation-only metadata. The dispatcher
@@ -1660,7 +1706,7 @@ func (a Agent) executeForeground(
 				done <- fmt.Errorf("sub-agent run panic: %v", r)
 			}
 		}()
-		done <- sub.Run(childCtx, events)
+		done <- agent.RunSubAgentWithContinuations(childCtx, events, sub, teammate, transcript)
 	}()
 
 	var output strings.Builder
@@ -1862,7 +1908,7 @@ func (a Agent) executeBackground(
 					done <- fmt.Errorf("sub-agent run panic: %v", r)
 				}
 			}()
-			done <- sub.Run(childCtx, events)
+			done <- agent.RunSubAgentWithContinuations(childCtx, events, sub, teammate, transcript)
 		}()
 
 		stopReason := ""

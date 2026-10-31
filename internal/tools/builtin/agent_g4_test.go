@@ -142,7 +142,7 @@ func TestAgentExecute_ResumeRestoresHistory(t *testing.T) {
 
 	// Plant a fixture transcript with an Anonymous=false teammate "alice".
 	agentID := "agt-resume-target"
-	hdr := agent.NewSubAgentHeader(agentID, "fixture-model", "fixture-parent", "alice", "/tmp/fx", "default")
+	hdr := agent.NewSubAgentHeader(agentID, "fixture-model", "fixture-parent", "alice", dir, "default")
 	tr, err := agent.NewSubAgentTranscript(dir, agentID, hdr)
 	if err != nil {
 		t.Fatalf("plant transcript: %v", err)
@@ -156,12 +156,18 @@ func TestAgentExecute_ResumeRestoresHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := tr.AppendExecution(agent.SubAgentExecutionConfig{
+		Version: 1, Provider: helloProvider().Name(), Model: hdr.Model, WorkDir: dir,
+		System: "saved child system", Tools: []string{}, PermissionMode: hdr.Mode,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	tr.Close()
 
 	roster := agent.NewRoster(0)
 	tool := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "m", "s").
 		WithRoster(roster).
-		WithSessionPersistence(dir, "another-parent")
+		WithSessionPersistence(dir, "fixture-parent")
 
 	res, err := tool.Execute(context.Background(), map[string]any{
 		"prompt":      "follow-up question",
@@ -255,9 +261,15 @@ func TestAgentExecute_ResumeReclaimsTeammateName(t *testing.T) {
 	dir := t.TempDir()
 
 	agentID := "agt-bob-paused"
-	hdr := agent.NewSubAgentHeader(agentID, "m", "p", "bob", "/tmp", "default")
+	hdr := agent.NewSubAgentHeader(agentID, "m", "parent", "bob", dir, "default")
 	tr, err := agent.NewSubAgentTranscript(dir, agentID, hdr)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.AppendExecution(agent.SubAgentExecutionConfig{
+		Version: 1, Provider: helloProvider().Name(), Model: hdr.Model, WorkDir: dir,
+		System: "saved child system", Tools: []string{}, PermissionMode: hdr.Mode,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	tr.Close()

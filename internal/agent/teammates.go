@@ -185,6 +185,9 @@ type Teammate struct {
 	// executionLease reports a Desktop child's current execution phase.
 	// Lifecycle Status remains running while a child yields its permit.
 	executionLease *DesktopExecutionLease
+	// continuation owns parent-directed input admission and the final Run
+	// boundary. Its own mutex never nests a Teammate lifecycle lock.
+	continuation *subAgentContinuation
 
 	// Name is what callers pass via `Agent({name: ...})`. Anonymous
 	// sub-agents get an auto-generated `_anon-<8hex>` prefix so the
@@ -906,7 +909,8 @@ func (r *Roster) Lookup(name string) (*Teammate, bool) {
 func (r *Roster) LookupRecentlyFinished(name string) (*Teammate, time.Duration, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	for _, t := range r.recentlyFinished {
+	for index := len(r.recentlyFinished) - 1; index >= 0; index-- {
+		t := r.recentlyFinished[index]
 		if t.Name != name {
 			continue
 		}
@@ -940,7 +944,8 @@ func (r *Roster) LookupByAgentID(id string) (*Teammate, bool) {
 			return t, true
 		}
 	}
-	for _, t := range r.recentlyFinished {
+	for index := len(r.recentlyFinished) - 1; index >= 0; index-- {
+		t := r.recentlyFinished[index]
 		if t.AgentID == id {
 			return t, true
 		}
@@ -955,16 +960,28 @@ func (r *Roster) LookupByAgentID(id string) (*Teammate, bool) {
 // Fix 2 (2026-05-15) — recentlyFinished teammates are included so
 // SubAgentList shows them with their Completed/Failed/Killed status
 // instead of disappearing the moment they finish. Live teammates
-// first (their Status is still Running), then finished.
+// win over older generations with the same AgentID. Finished continuations
+// retain only the latest generation of each stable ID; reused names belonging
+// to different AgentIDs remain separate records.
 func (r *Roster) List() []*Teammate {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]*Teammate, 0, len(r.teammates)+len(r.recentlyFinished))
+	seen := make(map[string]bool, len(r.teammates)+len(r.recentlyFinished))
 	for _, t := range r.teammates {
+		if t.AgentID != "" && seen[t.AgentID] {
+			continue
+		}
 		out = append(out, t)
+		seen[t.AgentID] = t.AgentID != ""
 	}
-	for _, t := range r.recentlyFinished {
+	for index := len(r.recentlyFinished) - 1; index >= 0; index-- {
+		t := r.recentlyFinished[index]
+		if t.AgentID != "" && seen[t.AgentID] {
+			continue
+		}
 		out = append(out, t)
+		seen[t.AgentID] = t.AgentID != ""
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Started.Before(out[j].Started)

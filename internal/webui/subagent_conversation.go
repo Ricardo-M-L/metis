@@ -357,7 +357,14 @@ func (s *Server) handleSubAgentConversation(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) enrichSubAgentDetail(view *subAgentDetailView, includeTask bool) {
-	if s == nil || s.store == nil || view == nil {
+	if view == nil {
+		return
+	}
+	view.ParentSessionID = view.SessionID
+	view.Ownership = "parent"
+	view.CanAcceptDirectInput = false
+	view.DirectInputBlockedReason = parentOwnedInputReason
+	if s == nil || s.store == nil {
 		return
 	}
 	if view.ConversationRevision == "" {

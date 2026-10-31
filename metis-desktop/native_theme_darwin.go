@@ -9,6 +9,7 @@ package main
 #import <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
+#include "native_dock_icon_darwin.h"
 
 static void metis_set_native_theme(const char *theme) {
 	char *theme_copy = strdup(theme == NULL ? "" : theme);
@@ -32,6 +33,7 @@ static void metis_set_native_theme(const char *theme) {
 				[window setAppearance:appearance];
 			}
 		}
+		metis_refresh_dock_icon();
 		free(theme_copy);
 	});
 }

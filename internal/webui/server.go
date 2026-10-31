@@ -1155,6 +1155,19 @@ type sessionItem struct {
 	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
+// sessionUpdatedAt uses the same persisted activity clock as Store.List.
+// Loading or selecting a session must not manufacture a new activity time,
+// and an absent timestamp must not serialize as Go's year-one zero date.
+func (s *Server) sessionUpdatedAt(id string, createdAt time.Time) time.Time {
+	if s != nil && s.store != nil {
+		path := filepath.Join(s.store.Dir, filepath.Base(id)+".jsonl")
+		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && !info.ModTime().IsZero() {
+			return info.ModTime()
+		}
+	}
+	return createdAt
+}
+
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		writeError(w, http.StatusServiceUnavailable, "session store unavailable")
@@ -1319,7 +1332,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	payload := map[string]any{"session": sessionItem{
 		ID: id, Title: hdr.Title, Model: hdr.Model, WorkDir: workspace.Path, WorkspaceID: workspace.ID, Mode: hdr.Mode,
 		Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status,
-		Archived: s.store.IsArchived(id), CreatedAt: hdr.CreatedAt,
+		Archived: s.store.IsArchived(id), CreatedAt: hdr.CreatedAt, UpdatedAt: s.sessionUpdatedAt(id, hdr.CreatedAt),
 	}, "messages": agent.PresentationHistory(messages), "workspace": workspace}
 	s.addPermissionStatus(payload, id)
 	item := payload["session"].(sessionItem)
@@ -1616,6 +1629,9 @@ func (s *Server) handleSessionActivate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "valid session id is required")
 		return
 	}
+	if s.rejectParentOwnedInput(w, body.ID, nil) {
+		return
+	}
 	s.stateMu.RLock()
 	selectionEpoch := s.selectedWorkspaceEpoch
 	s.stateMu.RUnlock()
@@ -1641,6 +1657,9 @@ func (s *Server) handleSessionActivate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
+	if s.rejectParentOwnedInput(w, body.ID, hdr) {
+		return
+	}
 	if err := s.activateSession(body.ID, hdr, history, contextEpoch); err != nil {
 		writeError(w, http.StatusConflict, "failed to activate session: "+err.Error())
 		return
@@ -1654,7 +1673,7 @@ func (s *Server) handleSessionActivate(w http.ResponseWriter, r *http.Request) {
 	workspace := s.sessionWorkspaceView(hdr, selectedWorkDir)
 	payload := map[string]any{"session": sessionItem{
 		ID: body.ID, Title: hdr.Title, Model: hdr.Model, WorkDir: workspace.Path, WorkspaceID: workspace.ID,
-		Mode: hdr.Mode, Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status, Archived: s.store.IsArchived(body.ID), CreatedAt: hdr.CreatedAt,
+		Mode: hdr.Mode, Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status, Archived: s.store.IsArchived(body.ID), CreatedAt: hdr.CreatedAt, UpdatedAt: s.sessionUpdatedAt(body.ID, hdr.CreatedAt),
 	}, "messages": agent.PresentationHistory(history), "workspace": workspace}
 	s.addPermissionStatus(payload, body.ID)
 	item := payload["session"].(sessionItem)
@@ -1726,6 +1745,9 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.SessionID != "" && !validSessionID(body.SessionID) {
 		writeError(w, http.StatusBadRequest, "invalid session id")
+		return
+	}
+	if body.SessionID != "" && s.rejectParentOwnedInput(w, body.SessionID, nil) {
 		return
 	}
 	newWorkDir := ""
@@ -1827,6 +1849,9 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
+	if s.rejectParentOwnedInput(w, body.SessionID, hdr) {
+		return
+	}
 	loadMs := time.Since(t0).Milliseconds()
 	turnWorkDir := strings.TrimSpace(hdr.WorkDir)
 	if turnWorkDir == "" {
@@ -1886,6 +1911,10 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	hdr, history, err = s.store.Load(body.SessionID)
 	if err != nil || hdr == nil {
 		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+
+	if s.rejectParentOwnedInput(w, body.SessionID, hdr) {
 		return
 	}
 
@@ -1949,6 +1978,9 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	hdr, history, err = s.store.Load(body.SessionID)
 	if err != nil || hdr == nil {
 		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if s.rejectParentOwnedInput(w, body.SessionID, hdr) {
 		return
 	}
 	loadMs += time.Since(t0).Milliseconds()
@@ -4091,27 +4123,31 @@ const subAgentDetailPreviewRefreshInterval = time.Second
 // SSE companion. Keeping this view detached from Teammate means the browser
 // never holds a pointer to mutable roster state.
 type subAgentDetailView struct {
-	activityRevision     string
-	Task                 string            `json:"task"`
-	Usage                subAgentUsageView `json:"usage"`
-	ConversationRevision string            `json:"conversationRevision"`
-	SessionID            string            `json:"sessionId"`
-	Name                 string            `json:"name"`
-	Model                string            `json:"model"`
-	AgentID              string            `json:"agentId"`
-	Status               string            `json:"status"`
-	ExecutionPhase       string            `json:"executionPhase,omitempty"`
-	HoldsExecutionSlot   bool              `json:"holdsExecutionSlot"`
-	Background           bool              `json:"background"`
-	StartedAt            time.Time         `json:"startedAt"`
-	EndedAt              time.Time         `json:"endedAt"`
-	ElapsedMS            int64             `json:"elapsedMs"`
-	Output               string            `json:"output"`
-	OutputTruncated      bool              `json:"outputTruncated"`
-	Result               string            `json:"result"`
-	ResultTruncated      bool              `json:"resultTruncated"`
-	StopHint             string            `json:"stopHint"`
-	ExitError            string            `json:"exitError"`
+	activityRevision         string
+	ParentSessionID          string            `json:"parentSessionId"`
+	Ownership                string            `json:"ownership"`
+	CanAcceptDirectInput     bool              `json:"canAcceptDirectInput"`
+	DirectInputBlockedReason string            `json:"directInputBlockedReason"`
+	Task                     string            `json:"task"`
+	Usage                    subAgentUsageView `json:"usage"`
+	ConversationRevision     string            `json:"conversationRevision"`
+	SessionID                string            `json:"sessionId"`
+	Name                     string            `json:"name"`
+	Model                    string            `json:"model"`
+	AgentID                  string            `json:"agentId"`
+	Status                   string            `json:"status"`
+	ExecutionPhase           string            `json:"executionPhase,omitempty"`
+	HoldsExecutionSlot       bool              `json:"holdsExecutionSlot"`
+	Background               bool              `json:"background"`
+	StartedAt                time.Time         `json:"startedAt"`
+	EndedAt                  time.Time         `json:"endedAt"`
+	ElapsedMS                int64             `json:"elapsedMs"`
+	Output                   string            `json:"output"`
+	OutputTruncated          bool              `json:"outputTruncated"`
+	Result                   string            `json:"result"`
+	ResultTruncated          bool              `json:"resultTruncated"`
+	StopHint                 string            `json:"stopHint"`
+	ExitError                string            `json:"exitError"`
 }
 
 func trimSubAgentDetailOutput(value string) (string, bool) {
@@ -4401,25 +4437,29 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, se
 
 func subAgentDeltaPayload(view subAgentDetailView, delta string) map[string]any {
 	return map[string]any{
-		"conversationRevision": view.ConversationRevision,
-		"usage":                view.Usage,
-		"executionPhase":       view.ExecutionPhase,
-		"holdsExecutionSlot":   view.HoldsExecutionSlot,
-		"sessionId":            view.SessionID,
-		"agentId":              view.AgentID,
-		"name":                 view.Name,
-		"model":                view.Model,
-		"status":               view.Status,
-		"background":           view.Background,
-		"startedAt":            view.StartedAt,
-		"endedAt":              view.EndedAt,
-		"elapsedMs":            view.ElapsedMS,
-		"delta":                delta,
-		"outputTruncated":      view.OutputTruncated,
-		"result":               view.Result,
-		"resultTruncated":      view.ResultTruncated,
-		"stopHint":             view.StopHint,
-		"exitError":            view.ExitError,
+		"parentSessionId":          view.ParentSessionID,
+		"ownership":                view.Ownership,
+		"canAcceptDirectInput":     view.CanAcceptDirectInput,
+		"directInputBlockedReason": view.DirectInputBlockedReason,
+		"conversationRevision":     view.ConversationRevision,
+		"usage":                    view.Usage,
+		"executionPhase":           view.ExecutionPhase,
+		"holdsExecutionSlot":       view.HoldsExecutionSlot,
+		"sessionId":                view.SessionID,
+		"agentId":                  view.AgentID,
+		"name":                     view.Name,
+		"model":                    view.Model,
+		"status":                   view.Status,
+		"background":               view.Background,
+		"startedAt":                view.StartedAt,
+		"endedAt":                  view.EndedAt,
+		"elapsedMs":                view.ElapsedMS,
+		"delta":                    delta,
+		"outputTruncated":          view.OutputTruncated,
+		"result":                   view.Result,
+		"resultTruncated":          view.ResultTruncated,
+		"stopHint":                 view.StopHint,
+		"exitError":                view.ExitError,
 	}
 }
 
@@ -4477,6 +4517,15 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 	s.stateMu.RUnlock()
 	if body.SessionID == "" {
 		body.SessionID = activeID
+	}
+	if validSessionID(body.SessionID) {
+		var header *pubsess.Header
+		if s.store != nil {
+			header, _, _ = s.store.LoadHeader(body.SessionID)
+		}
+		if s.rejectParentOwnedInput(w, body.SessionID, header) {
+			return
+		}
 	}
 	if !validSessionID(body.SessionID) || body.SessionID != activeID {
 		writeError(w, http.StatusConflict, "session is not the active turn")

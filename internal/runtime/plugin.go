@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -9,10 +10,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/BurntSushi/toml"
-
 	"github.com/Ricardo-M-L/metis/internal/agent/skills"
 	"github.com/Ricardo-M-L/metis/internal/config"
+	"github.com/Ricardo-M-L/metis/internal/pluginmanifest"
 	"github.com/Ricardo-M-L/metis/internal/runtime/mcp"
 	"github.com/Ricardo-M-L/metis/internal/sandbox"
 	"github.com/Ricardo-M-L/metis/internal/tools"
@@ -191,14 +191,11 @@ func LoadPluginsWithSandbox(ctx context.Context, registry *tools.Registry, manag
 // loadOne reads + validates one plugin's manifest, spawns its MCP server
 // (if any), and prefetches its skill files.
 func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.Registry, manager *sandbox.Manager) (_ *Plugin, retErr error) {
-	manifestPath := filepath.Join(rootDir, "plugin.toml")
-	var m pubplugin.Manifest
-	if _, err := toml.DecodeFile(manifestPath, &m); err != nil {
-		return nil, fmt.Errorf("decode manifest: %w", err)
-	}
-	if err := validateManifest(&m, expectedName); err != nil {
+	manifest, err := pluginmanifest.Read(rootDir, expectedName)
+	if err != nil {
 		return nil, err
 	}
+	m := *manifest
 
 	p := &Plugin{Manifest: m, RootDir: rootDir}
 	// Until the caller receives p, loadOne owns every MCP handle and tool
@@ -250,17 +247,27 @@ func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.
 			command = filepath.Join(workingDir, filepath.FromSlash(strings.TrimPrefix(strings.TrimPrefix(command, "./"), `.\`)))
 		}
 		entry := mcp.ServerEntry{
-			Name:    "plugin:" + m.Name + ":" + serverName,
+			Name:    pluginMCPServerName(m.Name, serverName),
 			Command: command, Args: append([]string(nil), spec.Args...), URL: spec.URL,
 			Headers: cloneStringMap(spec.Headers), Auth: spec.Auth, Env: cloneStringMap(spec.Env),
 			WorkingDir: workingDir, EnabledTools: append([]string(nil), spec.EnabledTools...),
 			DisabledTools: append([]string(nil), spec.DisabledTools...),
 		}
+		prefix := "mcp__" + entry.Name + "__"
+		for _, existing := range registry.All() {
+			if strings.HasPrefix(existing.Name(), prefix) {
+				return nil, errors.New("plugin MCP namespace collision with an already registered tool")
+			}
+		}
 		// Record the namespace before launch. The production launcher registers
 		// tools only after a successful handshake, but this also cleans up a future
 		// launcher that publishes some tools before returning an error.
 		ownedMCPNamespaces = append(ownedMCPNamespaces, entry.Name)
-		srv, err := launchPluginMCPServer(ctx, entry, registry, manager)
+		// Stage the launcher's original remote tool names privately. Only the
+		// validated, provider-portable aliases are published to the live model
+		// registry; raw long or non-ASCII names are never visible there.
+		staging := tools.NewRegistry()
+		srv, err := launchPluginMCPServer(ctx, entry, staging, manager)
 		if srv != nil {
 			p.MCPServers = append(p.MCPServers, srv)
 			if p.MCP == nil {
@@ -270,20 +277,24 @@ func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.
 		if err != nil {
 			return nil, fmt.Errorf("mcp server %s: %w", serverName, err)
 		}
+		portable, err := portablePluginMCPTools(entry.Name, staging.All(), registry)
+		if err != nil {
+			return nil, err
+		}
+		registry.ReplacePrefix(prefix, portable)
 	}
 
-	// Pre-load contributed skill files so the skill loader's plugin layer
-	// has them ready. Failures here are per-skill; we log via err return
-	// rather than blocking the whole plugin.
+	// Read checked all skills before any launch. Recheck the path immediately
+	// before loading in case an external change happened during MCP startup;
+	// failures roll back the plugin's partial resources.
 	for _, rel := range m.Skills {
-		// Reject ".." path traversal — skills must live inside the plugin dir.
-		if strings.Contains(rel, "..") || strings.HasPrefix(rel, "/") {
-			return nil, fmt.Errorf("skill path %q escapes plugin dir", rel)
+		full, err := pluginmanifest.SkillPath(rootDir, rel)
+		if err != nil {
+			return nil, fmt.Errorf("skill %q: %w", rel, err)
 		}
-		full := filepath.Join(rootDir, rel)
 		sk, err := skills.Load(full)
 		if err != nil || sk == nil {
-			return nil, fmt.Errorf("skill %s: %w", rel, err)
+			return nil, fmt.Errorf("skill %q: unreadable or invalid skill file", rel)
 		}
 		// Namespace the skill name so it doesn't collide with bundled.
 		if !strings.Contains(sk.Name, ":") {
@@ -294,6 +305,65 @@ func loadOne(ctx context.Context, rootDir, expectedName string, registry *tools.
 
 	owned = false
 	return p, nil
+}
+
+// MCP identifiers also become cache filenames and qualified tool names. Hash
+// the unambiguous identity tuple so plugin names cannot exceed the launcher's
+// portable length limit or collide through separator normalization.
+func pluginMCPServerName(pluginName, serverName string) string {
+	identity := sha256.Sum256([]byte(pluginName + "\x00" + serverName))
+	return fmt.Sprintf("plugin-%x", identity[:12])
+}
+
+// Embedding the concrete MCP tool preserves its optional exposure and host
+// behavior. Only the model-facing name changes: Execute still calls the
+// server's original remote name, and filtering happened before this wrapper.
+type pluginMCPTool struct {
+	*mcptools.MCPTool
+	name string
+}
+
+func (t *pluginMCPTool) Name() string { return t.name }
+
+func portablePluginMCPTools(serverName string, staged []tools.Tool, live *tools.Registry) ([]tools.Tool, error) {
+	prefix := "mcp__" + serverName + "__"
+	seen := make(map[string]bool, len(staged))
+	portable := make([]tools.Tool, 0, len(staged))
+	for _, raw := range staged {
+		mcpTool, ok := raw.(*mcptools.MCPTool)
+		if !ok || !strings.HasPrefix(raw.Name(), prefix) {
+			return nil, errors.New("plugin MCP launcher returned an unexpected tool namespace")
+		}
+		remoteName := strings.TrimPrefix(raw.Name(), prefix)
+		if remoteName == "" {
+			return nil, errors.New("plugin MCP server declared an empty tool name")
+		}
+		suffix := remoteName
+		if len(prefix)+len(suffix) > 64 || !portableFunctionSuffix(suffix) {
+			identity := sha256.Sum256([]byte(remoteName))
+			suffix = fmt.Sprintf("tool-%x", identity[:10])
+		}
+		name := prefix + suffix
+		if seen[name] {
+			return nil, errors.New("plugin MCP tool alias collision; no tools from this server were published")
+		}
+		seen[name] = true
+		if _, exists := live.Get(name); exists {
+			return nil, errors.New("plugin MCP tool alias collision with an already registered tool")
+		}
+		portable = append(portable, &pluginMCPTool{MCPTool: mcpTool, name: name})
+	}
+	return portable, nil
+}
+
+func portableFunctionSuffix(name string) bool {
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return name != ""
 }
 
 func releasePartialPluginMCP(p *Plugin, registry *tools.Registry, namespaces []string) error {
@@ -341,72 +411,14 @@ func releasePartialPluginMCP(p *Plugin, registry *tools.Registry, namespaces []s
 	return cleanupErr
 }
 
-// validateManifest enforces the must-haves: manifest_version supported,
-// name matches dir, command not shell-injected.
+// validateManifest retains the runtime's internal compatibility seam while all
+// manifest consumers use the same supported-capability contract.
 func validateManifest(m *pubplugin.Manifest, expectedName string) error {
-	if m.ManifestVersion == 0 {
-		// v0 = unset; auto-upgrade to v1 (the only version known).
-		m.ManifestVersion = pubplugin.CurrentManifestVersion
-	}
-	if m.ManifestVersion != pubplugin.CurrentManifestVersion {
-		return fmt.Errorf("manifest_version=%d not supported (this build understands v%d)",
-			m.ManifestVersion, pubplugin.CurrentManifestVersion)
-	}
-	if m.Name == "" {
-		return errors.New("name required")
-	}
-	if m.Name != expectedName {
-		return fmt.Errorf("manifest name %q must match plugin dir %q", m.Name, expectedName)
-	}
-	if m.MCPServer != nil {
-		if err := validateMCPServer(*m.MCPServer, "[mcp_server]"); err != nil {
-			return err
-		}
-	}
-	seenServers := map[string]bool{}
-	for i, server := range m.MCPServers {
-		label := fmt.Sprintf("[[mcp_servers]][%d]", i)
-		if server.Name == "" {
-			return fmt.Errorf("%s.name required", label)
-		}
-		if seenServers[server.Name] {
-			return fmt.Errorf("duplicate mcp server name %q", server.Name)
-		}
-		seenServers[server.Name] = true
-		if err := validateMCPServer(server, label); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func validateMCPServer(server pubplugin.MCPServerSpec, label string) error {
-	if server.Command == "" && server.URL == "" {
-		return fmt.Errorf("%s requires command or url", label)
-	}
-	if strings.ContainsAny(server.Command, ";&|`$<>") {
-		return fmt.Errorf("%s.command contains shell metacharacters: %q", label, server.Command)
-	}
-	return nil
+	return pluginmanifest.Validate(m, expectedName)
 }
 
 func pluginWorkingDir(root, declared string) (string, error) {
-	if strings.TrimSpace(declared) == "" {
-		return root, nil
-	}
-	if filepath.IsAbs(declared) {
-		return "", errors.New("working_dir must be relative to the plugin")
-	}
-	clean := filepath.Clean(filepath.FromSlash(declared))
-	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", errors.New("working_dir escapes plugin root")
-	}
-	resolved := filepath.Join(root, clean)
-	info, err := os.Stat(resolved)
-	if err != nil || !info.IsDir() {
-		return "", fmt.Errorf("working_dir is unavailable")
-	}
-	return resolved, nil
+	return pluginmanifest.WorkingDir(root, declared)
 }
 
 func cloneStringMap(input map[string]string) map[string]string {

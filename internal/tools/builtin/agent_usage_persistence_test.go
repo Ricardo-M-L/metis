@@ -91,7 +91,7 @@ func TestAgentExecute_PersistsProviderUsageWithoutChangingBudget(t *testing.T) {
 	}
 }
 
-func TestAgentExecute_UsageResumeKeepsOnlyTheCurrentParentLineage(t *testing.T) {
+func TestAgentExecute_UsageResumeCannotTransferParentLineage(t *testing.T) {
 	dir := t.TempDir()
 	run := func(parent, resume string, inputTokens int) string {
 		t.Helper()
@@ -117,12 +117,15 @@ func TestAgentExecute_UsageResumeKeepsOnlyTheCurrentParentLineage(t *testing.T) 
 	if err != nil || !continued.Available || continued.ParentSessionID != "parent-a" || continued.InputTokens != 12 {
 		t.Fatalf("same-parent continuation usage = %+v, %v; want parent-a input=12", continued, err)
 	}
-	if gotID := run("parent-b", agentID, 4); gotID != agentID {
-		t.Fatalf("cross-parent resume replaced stable agent ID: %q != %q", gotID, agentID)
+	other := NewAgent(permission.New(permission.ModeBypass), helloProvider(), tools.NewRegistry(), "model", "system").
+		WithRoster(agent.NewRoster(2)).WithSessionPersistence(dir, "parent-b")
+	result, executeErr := other.Execute(context.Background(), map[string]any{"prompt": "continue", "resume_from": agentID})
+	if executeErr != nil || result == nil || !result.IsError {
+		t.Fatalf("cross-parent continuation must be refused: %+v %v", result, executeErr)
 	}
-	moved, err := agent.LoadSubAgentUsage(dir, agentID)
-	if err != nil || !moved.Available || moved.ParentSessionID != "parent-b" || moved.InputTokens != 4 {
-		t.Fatalf("cross-parent continuation leaked old usage = %+v, %v; want parent-b input=4", moved, err)
+	unchanged, err := agent.LoadSubAgentUsage(dir, agentID)
+	if err != nil || !unchanged.Available || unchanged.ParentSessionID != "parent-a" || unchanged.InputTokens != 12 {
+		t.Fatalf("refused continuation changed parent usage = %+v, %v", unchanged, err)
 	}
 }
 

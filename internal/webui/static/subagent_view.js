@@ -448,7 +448,12 @@ function commitSubAgentConversationView() {
   updateSubAgentConversationChrome();
   const back = document.getElementById('subAgentBack');
   if (back) { back.setAttribute('aria-label', label('Back to parent conversation', '返回主对话')); const span = back.querySelector('span'); if (span) span.textContent = label('Parent conversation', '主对话'); }
-  const readOnly = document.getElementById('subAgentReadOnlyLabel'); if (readOnly) readOnly.textContent = label('Agent conversation · Read only', '子代理会话 · 只读');
+  const readOnly = document.getElementById('subAgentReadOnlyLabel');
+  if (readOnly) {
+    const parentOwned = agent.ownership === 'parent' || agent.canAcceptDirectInput !== true;
+    readOnly.textContent = parentOwned ? label('Managed by parent agent', '由主代理管理') : label('Agent conversation', '子代理会话');
+    readOnly.title = parentOwned ? label('Continue assigning this agent in the parent conversation.', '请在主对话中继续指派这个子代理。') : '';
+  }
   const infoToggle = document.getElementById('subAgentInfoToggle');
   if (infoToggle) { infoToggle.setAttribute('aria-label', label('Details', '详情')); const span = infoToggle.querySelector('span'); if (span) span.textContent = label('Details', '详情'); }
   const close = document.getElementById('subAgentDetailClose');
