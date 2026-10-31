@@ -605,6 +605,9 @@ type Event struct {
 	OutputTokens             int
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
+	// UsageModel identifies the actual provider model for this usage event.
+	// An empty value means its identity was not available.
+	UsageModel string
 	// PreviousContextTokens and ContextTokens are byte-derived context
 	// estimates attached to EventContextCompacted. They describe the
 	// history that was actually replaced, unlike the compaction API call's

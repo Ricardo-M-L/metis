@@ -16,6 +16,8 @@
 <link rel="stylesheet" href="durable_ops.css?v=__BUILD__">
 <link rel="stylesheet" href="providers.css?v=__BUILD__">
 <link rel="stylesheet" href="navigation.css?v=__BUILD__">
+<link rel="stylesheet" href="usage_stats.css?v=__BUILD__">
+<link rel="stylesheet" href="mcp_servers.css?v=__BUILD__">
 <link rel="stylesheet" href="subagents.css?v=__BUILD__">
 </head>
 <body>
@@ -310,6 +312,10 @@
         <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.3h3V4.8a1.7 1.7 0 1 1 3.4 0v1.5h4.6v2.4H12a1.7 1.7 0 1 0 0 3.4h1.5v1.4h-11V9h1.4a1.4 1.4 0 1 0 0-2.7H2.5Z"/></svg></span>
         <span data-i18n="plugins">Plugins</span>
       </button>
+      <button type="button" class="settings-item" id="settingsMcpBtn" data-settings-tab="mcp" onclick="showSettingsTab('mcp', this)">
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2v5a2 2 0 1 1-4 0V4M10 2v5a2 2 0 1 0 4 0V4M8 8v4a2 2 0 0 0 2 2h1"/><circle cx="2" cy="3" r="1"/><circle cx="14" cy="3" r="1"/></svg></span>
+        <span data-i18n="mcpServers">MCP servers</span>
+      </button>
       <button type="button" class="settings-item" id="settingsComputerUseBtn" data-settings-tab="computer-use" onclick="showSettingsTab('computer-use', this)">
         <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="8.5" rx="1.5"/><path d="M8 11v2.5M5.5 13.5h5"/></svg></span>
         <span data-i18n="computerUse">电脑操作</span>
@@ -321,6 +327,11 @@
       <button type="button" class="settings-item" id="settingsConfigBtn" data-settings-tab="config" onclick="showSettingsTab('config', this)">
         <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 2.5h8a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5H4A1.5 1.5 0 0 1 2.5 12V4A1.5 1.5 0 0 1 4 2.5Z"/><path d="M5.5 6h5M5.5 9h5"/></svg></span>
         <span data-i18n="configuration">Configuration</span>
+      </button>
+      <div class="settings-group-label" data-i18n="dataAndStatistics">Data &amp; statistics</div>
+      <button type="button" class="settings-item" id="settingsUsageBtn" data-settings-tab="usage" onclick="showSettingsTab('usage', this)">
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 13.5h11M4 11V7.5M8 11V3M12 11V5.5"/></svg></span>
+        <span data-i18n="usageStatistics">Usage statistics</span>
       </button>
     </div>
     <div class="settings-content" id="settingsContent"></div>
@@ -458,6 +469,8 @@
 <script src="trace.js?v=__BUILD__"></script>
 <script src="automations.js?v=__BUILD__"></script>
 <script src="durable_ops.js?v=__BUILD__"></script>
+<script src="usage_stats.js?v=__BUILD__"></script>
+<script src="mcp_servers.js?v=__BUILD__"></script>
 <script src="navigation.js?v=__BUILD__"></script>
 </body>
 </html>

@@ -126,6 +126,7 @@ func cmdDesktop(ctx context.Context, args []string) error {
 		OpenWorkspace:        launchNativeDesktop,
 		OpenPath:             desktop.OpenPath,
 		Plugins:              rt.plugins,
+		MCPServersSnapshot:   desktopMCPServersSnapshot(rt, rt.cfg.MCP.Servers),
 		Roster:               rt.subAgentRoster,
 		TraceAdapter:         rtpkg.CurrentTraceAdapter(),
 		TraceStore:           rtpkg.CurrentTraceStore(),

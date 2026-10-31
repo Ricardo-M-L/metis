@@ -172,6 +172,7 @@ const DESKTOP_I18N = {
     chat: 'Chat', trajectory: 'Trajectory', welcome: 'From idea to done', preview: 'METIS Desktop', sessionLog: 'Session log',
     composerPlaceholder: 'Describe what you want to build', jumpLatest: 'Jump to latest', details: 'Details', detailsPlaceholder: 'Select a tool row to inspect details',
     backToApp: 'Back to app', searchSettings: 'Search settings…', personal: 'Personal', general: 'General', appearance: 'Appearance',
+    dataAndStatistics: 'Data & statistics', usageStatistics: 'Usage statistics', mcpServers: 'MCP servers',
     modelProviders: 'Model Providers', agentPresets: 'Agent Presets', plugins: 'Plugins', computerUse: 'Computer Use', smartRouting: 'Smart Routing', configuration: 'Configuration',
     artifacts: 'Artifacts', files: 'Files', addWorkspace: 'Add workspace', sessionViewOptions: 'Session view options', showArchivedSessions: 'Show archived sessions',
     layout: 'Layout', groupByWorkspace: 'Grouped by workspace', flatList: 'Flat list', sort: 'Sort', mostRecent: 'Most recent', name: 'Name', manualOrder: 'Manual order', pageNavigation: 'Page navigation'
@@ -185,6 +186,7 @@ const DESKTOP_I18N = {
     chat: '对话', trajectory: '轨迹', welcome: '从想法，到完成', preview: 'METIS Desktop', sessionLog: '会话日志',
     composerPlaceholder: '描述你想要构建的内容', jumpLatest: '回到最新', details: '详情', detailsPlaceholder: '点击消息流中的工具行查看详情',
     backToApp: '返回应用', searchSettings: '搜索设置…', personal: '个人', general: '通用', appearance: '外观',
+    dataAndStatistics: '数据与统计', usageStatistics: '使用统计', mcpServers: 'MCP 服务器',
     modelProviders: '模型提供商', agentPresets: '代理预设', plugins: '插件', computerUse: '电脑操作', smartRouting: '智能路由', configuration: '配置',
     artifacts: '产物', files: '文件', addWorkspace: '添加工作区', sessionViewOptions: '会话列表选项', showArchivedSessions: '显示已归档会话',
     layout: '布局', groupByWorkspace: '按工作区分组', flatList: '平铺列表', sort: '排序', mostRecent: '最近更新', name: '名称', manualOrder: '手动排序', pageNavigation: '页面导航'

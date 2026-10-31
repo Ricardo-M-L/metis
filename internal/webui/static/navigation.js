@@ -120,8 +120,9 @@
     const settingsNames = {
       general: ['General', '通用'], appearance: ['Appearance', '外观'],
       providers: ['Model providers', '模型提供商'], presets: ['Agent presets', '代理预设'],
-      plugins: ['Plugins', '插件'], 'computer-use': ['Computer use', '电脑操作'],
-      routing: ['Smart routing', '智能路由'], config: ['Configuration', '配置']
+      plugins: ['Plugins', '插件'], mcp: ['MCP servers', 'MCP 服务器'], 'computer-use': ['Computer use', '电脑操作'],
+      routing: ['Smart routing', '智能路由'], config: ['Configuration', '配置'],
+      usage: ['Usage statistics', '使用统计']
     };
     function invalidateSelection() {
       if (typeof invalidateSessionAsyncLoads === 'function') invalidateSessionAsyncLoads();

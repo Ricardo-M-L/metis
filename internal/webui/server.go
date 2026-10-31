@@ -153,10 +153,14 @@ type Server struct {
 	automations             *automationManager
 	durableOps              *durableOperationsBridge
 	plugins                 *rtpkg.PluginRegistry
+	mcpServersSnapshot      func() (MCPServersSnapshot, error)
 	pluginMarket            *pluginmarket.Manager
 	artifactStore           *artifact.Store
 	traceAdapter            *rtpkg.TraceAdapter
 	traceStore              *session.TraceStore
+	usageStatsMu            sync.Mutex
+	usageStatsCached        *usageStatistics
+	usageStatsCachedAt      time.Time
 	shutdownToken           string
 	shutdown                func()
 	shutdownOnce            sync.Once
@@ -365,6 +369,8 @@ type RuntimeBindings struct {
 	ShutdownToken string
 	Shutdown      func()
 	Plugins       *rtpkg.PluginRegistry
+	// MCPServersSnapshot is a read-only snapshot. It must not launch servers.
+	MCPServersSnapshot func() (MCPServersSnapshot, error)
 	// TraceAdapter/TraceStore are passed explicitly by runtime assembly so the
 	// Desktop installs exactly one resolved-event observer without discovering
 	// or replacing unrelated process-global test/embedded trace state.
@@ -444,6 +450,7 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		clipboardFiles:          desktop.ClipboardFiles,
 		computerUse:             binding.ComputerUse,
 		plugins:                 binding.Plugins,
+		mcpServersSnapshot:      binding.MCPServersSnapshot,
 		pluginMarket:            pluginmarket.NewManager(),
 		traceAdapter:            binding.TraceAdapter,
 		traceStore:              binding.TraceStore,
@@ -685,6 +692,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/operations", s.handleDurableOperations)
 	mux.HandleFunc("/api/operations/action", s.handleDurableOperations)
 	mux.HandleFunc("/api/sessions", s.handleSessions)
+	mux.HandleFunc("/api/usage/statistics", s.handleUsageStatistics)
 	mux.HandleFunc("/api/sessions/activate", s.handleSessionActivate)
 	mux.HandleFunc("/api/sessions/", s.handleSession)
 	mux.HandleFunc("/api/artifacts", s.handleArtifacts)
@@ -722,6 +730,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/presets/default", s.handlePresetDefault)
 	mux.HandleFunc("/api/presets/open", s.handlePresetDirectory)
 	mux.HandleFunc("/api/plugins", s.handlePlugins)
+	mux.HandleFunc("/api/mcp/servers", s.handleMCPServers)
 	mux.HandleFunc("/api/plugins/catalog", s.handlePluginCatalog)
 	mux.HandleFunc("/api/plugins/icon", s.handlePluginIcon)
 	mux.HandleFunc("/api/plugins/catalog/refresh", s.handlePluginCatalogRefresh)

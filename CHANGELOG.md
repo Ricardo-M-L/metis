@@ -7,6 +7,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.108] - 2026-10-31
+
+Full CLI and Desktop release adding local usage statistics and a read-only
+view of configured MCP servers.
+
+### Added
+
+- Show locally recorded token totals, activity, trends, session duration and
+  model usage in Desktop settings, with daily, weekly and cumulative views.
+- List configured and plugin-provided MCP servers in Desktop settings without
+  starting them or exposing connection credentials.
+- Record the provider model associated with new token-usage trace events.
+
+### Improved
+
+- Show the token count when hovering over or focusing a daily trend bar.
+- Indicate incomplete historical data: older usage may lack dates or model
+  attribution, and session durations reflect recorded completed turns only.
+- Distinguish configured MCP state from the current Desktop backend's
+  registered handles; the list does not perform a live connection check.
+
 ## [0.4.107] - 2026-10-31
 
 Full CLI and Desktop release with updated terminal status rendering, macOS
