@@ -7,6 +7,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.109] - 2026-11-03
+
+Full CLI and Desktop release with request latency diagnostics and task progress
+that stays attached to the current conversation turn. macOS packages use the
+owner-authorized ad-hoc signing channel and are not Apple notarized.
+
+### Added
+
+- Record request preparation, capability refresh, HTTP request/response and
+  first reasoning/text milestones in session traces without changing UI TTFT.
+- Correlate latency diagnostics by session, turn, logical request and retry.
+
+### Fixed
+
+- Treat a successful provider message-stop event as normal stream completion.
+- Keep diagnostic timing rows out of existing request duration calculations.
+- Stop completed checklists from reappearing during a later task, delayed
+  status polling, history replay or conversation navigation.
+- Read worker task changes from disk and publish new task boundaries before
+  waiting for a model response, while preserving unfinished work and history.
+
 ## [0.4.108] - 2026-10-31
 
 Full CLI and Desktop release adding local usage statistics and a read-only
