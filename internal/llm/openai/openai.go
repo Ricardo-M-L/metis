@@ -156,6 +156,10 @@ type OpenAI struct {
 	rateUntil   time.Time
 	rateLastHit time.Time
 	rateStrikes int
+	// Accepted output-budget spellings are local to an exact endpoint/model.
+	// The provider is shared with child agents, so negotiation is synchronized.
+	tokenBudgetMu     sync.Mutex
+	tokenBudgetFields map[chatTokenBudgetRoute]chatTokenBudgetField
 }
 
 func New(apiKey, baseURL, model string, maxTokens int, timeout time.Duration, temperature float64) *OpenAI {
@@ -696,12 +700,13 @@ type oaiImageURL struct {
 }
 
 type oaiReq struct {
-	Model       string       `json:"model"`
-	Messages    []oaiMessage `json:"messages"`
-	Tools       []oaiTool    `json:"tools,omitempty"`
-	Stream      bool         `json:"stream,omitempty"`
-	MaxTokens   int          `json:"max_tokens,omitempty"`
-	Temperature *float64     `json:"temperature,omitempty"`
+	Model               string       `json:"model"`
+	Messages            []oaiMessage `json:"messages"`
+	Tools               []oaiTool    `json:"tools,omitempty"`
+	Stream              bool         `json:"stream,omitempty"`
+	MaxTokens           int          `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int          `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64     `json:"temperature,omitempty"`
 	// ReasoningEffort is recognized by OpenAI o1 / o3 / GPT-5-style
 	// reasoning models (and forwarded by most OpenAI-compat gateways).
 	// Empty string means: don't send the field. Non-reasoning models
@@ -1124,52 +1129,60 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 	// round-trip. Mirrors CC's withRetry.ts pattern where the retry
 	// context carries the failing response forward.
 	var lastBody string
+	var lastStatus int
+	budget := o.newChatTokenBudget(req)
 
 	doOnce := func(maxTokens int) error {
-		body := toOpenAI(req, o.Model, maxTokens)
-		body.ReasoningEffort = reasoningEffort
-		body.Stream = false
-		buf, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		return transport.RetryWithBackoff(ctx, 3, 0, func() error {
-			lastBody = ""
-			if err := o.waitRateCooldown(ctx); err != nil {
-				return err
-			}
-			httpReq, err := http.NewRequestWithContext(ctx, "POST", o.BaseURL+"/chat/completions", bytes.NewReader(buf))
+		return budget.run(ctx, func() (int, string, error) {
+			body := toOpenAI(req, budget.route.model, maxTokens)
+			budget.apply(&body, maxTokens)
+			body.ReasoningEffort = reasoningEffort
+			body.Stream = false
+			buf, err := json.Marshal(body)
 			if err != nil {
-				return err
+				return 0, "", err
 			}
-			o.setHeaders(httpReq)
-			resp, err := transport.Do(o.httpClient, httpReq)
-			if err != nil {
-				return err
-			}
-			defer resp.Body.Close()
-			rb, readErr := io.ReadAll(resp.Body)
-			if readErr != nil {
-				return o.responseBodyReadError(resp, readErr)
-			}
-			if resp.StatusCode >= 400 {
-				lastBody = string(rb)
-				httpErr := chatHTTPStatusError(resp.StatusCode, lastBody, o.APIKey)
-				if transport.IsRetryableStatus(resp.StatusCode) {
-					after := transport.ParseRetryAfter(resp)
-					if resp.StatusCode == http.StatusTooManyRequests {
-						after = o.noteRateLimit(after)
-					}
-					return &transport.RetryableError{Err: httpErr, After: after}
+			err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
+				lastBody = ""
+				lastStatus = 0
+				if err := o.waitRateCooldown(ctx); err != nil {
+					return err
 				}
-				return httpErr
-			}
-			o.noteRateSuccess()
-			return json.Unmarshal(rb, &or)
+				httpReq, err := http.NewRequestWithContext(ctx, "POST", budget.route.baseURL+"/chat/completions", bytes.NewReader(buf))
+				if err != nil {
+					return err
+				}
+				o.setHeaders(httpReq)
+				resp, err := transport.Do(o.httpClient, httpReq)
+				if err != nil {
+					return err
+				}
+				lastStatus = resp.StatusCode
+				defer resp.Body.Close()
+				rb, readErr := io.ReadAll(resp.Body)
+				if readErr != nil {
+					return o.responseBodyReadError(resp, readErr)
+				}
+				if resp.StatusCode >= 400 {
+					lastBody = string(rb)
+					httpErr := chatHTTPStatusError(resp.StatusCode, lastBody, o.APIKey)
+					if transport.IsRetryableStatus(resp.StatusCode) {
+						after := transport.ParseRetryAfter(resp)
+						if resp.StatusCode == http.StatusTooManyRequests {
+							after = o.noteRateLimit(after)
+						}
+						return &transport.RetryableError{Err: httpErr, After: after}
+					}
+					return httpErr
+				}
+				o.noteRateSuccess()
+				return json.Unmarshal(rb, &or)
+			})
+			return lastStatus, lastBody, err
 		})
 	}
 
-	err = doOnce(o.MaxTokens)
+	err = doOnce(budget.amount)
 	if err != nil {
 		// CC-aligned auto-recovery for 400 context overflow: parse the
 		// input/cap figures out of the failing body, reduce max_tokens
@@ -1182,7 +1195,7 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 					fmt.Fprintf(os.Stderr, "[openai] context overflow %d/%d — retrying with max_tokens=%d\n", in, cap, adjusted)
 				}
 				lastBody = ""
-				err = doOnce(adjusted)
+				err = doOnce(min(budget.amount, adjusted))
 			} else {
 				err = fmt.Errorf("%w\n\n%s", err, transport.BuildOverflowHint(in, cap))
 			}
@@ -1212,52 +1225,60 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 
 	var resp *http.Response
 	var lastBody string
+	var lastStatus int
+	budget := o.newChatTokenBudget(req)
 
 	openOnce := func(maxTokens int) error {
-		body := toOpenAI(req, o.Model, maxTokens)
-		body.ReasoningEffort = reasoningEffort
-		body.Stream = true
-		buf, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		return transport.RetryWithBackoff(ctx, 3, 0, func() error {
-			lastBody = ""
-			if err := o.waitRateCooldown(ctx); err != nil {
-				return err
-			}
-			httpReq, err := http.NewRequestWithContext(ctx, "POST", o.BaseURL+"/chat/completions", bytes.NewReader(buf))
+		return budget.run(ctx, func() (int, string, error) {
+			body := toOpenAI(req, budget.route.model, maxTokens)
+			budget.apply(&body, maxTokens)
+			body.ReasoningEffort = reasoningEffort
+			body.Stream = true
+			buf, err := json.Marshal(body)
 			if err != nil {
-				return err
+				return 0, "", err
 			}
-			o.setHeaders(httpReq)
-			resp, err = transport.Do(o.httpClient, httpReq)
-			if err != nil {
-				return err
-			}
-			if resp.StatusCode >= 400 {
-				rb, readErr := io.ReadAll(resp.Body)
-				_ = resp.Body.Close()
-				if readErr != nil {
-					return o.responseBodyReadError(resp, readErr)
+			err = transport.RetryWithBackoff(ctx, 3, 0, func() error {
+				lastBody = ""
+				lastStatus = 0
+				if err := o.waitRateCooldown(ctx); err != nil {
+					return err
 				}
-				lastBody = string(rb)
-				httpErr := chatHTTPStatusError(resp.StatusCode, lastBody, o.APIKey)
-				if transport.IsRetryableStatus(resp.StatusCode) {
-					after := transport.ParseRetryAfter(resp)
-					if resp.StatusCode == http.StatusTooManyRequests {
-						after = o.noteRateLimit(after)
+				httpReq, err := http.NewRequestWithContext(ctx, "POST", budget.route.baseURL+"/chat/completions", bytes.NewReader(buf))
+				if err != nil {
+					return err
+				}
+				o.setHeaders(httpReq)
+				resp, err = transport.Do(o.httpClient, httpReq)
+				if err != nil {
+					return err
+				}
+				lastStatus = resp.StatusCode
+				if resp.StatusCode >= 400 {
+					rb, readErr := io.ReadAll(resp.Body)
+					_ = resp.Body.Close()
+					if readErr != nil {
+						return o.responseBodyReadError(resp, readErr)
 					}
-					return &transport.RetryableError{Err: httpErr, After: after}
+					lastBody = string(rb)
+					httpErr := chatHTTPStatusError(resp.StatusCode, lastBody, o.APIKey)
+					if transport.IsRetryableStatus(resp.StatusCode) {
+						after := transport.ParseRetryAfter(resp)
+						if resp.StatusCode == http.StatusTooManyRequests {
+							after = o.noteRateLimit(after)
+						}
+						return &transport.RetryableError{Err: httpErr, After: after}
+					}
+					return httpErr
 				}
-				return httpErr
-			}
-			o.noteRateSuccess()
-			return nil
+				o.noteRateSuccess()
+				return nil
+			})
+			return lastStatus, lastBody, err
 		})
 	}
 
-	err = openOnce(o.MaxTokens)
+	err = openOnce(budget.amount)
 	if err != nil {
 		if in, cap, ok := transport.ParseContextOverflow(lastBody); ok {
 			if adjusted, retryOK := transport.ComputeAdjustedMaxTokens(in, cap); retryOK {
@@ -1265,7 +1286,7 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 					fmt.Fprintf(os.Stderr, "[openai stream] context overflow %d/%d — retrying with max_tokens=%d\n", in, cap, adjusted)
 				}
 				lastBody = ""
-				err = openOnce(adjusted)
+				err = openOnce(min(budget.amount, adjusted))
 			} else {
 				err = fmt.Errorf("%w\n\n%s", err, transport.BuildOverflowHint(in, cap))
 			}
