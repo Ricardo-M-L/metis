@@ -7,6 +7,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.110] - 2026-11-03
+
+### Fixed
+
+- Adapt OpenAI Chat output token limit parameters to the selected model and
+  provider, including compatibility fallback for unsupported parameters.
+
 ## [0.4.109] - 2026-11-03
 
 Full CLI and Desktop release with request latency diagnostics and task progress
