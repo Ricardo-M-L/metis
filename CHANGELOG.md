@@ -7,6 +7,46 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.108] - 2026-10-31
+
+Full CLI and Desktop release adding local usage statistics and a read-only
+view of configured MCP servers.
+
+### Added
+
+- Show locally recorded token totals, activity, trends, session duration and
+  model usage in Desktop settings, with daily, weekly and cumulative views.
+- List configured and plugin-provided MCP servers in Desktop settings without
+  starting them or exposing connection credentials.
+- Record the provider model associated with new token-usage trace events.
+
+### Improved
+
+- Show the token count when hovering over or focusing a daily trend bar.
+- Indicate incomplete historical data: older usage may lack dates or model
+  attribution, and session durations reflect recorded completed turns only.
+- Distinguish configured MCP state from the current Desktop backend's
+  registered handles; the list does not perform a live connection check.
+
+## [0.4.107] - 2026-10-31
+
+Full CLI and Desktop release with updated terminal status rendering, macOS
+window layout, and parent-owned subagent and plugin improvements.
+
+### Improved
+
+- Integrate the macOS title bar into the Desktop sidebar and navigation while
+  preserving native window controls, fullscreen and theme support.
+- Show clear running tool status, preserve more path detail when space allows,
+  and avoid repeating task confirmations in terminal transcripts.
+- Persist parent-owned subagent conversations and validate plugin manifests.
+
+### Fixed
+
+- Restore themed, rounded macOS Dock icon tiles and preserve valid sidebar
+  session activity times.
+- Remove unnecessary divider lines from the macOS Desktop navigation row.
+
 ## [0.4.106] - 2026-10-29
 
 Full CLI and Desktop release with consistent terminal layout and colors,

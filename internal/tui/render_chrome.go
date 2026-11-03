@@ -335,8 +335,19 @@ func renderSpinnerStatus(m *Model) string {
 	// walks one row short and leaves stale debris on screen (the "g" /
 	// "1." fragments in the user's screenshot, which came from this
 	// exact row during Compacting).
-	var mainRow strings.Builder
-	mainRow.WriteString(styleAccent.Render("  " + frame + " "))
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	prefix := "  " + frame + " "
+	if width < 20 {
+		prefix = frame + " "
+	}
+	if width < 8 {
+		prefix = ""
+	}
+	available := max(0, width-xansi.StringWidth(prefix))
+	var label strings.Builder
 	switch {
 	case m.spinnerOverride != "":
 		// Compaction (or any other long-running blocking phase) — the
@@ -347,22 +358,25 @@ func renderSpinnerStatus(m *Model) string {
 		// EventCompactionStart) is the primary visual cue; an inline
 		// token counter on top of that is redundant (user feedback
 		// 2026-05-15).
-		mainRow.WriteString(shimmerStyle(elapsed).Render(m.spinnerOverride))
+		label.WriteString(shimmerStyle(elapsed).Render(spinnerSingleLine(m.spinnerOverride)))
 	case m.spinnerSub != "":
-		mainRow.WriteString(toolUseFlashStyle(elapsed).Render(m.spinnerVerb))
-		mainRow.WriteString(styleDim.Render(" · " + truncate(m.spinnerSub, 35)))
+		label.WriteString(toolUseFlashStyle(elapsed).Render(spinnerSingleLine(m.spinnerVerb)))
+		label.WriteString(styleDim.Render(" · " + spinnerSingleLine(m.spinnerSub)))
 	default:
-		mainRow.WriteString(shimmerStyle(elapsed).Render(m.spinnerVerb))
+		label.WriteString(shimmerStyle(elapsed).Render(spinnerSingleLine(m.spinnerVerb)))
 	}
-	if len(parts) > 0 {
-		// Status info (elapsed · tokens · thought) — readable in dim,
-		// not buried in muted grey. Parens themselves stay muted as
-		// punctuation so the eye reads through them.
-		mainRow.WriteString(styleMuted.Render(" ("))
-		mainRow.WriteString(styleDim.Render(strings.Join(parts, " · ")))
-		mainRow.WriteString(styleMuted.Render(")"))
-	}
-	s.WriteString(clampLine(mainRow.String(), m.width))
+	// Reserve the clock/counter before fitting the task text: clamping the
+	// complete row used to discard both when a path or task name was long.
+	// A long label also gets a useful share of a narrow pane before optional
+	// status words; compacting "↑ 192 tokens" to "↑192" preserves its value.
+	labelReserve := min(24, width/2, xansi.StringWidth(label.String()))
+	status := spinnerStatusWithinWidth(parts, max(0, available-labelReserve), available)
+	labelWidth := max(0, available-xansi.StringWidth(status))
+	// spinnerSub can be a path, shell command, query, or Agent description.
+	// Do not infer a filesystem path and remove a legitimate prefix. Keeping
+	// both ends preserves the action and filename/task ending at any width.
+	mainRow := styleAccent.Render(prefix) + truncateMiddleCells(label.String(), labelWidth) + status
+	s.WriteString(clampLine(mainRow, width))
 	s.WriteString("\n")
 	// Compaction extras — match claude-code's image #19 layout: spinner
 	// row + progress bar with % + sub-line announcing the auto-window
@@ -381,6 +395,57 @@ func renderSpinnerStatus(m *Model) string {
 		s.WriteString(renderDreamingExtras(m))
 	}
 	return s.String()
+}
+
+// A live tool argument may contain a heredoc, tabs, or terminal controls.
+// Flatten only its presentation so this item remains exactly one physical row.
+func spinnerSingleLine(value string) string {
+	return strings.TrimSpace(strings.ReplaceAll(toolArgsDisplayText(value), "\n", " "))
+}
+
+func spinnerStatusWithinWidth(parts []string, preferred, available int) string {
+	if len(parts) == 0 || available <= 0 {
+		return ""
+	}
+	render := func(values []string) string {
+		return styleMuted.Render(" (") + styleDim.Render(strings.Join(values, " · ")) + styleMuted.Render(")")
+	}
+	full := render(parts)
+	if xansi.StringWidth(full) <= preferred {
+		return full
+	}
+	// Thought latency is supplementary; elapsed and the active token count
+	// remain visible before we spend the remaining cells on task text.
+	essential := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if !strings.HasPrefix(part, "thought for ") {
+			essential = append(essential, part)
+		}
+	}
+	full = render(essential)
+	if xansi.StringWidth(full) <= preferred {
+		return full
+	}
+	compact := append([]string(nil), essential...)
+	for i := 1; i < len(compact); i++ {
+		compact[i] = strings.TrimSuffix(compact[i], " tokens")
+		compact[i] = strings.TrimSuffix(compact[i], " summary")
+		compact[i] = strings.ReplaceAll(compact[i], " ", "")
+	}
+	short := render(compact)
+	if xansi.StringWidth(short) <= available {
+		return short
+	}
+	// Very small panes can still show "43s ↑192" without punctuation. Only
+	// when even that cannot fit do we fall back to the clock alone.
+	short = " " + strings.Join(compact, " ")
+	if xansi.StringWidth(short) <= available {
+		return styleDim.Render(short)
+	}
+	if clock := " " + parts[0]; xansi.StringWidth(clock) <= available {
+		return styleDim.Render(clock)
+	}
+	return styleDim.Render(xansi.Truncate(parts[0], available, "…"))
 }
 
 // renderDreamingExtras draws the single sub-row that sits under the

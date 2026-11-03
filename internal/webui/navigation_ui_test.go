@@ -98,7 +98,7 @@ function setup() {
  const elements=new Map(), get=id=>{if(!elements.has(id))elements.set(id,new Element());return elements.get(id);};
  const listeners=new Map(), app=new Element(), main=new Element(), sidebar=new Element();
  main.classes.add('trace-mode');
- const tabs=['general','appearance','providers','presets','plugins','computer-use','routing','config'].map(tab=>{const item=new Element();item.dataset.settingsTab=tab;return item;});
+ const tabs=['general','appearance','providers','presets','plugins','mcp','computer-use','routing','config','usage'].map(tab=>{const item=new Element();item.dataset.settingsTab=tab;return item;});
  const modal=new Element();modal.hidden=true;
  const c={console,Promise,Map,Set,setTimeout,clearTimeout,currentSessionId:'A',currentView:'trace',settingsTab:'general',settingsCache:{settings:[]},
   pendingSessionId:null,selectionGeneration:0,artifactState:{active:null,previewSequence:0,authoritativeIDs:new Set(),liveRevisions:new Map()},sessions:[{id:'A',title:'Session A'}],
@@ -131,6 +131,14 @@ function setup() {
  return {c,get,app,main,tabs,modal,dispatch};
 }
 (async()=>{
+ // MCP is a first-class settings route and participates in back/forward.
+ {
+  const {c,app,tabs}=setup(),nav=c.metisNavigation;
+  await c.openSettings('mcp');assert.equal(app.dataset.page,'settings');assert.equal(c.settingsTab,'mcp');
+  assert(tabs.find(t=>t.dataset.settingsTab==='mcp').classes.has('active'));
+  await c.showSettingsTab('usage');assert.equal(c.settingsTab,'usage');
+  await nav.back();assert.equal(c.settingsTab,'mcp');await nav.forward();assert.equal(c.settingsTab,'usage');
+ }
  // Real settings functions route subpages and return to the original view,
  // retaining the exact composer/transcript nodes while a stream continues.
  {

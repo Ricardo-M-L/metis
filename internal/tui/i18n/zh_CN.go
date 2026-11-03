@@ -39,6 +39,7 @@ var zhCN = map[string]string{
 	"verb.compiling":  "组织中",
 	"verb.brewing":    "酝酿中",
 	"verb.simmering":  "梳理中",
+	"tool.running":    "运行中",
 
 	// Errors / info rows
 	"err.network":           "网络错误",

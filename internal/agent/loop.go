@@ -1967,6 +1967,16 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
 		}
+		// Snapshot before dispatch: providers encode their own model, not
+		// necessarily req.Model. An in-place change during a stream cannot be
+		// safely attributed, but must not affect request or billing behavior.
+		usageModelSnapshot := func() string {
+			if provider == nil {
+				return ""
+			}
+			return strings.TrimSpace(provider.ModelID())
+		}
+		usageModel := usageModelSnapshot()
 		stream, err := openStreamWithRecovery(recoveryCtx, provider, req, recoverySession)
 		if err != nil {
 			// Classify before deciding the recovery path. Mirrors
@@ -1989,6 +1999,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					if provider == nil {
 						provider = l.Provider
 					}
+					usageModel = usageModelSnapshot()
 					stream, err = openStreamWithRecovery(recoveryCtx, provider, req, recoverySession)
 				}
 			case RecoveryFailUser:
@@ -2005,6 +2016,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				// that return a plain transient error still retain this one
 				// loop-level recovery attempt.
 				if recoverySession == nil && !transport.IsRetryExhausted(err) {
+					usageModel = usageModelSnapshot()
 					stream, err = openStreamWithRecovery(recoveryCtx, provider, req, recoverySession)
 				}
 			}
@@ -2023,9 +2035,19 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					Fingerprint: FingerprintRequest(req),
 				})
 			}
+			observedModel := usageModelSnapshot()
+			attributedModel := usageModel
+			if observedModel != usageModel {
+				// Identity changed while the attempt was in flight. Preserve the
+				// tokens, but do not assign them to either model by guessing.
+				attributedModel = ""
+			}
+			// The next recovery attempt starts after this callback returns.
+			usageModel = observedModel
 			emit(ctx, out, Event{
 				Kind: EventTokens, InputTokens: reported.in, OutputTokens: reported.out,
 				CacheCreationInputTokens: reported.cacheCreate, CacheReadInputTokens: reported.cacheRead,
+				UsageModel: attributedModel,
 			})
 			// The physical ledger is the sole writer for observed requests. A
 			// second legacy spend entry would become an uncorrectable floor after

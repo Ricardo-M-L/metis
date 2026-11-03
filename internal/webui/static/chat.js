@@ -6869,6 +6869,8 @@ async function initTheme() {
 
 function renderSettingsTab() {
   const content = document.getElementById('settingsContent');
+  if (settingsTab === 'usage') { renderUsageStatistics(); return; }
+  if (settingsTab === 'mcp') { renderMcpServers(); return; }
   if (!settingsCache) {
     content.innerHTML = '<p style="color:var(--text-secondary);margin-top:12px;">' + uiText('Loading settings...', '正在加载设置…') + '</p>';
     return;

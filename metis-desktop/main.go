@@ -42,11 +42,13 @@ func desktopOptions(app *App) *options.App {
 		MinWidth:  800,
 		MinHeight: 600,
 		Frameless: false,
-		// Wails v2 defaults the native macOS zoom flag to false when Mac is
-		// nil, which disables the green traffic-light button even though the
-		// window itself remains resizable. Keep the native maximize affordance
-		// explicit on macOS while retaining the cross-platform defaults.
-		Mac: &mac.Options{DisableZoom: false},
+		// Keep native traffic lights and resizing while the macOS content
+		// extends behind the transparent titlebar. Other platforms retain
+		// their native framed window and receive no overlay layout inset.
+		Mac: &mac.Options{
+			TitleBar:    mac.TitleBarHiddenInset(),
+			DisableZoom: false,
+		},
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},

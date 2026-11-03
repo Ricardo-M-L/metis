@@ -743,6 +743,9 @@ func (a *TraceAdapter) appendLocked(origin traceOrigin, kind string, ev agent.Ev
 	if kind == "context" {
 		te.Source = agent.NormalizeContextSource(ev.Source)
 	}
+	if kind == "tokens" {
+		te.UsageModel = ev.UsageModel
+	}
 	if origin.subAgent != "" && x.ParentID == "" {
 		te.SubAgentOf = origin.subAgent
 	}

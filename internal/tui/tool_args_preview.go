@@ -15,15 +15,12 @@ import (
 // in-flight tool args. Strategy:
 //
 //   - look for the first "key":"value" pair
-//   - if found, render: tool · value (truncated to maxArgsPreviewLen)
+//   - if found, render: tool · value
 //   - if not yet found (still typing the key, or value is non-string),
 //     fall back to the raw chunk so the user sees *something* moving
 //
-// Stays cheap (one allocation, single pass) so we can call it on
-// every chunk without worrying about render cost.
+// Bounds the displayed preview while leaving layout to the status renderer.
 func previewStreamingArgs(toolName string, raw []byte) string {
-	const maxArgsPreviewLen = 48
-
 	if len(raw) == 0 {
 		return toolName
 	}
@@ -32,14 +29,14 @@ func previewStreamingArgs(toolName string, raw []byte) string {
 	// Try: first quoted string after the first colon. That's the
 	// most common shape: {"path":"X", "key":"Y"} → first value X.
 	if val, ok := extractFirstStringValue(str); ok {
-		val = trimSnippet(val, maxArgsPreviewLen)
+		val = streamingArgsSnippet(val)
 		if val == "" {
 			return toolName
 		}
 		if toolName == "" {
-			return val + "…"
+			return val
 		}
-		return toolName + " · " + val + "…"
+		return toolName + " · " + val
 	}
 
 	// Fallback: whatever's typed so far, with the leading `{` and
@@ -48,14 +45,22 @@ func previewStreamingArgs(toolName string, raw []byte) string {
 	preview := strings.TrimLeftFunc(str, func(r rune) bool {
 		return r == '{' || unicode.IsSpace(r)
 	})
-	preview = trimSnippet(preview, maxArgsPreviewLen)
+	preview = streamingArgsSnippet(preview)
 	if preview == "" {
 		return toolName
 	}
 	if toolName == "" {
-		return preview + "…"
+		return preview
 	}
-	return toolName + " · " + preview + "…"
+	return toolName + " · " + preview
+}
+
+// Leave ordinary paths and descriptions intact for the cell-aware status
+// renderer. This defensive cap only bounds pathological streamed arguments;
+// an ellipsis means content was actually omitted, not merely still arriving.
+func streamingArgsSnippet(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(toolArgsDisplayText(value), "\n", " "))
+	return truncateMiddleCells(value, toolArgsPreviewMaxRunes)
 }
 
 // extractFirstStringValue scans s for the first `"key":"value"`
@@ -96,18 +101,4 @@ func extractFirstStringValue(s string) (string, bool) {
 		return rest, true
 	}
 	return rest[:end], true
-}
-
-// trimSnippet truncates s to max runes, returning a trimmed copy. If
-// already shorter, returns s unchanged. Trims trailing whitespace
-// after truncation so cuts don't leave "/foo " hanging.
-func trimSnippet(s string, max int) string {
-	if max <= 0 {
-		return ""
-	}
-	runes := []rune(s)
-	if len(runes) <= max {
-		return strings.TrimRightFunc(s, unicode.IsSpace)
-	}
-	return strings.TrimRightFunc(string(runes[:max]), unicode.IsSpace)
 }

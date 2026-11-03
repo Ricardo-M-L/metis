@@ -39,6 +39,7 @@ var en = map[string]string{
 	"verb.compiling":  "Compiling",
 	"verb.brewing":    "Brewing",
 	"verb.simmering":  "Simmering",
+	"tool.running":    "running",
 
 	// Errors / info rows
 	"err.network":           "network error",

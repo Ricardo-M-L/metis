@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	xansi "github.com/charmbracelet/x/ansi"
+
+	"github.com/Ricardo-M-L/metis/internal/tui/i18n"
 )
 
 func TestBashDescriptionDistinguishesCommandsWithoutHidingDetails(t *testing.T) {
@@ -83,12 +85,13 @@ func TestBashDescriptionStaysInOneTerminalRow(t *testing.T) {
 	}
 
 	input["description"] = strings.Repeat("核对👩‍💻历史记录", 100)
+	headerWidth := xansi.StringWidth("  " + glyphBullet + " bash() · " + i18n.T("tool.running"))
 	for _, width := range []int{24, 40, 80, 400} {
 		out = stripANSI(renderToolEventAtWidth(te, false, width))
 		if strings.Count(out, "\n") != 1 {
 			t.Fatalf("long description introduced extra rows: %q", out)
 		}
-		if cells := xansi.StringWidth(strings.TrimSuffix(out, "\n")); cells > min(width, toolArgsPreviewMaxRunes+12) {
+		if cells := xansi.StringWidth(strings.TrimSuffix(out, "\n")); cells > min(width, toolArgsPreviewMaxRunes+headerWidth) {
 			t.Errorf("description exceeds viewport or preview cap at width %d: %d cells", width, cells)
 		}
 	}

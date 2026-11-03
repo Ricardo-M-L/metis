@@ -44,13 +44,33 @@ func TestPreviewStreamingArgs_EmptyReturnsToolName(t *testing.T) {
 }
 
 func TestPreviewStreamingArgs_LongValueTruncated(t *testing.T) {
-	long := strings.Repeat("x", 200)
+	long := "/workspace/" + strings.Repeat("长目录/", 200) + "compaction.go"
 	got := previewStreamingArgs("Read", []byte(`{"path":"`+long+`"}`))
-	if len(got) > 80 {
-		t.Errorf("preview should stay under 80 chars; got %d (%q)", len(got), got)
+	if len([]rune(got)) > toolArgsPreviewMaxRunes+len([]rune("Read · ")) {
+		t.Errorf("preview exceeded defensive bound: %q", got)
 	}
-	if !strings.Contains(got, "…") {
-		t.Errorf("truncated preview should end with ellipsis; got %q", got)
+	if !strings.Contains(got, "…") || !strings.HasSuffix(got, "compaction.go") {
+		t.Errorf("long preview must signal omission and retain filename; got %q", got)
+	}
+}
+
+func TestPreviewStreamingArgs_PreservesOrdinaryPathWithoutFalseEllipsis(t *testing.T) {
+	path := "/Users/ricardo/Documents/公司学习文件/我自己的agent的cli/metis/internal/agent/compaction.go"
+	for _, raw := range []string{`{"path":"` + path + `"}`, `{"path":"` + path} {
+		got := previewStreamingArgs("Read", []byte(raw))
+		if got != "Read · "+path {
+			t.Errorf("ordinary streamed path must reach the renderer intact: %q", got)
+		}
+	}
+}
+
+func TestPreviewStreamingArgs_DoesNotInventTruncationForShortValues(t *testing.T) {
+	for _, tool := range []string{"Bash", ""} {
+		for _, raw := range []string{`{"command":"git stat`, `{"file_pa`, `{"duration_ms":5000`} {
+			if got := previewStreamingArgs(tool, []byte(raw)); strings.Contains(got, "…") {
+				t.Errorf("untruncated partial args should not imply hidden content: %q", got)
+			}
+		}
 	}
 }
 
@@ -75,9 +95,9 @@ func TestExtractFirstStringValue_NoColon(t *testing.T) {
 	}
 }
 
-func TestTrimSnippet_TrimsTrailingWS(t *testing.T) {
-	got := trimSnippet("hello    ", 100)
-	if got != "hello" {
-		t.Errorf("trailing whitespace should be trimmed; got %q", got)
+func TestPreviewStreamingArgs_KeepsStatusSingleLineWithoutChangingQuotedSpaces(t *testing.T) {
+	got := previewStreamingArgs("Bash", []byte("{\"command\":\"echo 'a  b'\nnext\x1b[31m"))
+	if got != "Bash · echo 'a  b' next" {
+		t.Errorf("preview must remove terminal controls but preserve argument spacing: %q", got)
 	}
 }

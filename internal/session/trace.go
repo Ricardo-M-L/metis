@@ -45,6 +45,7 @@ type TraceEvent struct {
 	ParentID   string    `json:"parent_id,omitempty"` // tool_use_id of the event this nests under
 	ToolName   string    `json:"tool_name,omitempty"`
 	ToolUseID  string    `json:"tool_use_id,omitempty"`
+	UsageModel string    `json:"usage_model,omitempty"` // provider model for token usage only; absent for older traces
 	Text       string    `json:"text,omitempty"`
 	Source     string    `json:"source,omitempty"` // fixed context provenance category; absent in legacy rows
 	IsError    bool      `json:"is_error,omitempty"`

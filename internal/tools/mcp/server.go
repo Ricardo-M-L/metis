@@ -482,6 +482,24 @@ func (s *Server) IsSpawned() bool {
 	return s.client != nil
 }
 
+// SnapshotStatus reports local lifecycle state without spawning, reconnecting
+// or probing the server. Registered indicates an initialized client handle,
+// not a remote health guarantee. Error details are intentionally not exposed.
+func (s *Server) SnapshotStatus() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return "stopped"
+	}
+	if s.client != nil {
+		return "registered"
+	}
+	if s.spawn != nil && s.spawnErr == nil {
+		return "lazy"
+	}
+	return "stopped"
+}
+
 // IsManagedComputerUseConnected reports whether this live server was marked
 // managed only after the executable and handshake were verified. A matching
 // server name by itself is not sufficient to enable native input controls.

@@ -79,6 +79,67 @@ func (r *PluginRegistry) All() []*Plugin {
 	return out
 }
 
+// PluginMCPStatus describes a configured plugin server without exposing its
+// launch configuration. Registered means a client was initialized in this
+// process, not that an active health check succeeded.
+type PluginMCPStatus struct {
+	Name, Transport, Status string
+	Enabled                 bool
+	ToolCount               int
+}
+
+// MCPServerStatuses holds the registry lock while reading mutable MCP handles.
+// It never starts a process or sends a network request.
+func (r *PluginRegistry) MCPServerStatuses() []PluginMCPStatus {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var result []PluginMCPStatus
+	for _, p := range r.plugins {
+		if p == nil {
+			continue
+		}
+		specs := append([]pubplugin.MCPServerSpec(nil), p.Manifest.MCPServers...)
+		if p.Manifest.MCPServer != nil {
+			specs = append([]pubplugin.MCPServerSpec{*p.Manifest.MCPServer}, specs...)
+		}
+		for _, spec := range specs {
+			name := spec.Name
+			if name == "" {
+				name = "default"
+			}
+			transport := "unknown"
+			if spec.URL != "" {
+				transport = "http"
+			} else if spec.Command != "" {
+				transport = "stdio"
+			}
+			status := "stopped"
+			if spec.Disabled {
+				status = "disabled"
+			}
+			view := PluginMCPStatus{Name: p.Manifest.Name + " / " + name, Transport: transport, Status: status, Enabled: !spec.Disabled}
+			want := pluginMCPServerName(p.Manifest.Name, name)
+			servers := p.MCPServers
+			if len(servers) == 0 && p.MCP != nil {
+				servers = []*mcptools.Server{p.MCP}
+			}
+			for _, server := range servers {
+				if server == nil || server.Name() != want {
+					continue
+				}
+				view.ToolCount = len(server.Tools())
+				view.Status = server.SnapshotStatus()
+				break
+			}
+			result = append(result, view)
+		}
+	}
+	return result
+}
+
 // SkillSources returns each plugin wrapped as a skills.PluginSkillSource
 // so the multi-source skill loader can pick them up at the "plugin" layer.
 func (r *PluginRegistry) SkillSources() []skills.PluginSkillSource {
