@@ -48,7 +48,7 @@ function fixture(lang = 'en') {
     'handleSubagentLifecycle','handleThinkingDelta','handleTokensEvent','handleContextEvent',
     'handleCompactionStart','handleCompactionProgress','handleCompactionEnd','handleAskUser',
     'handleRedactedThinking','handlePermissionRequest','handleInteractionResolved','endStreamingMessage',
-    'handleBackgroundContinuation','clearTodoPlan','resumeAutoScroll','closeMismatchedSubAgentDetails',
+    'handleBackgroundContinuation','clearTodoPlan','startTodoPlanTurn','rejectTodoPlanSubmission','uncertainTodoPlanSubmission','resumeAutoScroll','closeMismatchedSubAgentDetails',
     'updateSendBtn','loadSessionStatsbar','drainQueuedTurns']) c[key] = noop;
   vm.createContext(c);
   vm.runInContext(extract('function connectEvents()', 'function handleBackgroundContinuation(d)'),c);

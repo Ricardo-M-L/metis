@@ -269,7 +269,7 @@ function context(){
   backgroundContinuationGenerations:new Map(),backgroundContinuationGeneration:0,runningTurnIncompleteReason:'',runningTurnNeedsHistorySync:false,
   streamedTextThisTurn:false,messages:[],workspaceSelectionPending:false,workspaceCanRun:true,
   isWorkspaceSelectionPending:()=>c.workspaceSelectionPending,selectedWorkspaceCanRun:()=>c.workspaceCanRun,applyLayout(){},
-  clearTodoPlan(){},resumeAutoScroll(){},beginUserTurn(){},finishUserTurn(){},renderTodoPlan(){},renderSessions(){},
+  clearTodoPlan(){},startTodoPlanTurn(){},rejectTodoPlanSubmission(){},uncertainTodoPlanSubmission(){},resumeAutoScroll(){},beginUserTurn(){},finishUserTurn(){},renderTodoPlan(){},renderSessions(){},
   renderAttachments(){},autoResize(){},closeCommandMenu(){},executeComposerCommand:async()=>false,
   renderQueuedTurns(){if(typeof c.saveSessionQueue==='function')c.saveSessionQueue();},
   addMessage:(role,text)=>added.push({session:c.currentSessionId,role,text}),

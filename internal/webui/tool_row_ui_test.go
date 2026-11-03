@@ -322,7 +322,7 @@ context = {
   isTodoWriteTool: () => false, isPlanningTool: () => false,
   renderSearchCard() {}, renderFileEditCard() {},
   autoScroll() {}, finishThinking() {}, endStreamingMessage() {}, endTurnStatus() {}, showTurnStatsLine() {}, beginTurnStatus() {}, refreshTurnStatusLanguage() {}, refreshTurnMetricsLanguage() {},
-  updateEmptyLayout() {}, resumeAutoScroll() {}, restoreTodoPlanFromHistory() {}, loadSessionFiles() {},
+  updateEmptyLayout() {}, resumeAutoScroll() {}, restoreTodoPlanFromHistory() {}, scheduleTodoPlanHistoryRestore() {}, loadSessionFiles() {},
   messageActionsMarkup: () => '', formatContent: value => String(value),
   showToast: message => toasts.push(String(message)),
   turnStartMs: 0, streaming: false, toolDetails: {}, selectedToolId: null, detailTab: 'summary',

@@ -28,6 +28,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/google/uuid"
 )
 
@@ -61,6 +62,8 @@ type TraceEvent struct {
 	// later response, so they cannot safely pair starts with results on their
 	// own. Empty preserves compatibility with traces written before v0.4.34.
 	TraceCallID string `json:"trace_call_id,omitempty"`
+	// Timing rows are appended at Run exit, with TS set to occurrence time.
+	RequestTiming *transport.TimingRecord `json:"request_timing,omitempty"`
 }
 
 // traceWriter pairs a session's buffered writer with its underlying
@@ -68,6 +71,12 @@ type TraceEvent struct {
 type traceWriter struct {
 	w *bufio.Writer
 	f *os.File
+}
+
+type traceInputBoundary struct {
+	turn int
+	at   time.Time
+	kind string
 }
 
 // TraceStore appends TraceEvents to JSONL and serves searches over an
@@ -84,6 +93,7 @@ type TraceStore struct {
 	ids            map[string]struct{}            // event ID -> exists (ingest dedup)
 	turned         map[string]int                 // sessionID -> current turn index
 	diskReadOffset map[string]int64               // bytes imported by Refresh from another process
+	inputBoundary  map[string]traceInputBoundary  // latest root task's first explicit input
 }
 
 // NewTraceStore opens (lazily creating) the trace directory. Existing
@@ -102,6 +112,7 @@ func NewTraceStore(dir string) (*TraceStore, error) {
 		ids:            make(map[string]struct{}),
 		turned:         make(map[string]int),
 		diskReadOffset: make(map[string]int64),
+		inputBoundary:  make(map[string]traceInputBoundary),
 	}, nil
 }
 
@@ -262,6 +273,19 @@ func (s *TraceStore) ingest(sid string, ev *TraceEvent) {
 		return
 	}
 	s.ids[ev.ID] = struct{}{}
+	// A late peer/context injection in an existing turn is not a new task.
+	// Keep the first root input for the highest turn, preferring its human
+	// anchor when an earlier automatic context row exists in that same turn.
+	if ev.Turn > 0 && !ev.TS.IsZero() && ev.SubAgentOf == "" && ev.ParentID == "" &&
+		ev.TraceParentInvocationID == "" && (ev.Kind == "user" || ev.Kind == "context") {
+		if s.inputBoundary == nil {
+			s.inputBoundary = make(map[string]traceInputBoundary)
+		}
+		current := s.inputBoundary[sid]
+		if ev.Turn > current.turn || ev.Turn == current.turn && ev.Kind == "user" && current.kind != "user" {
+			s.inputBoundary[sid] = traceInputBoundary{turn: ev.Turn, at: ev.TS, kind: ev.Kind}
+		}
+	}
 	seen := make(map[string]struct{}, 8)
 	for _, tok := range tokenize(ev.Text + " " + ev.ToolName + " " + ev.Kind) {
 		if _, dup := seen[tok]; dup {
@@ -357,6 +381,21 @@ func (s *TraceStore) CurrentTurn(sid string) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.turned[sid]
+}
+
+// LatestInputBoundary returns the latest root task's first explicit user or
+// automatic input. It does not treat internal context or child events as a new
+// task. The projection is maintained at ingest time, so polling does not copy
+// or rescan a long session. Call Refresh first when another process writes it.
+func (s *TraceStore) LatestInputBoundary(sid string) (int, time.Time) {
+	if !validTraceSessionID(sid) {
+		return 0, time.Time{}
+	}
+	s.ensureLoaded(sid)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	boundary := s.inputBoundary[sid]
+	return boundary.turn, boundary.at
 }
 
 // Events returns all trace events for a session, in order.
@@ -677,6 +716,23 @@ func (s *TraceStore) Sync() error {
 	return nil
 }
 
+// FlushSession publishes buffered events to readers in other processes without
+// an fsync. Explicit input anchors use this before a possibly long model wait;
+// normal terminal boundaries retain SyncSession's stronger durability.
+func (s *TraceStore) FlushSession(sessionID string) error {
+	if !validTraceSessionID(sessionID) {
+		return fmt.Errorf("trace: invalid session_id %q", sessionID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w := s.writers[sessionID]; w != nil {
+		if err := w.w.Flush(); err != nil {
+			return fmt.Errorf("trace: flush %s: %w", sessionID, err)
+		}
+	}
+	return nil
+}
+
 // SyncSession flushes buffered events for one session while keeping its append
 // file open. Terminal turn events call this so short traces do not
 // depend on reaching the periodic 200-event flush threshold or process-wide
@@ -735,6 +791,7 @@ func (s *TraceStore) Delete(sessionID string) error {
 	delete(s.seq, sessionID)
 	delete(s.events, sessionID)
 	delete(s.turned, sessionID)
+	delete(s.inputBoundary, sessionID)
 
 	path := filepath.Join(s.dir, sessionID+".jsonl")
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {

@@ -33,7 +33,7 @@ function context(){
   sessions:[{id:'A'},{id:'B'}],pendingAsk:null,attachments:[],desktopPreferences:{busyEnter:'queue'},resumeSessionGeneration:0,
   backgroundContinuationGenerations:new Map(),backgroundContinuationGeneration:0,runningTurnIncompleteReason:'',runningTurnNeedsHistorySync:false,
   streamedTextThisTurn:false,messages:[],stopRequestPending:false,
-  clearTodoPlan(){},resumeAutoScroll(){},beginUserTurn(){},finishUserTurn(){},syncTurnControls(){},updateSendBtn(){},
+  clearTodoPlan(){}, startTodoPlanTurn() {}, rejectTodoPlanSubmission() {}, uncertainTodoPlanSubmission() {},resumeAutoScroll(){},beginUserTurn(){},finishUserTurn(){},syncTurnControls(){},updateSendBtn(){},
   renderSessions(){},renderAttachments(){},autoResize(){},closeCommandMenu(){},executeComposerCommand:async()=>false,
   renderQueuedTurns(){if(typeof c.saveSessionQueue==='function')c.saveSessionQueue();},
   addMessage:(role,text)=>added.push({session:c.currentSessionId,role,text}),

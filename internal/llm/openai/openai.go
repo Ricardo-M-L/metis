@@ -194,7 +194,9 @@ func newOpenAIRequestSlots() chan struct{} {
 	return make(chan struct{}, limit)
 }
 
-func (o *OpenAI) acquireRequestSlot(ctx context.Context) (func(), error) {
+func (o *OpenAI) acquireRequestSlot(ctx context.Context) (release func(), err error) {
+	transport.RecordTiming(ctx, "request_slot_wait_start")
+	defer func() { transport.RecordTimingResult(ctx, "request_slot_wait_end", transport.TimingOutcome(err), 0) }()
 	if o.requestSlots == nil {
 		return func() {}, nil
 	}
@@ -207,7 +209,9 @@ func (o *OpenAI) acquireRequestSlot(ctx context.Context) (func(), error) {
 	}
 }
 
-func (o *OpenAI) waitRateCooldown(ctx context.Context) error {
+func (o *OpenAI) waitRateCooldown(ctx context.Context) (err error) {
+	transport.RecordTiming(ctx, "rate_cooldown_wait_start")
+	defer func() { transport.RecordTimingResult(ctx, "rate_cooldown_wait_end", transport.TimingOutcome(err), 0) }()
 	for {
 		o.rateMu.Lock()
 		remaining := time.Until(o.rateUntil)
@@ -1139,7 +1143,7 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 				return err
 			}
 			o.setHeaders(httpReq)
-			resp, err := o.httpClient.Do(httpReq)
+			resp, err := transport.Do(o.httpClient, httpReq)
 			if err != nil {
 				return err
 			}
@@ -1227,7 +1231,7 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) 
 				return err
 			}
 			o.setHeaders(httpReq)
-			resp, err = o.httpClient.Do(httpReq)
+			resp, err = transport.Do(o.httpClient, httpReq)
 			if err != nil {
 				return err
 			}

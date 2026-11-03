@@ -1591,6 +1591,12 @@ func (l *Loop) IterIdx() int {
 //  8. Append assistant + tool_results, emit TurnEnd
 //  9. Loop-detect / max-iter / grace-call checks
 func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
+	ctx, flushTiming := beginRunTiming(ctx)
+	defer flushTiming()
+	// Preparation begins at Run entry, not the UI submission boundary. The
+	// first logical request also owns initial memory/capability preparation.
+	ctx = transport.BeginTimingRequest(ctx)
+	transport.RecordTiming(ctx, "run_start")
 	if l.DurablePeer != nil {
 		ctx = WithAgentName(ctx, l.DurablePeer.Recipient)
 	}
@@ -1740,7 +1746,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	defer finish() // release native input before persistence/user-hook finalizers
 	// Metadata discovery can finish after construction. Refresh before any
 	// schema or compaction decision; a failed discovery retains the old cap.
-	if err := l.refreshCapabilitiesForRequest(ctx); errors.Is(err, ErrContextCapabilitiesBudget) || errors.Is(err, llm.ErrContextBudgetPolicy) || ctx.Err() != nil {
+	if err := refreshCapabilitiesTimed(ctx, l.refreshCapabilitiesForRequest); errors.Is(err, ErrContextCapabilitiesBudget) || errors.Is(err, llm.ErrContextBudgetPolicy) || ctx.Err() != nil {
 		stopReason = "error"
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -1797,6 +1803,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	}
 
 	for {
+		if runIter > 0 {
+			ctx = transport.BeginTimingRequest(ctx)
+		}
 		// All tool-result messages and any re-entry steering from the previous
 		// iteration are now complete. The producer must cross this durability
 		// boundary before making another provider call; event consumers can lag
@@ -1924,7 +1933,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		// Tool/skill/plugin availability is live runtime state. Refresh the
 		// schema every iteration so post-compaction requests cannot inherit a
 		// stale Run-start catalog after lazy MCP discovery or plugin changes.
-		if err := l.refreshCapabilitiesForRequest(ctx); errors.Is(err, ErrContextCapabilitiesBudget) || errors.Is(err, llm.ErrContextBudgetPolicy) || ctx.Err() != nil {
+		if err := refreshCapabilitiesTimed(ctx, l.refreshCapabilitiesForRequest); errors.Is(err, ErrContextCapabilitiesBudget) || errors.Is(err, llm.ErrContextBudgetPolicy) || ctx.Err() != nil {
 			stopReason = "error"
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -1944,7 +1953,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			return err
 		}
 		requestWithoutTools := l.rescueNoToolsSnapshot()
+		transport.RecordTiming(ctx, "request_build_start")
 		req, contextAnchor := l.buildRequestWithContext(specs)
+		transport.RecordTiming(ctx, "request_build_end")
 		provider := contextAnchor.provider
 		if provider == nil {
 			provider = l.Provider
@@ -1971,7 +1982,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 						emit(ctx, out, Event{Kind: EventError, Err: checkpointErr})
 						return checkpointErr
 					}
+					transport.RecordTiming(ctx, "request_build_start")
 					req, contextAnchor = l.buildRequestForRetryWithContext(specs, requestWithoutTools)
+					transport.RecordTiming(ctx, "request_build_end")
 					provider = contextAnchor.provider
 					if provider == nil {
 						provider = l.Provider

@@ -32,14 +32,14 @@ func TestDesktopTodoPlanProjectsComplexTaskProgress(t *testing.T) {
 		"function isTodoWriteTool(name)",
 		"function isPlanningTool(name)",
 		"function applyTodoSnapshot(name, input)",
-		"function applyStatusPlanSnapshot(status)",
+		"function applyStatusPlanSnapshot(status, generation = todoPlanSnapshotGeneration)",
 		"status.planItems",
 		"queueMicrotask(() => pollStatus())",
 		"function restoreTodoPlanFromHistory(history)",
 		"const failedToolUses = new Set()",
 		"function toggleTodoPlan()",
 		"applyTodoSnapshot(name, chip.getAttribute('data-args') || '')",
-		"queueMicrotask(() => restoreTodoPlanFromHistory(history))",
+		"scheduleTodoPlanHistoryRestore(history)",
 		"async function runTurnItem(item) {",
 	} {
 		if !strings.Contains(js, want) {
@@ -48,7 +48,7 @@ func TestDesktopTodoPlanProjectsComplexTaskProgress(t *testing.T) {
 	}
 	turnStart := strings.Index(js, "async function runTurnItem(item) {")
 	turnEnd := strings.Index(js[turnStart:], "const MESSAGE_ACTION_ICONS")
-	if turnEnd < 0 || !strings.Contains(js[turnStart:turnStart+turnEnd], "clearTodoPlan();") {
+	if turnEnd < 0 || !strings.Contains(js[turnStart:turnStart+turnEnd], "startTodoPlanTurn(currentSessionId);") {
 		t.Fatal("runTurnItem must clear the prior todo plan before starting a model turn")
 	}
 

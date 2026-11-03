@@ -954,6 +954,58 @@ function finishThinking() {
 
 let todoPlanItems = [];
 let todoPlanOpen = false;
+// Scope status updates independently from permission/context snapshots. A
+// same-session task boundary must invalidate an already in-flight plan poll.
+let todoPlanSnapshotGeneration = 0;
+const todoPlanSessionScopes = new Map();
+
+function todoPlanScope(sessionId = String(currentSessionId || '')) {
+  if (!sessionId) return null;
+  if (!todoPlanSessionScopes.has(sessionId)) {
+    todoPlanSessionScopes.set(sessionId, { turn: 0, minimumTurn: 0, awaitedTurn: 0, awaitingFresh: false, livePlan: false, pendingTurn: null });
+  }
+  return todoPlanSessionScopes.get(sessionId);
+}
+
+function startTodoPlanTurn(sessionId) {
+  const scope = todoPlanScope(String(sessionId || ''));
+  let submission = null;
+  if (scope) {
+    submission = { scope, previous: { turn: scope.turn, minimumTurn: scope.minimumTurn,
+      awaitedTurn: scope.awaitedTurn, awaitingFresh: scope.awaitingFresh, livePlan: scope.livePlan },
+      confirmed: false, uncertain: false, rejected: false };
+    scope.pendingTurn = submission;
+    scope.minimumTurn = Math.max(scope.minimumTurn, scope.turn > 0 ? scope.turn + 1 : 0);
+    scope.awaitedTurn = scope.turn;
+    scope.awaitingFresh = true;
+    scope.livePlan = false;
+  }
+  clearTodoPlan();
+  return submission;
+}
+
+function noteLiveTodoPlanUpdate() {
+  todoPlanSnapshotGeneration++;
+  const scope = todoPlanScope();
+  if (scope) {
+    scope.livePlan = true;
+    if (scope.pendingTurn) scope.pendingTurn.confirmed = true;
+  }
+}
+
+function rejectTodoPlanSubmission(submission) {
+  if (!submission || submission.scope.pendingTurn !== submission || submission.confirmed) return;
+  Object.assign(submission.scope, submission.previous, { pendingTurn: null });
+  submission.rejected = true;
+  todoPlanSnapshotGeneration++;
+}
+
+function uncertainTodoPlanSubmission(submission) {
+  if (submission && submission.scope.pendingTurn === submission && !submission.confirmed && !submission.rejected) {
+    submission.uncertain = true;
+    todoPlanSnapshotGeneration++;
+  }
+}
 
 function isTodoWriteTool(name) {
   const normalized = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
@@ -1052,15 +1104,17 @@ function renderTodoPlan() {
 }
 
 function applyTodoSnapshot(name, input) {
-  if (!isTodoWriteTool(name)) return false;
+  if (!isTodoWriteTool(name) || (typeof renderingActivityHistory !== 'undefined' && renderingActivityHistory)) return false;
   const next = normalizeTodoItems(input);
   if (!next) return false;
+  noteLiveTodoPlanUpdate();
   todoPlanItems = next;
   renderTodoPlan();
   return true;
 }
 
-function applyStatusPlanSnapshot(status) {
+function applyStatusPlanSnapshot(status, generation = todoPlanSnapshotGeneration) {
+  if (generation !== todoPlanSnapshotGeneration) return false;
   const activeSessionId = String((status && status.activeSessionId) || '');
   const selectedSessionId = String(currentSessionId || (turnRunning ? runningSessionId : '') || '');
   if (!activeSessionId || activeSessionId !== selectedSessionId) return false;
@@ -1070,12 +1124,45 @@ function applyStatusPlanSnapshot(status) {
     status: String((item && item.status) || 'pending').toLowerCase(),
     owner: String((item && item.owner) || '').trim(),
   })).filter(item => item.content && ['pending', 'in_progress', 'completed'].includes(item.status));
+  const scope = todoPlanScope(selectedSessionId);
+  const planTurn = Number(status.planTurn) || 0;
+  const pending = scope && scope.pendingTurn;
+  const sessionRunning = (Array.isArray(status.isolatedTurnSessions) && status.isolatedTurnSessions.map(String).includes(selectedSessionId)) ||
+    (status.turnRunning && (!status.runningSessionId || String(status.runningSessionId) === selectedSessionId));
+  // A lost response is ambiguous. Only an authoritative idle snapshot at the
+  // previous boundary can reopen that unfinished plan; completed old work
+  // remains suppressed until a live update or a genuinely newer turn.
+  if (pending && pending.uncertain && !pending.confirmed && !sessionRunning &&
+      pending.previous.turn > 0 && planTurn === pending.previous.turn && scope.turn <= pending.previous.turn) {
+    scope.minimumTurn = pending.previous.minimumTurn;
+    scope.awaitedTurn = pending.previous.turn;
+    scope.awaitingFresh = true;
+    scope.pendingTurn = null;
+  }
+  if (scope && planTurn > 0 && planTurn < Math.max(scope.turn, scope.minimumTurn)) return false;
+  const advanced = scope && scope.awaitingFresh && scope.awaitedTurn > 0 && planTurn > scope.awaitedTurn;
+  const fresh = scope && (scope.livePlan || advanced);
+  const completed = next.length > 0 && next.every(item => item.status === 'completed');
+  if (scope && scope.awaitingFresh && !fresh && completed) return false;
+  if (scope && planTurn > 0) {
+    // The first observation of an unknown scope is only a baseline. Empty or
+    // unfinished data must not unlock a later completed list from that turn.
+    if (scope.awaitingFresh && scope.awaitedTurn === 0) scope.awaitedTurn = planTurn;
+    scope.turn = planTurn;
+    scope.minimumTurn = planTurn;
+    if (fresh) {
+      scope.awaitingFresh = false;
+      if (scope.pendingTurn) scope.pendingTurn.confirmed = true;
+    }
+  }
+  todoPlanSnapshotGeneration++;
   todoPlanItems = next;
   renderTodoPlan();
   return true;
 }
 
 function clearTodoPlan() {
+  todoPlanSnapshotGeneration++;
   todoPlanItems = [];
   todoPlanOpen = false;
   renderTodoPlan();
@@ -1085,6 +1172,30 @@ function toggleTodoPlan() {
   if (!todoPlanItems.length) return;
   todoPlanOpen = !todoPlanOpen;
   renderTodoPlan();
+}
+
+function scheduleTodoPlanHistoryRestore(history) {
+  const sessionId = String(currentSessionId || '');
+  const generation = todoPlanSnapshotGeneration;
+  const viewGeneration = typeof resumeSessionGeneration === 'number' ? resumeSessionGeneration : 0;
+  queueMicrotask(() => {
+    if (sessionId !== String(currentSessionId || '') || generation !== todoPlanSnapshotGeneration ||
+        viewGeneration !== (typeof resumeSessionGeneration === 'number' ? resumeSessionGeneration : 0)) return;
+    restoreTodoPlanFromHistory(history);
+  });
+}
+
+function todoHistoryStartsUserTurn(message, blocks) {
+  if (!message || message.role !== 'user' || message.synthetic) return false;
+  return blocks.some(block => {
+    if (!block || block.synthetic) return false;
+    if (block.type === 'text') {
+      const text = String(block.text || block.content || '');
+      if (text.startsWith('[user steer mid-turn] ')) return false;
+      return (typeof visibleTranscriptText === 'function' ? visibleTranscriptText(text) : text).trim();
+    }
+    return ['image', 'image_url', 'input_image', 'document', 'file', 'input_file', 'audio', 'input_audio', 'video', 'input_video'].includes(block.type);
+  });
 }
 
 function restoreTodoPlanFromHistory(history) {
@@ -1100,20 +1211,38 @@ function restoreTodoPlanFromHistory(history) {
   }
 
   let restored = [];
+  let sawUserTurn = false;
+  let hasCurrentPlan = false;
   for (const message of messages) {
     const blocks = Array.isArray(message && message.content)
       ? message.content
       : (typeof (message && message.content) === 'string' ? [{ type: 'text', text: message.content }] : []);
-    const startsUserTurn = message && message.role === 'user' && blocks.some(block =>
-      block && block.type === 'text' && String(block.text || block.content || '').trim());
-    if (startsUserTurn) restored = [];
+    if (todoHistoryStartsUserTurn(message, blocks)) {
+      restored = [];
+      sawUserTurn = true;
+      hasCurrentPlan = false;
+    }
     for (const block of blocks) {
-      if (!block || block.type !== 'tool_use' || !isTodoWriteTool(block.name)) continue;
+      if (!message || message.role !== 'assistant' || !block || block.type !== 'tool_use' || !isPlanningTool(block.name)) continue;
       if (block.tool_use_id && failedToolUses.has(String(block.tool_use_id))) continue;
+      hasCurrentPlan = true;
+      // Task* outputs are authoritative in /api/status; their call arguments
+      // alone cannot reconstruct the persisted structured task state.
+      if (!isTodoWriteTool(block.name)) continue;
       const next = normalizeTodoItems(block.input, restored);
       if (next) restored = next;
     }
   }
+  const scope = todoPlanScope();
+  const unconfirmedSubmission = scope && scope.pendingTurn && !scope.pendingTurn.confirmed;
+  // Navigating through older history cannot certify that the pending POST
+  // was accepted. Only a live result, a newer boundary or its HTTP reply can.
+  if (scope && sawUserTurn && !unconfirmedSubmission) {
+    scope.livePlan = hasCurrentPlan;
+    scope.awaitingFresh = !hasCurrentPlan;
+  }
+  if (unconfirmedSubmission && restored.length > 0 && restored.every(item => item.status === 'completed')) restored = [];
+  todoPlanSnapshotGeneration++;
   todoPlanItems = restored;
   todoPlanOpen = false;
   renderTodoPlan();
@@ -3050,11 +3179,10 @@ function handleToolResult(d) {
     if (isSubagentTool(name) && d.presentation && d.presentation.subagent) {
       attachSubagentIdentity(chip, d.presentation.subagent, d.presentation.subagent.status || (ok ? 'completed' : 'failed'));
     }
-    if (ok && isTodoWriteTool(name)) {
-      applyTodoSnapshot(name, chip.getAttribute('data-args') || '');
-    }
-    if (ok && isPlanningTool(name) && typeof pollStatus === 'function') {
-      queueMicrotask(() => pollStatus());
+    if (ok && !renderingActivityHistory && isPlanningTool(name)) {
+      if (isTodoWriteTool(name)) applyTodoSnapshot(name, chip.getAttribute('data-args') || '');
+      else noteLiveTodoPlanUpdate();
+      if (typeof pollStatus === 'function') queueMicrotask(() => pollStatus());
     }
     const t = chip.querySelector('.tc-time');
     if (t) t.textContent = d.elapsedMs ? fmtMs(d.elapsedMs) : '';
@@ -4203,7 +4331,8 @@ async function runTurnItem(item) {
     if (typeof pollStatus === 'function') void pollStatus();
     return false;
   }
-  if (!item.skipClearTodoPlan && !item.resume) clearTodoPlan();
+  let todoPlanSubmission = null;
+  if (!item.skipClearTodoPlan && !item.resume) todoPlanSubmission = startTodoPlanTurn(currentSessionId);
   const text = item.text || '';
   const images = item.images || [];
   const turnSessionId = currentSessionId;
@@ -4257,6 +4386,12 @@ async function runTurnItem(item) {
       signal: foregroundRequest.controller && foregroundRequest.controller.signal
     });
     const data = await res.json();
+    if (todoPlanSubmission && (res.ok || data.incomplete)) todoPlanSubmission.confirmed = true;
+    // These /api/turns client errors are emitted before input is accepted.
+    // Network errors, timeouts and server failures remain ambiguous.
+    if (!res.ok && !data.incomplete && [400, 401, 403, 404, 405, 409, 413, 415, 422, 423, 429].includes(res.status)) {
+      rejectTodoPlanSubmission(todoPlanSubmission);
+    }
     // Local limits are unsuccessful outcomes, even when conveyed with an HTTP
     // error status. Their typed terminal reason is not a request/API failure.
     const incompleteReason = data.incomplete ? (data.stopReason || 'incomplete')
@@ -4306,6 +4441,7 @@ async function runTurnItem(item) {
     await loadSessions();
     turnSucceeded = !data.stopped && !incompleteReason;
   } catch (e) {
+    uncertainTodoPlanSubmission(todoPlanSubmission);
     turnOutcome = e && e.name === 'AbortError' ? 'stopped' : 'error';
     if (e && e.name === 'AbortError') { if (viewingTurn()) showToast('Turn stopped'); }
     else if (viewingTurn()) showError(e.message || 'The request failed.');
@@ -5086,7 +5222,7 @@ function renderVirtualHistoryMessages(history) {
     if (key && ['queued', 'running'].includes(child.status)) chatHistoryViewport.setPinned(key, 'agent:' + id, true);
   });
   if (viewedHistoryTurnIsRunning() && units.length) chatHistoryViewport.ensureMounted(units[units.length - 1].key);
-  queueMicrotask(() => restoreTodoPlanFromHistory(history));
+  scheduleTodoPlanHistoryRestore(history);
   if (typeof loadSessionFiles === 'function') void loadSessionFiles(sessionId);
   if (typeof statusRosterForSelectedSession === 'function' && typeof lastStatusSnapshot !== 'undefined') reconcileSubagentToolRows(statusRosterForSelectedSession(lastStatusSnapshot));
   void restoreHistoryMessageMetadata(sessionId, activityHistoryGeneration);
@@ -5112,7 +5248,7 @@ function renderHistoryMessagesLegacy(history) {
   historyMessageBatch = [];
   const historySessionId = String(currentSessionId || '');
   if (typeof loadSessionFiles === 'function') void loadSessionFiles(currentSessionId);
-  queueMicrotask(() => restoreTodoPlanFromHistory(history));
+  scheduleTodoPlanHistoryRestore(history);
   const area = document.getElementById('chatArea');
   // Avoid forcing a layout/scroll for every reconstructed history block. The
   // selected transcript is pinned once, after the complete history exists.

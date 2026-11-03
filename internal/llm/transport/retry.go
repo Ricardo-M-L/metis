@@ -174,10 +174,13 @@ func RetryWithBackoff(ctx context.Context, attempts int, maxBackoff time.Duratio
 				backoff = 60 * time.Second
 			}
 		}
+		RecordTiming(ctx, "retry_backoff_start")
 		select {
 		case <-ctx.Done():
+			RecordTimingResult(ctx, "retry_backoff_end", TimingOutcome(ctx.Err()), 0)
 			return ctx.Err()
 		case <-time.After(backoff):
+			RecordTimingResult(ctx, "retry_backoff_end", "ok", 0)
 		}
 	}
 	return &RetryExhaustedError{Err: lastErr, Attempts: attempts}

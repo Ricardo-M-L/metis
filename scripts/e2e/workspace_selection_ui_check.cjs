@@ -50,7 +50,7 @@ function context() {
     PERMISSION_LABELS: { default: 'Default', plan: 'Plan', acceptEdits: 'Accept edits', fullAccess: 'Full access' }, PERMISSION_LABELS_ZH: { default: '默认确认', plan: '计划模式', acceptEdits: '自动确认编辑', fullAccess: '完全访问' },
     workspaceLabel: path => String(path || '').split('/').filter(Boolean).at(-1) || 'metis',
     detachRunningTurnView() { c.detached = (c.detached || 0) + 1; },
-    closeWorkspaceMenu() {}, clearTodoPlan() {}, resumeAutoScroll() {}, beginUserTurn() {}, finishUserTurn() {},
+    closeWorkspaceMenu() {}, clearTodoPlan() {}, startTodoPlanTurn() {}, rejectTodoPlanSubmission() {}, uncertainTodoPlanSubmission() {}, resumeAutoScroll() {}, beginUserTurn() {}, finishUserTurn() {},
     setTurnRunning: (value, id) => { c.turnRunning = value; c.runningSessionId = value ? id : null; },
     addMessage: (role, text) => { c.messages.push({ sessionId: c.currentSessionId, role, text }); },
     loadSessions: async () => {}, isViewedTurnRunning: () => c.foregroundRequests.has(c.currentSessionId),

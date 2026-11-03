@@ -8,6 +8,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/budget"
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/google/uuid"
 )
@@ -163,6 +164,11 @@ const (
 	// EventContextInjected records runtime-provided text added to the model's
 	// conversation. It is not a human submission and does not start a user turn.
 	EventContextInjected
+
+	// Trace-only, buffered until Run exits; never sent to the UI channel.
+	EventRequestTiming
+	EventRequestTimingBind
+	EventRequestTimingUnbind
 )
 
 // agentNameKey carries the current agent's team identity (the `name` param
@@ -526,7 +532,8 @@ func PlanControllerFromContext(ctx context.Context) PlanController {
 
 // Event is the discriminated union streamed from Loop.Run.
 type Event struct {
-	Kind EventKind
+	Kind          EventKind
+	RequestTiming *transport.TimingRecord
 
 	// Text events
 	TextDelta string

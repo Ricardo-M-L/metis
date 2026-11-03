@@ -4042,10 +4042,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			jobDetails = append(jobDetails, map[string]any{"id": item.ID, "description": item.Description, "status": item.Status, "startedAt": item.StartedAt})
 		}
 	}
-	planItems := []tasks.Item(nil)
-	if activeSessionID != "" {
-		planItems, _ = tasks.PlanningItems(activeSessionID)
-	}
+	planItems, planTurn, planTurnStartedAt := planningStatus(activeSessionID)
 	executionStrategy := executionStrategyForStatus(len(planItems), subAgents, namedAgents)
 	payload := map[string]any{
 		"subAgents": subAgents, "backgroundTasks": backgroundTasks, "workspace": workspace,
@@ -4064,6 +4061,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"isolatedTurnsEnabled": s.isolatedRunner != nil,
 		"activeSessionId":      activeSessionID,
 		"planItems":            planItems,
+		"planTurn":             planTurn,
+		"planTurnStartedAt":    planTurnStartedAt,
 		"executionStrategy":    executionStrategy,
 		"build":                s.buildVersion,
 	}
@@ -5191,7 +5190,7 @@ func traceTurnMetrics(nodes []session.TracedNode) []traceTurnMetricView {
 	turns := make(map[int]*turnMetric)
 	for _, node := range nodes {
 		ev := node.Event
-		if ev.Turn <= 0 || ev.TS.IsZero() {
+		if ev.Kind == "request_timing" || ev.Turn <= 0 || ev.TS.IsZero() {
 			continue
 		}
 		metric := turns[ev.Turn]
@@ -5270,7 +5269,7 @@ func activeTraceDuration(nodes []session.TracedNode) int64 {
 	ranges := make(map[int]turnRange)
 	for _, node := range nodes {
 		ev := node.Event
-		if ev.TS.IsZero() {
+		if ev.Kind == "request_timing" || ev.TS.IsZero() {
 			continue
 		}
 		r := ranges[ev.Turn]
@@ -5311,7 +5310,7 @@ func activeTraceToolDuration(nodes []session.TracedNode) int64 {
 	turns := make(map[int]*turnIntervals)
 	for _, node := range nodes {
 		ev := node.Event
-		if ev.TS.IsZero() {
+		if ev.Kind == "request_timing" || ev.TS.IsZero() {
 			continue
 		}
 		turn := turns[ev.Turn]
@@ -5556,7 +5555,7 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 	turnFirstToken := make(map[int]time.Time)
 	for _, n := range nodes {
 		ev := n.Event
-		if !ev.TS.IsZero() {
+		if ev.Kind != "request_timing" && !ev.TS.IsZero() {
 			if t, ok := turnFirst[ev.Turn]; !ok || ev.TS.Before(t) {
 				turnFirst[ev.Turn] = ev.TS
 			}

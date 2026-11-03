@@ -213,7 +213,7 @@ const c = {
   formatContent: text => String(text),
   messageActionsMarkup: () => '', visibleTranscriptText: value => String(value),
   autoScroll() {}, updateEmptyLayout() {}, updateSendBtn() {}, loadSessions() {}, loadSessionStatsbar() {},
-  resumeAutoScroll() {}, restoreTodoPlanFromHistory() {}, restoreHistoryMessageMetadata() {},
+  resumeAutoScroll() {}, restoreTodoPlanFromHistory() {}, scheduleTodoPlanHistoryRestore() {}, restoreHistoryMessageMetadata() {},
   endTurnStatus() {}, showTurnStatsLine() {},
   loadSessionFiles() {}, attachMessageActions() {}, isTodoWriteTool: () => false, isPlanningTool: () => false,
   renderDetailPanel() {}, closeToolDetail() { c.selectedToolId = null; },

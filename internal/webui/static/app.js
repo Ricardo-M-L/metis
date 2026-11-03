@@ -430,6 +430,7 @@ async function pollStatus(shouldApply = () => true) {
   const checkpointGeneration = typeof checkpointControlGeneration === 'number' ? checkpointControlGeneration : 0;
   const permissionGeneration = typeof permissionModeGeneration === 'number' ? permissionModeGeneration : 0;
   const permissionWasPending = typeof permissionModePending !== 'undefined' && permissionModePending;
+  const planGeneration = typeof todoPlanSnapshotGeneration === 'number' ? todoPlanSnapshotGeneration : 0;
   const selectedSessionId = String(currentSessionId || '');
   const viewGeneration = typeof resumeSessionGeneration === 'number' ? resumeSessionGeneration : 0;
   try {
@@ -445,7 +446,7 @@ async function pollStatus(shouldApply = () => true) {
     if (typeof renderCheckpointControl === 'function' && checkpointGeneration === (typeof checkpointControlGeneration === 'number' ? checkpointControlGeneration : 0)) renderCheckpointControl(d.checkpoint);
     renderStatusSnapshot(d);
     if (typeof applyResumeSnapshot === 'function') applyResumeSnapshot(d, selectedSessionId);
-    if (typeof applyStatusPlanSnapshot === 'function') applyStatusPlanSnapshot(d);
+    if (typeof applyStatusPlanSnapshot === 'function') applyStatusPlanSnapshot(d, planGeneration);
     if (typeof applyStatusPermissionSnapshot === 'function' &&
         permissionGeneration === permissionModeGeneration && !permissionWasPending && !permissionModePending) {
       applyStatusPermissionSnapshot(d, selectedSessionId);

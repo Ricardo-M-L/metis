@@ -42,10 +42,10 @@ func emitRecoveryInfo(out chan<- Event, info string) {
 
 func openStreamWithRecovery(ctx context.Context, p llm.Provider, req llm.Request, session *transport.RecoverySession) (llm.StreamReader, error) {
 	if session == nil {
-		return p.Stream(ctx, req)
+		return timedProviderStream(ctx, p, req)
 	}
 	if managed, ok := p.(interface{ ManagesRecoverySession() bool }); ok && managed.ManagesRecoverySession() {
-		return p.Stream(ctx, req)
+		return timedProviderStream(ctx, p, req)
 	}
 	// Custom providers without internal recovery use the same finite policy.
 	// An existing RetryExhaustedError is never retried here.
@@ -53,7 +53,7 @@ func openStreamWithRecovery(ctx context.Context, p llm.Provider, req llm.Request
 	var stream llm.StreamReader
 	release, err := transport.RetryWithRecovery(ctx, policy, func(attemptCtx context.Context) error {
 		var callErr error
-		stream, callErr = p.Stream(attemptCtx, req)
+		stream, callErr = timedProviderStream(attemptCtx, p, req)
 		if callErr != nil && stream != nil {
 			_ = stream.Close()
 			stream = nil

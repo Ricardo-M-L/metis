@@ -54,6 +54,7 @@ type TraceAdapter struct {
 	legacyChildOrigin map[legacyTraceKey]traceOrigin
 	turnUsage         map[traceTurnKey]session.CostSnapshot
 	resolvedObserver  func(ResolvedTraceEvent)
+	timingOrigins     map[string]traceOrigin
 
 	// Streaming deltas are coalesced, but the buffer must carry its immutable
 	// owner. A background child can outlive the parent turn or a session switch;
@@ -265,6 +266,13 @@ func recordSubmittedTraceInput(sessionID, kind, source, text string) {
 	origin := traceOrigin{sessionID: sessionID, turn: a.ensureTurnLocked(sessionID)}
 	a.flushBurstLocked()
 	a.appendLocked(origin, kind, agent.Event{Source: source}, TraceExtra{Text: strings.TrimSpace(text)})
+	// Publish the task boundary before a worker waits for its provider. The
+	// Desktop parent must not need a later token or loop_done to retire the
+	// previous task's completed checklist. This flushes userspace buffering;
+	// it does not add an fsync or change streaming-delta persistence.
+	if err := a.store.FlushSession(sessionID); err != nil {
+		log.Printf("trace: publish input boundary %s: %v", sessionID, err)
+	}
 }
 
 func (a *TraceAdapter) OnEvent(ev agent.Event) {
@@ -284,6 +292,22 @@ func (a *TraceAdapter) OnEvent(ev agent.Event) {
 	if a.store == nil {
 		return
 	}
+	if ev.Kind == agent.EventRequestTimingBind {
+		owner := ev
+		owner.TraceInvocationID = ev.TraceParentInvocationID
+		owner.TraceParentInvocationID = ""
+		if origin, ok := a.originForEventLocked(owner); ok {
+			if a.timingOrigins == nil {
+				a.timingOrigins = make(map[string]traceOrigin)
+			}
+			a.timingOrigins[ev.TraceInvocationID] = origin
+		}
+		return
+	}
+	if ev.Kind == agent.EventRequestTimingUnbind {
+		delete(a.timingOrigins, ev.TraceInvocationID)
+		return
+	}
 	if ev.Kind == agent.EventTraceInvocationStart || ev.Kind == agent.EventTraceInvocationEnd {
 		// Lifecycle boundaries separate Ralph rounds even when the provider
 		// emits adjacent text deltas with the same outer invocation ID.
@@ -295,6 +319,9 @@ func (a *TraceAdapter) OnEvent(ev agent.Event) {
 		return // transport noise — not part of the agent's trajectory
 	}
 	origin, ok := a.originForEventLocked(ev)
+	if ev.Kind == agent.EventRequestTiming {
+		origin, ok = a.timingOrigins[ev.TraceInvocationID]
+	}
 	if !ok {
 		// A child without a known parent origin must never fall back to the
 		// currently selected session. In normal execution the top-level Agent
@@ -314,6 +341,21 @@ func (a *TraceAdapter) OnEvent(ev agent.Event) {
 	// ends when its type OR immutable owner changes, or at the first non-delta
 	// event, preserving provider order without combining parent/child streams.
 	switch ev.Kind {
+	case agent.EventRequestTiming:
+		if ev.RequestTiming == nil {
+			return
+		}
+		r := ev.RequestTiming
+		// Timing is already buffered by Run. Do not settle streaming bursts or
+		// sync here: this must not change existing text/TTFT semantics.
+		te := &session.TraceEvent{SessionID: origin.sessionID, Turn: origin.turn,
+			Kind: "request_timing", TS: r.At, TraceInvocationID: origin.invocationID,
+			SubAgentOf: origin.subAgent, RequestTiming: r,
+			Text: fmt.Sprintf("%s request=%s call=%d attempt=%d elapsed_ms=%d outcome=%s status=%d", r.Phase, r.RequestID, r.ProviderCall, r.Attempt, r.ElapsedMS, r.Outcome, r.StatusCode)}
+		if err := a.store.Append(te); err != nil {
+			log.Printf("trace: append timing: %v", err)
+		}
+		return
 	case agent.EventTextDelta:
 		a.bufferDeltaLocked(origin, "text", ev.TextDelta)
 		return

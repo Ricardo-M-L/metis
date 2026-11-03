@@ -45,7 +45,7 @@ function fixture(){
   uiText:(en,zh)=>en,showToast:m=>toasts.push(m),showError:m=>toasts.push(m),
   mergeServerSessionMetadata(){},renderSessions(){},renderStatusSnapshot(){},applyResumeSnapshot(){},restoreCompactionHistory:async()=>{},loadSessionStatsbar(){},
   renderHistoryMessages(){},loadEffort:async()=>{},renderQueuedTurns(){},syncTurnControls(){},updateSendBtn(){},
-  closeMismatchedSubAgentDetails(){},clearTodoPlan(){},resumeAutoScroll(){},beginUserTurn(){},finishUserTurn(){},addMessage(){},setTurnRunning(){},
+  closeMismatchedSubAgentDetails(){},clearTodoPlan(){},startTodoPlanTurn(){},rejectTodoPlanSubmission(){},uncertainTodoPlanSubmission(){},resumeAutoScroll(){},beginUserTurn(){},finishUserTurn(){},addMessage(){},setTurnRunning(){},
   loadSessions:async()=>{},backgroundContinuationGenerations:new Map(),backgroundContinuationGeneration:0,
   pendingForegroundRequest:null,runningSessionId:null,runningTurnIncompleteReason:'',runningTurnNeedsHistorySync:false,
   settingByKey(){return null;},normalizedPermissionMode:v=>['default','plan','fullAccess'].includes(v)?v:null,

@@ -872,7 +872,7 @@ function renderRequestInspector(insp) {
     return acc;
   }, { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 });
   const calls = tr.filter(isToolRow).length;
-  const ts = tr.map(x => Date.parse(x.ts)).filter(Number.isFinite);
+  const ts = tr.filter(x => x.kind !== 'request_timing').map(x => Date.parse(x.ts)).filter(Number.isFinite);
   const started = ts.length ? new Date(Math.min(...ts)).toISOString() : null;
   const dur = ts.length > 1 ? Math.max(...ts) - Math.min(...ts) : 0;
   const hasError = tr.some(x => rowState(x) === 'error');

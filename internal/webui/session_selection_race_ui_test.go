@@ -41,7 +41,7 @@ function context() {
   queuedTurns:[],queuedSessionId:null,drainingQueuedTurns:false,backgroundContinuationGeneration:0,
   backgroundContinuationGenerations:new Map(),pendingForegroundRequest:null,runningTurnNeedsHistorySync:false,runningTurnIncompleteReason:'',
   document:{documentElement:{lang:'en'},getElementById:id=>id==='welcomeScreen'?null:{disabled:false},querySelector:()=>null,querySelectorAll:()=>[]},
-  clearTodoPlan(){},resumeAutoScroll(){},beginUserTurn(){},finishUserTurn(){},updateSendBtn(){},syncTurnControls(){},
+  clearTodoPlan(){},startTodoPlanTurn(){},rejectTodoPlanSubmission(){},uncertainTodoPlanSubmission(){},resumeAutoScroll(){},beginUserTurn(){},finishUserTurn(){},updateSendBtn(){},syncTurnControls(){},
   setTurnRunning:(value,id)=>{c.turnRunning=value;c.runningSessionId=value?id:null;},
   addMessage:(role,text)=>added.push({session:c.currentSessionId,role,text}),
   renderHistoryMessages:history=>rendered.push({session:c.currentSessionId,history}),
