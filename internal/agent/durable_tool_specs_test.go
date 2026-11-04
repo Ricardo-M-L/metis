@@ -116,15 +116,15 @@ func TestDurableToolSpecsPreserveLazyToolsAndDetachedContext(t *testing.T) {
 	if len(durable) != len(ordinary) {
 		t.Fatal("durable projection dropped lazy catalog entries")
 	}
-	for _, name := range []string{"Read", "mcp__remote__write", "ToolSearch"} {
+	for _, name := range []string{"Read", "ToolSearch"} {
 		before := findDurableTestSpec(t, ordinary, name)
 		after := findDurableTestSpec(t, durable, name)
 		if !reflect.DeepEqual(before, after) {
 			t.Fatalf("durable projection changed unrelated/lazy tool %s", name)
 		}
 	}
-	if !isLazyPlaceholderSpec(findDurableTestSpec(t, durable, "mcp__remote__write")) {
-		t.Fatal("lazy schema discovery was bypassed")
+	if containsName(durable, "mcp__remote__write") || !loop.deferredSchemaPending("mcp__remote__write") {
+		t.Fatal("unselected durable tool leaked or bypassed discovery")
 	}
 	properties := findDurableTestSpec(t, durable, "Bash").InputSchema["properties"].(map[string]any)
 	if _, exists := properties["await_completion"]; exists {

@@ -97,26 +97,13 @@ func TestDispatchToolSpecsUsesExposureForNonMCPDeferredTool(t *testing.T) {
 	reg := tools.NewRegistry()
 	reg.Register(explicitlyDeferredFatTool{&fatTool{name: "RemoteDocumentSearch", schemaPad: 2000}})
 	l := &Loop{Registry: reg, ContextWindow: 200_000}
-	specs := l.toolSpecs()
-	if !hasToolSearchSpec(specs) {
-		t.Fatal("explicit Deferred tool did not activate ToolSearch")
+	if got := l.toolSpecs(); len(got) != 1 || got[0].Name != "ToolSearch" || !l.deferredSchemaPending("RemoteDocumentSearch") {
+		t.Fatalf("omitted discovery gate mismatch: %+v", got)
 	}
-	for _, spec := range specs {
-		if spec.Name == "RemoteDocumentSearch" {
-			if spec.Exposure != string(tools.ToolExposureDeferred) {
-				t.Fatalf("provider metadata exposure = %q, want deferred", spec.Exposure)
-			}
-			desc, _ := spec.InputSchema["description"].(string)
-			if !strings.Contains(desc, "deferred") {
-				t.Fatalf("deferred tool kept its full schema: %#v", spec.InputSchema)
-			}
-			return
-		}
-		if spec.Name == "ToolSearch" && spec.Exposure != string(tools.ToolExposureDeferred) {
-			t.Fatalf("ToolSearch exposure = %q, want deferred", spec.Exposure)
-		}
+	result := handleToolSearch(l, llm.ContentBlock{ToolUseID: "search", ToolInput: map[string]any{"query": "select:RemoteDocumentSearch"}})
+	if result.IsError || !containsName(l.toolSpecs(), "RemoteDocumentSearch") || l.deferredSchemaPending("RemoteDocumentSearch") {
+		t.Fatal("non-MCP deferred capability cannot be loaded")
 	}
-	t.Fatal("deferred tool missing from lazy catalog")
 }
 
 // TestDispatchToolSpecs_EnvTrueIgnoresUnknownWindow — always-mode

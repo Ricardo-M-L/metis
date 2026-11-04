@@ -50,6 +50,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/memdir"
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	pubprovider "github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
 // AutoMemoryEvery legacy constant — kept so the v1 callers compile,
@@ -916,6 +917,7 @@ func (e *AutoMemoryExtractor) runOnceInner(parentCtx context.Context, eventOut c
 	if dreamReg != run.registry {
 		preserve := discoveredDeferredFromSpecs(snap.ToolSpecs)
 		snap.ToolSpecs = toolSpecsFromRegistry(dreamReg, run.shortToolDescriptions, snap.ContextWindow, preserve)
+		snap.ToolSpecs = boundedToolSpecs(snap.ToolSpecs, dreamReg, preserve, nil, pubprovider.ToolDefinitionLimit(snap.Provider))
 	}
 
 	// List user skills NOW (Orient phase input) so the prompt can show

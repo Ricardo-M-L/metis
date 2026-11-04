@@ -492,13 +492,9 @@ func stripAndAppendToolSearch(specs []llm.ToolSpec) []llm.ToolSpec {
 // (cross-compaction stability, openclaude pattern; see
 // lazy_tools_discovered.go).
 //
-// The rewrite:
-//   - For each Deferred tool NOT in preserve, replace InputSchema with
-//     the lazy placeholder.
-//   - For each Deferred tool IN preserve, keep the original schema.
-//   - Append the synthetic ToolSearch entry IFF any stripping
-//     happened — if preserve covers all mcp__ tools, the meta-tool is
-//     pointless and would just add a confusing entry to tools[].
+// Unselected Deferred definitions are omitted, selected definitions keep their
+// complete schemas, and ToolSearch remains available to load any catalog entry.
+// Registry is never changed. Count-bounded selection runs after this projection.
 //
 // Direct tools are always passed through verbatim. The core Read/Edit/Bash
 // capabilities have small, well-known schemas and remain Direct.
@@ -512,7 +508,6 @@ func stripAndAppendToolSearchWithPreserve(specs []llm.ToolSpec, preserve map[str
 // name prefix.
 func stripAndAppendToolSearchWithExposure(specs []llm.ToolSpec, deferred map[string]bool, preserve map[string]bool) []llm.ToolSpec {
 	out := make([]llm.ToolSpec, 0, len(specs)+1)
-	stripped := false
 	for _, s := range specs {
 		if !deferred[s.Name] {
 			out = append(out, s)
@@ -525,20 +520,20 @@ func stripAndAppendToolSearchWithExposure(specs []llm.ToolSpec, deferred map[str
 			out = append(out, s)
 			continue
 		}
-		stripped = true
-		out = append(out, llm.ToolSpec{
-			Name:        s.Name,
-			Description: stripDescriptionForLazy(s.Description),
-			InputSchema: lazyPlaceholderSchema(),
-			Exposure:    s.Exposure,
-		})
+		// Unselected tools stay in Registry, not in the provider tools array.
 	}
-	if !stripped {
-		// Either no Deferred tools exist, or every Deferred tool is already
-		// preserved. Nothing to defer → don't append ToolSearch.
+	if len(deferred) == 0 {
 		return specs
 	}
-	out = append(out, toolSearchSpecWithExposure(specs, deferred))
+	// Keep discovery even when every tool was previously loaded: bounded
+	// projections may evict old schemas and must allow them to be reselected.
+	filtered := out[:0]
+	for _, spec := range out {
+		if spec.Name != "ToolSearch" {
+			filtered = append(filtered, spec)
+		}
+	}
+	out = append(filtered, toolSearchSpecWithExposure(specs, deferred))
 	return out
 }
 
@@ -704,16 +699,11 @@ func toolSearchSpec(allSpecs []llm.ToolSpec) llm.ToolSpec {
 }
 
 func toolSearchSpecWithExposure(allSpecs []llm.ToolSpec, deferredNames map[string]bool) llm.ToolSpec {
-	deferred := 0
-	for _, s := range allSpecs {
-		if deferredNames[s.Name] {
-			deferred++
-		}
-	}
+	deferred := len(deferredNames)
 	desc := fmt.Sprintf(
 		"Fetches full schema definitions for deferred tools so they can be called.\n\n"+
-			"Deferred tools appear by name in the tools list with '[schema lazy]' in their description "+
-			"but no parameter schema. Call this BEFORE invoking such a tool — otherwise the tool call "+
+			"Unloaded tools are omitted from the tools list. Search by keywords to discover them. "+
+			"Call select:<name> to load a tool before invoking it — otherwise the tool call "+
 			"will fail with an invalid-params error. Currently %d tool(s) are deferred.\n\n"+
 			"Query forms:\n"+
 			"  \"select:Read,Edit,Grep\" — fetch these exact tools by name\n"+

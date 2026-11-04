@@ -513,6 +513,7 @@ type Loop struct {
 	// the prior ToolSearch tool_result is still in l.Messages.
 	discoveredMCP         map[string]bool
 	discoveredMCPHydrated bool
+	discoveredMCPRecent   []string
 
 	// contract enforces the dispatch contract at the loop level —
 	// see contract.go. Per-loop state (counters reset on Loop.Reset);
@@ -1440,6 +1441,7 @@ func (l *Loop) ResetSession(messages []llm.Message) {
 	l.lastAutoMemoryTurn = 0
 	l.BypassNextCache = false
 	l.discoveredMCP = nil
+	l.discoveredMCPRecent = nil
 	l.discoveredMCPHydrated = false
 	l.contract.reset()
 	if ownsCompact {

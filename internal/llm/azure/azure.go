@@ -168,6 +168,9 @@ func (a *Azure) preflight() error {
 }
 
 func (a *Azure) Complete(ctx context.Context, req Request) (*Response, error) {
+	if err := provider.ValidateToolDefinitions(req.Tools, a.MaxToolDefinitions()); err != nil {
+		return nil, err
+	}
 	if err := a.preflight(); err != nil {
 		return nil, err
 	}
@@ -211,6 +214,9 @@ func (a *Azure) Complete(ctx context.Context, req Request) (*Response, error) {
 }
 
 func (a *Azure) Stream(ctx context.Context, req Request) (StreamReader, error) {
+	if err := provider.ValidateToolDefinitions(req.Tools, a.MaxToolDefinitions()); err != nil {
+		return nil, err
+	}
 	if err := a.preflight(); err != nil {
 		return nil, err
 	}
@@ -249,3 +255,6 @@ func (a *Azure) Stream(ctx context.Context, req Request) (StreamReader, error) {
 	}
 	return openai.NewStream(resp.Body), nil
 }
+
+// MaxToolDefinitions is the endpoint wire limit, independent of context tokens.
+func (a *Azure) MaxToolDefinitions() int { return 128 }

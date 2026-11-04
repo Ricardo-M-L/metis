@@ -352,6 +352,13 @@ func RunForkedAgent(ctx context.Context, p ForkedAgentParams) (*ForkedResult, er
 	prefixLen := len(p.Cache.PrefixMessages)
 	result := &ForkedResult{}
 	toolSpecs := append([]llm.ToolSpec(nil), p.Cache.ToolSpecs...)
+	discovery := &Loop{Registry: p.Registry, Provider: p.Cache.Provider, ContextWindow: p.Cache.ContextWindow, discoveredMCPHydrated: true, discoveredMCP: discoveredDeferredFromSpecs(toolSpecs)}
+	for _, spec := range toolSpecs {
+		if discovery.discoveredMCP[spec.Name] {
+			discovery.discoveredMCPRecent = append(discovery.discoveredMCPRecent, spec.Name)
+		}
+	}
+	toolSpecs = discovery.boundToolSpecs(toolSpecs, discovery.snapshotDiscoveredMCP())
 
 	defer func() {
 		result.Duration = time.Since(start)
@@ -428,6 +435,24 @@ func RunForkedAgent(ctx context.Context, p ForkedAgentParams) (*ForkedResult, er
 		for _, tu := range toolUses {
 			block := executeForkTool(ctx, p, tu, toolSpecs)
 			results = append(results, block)
+			if tu.ToolName == "ToolSearch" && !block.IsError {
+				var selected struct {
+					Matches []struct {
+						Name        string         `json:"name"`
+						InputSchema map[string]any `json:"input_schema"`
+					} `json:"matches"`
+				}
+				if json.Unmarshal([]byte(block.ToolResult), &selected) == nil {
+					for _, item := range selected.Matches {
+						if item.InputSchema != nil {
+							discovery.markDeferredDiscovered(item.Name)
+						}
+					}
+				}
+				toolSpecs = discovery.toolSpecs()
+			} else if !block.IsError {
+				discovery.markDeferredDiscovered(tu.ToolName)
+			}
 		}
 		msgs = append(msgs, llm.Message{
 			Role: llm.RoleUser, Content: results,
@@ -556,7 +581,7 @@ func forkDeferredSchemaPending(specs []llm.ToolSpec, name string) bool {
 			return isLazyPlaceholderSpec(spec)
 		}
 	}
-	return false
+	return true
 }
 
 // hydrateForkToolSpecs upgrades only schemas actually returned by a select:

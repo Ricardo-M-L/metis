@@ -28,47 +28,18 @@ func fatMCPSpec(name string, descLen int) llm.ToolSpec {
 // placeholder, every other tool stays intact, and a synthetic
 // ToolSearch entry is appended.
 func TestStripAndAppendToolSearch_StripsMCPSchemas(t *testing.T) {
-	specs := []llm.ToolSpec{
-		{Name: "Read", InputSchema: map[string]any{"properties": "real"}},
-		{Name: "Bash", InputSchema: map[string]any{"properties": "real"}},
-		{Name: "mcp__fs__read", InputSchema: map[string]any{"properties": "real-mcp-1"}},
-		{Name: "mcp__fs__write", InputSchema: map[string]any{"properties": "real-mcp-2"}},
-		{Name: "mcp__http__get", InputSchema: map[string]any{"properties": "real-mcp-3"}},
-	}
+	specs := []llm.ToolSpec{{Name: "Read", InputSchema: map[string]any{"properties": "real"}}, {Name: "Bash", InputSchema: map[string]any{"properties": "real"}}, {Name: "mcp__fs__read"}, {Name: "mcp__fs__write"}, {Name: "mcp__http__get"}}
 	out := stripAndAppendToolSearch(specs)
-
-	if len(out) != 6 {
-		t.Fatalf("expected 6 specs (5 + ToolSearch); got %d", len(out))
+	if len(out) != 3 || out[0].Name != "Read" || out[1].Name != "Bash" || out[2].Name != "ToolSearch" {
+		t.Fatalf("deferred entries leaked: %+v", out)
 	}
 	for _, s := range out[:2] {
 		if s.InputSchema["properties"] != "real" {
-			t.Errorf("core tool %s schema was stripped; got %+v", s.Name, s.InputSchema)
+			t.Fatal("Direct schema changed")
 		}
 	}
-	for _, s := range out[2:5] {
-		if s.InputSchema["additionalProperties"] != true {
-			t.Errorf("mcp tool %s schema was NOT stripped; got %+v", s.Name, s.InputSchema)
-		}
-		if !strings.Contains(s.Description, "schema lazy") {
-			t.Errorf("mcp tool %s description missing lazy hint; got %q", s.Name, s.Description)
-		}
-	}
-	if out[5].Name != "ToolSearch" {
-		t.Errorf("expected ToolSearch as last entry; got %q", out[5].Name)
-	}
-	// Post-refactor (P2): the description should NOT dump per-tool
-	// names — deferred names appear in the stripped tool entries
-	// themselves. The description carries query syntax help only.
-	if strings.Contains(out[5].Description, "mcp__fs__read") {
-		t.Errorf("ToolSearch description should not list tool names verbatim (P2 trim); got: %s", out[5].Description)
-	}
-	if !strings.Contains(out[5].Description, "select:") {
-		t.Errorf("ToolSearch description should explain the select: syntax; got: %s", out[5].Description)
-	}
-	// Deferred count must appear so the model knows how many tools are
-	// behind the search.
-	if !strings.Contains(out[5].Description, "3") {
-		t.Errorf("ToolSearch description should mention the deferred count (3); got: %s", out[5].Description)
+	if strings.Contains(out[2].Description, "mcp__fs__read") || !strings.Contains(out[2].Description, "select:") || !strings.Contains(out[2].Description, "3") {
+		t.Fatal("discovery help missing or catalog dumped")
 	}
 }
 
@@ -95,19 +66,10 @@ func TestStripAndAppendToolSearch_NoMCPNoChange(t *testing.T) {
 // 16k window with ~2k tokens of MCP schema (12.5% of budget) MUST
 // trigger lazy mode under the default 10% percentage.
 func TestApplyLazySchemaByTokens_SmallWindowFires(t *testing.T) {
-	specs := []llm.ToolSpec{
-		{Name: "Read", InputSchema: map[string]any{"type": "object"}},
-		fatMCPSpec("mcp__playwright__navigate", 5000), // ~2000 est tokens
-	}
+	specs := []llm.ToolSpec{{Name: "Read", InputSchema: map[string]any{"type": "object"}}, fatMCPSpec("mcp__playwright__navigate", 5000)}
 	out := applyLazySchemaByTokens(specs, 16_000, 10)
-	if len(out) != 3 {
-		t.Fatalf("16k+12.5%% should fire; got %d specs (want 3)", len(out))
-	}
-	if out[2].Name != "ToolSearch" {
-		t.Errorf("expected ToolSearch as last entry; got %q", out[2].Name)
-	}
-	if out[1].InputSchema["additionalProperties"] != true {
-		t.Errorf("MCP schema not stripped; got %+v", out[1].InputSchema)
+	if len(out) != 2 || out[1].Name != "ToolSearch" || containsName(out, "mcp__playwright__navigate") {
+		t.Fatalf("deferred definition leaked: %+v", out)
 	}
 }
 

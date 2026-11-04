@@ -1110,6 +1110,9 @@ func mapOAIStop(s string) string {
 // --- Provider impl ---
 
 func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
+	if err := provider.ValidateToolDefinitions(req.Tools, o.MaxToolDefinitions()); err != nil {
+		return nil, err
+	}
 	if o.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set OPENAI_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
@@ -1211,6 +1214,9 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (*Response, error) {
 }
 
 func (o *OpenAI) Stream(ctx context.Context, req Request) (StreamReader, error) {
+	if err := provider.ValidateToolDefinitions(req.Tools, o.MaxToolDefinitions()); err != nil {
+		return nil, err
+	}
 	if o.APIKey == "" {
 		return nil, fmt.Errorf("API key not configured. Set OPENAI_API_KEY environment variable or configure in ~/.metis/config.toml")
 	}
@@ -1711,3 +1717,6 @@ func (s *openAIStream) popPending() (StreamEvent, error) {
 	}
 	return ev, nil
 }
+
+// MaxToolDefinitions is the endpoint wire limit, independent of context tokens.
+func (o *OpenAI) MaxToolDefinitions() int { return 128 }

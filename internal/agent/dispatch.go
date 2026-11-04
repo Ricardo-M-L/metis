@@ -81,18 +81,13 @@ func (l *Loop) toolSpecs() []llm.ToolSpec {
 	// tool the model already used.
 	preserve := l.snapshotDiscoveredMCP()
 	switch mode {
-	case LazyModeStandard:
-		return out
 	case LazyModeAlways:
-		return stripAndAppendToolSearchWithExposure(out, deferred, preserve)
+		out = stripAndAppendToolSearchWithExposure(out, deferred, preserve)
 	case LazyModeAuto:
 		_, _, window := l.ProviderModelSnapshot()
-		if window <= 0 {
-			return out
-		}
-		return applyLazySchemaByTokensWithExposure(out, window, pct, deferred, preserve)
+		out = applyLazySchemaByTokensWithExposure(out, window, pct, deferred, preserve)
 	}
-	return out
+	return l.boundToolSpecs(out, preserve)
 }
 
 // deferredSchemaPending reports whether the exact tool is currently present
@@ -106,7 +101,7 @@ func (l *Loop) deferredSchemaPending(name string) bool {
 		}
 		return isLazyPlaceholderSpec(spec)
 	}
-	return false
+	return true
 }
 
 // descriptionForTool picks the right description for a tool given the
@@ -453,6 +448,10 @@ func (l *Loop) executeBatch(ctx context.Context, toolUses []llm.ContentBlock, ou
 		}
 		if rejectIfTransitioned(j) {
 			continue
+		}
+
+		if entry.Exposure == tools.ToolExposureDeferred {
+			l.markDeferredDiscovered(t.Name())
 		}
 
 		// Normalize provider input before any hook, audit, presentation, or

@@ -51,59 +51,28 @@ func TestHandleSelectQuery_MarksDiscovered(t *testing.T) {
 // + appends ToolSearch for any non-preserved mcp__ tools so the model
 // can fetch them on demand.
 func TestStripAndAppendToolSearchWithPreserve_KeepsDiscovered(t *testing.T) {
-	specs := []llm.ToolSpec{
-		{Name: "Read", InputSchema: map[string]any{"core": true}},
-		{Name: "mcp__fs__read", InputSchema: map[string]any{"path": "real"}},
-		{Name: "mcp__fs__write", InputSchema: map[string]any{"path": "real"}},
-		{Name: "mcp__http__get", InputSchema: map[string]any{"url": "real"}},
+	specs := []llm.ToolSpec{llm.ToolSpec{Name: "Read", InputSchema: map[string]any{"core": true}}, llm.ToolSpec{Name: "mcp__a", InputSchema: map[string]any{"real": "schema"}}, llm.ToolSpec{Name: "mcp__b", InputSchema: map[string]any{"real": "schema"}}, llm.ToolSpec{Name: "mcp__c", InputSchema: map[string]any{"real": "schema"}}}
+	out := stripAndAppendToolSearchWithPreserve(specs, map[string]bool{"mcp__b": true})
+	if len(out) != 3 || out[0].Name != "Read" || out[1].Name != "mcp__b" || out[1].InputSchema["real"] != "schema" || out[2].Name != "ToolSearch" {
+		t.Fatalf("wrong discovery projection: %+v", out)
 	}
-	preserve := map[string]bool{"mcp__fs__read": true}
-
-	out := stripAndAppendToolSearchWithPreserve(specs, preserve)
-
-	if len(out) != 5 {
-		t.Fatalf("expected 4 originals + ToolSearch = 5; got %d", len(out))
-	}
-	// Read unchanged
-	if out[0].InputSchema["core"] != true {
-		t.Errorf("core Read schema must pass through; got %+v", out[0].InputSchema)
-	}
-	// mcp__fs__read preserved — schema kept
-	if out[1].InputSchema["path"] != "real" {
-		t.Errorf("preserved mcp__fs__read schema should be intact; got %+v", out[1].InputSchema)
-	}
-	// mcp__fs__write stripped — placeholder
-	if out[2].InputSchema["additionalProperties"] != true {
-		t.Errorf("non-preserved mcp__fs__write should be stripped; got %+v", out[2].InputSchema)
-	}
-	// mcp__http__get stripped — placeholder
-	if out[3].InputSchema["additionalProperties"] != true {
-		t.Errorf("non-preserved mcp__http__get should be stripped; got %+v", out[3].InputSchema)
-	}
-	if out[4].Name != "ToolSearch" {
-		t.Errorf("ToolSearch should be appended; got last entry %q", out[4].Name)
+	if specs[2].InputSchema["real"] != "schema" {
+		t.Fatal("input mutated")
 	}
 }
 
-// TestStripAndAppendToolSearchWithPreserve_AllPreserved_NoMetaTool —
+// TestStripAndAppendToolSearchWithPreserve_AllPreservedRetainsDiscovery —
 // when every MCP tool is already discovered, the synthetic ToolSearch
 // entry would be pointless. Don't append it.
-func TestStripAndAppendToolSearchWithPreserve_AllPreserved_NoMetaTool(t *testing.T) {
-	specs := []llm.ToolSpec{
-		{Name: "Read", InputSchema: map[string]any{"core": true}},
-		{Name: "mcp__a", InputSchema: map[string]any{"real": "schema"}},
-		{Name: "mcp__b", InputSchema: map[string]any{"real": "schema"}},
+func TestStripAndAppendToolSearchWithPreserve_AllPreservedRetainsDiscovery(t *testing.T) {
+	specs := []llm.ToolSpec{llm.ToolSpec{Name: "Read", InputSchema: map[string]any{"core": true}}, llm.ToolSpec{Name: "mcp__a", InputSchema: map[string]any{"real": "schema"}}, llm.ToolSpec{Name: "mcp__b", InputSchema: map[string]any{"real": "schema"}}}
+	out := stripAndAppendToolSearchWithPreserve(specs, map[string]bool{"mcp__a": true, "mcp__b": true})
+	if len(out) != 4 || !containsName(out, "ToolSearch") {
+		t.Fatalf("reload/discovery entry disappeared: %+v", out)
 	}
-	preserve := map[string]bool{"mcp__a": true, "mcp__b": true}
-
-	out := stripAndAppendToolSearchWithPreserve(specs, preserve)
-
-	if len(out) != 3 {
-		t.Fatalf("all-preserved should pass through unchanged length; got %d (%+v)", len(out), out)
-	}
-	for _, s := range out {
-		if s.Name == "ToolSearch" {
-			t.Errorf("ToolSearch should NOT be appended when nothing is stripped")
+	for i := range specs {
+		if out[i].Name != specs[i].Name || out[i].InputSchema["real"] != specs[i].InputSchema["real"] {
+			t.Fatal("loaded schema changed")
 		}
 	}
 }

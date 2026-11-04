@@ -381,6 +381,9 @@ func (r *Responses) buildResponsesRequest(req provider.Request) (*responsesReque
 }
 
 func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Request, volatileInInstructions bool) (*responsesRequest, error) {
+	if err := provider.ValidateToolDefinitions(req.Tools, r.MaxToolDefinitions()); err != nil {
+		return nil, err
+	}
 	reasoningEffort, err := resolveReasoningEffort(req.Effort, r.ReasoningEffortValues, r.ReasoningEffortDisabled, string(req.Effort))
 	if err != nil {
 		return nil, err
@@ -624,6 +627,11 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 		default:
 			return nil, fmt.Errorf("responses hosted tool %q is not supported by Metis; supported: web_search", hosted)
 		}
+	}
+	// Validate the final wire array as well: adapter-owned entries must never
+	// escape the same bound applied to the agent's function definitions.
+	if len(out.Tools) > 128 {
+		return nil, fmt.Errorf("invalid request: tool definition limit exceeded: final Responses request has %d tools, endpoint allows 128", len(out.Tools))
 	}
 	return out, nil
 }
@@ -1684,4 +1692,18 @@ func mapResponsesIncompleteReason(reason string) string {
 	default:
 		return "provider_incomplete"
 	}
+}
+
+// Reserve array entries for the adapter-owned hosted tools as well.
+func (r *Responses) MaxToolDefinitions() int {
+	n := 0
+	for _, v := range r.HostedTools {
+		if strings.TrimSpace(v) != "" {
+			n++
+		}
+	}
+	if n >= 128 {
+		return 1
+	}
+	return 128 - n
 }

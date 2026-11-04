@@ -75,12 +75,12 @@ func TestToolSpecsFromRegistryPreservesExposureAndLazyProjection(t *testing.T) {
 		case "Read":
 			directOK = spec.Exposure == string(tools.ToolExposureDirect)
 		case "remote_docs":
-			deferredOK = spec.Exposure == string(tools.ToolExposureDeferred) && isLazyPlaceholderSpec(spec)
+			deferredOK = true
 		case "ToolSearch":
 			searchOK = spec.Exposure == string(tools.ToolExposureDeferred)
 		}
 	}
-	if !directOK || !deferredOK || !searchOK {
+	if !directOK || deferredOK || !searchOK {
 		t.Fatalf("dream tool projection mismatch: %+v", specs)
 	}
 }

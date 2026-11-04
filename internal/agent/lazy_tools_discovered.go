@@ -19,6 +19,7 @@ package agent
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
@@ -55,6 +56,7 @@ func (l *Loop) markDiscoveredName(name string) {
 		l.discoveredMCP = make(map[string]bool, 4)
 	}
 	l.discoveredMCP[name] = true
+	l.discoveredMCPRecent = touchDiscovered(l.discoveredMCPRecent, name)
 }
 
 // snapshotDiscoveredMCP returns a read-only copy of the discovered set
@@ -106,12 +108,59 @@ func (l *Loop) ensureDiscoveredHydrated() {
 	}
 	candidates := make(map[string]bool)
 	rebuildDiscoveredToolNamesFromMessages(candidates, l.Messages)
+	names := make([]string, 0, len(candidates))
 	for name := range candidates {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		entry, ok := l.Registry.GetModelEntry(name)
 		if (ok && entry.Exposure == tools.ToolExposureDeferred) || (!ok && strings.HasPrefix(name, "mcp__")) {
 			l.discoveredMCP[name] = true
+			l.discoveredMCPRecent = touchDiscovered(l.discoveredMCPRecent, name)
 		}
 	}
+	results := make(map[string]llm.ContentBlock)
+	for _, m := range l.Messages {
+		for _, b := range m.Content {
+			if b.Type == "tool_result" {
+				results[b.ToolUseID] = b
+			}
+		}
+	}
+	for _, m := range l.Messages {
+		if m.Role != llm.RoleAssistant {
+			continue
+		}
+		for _, b := range m.Content {
+			if b.Type != "tool_use" {
+				continue
+			}
+			if l.discoveredMCP[b.ToolName] {
+				l.discoveredMCPRecent = touchDiscovered(l.discoveredMCPRecent, b.ToolName)
+			}
+			if b.ToolName == "ToolSearch" {
+				res, ok := results[b.ToolUseID]
+				if !ok || res.IsError {
+					continue
+				}
+				var payload struct {
+					Matches []struct {
+						Name        string         `json:"name"`
+						InputSchema map[string]any `json:"input_schema"`
+					} `json:"matches"`
+				}
+				if json.Unmarshal([]byte(res.ToolResult), &payload) == nil {
+					for _, v := range payload.Matches {
+						if v.InputSchema != nil && l.discoveredMCP[v.Name] {
+							l.discoveredMCPRecent = touchDiscovered(l.discoveredMCPRecent, v.Name)
+						}
+					}
+				}
+			}
+		}
+	}
+
 }
 
 // rebuildDiscoveredMCPFromMessages walks one pass of a message slice

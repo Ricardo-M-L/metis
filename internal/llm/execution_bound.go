@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"errors"
+	pubprovider "github.com/Ricardo-M-L/metis/pkg/provider"
 	"sync"
 
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
@@ -74,6 +75,11 @@ func BindExecutionProvider(base Provider, execution context.Context) Provider {
 type executionBoundProvider struct {
 	Provider
 	execution context.Context
+}
+
+// Forward the adapter's optional count budget through execution binding.
+func (p *executionBoundProvider) MaxToolDefinitions() int {
+	return pubprovider.ToolDefinitionLimit(p.Provider)
 }
 
 // Recovery consumers test this marker's value rather than its presence.
