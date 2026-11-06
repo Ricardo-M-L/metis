@@ -49,13 +49,14 @@ type ContextUsage struct {
 }
 
 type contextPrefixEstimate struct {
-	valid           bool
-	systemTokens    int
-	toolTokens      int
-	historyRevision uint64
-	routingRevision uint64
-	provider        contextProviderIdentity
-	model           string
+	valid                   bool
+	systemTokens            int
+	toolTokens              int
+	pendingCheckpointTokens int
+	historyRevision         uint64
+	routingRevision         uint64
+	provider                contextProviderIdentity
+	model                   string
 }
 
 // ContextUsageSnapshot never assembles a request, hydrates tools, retrieves
@@ -72,8 +73,12 @@ func (l *Loop) ContextUsageSnapshot() ContextUsage {
 		return ContextUsage{}
 	}
 	defer l.mu.RUnlock()
+	return l.contextUsageSnapshotLocked()
+}
+
+func (l *Loop) contextUsageSnapshotLocked() ContextUsage {
 	overhead := int(l.requestOverheadTokens.Load())
-	used := estimateActiveHistoryTokens(l.Messages) + overhead
+	used := estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages)) + overhead
 	if base, ok := l.activeContextBaseLocked(); ok {
 		used = max(base+overhead, 0)
 	}
@@ -88,7 +93,7 @@ func (l *Loop) ContextUsageSnapshot() ContextUsage {
 		prefix.routingRevision == l.routingRevision && prefix.model == l.Model &&
 		prefix.provider == identifyContextProvider(l.Provider) {
 		snapshot.Breakdown = &ContextBreakdown{SystemTokens: prefix.systemTokens,
-			ToolTokens: prefix.toolTokens, MessageTokens: estimateActiveHistoryTokens(l.Messages), Estimated: true}
+			ToolTokens: prefix.toolTokens, MessageTokens: estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages)) + prefix.pendingCheckpointTokens, Estimated: true}
 	}
 	l.estTokens.Store(int64(used))
 	l.contextUsageCache.Store(&snapshot)
@@ -131,10 +136,13 @@ type contextRequestAnchor struct {
 	historyRevision uint64
 	routingRevision uint64
 	requestOverhead int
-	maxContext      int
-	windowKind      string
-	maxInput        int
-	maxOutput       int
+	// Captured from the actual projected request, independently of the live
+	// history position used to attribute the response.
+	requestUsageFloor int
+	maxContext        int
+	windowKind        string
+	maxInput          int
+	maxOutput         int
 }
 
 func identifyContextProvider(provider llm.Provider) contextProviderIdentity {
@@ -186,18 +194,21 @@ func (l *Loop) contextRequestAnchorLocked(provider llm.Provider, req llm.Request
 		maxContext = provider.MaxContextTokens()
 	}
 	return contextRequestAnchor{
-		valid:           true,
-		provider:        provider,
-		providerID:      identifyContextProvider(provider),
-		requestModel:    req.Model,
-		messageCount:    len(req.Messages),
-		historyRevision: l.historyRevision,
-		routingRevision: l.routingRevision,
-		requestOverhead: overhead,
-		maxContext:      maxContext,
-		windowKind:      l.contextCapabilities.WindowKind,
-		maxInput:        l.contextCapabilities.MaxInputTokens,
-		maxOutput:       l.contextCapabilities.MaxOutputTokens,
+		valid:        true,
+		provider:     provider,
+		providerID:   identifyContextProvider(provider),
+		requestModel: req.Model,
+		// Adapter projection can omit host checkpoints without changing live
+		// history. Usage is installed after appending to that history, not wire input.
+		messageCount:      len(l.Messages),
+		historyRevision:   l.historyRevision,
+		routingRevision:   l.routingRevision,
+		requestOverhead:   overhead,
+		requestUsageFloor: estimateUsageFloor(req.Messages),
+		maxContext:        maxContext,
+		windowKind:        l.contextCapabilities.WindowKind,
+		maxInput:          l.contextCapabilities.MaxInputTokens,
+		maxOutput:         l.contextCapabilities.MaxOutputTokens,
 	}
 }
 
@@ -396,7 +407,7 @@ func (l *Loop) storeActiveContextSnapshotLocked(usage *usageTotals, anchor conte
 			tokens += assistantContextTokens(anchor.provider, assistant, usage.out)
 		}
 	}
-	estimatedAnchorTokens := estimateUsageFloor(l.Messages[:min(anchor.messageCount, len(l.Messages))]) + anchor.requestOverhead
+	estimatedAnchorTokens := anchor.requestUsageFloor + anchor.requestOverhead
 	if len(assistant.Content) > 0 {
 		estimatedAnchorTokens += assistantContextTokens(anchor.provider, assistant, 0)
 	}
@@ -407,7 +418,7 @@ func (l *Loop) storeActiveContextSnapshotLocked(usage *usageTotals, anchor conte
 		usageClearlyUnderreports(tokens, estimatedAnchorTokens) ||
 		!contextUsageFitsAnchor(usage, promptTokens, tokens, anchor) {
 		l.invalidateProviderContextLocked()
-		l.estTokens.Store(int64(estimateActiveHistoryTokens(l.Messages)) + l.requestOverheadTokens.Load())
+		l.estTokens.Store(int64(estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))) + l.requestOverheadTokens.Load())
 		return
 	}
 	l.activeContext = activeContextSnapshot{
@@ -456,5 +467,11 @@ func (l *Loop) activeContextBaseLocked() (int, bool) {
 		snapshot.provider != identifyContextProvider(l.Provider) {
 		return 0, false
 	}
-	return snapshot.tokens + estimateActiveHistoryTokens(l.Messages[snapshot.messageCount:]) - snapshot.requestOverhead, true
+	// Project the complete history before selecting the live-position delta:
+	// checkpoint removal (including obsolete continuation markers) depends on
+	// surrounding history, not just the newly appended suffix.
+	projected := l.projectDynamicCheckpoints(l.Messages)
+	projectedPrefix := l.projectDynamicCheckpoints(l.Messages[:snapshot.messageCount])
+	delta := estimateActiveHistoryTokens(projected) - estimateActiveHistoryTokens(projectedPrefix)
+	return snapshot.tokens + delta - snapshot.requestOverhead, true
 }

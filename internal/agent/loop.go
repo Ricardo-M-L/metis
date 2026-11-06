@@ -130,6 +130,11 @@ type Loop struct {
 	// via runtime.BuildAgentLoop's env override.
 	AutoRetrieveK int
 
+	// Per-turn newly admitted recall estimates, not a session-wide quota.
+	// Zero uses 800 target / 1500 hard maximum. Complete fences are preserved.
+	AutoRetrieveTargetTokens int
+	AutoRetrieveMaxTokens    int
+
 	// AutoRetrieveRerank, when true, fetches BM25 top K*3 candidates
 	// then asks the active provider to LLM-rerank them down to top-K.
 	// More accurate than raw BM25 (the ranker is an actual language
@@ -152,6 +157,8 @@ type Loop struct {
 	turnMemoryRecall         string
 	turnMemoryPrepared       bool
 	turnMemoryRecallAttached bool
+	memoryGuardSnapshot      *guardedMemorySnapshot
+	memoryRevocationBefore   []llm.Message
 
 	// PlanMode keeps read-only exploration available while plan-control tools
 	// execute normally and potentially mutating tools receive denied results.
@@ -228,6 +235,10 @@ type Loop struct {
 	// (METIS_SPILL / METIS_MICROCOMPACT) stay independent. Empty =
 	// spilling disabled.
 	SpillDir string
+
+	// First-history estimated-token limits; zero uses env/default (8000/24000).
+	ToolResultTokenLimit int
+	ToolBatchTokenLimit  int
 
 	// Detector monitors tool call patterns; aborts run when ShouldAbort returns true.
 	// nil = disabled.
@@ -750,19 +761,19 @@ func (l *Loop) prepareTurnMemory(ctx context.Context) {
 	revision := l.historyRevision
 	l.mu.RUnlock()
 
-	memBody, retrieveBody := "", ""
+	generation, memBody, snapshotOK := recallSnapshot(manager)
+	retrieveBody := ""
 	var picked []memory.Passage
-	if manager != nil {
-		memBody = manager.BuildContext()
+	if manager != nil && snapshotOK {
 		if k > 0 && query != "" {
 			candidates := manager.AutoRetrieveCandidates(query, k)
 			if rerank && provider != nil {
 				candidates = manager.AutoRetrieveCandidates(query, k*3)
+				candidates = relevantRecallCandidates(candidates, query)
 				picked = rerankAutoRetrieve(ctx, provider, query, candidates, k)
 			} else {
 				picked = candidates
 			}
-			retrieveBody = memory.FormatRetrieveSection(picked)
 		}
 	}
 
@@ -774,28 +785,39 @@ func (l *Loop) prepareTurnMemory(ctx context.Context) {
 		l.mu.Unlock()
 		return
 	}
-	l.turnMemoryContext = memBody
-	l.turnMemoryRecall = retrieveBody
-	l.turnMemoryPrepared = true
-	if retrieveBody == "" {
-		l.mu.Unlock()
-		return
-	}
-	idx := transcript.LastPlainUserIndex(l.Messages)
-	if idx < 0 || messageContainsAutoRetrieve(l.Messages[idx]) {
-		l.mu.Unlock()
-		return
-	}
-	l.Messages[idx].Content = append(l.Messages[idx].Content, llm.ContentBlock{
-		Type: "text", Text: retrieveBody, Synthetic: true,
+	l.withMemoryGuardLocked(func() {
+		currentGeneration, currentBody, currentOK := l.memorySnapshotLocked()
+		if !currentOK || currentGeneration != generation || ctx.Err() != nil {
+			picked = nil
+			memBody = currentBody
+		}
+		l.validateMemorySnapshotLocked()
+		picked = novelRecall(picked, l.Messages, query, l.AutoRetrieveTargetTokens, l.AutoRetrieveMaxTokens)
+		retrieveBody = formatRecall(picked, generation)
+		l.turnMemoryContext = memBody
+		l.turnMemoryRecall = retrieveBody
+		l.turnMemoryPrepared = true
+		if retrieveBody == "" {
+			return
+		}
+		idx := transcript.LastPlainUserIndex(l.Messages)
+		if idx < 0 || messageContainsAutoRetrieve(l.Messages[idx]) {
+			picked = nil
+			return
+		}
+		l.Messages[idx].Content = append(l.Messages[idx].Content, llm.ContentBlock{
+			Type: "text", Text: retrieveBody, Synthetic: true,
+		})
+		l.turnMemoryRecallAttached = true
 	})
-	l.turnMemoryRecallAttached = true
 	l.mu.Unlock()
 
 	// Retrieval candidates and token estimates are previews, not memory use.
 	// Persist usage only after the exact Top-K has survived the session/history
 	// revision check and was attached to the request-bound user message.
-	_ = manager.MarkRetrieved(picked)
+	if manager != nil && len(picked) > 0 {
+		_ = manager.MarkRetrieved(picked)
+	}
 }
 
 func messageContainsAutoRetrieve(message llm.Message) bool {
@@ -872,7 +894,7 @@ func (l *Loop) EstimateContextTokens() int {
 		if base, ok := l.activeContextBaseLocked(); ok {
 			v = max(base+overhead, 0)
 		} else {
-			v = estimateActiveHistoryTokens(l.Messages) + overhead
+			v = estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages)) + overhead
 		}
 		l.mu.RUnlock()
 		l.estTokens.Store(int64(v))
@@ -892,7 +914,7 @@ func (l *Loop) storeContextEstimateFromHistory(historyTokens int) {
 	l.invalidateActiveContextLocked()
 	l.historyRevision++
 	l.historyReplacementTokens = historyTokens
-	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.Messages)) + l.requestOverheadTokens.Load())
+	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))) + l.requestOverheadTokens.Load())
 }
 
 // EstimateRequestContextTokens preflights the input that the next provider
@@ -909,16 +931,16 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 	// pixels/tiles, not by tokenizing their base64 transport bytes. Counting
 	// base64 here can turn one screenshot into more than a million fake tokens
 	// and trigger destructive compaction before the provider sees the image.
-	historyTokens := estimateActiveHistoryTokens(l.Messages)
+	historyTokens := estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))
+	messages := append([]llm.Message(nil), l.Messages...)
+	checkpointCapable := false
+	if capability, ok := l.Provider.(interface{ DynamicContextCheckpoints() bool }); ok {
+		checkpointCapable = capability.DynamicContextCheckpoints()
+	}
 	activeBase, hasActiveSnapshot := l.activeContextBaseLocked()
 	system := l.System
 	sections := append([]llm.SystemSection(nil), l.SystemSections...)
-	if l.principalIdentity != "" {
-		system += "\n\n" + l.principalIdentity
-		if len(sections) > 0 {
-			sections = append(sections, llm.SystemSection{Name: "principal_identity", Body: l.principalIdentity, Cache: true})
-		}
-	}
+	principalIdentity := l.principalIdentity
 	planMode := l.planMode
 	planPrompt := l.PlanSystemPrompt
 	planBodiesToRemove := make([]string, 0, 2)
@@ -991,12 +1013,23 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 		}
 		dynamic = []llm.SystemSection{{Name: "runtime_state", Body: state.Render(), Cache: true}}
 	} else if currentStateSections != nil {
-		dynamic = currentStateSections()
+		dynamic = append([]llm.SystemSection(nil), currentStateSections()...)
+		for i := range dynamic {
+			dynamic[i].Cache = false
+			dynamic[i].Volatile = true
+		}
 	}
 
 	requestSections := []llm.SystemSection(nil)
-	if len(sections) > 0 {
+	if len(sections) > 0 || checkpointCapable {
 		requestSections = make([]llm.SystemSection, 0, len(sections)+len(dynamic)+3)
+		if len(sections) == 0 {
+			base := system
+			if planMode && planPrompt != "" {
+				base = strings.TrimSpace(strings.TrimSuffix(base, planPrompt))
+			}
+			requestSections = append(requestSections, llm.SystemSection{Name: "base", Body: base, Cache: true})
+		}
 		for _, section := range sections {
 			if section.Name == "plan_mode" {
 				continue
@@ -1032,14 +1065,26 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 			system += "\n\n" + retrieveBody
 		}
 	}
+	if principalIdentity != "" {
+		system += "\n\n" + principalIdentity
+		if len(requestSections) > 0 {
+			requestSections = append(requestSections, llm.SystemSection{Name: "principal_identity", Body: principalIdentity, Cache: true})
+		}
+	}
 	requestTools := specs
 	if rescueWithoutTools {
 		requestTools = nil
 	}
+	checkpointDelta := 0
+	if checkpointCapable && len(requestSections) > 0 {
+		projected, stable := projectCheckpointSnapshot(messages, requestSections)
+		checkpointDelta = estimateActiveHistoryTokens(projected) - estimateActiveHistoryTokens(messages)
+		requestSections = stable
+	}
 	systemTokens, toolTokens := estimateRequestPrefix(llm.Request{
 		System: system, SystemSections: requestSections, Tools: requestTools,
 	})
-	overhead := systemTokens + toolTokens
+	overhead := systemTokens + toolTokens + checkpointDelta
 
 	total := historyTokens + overhead
 	if hasActiveSnapshot {
@@ -1052,11 +1097,10 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 		l.contextUsageEpoch.Load() == contextEpoch && l.Model == runtimeModel && identifyContextProvider(l.Provider) == providerID {
 		l.requestOverheadTokens.Store(int64(overhead))
 		l.cacheContextPrefixLocked(systemTokens, toolTokens)
-		displayTotal := estimateActiveHistoryTokens(l.Messages) + overhead
-		if base, ok := l.activeContextBaseLocked(); ok {
-			displayTotal = max(base+overhead, 0)
-		}
-		l.estTokens.Store(int64(displayTotal))
+		l.contextPrefix.pendingCheckpointTokens = checkpointDelta
+		// Publish the coherent reading now, so a busy UI reader observes this
+		// preflight too, without having to assemble another request.
+		l.contextUsageSnapshotLocked()
 	}
 	l.mu.Unlock()
 	return total
@@ -1185,7 +1229,7 @@ func (l *Loop) rebindProviderRuntime(provider llm.Provider, model string, maxOut
 	}
 	l.routingRevision++
 	l.invalidateActiveContextLocked()
-	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.Messages)) + l.requestOverheadTokens.Load())
+	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))) + l.requestOverheadTokens.Load())
 }
 
 // ProviderRuntimeState returns an immutable provider/runtime binding snapshot.
@@ -1303,6 +1347,7 @@ func (l *Loop) Reset() {
 	ownsCompact := l.compactMu.TryLock()
 	l.mu.Lock()
 	l.Messages = nil
+	l.memoryRevocationBefore = nil
 	l.invalidateActiveContextLocked()
 	l.turnIdx = 0
 	l.iterIdx = 0
@@ -1424,12 +1469,15 @@ func (l *Loop) ResetSession(messages []llm.Message) {
 	ownsCompact := l.compactMu.TryLock()
 	l.mu.Lock()
 	l.restoreMessagesLocked(messages)
+	// A failed replacement belongs to the old physical session ledger only.
+	l.memoryRevocationBefore = nil
+	l.memoryGuardSnapshot = nil
 	l.requestOverheadTokens.Store(0)
 	// ResetSession can be followed immediately by a non-blocking status poll.
 	// Prime the fallback from the restored history while mu is held so a
 	// concurrent compaction/lifecycle write lock cannot make a real session
 	// appear to have an empty context window.
-	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.Messages)))
+	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))))
 	l.todoWriteIter = 0
 	l.todoReminderIter = 0
 	l.todoReconciledThisTurn = false
@@ -1958,6 +2006,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		transport.RecordTiming(ctx, "request_build_start")
 		req, contextAnchor := l.buildRequestWithContext(specs)
 		transport.RecordTiming(ctx, "request_build_end")
+		if err := l.checkpointRequestHistory(); err != nil {
+			stopReason = "error"
+			emit(ctx, out, Event{Kind: EventError, Err: err})
+			return err
+		}
 		provider := contextAnchor.provider
 		if provider == nil {
 			provider = l.Provider
@@ -1997,6 +2050,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					transport.RecordTiming(ctx, "request_build_start")
 					req, contextAnchor = l.buildRequestForRetryWithContext(specs, requestWithoutTools)
 					transport.RecordTiming(ctx, "request_build_end")
+					if checkpointErr := l.checkpointRequestHistory(); checkpointErr != nil {
+						return checkpointErr
+					}
 					provider = contextAnchor.provider
 					if provider == nil {
 						provider = l.Provider
@@ -2031,7 +2087,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		accountUsage := func(reported *usageTotals) error {
 			runOutputTokens += reported.out
 			if l.CacheStats != nil {
-				l.CacheStats.Add(CacheStat{
+				l.CacheStats.RecordRequest(req, CacheStat{
 					Turn: runIter, Input: reported.in, Output: reported.out,
 					CacheCreate: reported.cacheCreate, CacheRead: reported.cacheRead,
 					Fingerprint: FingerprintRequest(req),
@@ -2600,10 +2656,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					results = append(results, llm.ContentBlock{Type: "text", Text: pendingContractReminder})
 					pendingContractReminder = ""
 				}
-				l.mu.Lock()
-				l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
-				l.mu.Unlock()
-				if err := l.checkpointHistory(); err != nil {
+				if err := l.commitToolBatch(results); err != nil {
 					stopReason = "error"
 					emit(ctx, out, Event{Kind: EventError, Err: err})
 					return err
@@ -2767,10 +2820,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				results = append(results, llm.ContentBlock{Type: "text", Text: pendingContractReminder})
 				pendingContractReminder = ""
 			}
-			l.mu.Lock()
-			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
-			l.mu.Unlock()
-			if err := l.checkpointHistory(); err != nil {
+			if err := l.commitToolBatch(results); err != nil {
 				stopReason = "error"
 				emit(ctx, out, Event{Kind: EventError, Err: err})
 				return err
@@ -2870,10 +2920,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				})
 				pendingContractReminder = ""
 			}
-			l.mu.Lock()
-			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
-			l.mu.Unlock()
-			if err := l.checkpointHistory(); err != nil {
+			if err := l.commitToolBatch(results); err != nil {
 				stopReason = "error"
 				emit(ctx, out, Event{Kind: EventError, Err: err})
 				return err
@@ -2916,11 +2963,8 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				})
 				pendingContractReminder = ""
 			}
-			l.mu.Lock()
-			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
-			l.mu.Unlock()
 			stopReason = "halted_by_hook"
-			if err := l.checkpointHistory(); err != nil {
+			if err := l.commitToolBatch(results); err != nil {
 				stopReason = "error"
 				emit(ctx, out, Event{Kind: EventError, Err: err})
 				return err
@@ -2955,11 +2999,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			})
 			pendingContractReminder = ""
 		}
-		l.mu.Lock()
-		l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: results})
-		l.mu.Unlock()
-
-		if err := l.checkpointHistory(); err != nil {
+		if err := l.commitToolBatch(results); err != nil {
 			stopReason = "error"
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
@@ -3111,9 +3151,17 @@ func (l *Loop) buildRequest(specs []llm.ToolSpec) llm.Request {
 // provider and header identity that produced it. Run retains the anchor until
 // the response is appended so a concurrent session/model replacement cannot
 // publish stale provider usage as the new active-context value.
-func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, contextRequestAnchor) {
+func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (req llm.Request, anchor contextRequestAnchor) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.withMemoryGuardLocked(func() {
+		req, anchor = l.buildRequestMemoryLocked(specs)
+	})
+	return
+}
+
+func (l *Loop) buildRequestMemoryLocked(specs []llm.ToolSpec) (llm.Request, contextRequestAnchor) {
+	l.validateMemorySnapshotLocked()
 	system := l.System
 	var sections []llm.SystemSection
 	memBody := l.turnMemoryContext
@@ -3122,7 +3170,7 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, conte
 		retrieveBody = ""
 	}
 	if !l.turnMemoryPrepared && l.Memory != nil {
-		memBody = l.Memory.BuildContext()
+		_, memBody, _ = l.memorySnapshotLocked()
 	}
 	// Per-turn auto retrieval: BM25 the latest user message against archival
 	// and topic memory. Runtime defaults to Top-5; AutoRetrieveK == 0 disables
@@ -3135,15 +3183,11 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, conte
 	// Falls back to BM25 ordering on any failure.
 	if !l.turnMemoryPrepared && l.Memory != nil && l.AutoRetrieveK > 0 {
 		query := lastUserTextLocked(l.Messages)
-		if l.AutoRetrieveRerank && l.Provider != nil {
-			candidates := l.Memory.AutoRetrieveCandidates(query, l.AutoRetrieveK*3)
-			// Compatibility path for embedders that call buildRequest directly
-			// without Run/prepareTurnMemory. Live turns always use the cancellable
-			// precomputed path above and never rerank while l.mu is held.
-			picked := capPassages(candidates, l.AutoRetrieveK)
-			retrieveBody = memory.FormatRetrieveSection(picked)
-		} else {
-			retrieveBody = l.Memory.PreviewAutoRetrieve(query, l.AutoRetrieveK)
+		generation, _, ok := l.memorySnapshotLocked()
+		if ok {
+			candidates := l.memoryCandidatesLocked(query, l.AutoRetrieveK)
+			picked := novelRecall(candidates, l.Messages, query, l.AutoRetrieveTargetTokens, l.AutoRetrieveMaxTokens)
+			retrieveBody = formatRecall(picked, generation)
 		}
 	}
 	// Resolve the plan overlay body from the explicit runtime injection, or
@@ -3179,8 +3223,19 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, conte
 		}
 	}
 
-	if len(l.SystemSections) > 0 {
+	checkpointCapable := false
+	if capability, ok := l.Provider.(interface{ DynamicContextCheckpoints() bool }); ok {
+		checkpointCapable = capability.DynamicContextCheckpoints()
+	}
+	if len(l.SystemSections) > 0 || checkpointCapable {
 		sections = make([]llm.SystemSection, 0, len(l.SystemSections)+4)
+		if len(l.SystemSections) == 0 {
+			base := system
+			if l.planMode && planPrompt != "" {
+				base = strings.TrimSpace(strings.TrimSuffix(base, planPrompt))
+			}
+			sections = append(sections, llm.SystemSection{Name: "base", Body: base, Cache: true})
+		}
 		for _, section := range l.SystemSections {
 			if section.Name != "plan_mode" {
 				sections = append(sections, section)
@@ -3275,6 +3330,7 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, conte
 		}
 		l.BypassNextCache = false
 	}
+	sections = l.checkpointDynamicContextLocked(sections)
 	requestSessionID := ""
 	if l.CurrentStateSnapshot != nil {
 		requestSessionID = strings.TrimSpace(l.runtimeStateSnapshot.SessionID)
@@ -3284,7 +3340,7 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (llm.Request, conte
 		SessionID:      requestSessionID,
 		System:         system,
 		SystemSections: sections,
-		Messages:       append([]llm.Message(nil), l.Messages...),
+		Messages:       l.projectDynamicCheckpoints(transcript.DeepSnapshot(l.Messages)),
 		Tools:          specs,
 		Stream:         true,
 		// Effort has a dedicated lock so the TUI can update it while the main

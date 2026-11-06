@@ -1204,6 +1204,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		return llm.ContentBlock{
 			Type: "tool_result", ToolUseID: blk.ToolUseID,
 			ToolResult: modelBody, IsError: true,
+			TrustedResultSuffix: modelBody[len(displayBody):],
 		}
 	}
 	emit(ctx, out, Event{
@@ -1239,6 +1240,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	}
 	// PostToolUseContext hook feedback — appended AFTER the spill check
 	// so fresh diagnostics never get offloaded with the bulk output.
+	trustedBodyStart := len(resultBody)
 	if hookContext != "" {
 		resultBody = resultBody + wrapAsSystemReminder(hookContext)
 	}
@@ -1304,18 +1306,20 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 			return llm.ContentBlock{
 				Type: "tool_result", ToolUseID: blk.ToolUseID,
 				ToolResult: resultBody, IsError: res.IsError,
-				ToolResultBlocks: blocks,
-				Display:          res.Display,
-				Presentation:     clonePresentation(res.Presentation),
+				ToolResultBlocks:    blocks,
+				TrustedResultSuffix: resultBody[trustedBodyStart:],
+				Display:             res.Display,
+				Presentation:        clonePresentation(res.Presentation),
 			}
 		}
 	}
 	return llm.ContentBlock{
 		Type: "tool_result", ToolUseID: blk.ToolUseID,
-		ToolResult:   resultBody,
-		IsError:      res.IsError,
-		Display:      res.Display,
-		Presentation: clonePresentation(res.Presentation),
+		ToolResult:          resultBody,
+		TrustedResultSuffix: resultBody[trustedBodyStart:],
+		IsError:             res.IsError,
+		Display:             res.Display,
+		Presentation:        clonePresentation(res.Presentation),
 	}
 }
 

@@ -32,6 +32,9 @@ func (s *Store) Delete(id string) error {
 	remove("cost temp", s.costPath(id)+".tmp")
 	remove("archive marker", s.archivePath(id))
 	remove("tag", filepath.Join(s.Dir, "tags", id+".txt"))
+	if err := s.removeAttachmentDirectory(s.attachmentDir(id)); err != nil {
+		joined = errors.Join(joined, err)
+	}
 
 	if err := s.deleteNamedSnapshots(id); err != nil {
 		joined = errors.Join(joined, err)
@@ -151,6 +154,9 @@ func (s *Store) deleteSubagentTranscripts(id string) error {
 		// the old parent is deleted. Remove these before the ownership header so
 		// a failed removal remains discoverable and retryable.
 		var sidecarErr error
+		if err := s.removeAttachmentDirectory(path + ".attachments"); err != nil {
+			sidecarErr = errors.Join(sidecarErr, err)
+		}
 		for _, sidecarDir := range []string{"subagent-usage", "subagent-activity"} {
 			sidecarPath := filepath.Join(s.Dir, sidecarDir, entry.Name())
 			if err := os.Remove(sidecarPath); err != nil && !errors.Is(err, os.ErrNotExist) {

@@ -85,6 +85,29 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 		l.mu.Unlock()
 		return result, fmt.Errorf("compact: compactor/provider unavailable")
 	}
+	// Validate before sending even the summarizer an obsolete memory source.
+	l.withMemoryGuardLocked(func() {
+		l.validateMemorySnapshotLocked()
+		if raw, exists := compactor.lastSummaryMemory[summaryMemoryHint]; exists {
+			_, body, valid := l.memorySnapshotLocked()
+			_, capable := l.Memory.(memorySnapshotter)
+			visible := map[string]string{}
+			if capable && l.Memory != nil {
+				passages, err := l.memoryPassagesLocked()
+				valid = valid && err == nil
+				for _, passage := range passages {
+					visible[passage.ID] = recallPassageHash(passage)
+				}
+			}
+			if !validSummaryMemory(raw, body, visible, valid && capable) {
+				compactor.ResetCircuit()
+			}
+		}
+	})
+	if l.compactorResetPending {
+		compactor.ResetCircuit()
+		l.compactorResetPending = false
+	}
 	hooks := l.Hooks
 	checkpoint := l.CompactionCheckpoint
 	model, turn := l.Model, l.turnIdx
@@ -115,11 +138,13 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	beforeIdentity := l.Messages
 	before := cloneMessages(l.Messages)
 	priorSummary := compactor.LastSummary
+	priorSummaryMemory := compactor.lastSummaryMemory
 	priorFailures := compactor.consecutiveFailures
 	l.mu.Unlock()
 
 	restoreCompactorState := func() {
 		compactor.LastSummary = priorSummary
+		compactor.lastSummaryMemory = priorSummaryMemory
 		compactor.consecutiveFailures = priorFailures
 	}
 	setResultHistory := func(history []llm.Message) {
@@ -215,6 +240,7 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 		// later validation rejects the checkpoint. An unsuccessful Loop-level
 		// transaction must never replace the last durable summary seed.
 		compactor.LastSummary = priorSummary
+		compactor.lastSummaryMemory = priorSummaryMemory
 
 		// User cancellation and deadline expiry describe the lifetime of this
 		// attempt, not summarizer health. CompactWithInstructions records every

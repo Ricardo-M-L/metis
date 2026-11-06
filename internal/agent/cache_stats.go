@@ -49,6 +49,9 @@ type CacheStat struct {
 	// Comparing fingerprints across turns identifies which input
 	// changed when the cache breaks unexpectedly.
 	Fingerprint string
+	// Projection is a local, pre-adapter estimate, NOT actual wire order or a
+	// provider cache-hit prediction. Usage fields above remain authoritative.
+	Projection RequestCacheProjection
 }
 
 // HitRate returns CacheRead / (CacheRead + CacheCreate + Input).
@@ -66,9 +69,10 @@ func (s CacheStat) HitRate() float64 {
 // Cap defaults to 100 — large enough to see patterns, small enough
 // not to inflate memory in long-lived sessions.
 type CacheStatsRing struct {
-	mu  sync.RWMutex
-	buf []CacheStat
-	cap int
+	mu              sync.RWMutex
+	buf             []CacheStat
+	cap             int
+	previousRequest []cacheProjectionPart
 }
 
 // NewCacheStatsRing constructs a ring with the given cap. Pass 0 to
@@ -84,6 +88,10 @@ func NewCacheStatsRing(cap int) *CacheStatsRing {
 func (r *CacheStatsRing) Add(s CacheStat) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.addLocked(s)
+}
+
+func (r *CacheStatsRing) addLocked(s CacheStat) {
 	if len(r.buf) >= r.cap {
 		// Drop the oldest. A single-shift on a 100-element slice is
 		// effectively free — we don't bother with the head/tail
@@ -102,6 +110,7 @@ func (r *CacheStatsRing) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.buf = nil
+	r.previousRequest = nil
 }
 
 // Snapshot returns a defensive copy of the current ring contents.
@@ -129,16 +138,10 @@ func (r *CacheStatsRing) HitRate() float64 {
 	return float64(read) / float64(total)
 }
 
-// LastBreak compares the most recent stat's fingerprint to the one
-// before it. Returns ("", "") when there's no break or when fewer
-// than 2 entries exist; otherwise returns (oldFP, newFP) so callers
-// can log "cache broke at turn N (was X, now Y)".
-//
-// Note: we return only the fingerprints — comparing them is
-// caller's job. We deliberately don't try to identify "which field
-// changed" because the inputs to the hash are short and the caller
-// likely already has the model/system/tools at hand to diff
-// directly.
+// LastBreak compares the most recent stat's fingerprint to the one before it.
+// Historical API name: this reports a LOCAL PROJECTION CHANGE, not a cache
+// break, miss, or lost cached tokens. Earlier prefix blocks may still hit.
+// Returns empty strings when unchanged or fewer than two entries exist.
 func (r *CacheStatsRing) LastBreak() (oldFP, newFP string) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -184,9 +187,9 @@ func FingerprintFor(model, system string, tools []llm.ToolSpec, effort llm.Effor
 	return fmt.Sprintf("%x", sum[:6])
 }
 
-// FingerprintRequest hashes the exact cache-relevant request projection. It
-// includes typed system sections because providers such as Anthropic ignore
-// the flattened System string whenever sections are present.
+// FingerprintRequest hashes the local model/system/tool/effort projection.
+// This is neither the actual wire payload nor the complete cache identity.
+// It includes typed sections because some transports ignore flattened System.
 func FingerprintRequest(req llm.Request) string {
 	system := req.System
 	if len(req.SystemSections) > 0 {

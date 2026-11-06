@@ -82,6 +82,13 @@ func (p *executionBoundProvider) MaxToolDefinitions() int {
 	return pubprovider.ToolDefinitionLimit(p.Provider)
 }
 
+// DynamicContextCheckpoints forwards the live transport mode, rather than
+// inferring support from a provider name or unwrapping execution authority.
+func (p *executionBoundProvider) DynamicContextCheckpoints() bool {
+	capability, ok := p.Provider.(interface{ DynamicContextCheckpoints() bool })
+	return ok && capability.DynamicContextCheckpoints()
+}
+
 // Recovery consumers test this marker's value rather than its presence.
 func (p *executionBoundProvider) ManagesRecoverySession() bool {
 	managed, ok := p.Provider.(interface{ ManagesRecoverySession() bool })

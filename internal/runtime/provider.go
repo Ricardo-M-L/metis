@@ -172,6 +172,12 @@ type visionOverrideProvider struct {
 
 func (p visionOverrideProvider) SupportsVision() bool { return p.supportsVision }
 
+// This is a value capability: false preserves the underlying adapter's opt-out.
+func (p visionOverrideProvider) DynamicContextCheckpoints() bool {
+	capability, ok := p.Provider.(interface{ DynamicContextCheckpoints() bool })
+	return ok && capability.DynamicContextCheckpoints()
+}
+
 // ManagesRecoverySession forwards only an explicit true marker. Unlike
 // capability-presence interfaces, its consumer checks this boolean, so the
 // wrapper does not accidentally claim provider-owned retries for other SDKs.

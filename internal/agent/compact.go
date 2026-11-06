@@ -330,6 +330,8 @@ type Compactor struct {
 	// Cleared by ResetCircuit (which fires on /clear). Survives
 	// across Compact calls within a session.
 	LastSummary string
+	// Mirrors the iterative seed when a budget snip removes its boundary.
+	lastSummaryMemory map[string]string
 }
 
 // MaxConsecutiveCompactFailures is the count after which the compactor
@@ -537,7 +539,8 @@ func (c *Compactor) CollapseMiddle(ctx context.Context, messages []llm.Message) 
 	// EARLY-conversation context, not the running narrative, so an
 	// iterative merge with c.LastSummary (which describes the
 	// recent middle) would conflate two different scopes.
-	summary, err := c.summarize(ctx, middle, "")
+	var summaryHints map[string]string
+	summary, err := c.summarizeWithSources(ctx, middle, "", "", nil, &summaryHints)
 	if err != nil {
 		c.recordCompactResult(false, err)
 		return nil, err
@@ -545,8 +548,10 @@ func (c *Compactor) CollapseMiddle(ctx context.Context, messages []llm.Message) 
 	boundary := llm.Message{
 		Role: llm.RoleAssistant,
 		Content: []llm.ContentBlock{{
-			Type: "text",
-			Text: "[Early conversation collapsed: " + summary + "]",
+			Type:         "text",
+			Text:         "[Early conversation collapsed: " + summary + "]",
+			Synthetic:    true,
+			ProviderHint: summaryHints,
 		}},
 	}
 	out := make([]llm.Message, 0, c.ProtectFirst+2+len(keepLater))
@@ -907,6 +912,7 @@ func (c *Compactor) CircuitTripped() bool {
 func (c *Compactor) ResetCircuit() {
 	c.consecutiveFailures = 0
 	c.LastSummary = ""
+	c.lastSummaryMemory = nil
 }
 
 // recordCompactResult updates the failure counter. Called from Compact()
@@ -1054,9 +1060,19 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 	// re-summarizing from scratch. Falls through to non-iterative
 	// when no prior summary exists in middle (first-time compact).
 	priorSummary := c.LastSummary
+	seedHints := c.lastSummaryMemory
 	if body, rest, ok := extractLeadingCheckpoint(middle); ok {
 		priorSummary = body
+		seedHints = summaryMemoryHints(middle[:len(middle)-len(rest)])
 		middle = rest
+	}
+	if !c.IterativeSummary && (len(middle) > 0 || instructions != "") {
+		// A cold summary must still summarize a leading checkpoint as evidence.
+		// Only remove it when its body is actually used as the iterative seed
+		// (or reused verbatim without a model call).
+		middle = messages[:cut]
+		priorSummary = ""
+		seedHints = nil
 	}
 	if len(middle) == 0 && strings.TrimSpace(priorSummary) != "" {
 		// There are no new old-prefix messages to merge. Reusing the prior
@@ -1066,9 +1082,10 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 	}
 
 	summary := priorSummary
+	summaryHints := seedHints // direct reuse inherits even with iterative mode disabled
 	if len(middle) > 0 || strings.TrimSpace(summary) == "" || instructions != "" {
 		var err error
-		summary, err = c.summarizeWithInstructions(ctx, middle, priorSummary, instructions)
+		summary, err = c.summarizeWithSources(ctx, middle, priorSummary, instructions, seedHints, &summaryHints)
 		if err != nil {
 			c.recordCompactResult(false, err)
 			return nil, err
@@ -1089,8 +1106,10 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 	boundary := llm.Message{
 		Role: llm.RoleAssistant,
 		Content: []llm.ContentBlock{{
-			Type: "text",
-			Text: "[Earlier conversation summarized: " + summary + "]",
+			Type:         "text",
+			Text:         "[Earlier conversation summarized: " + summary + "]",
+			Synthetic:    true,
+			ProviderHint: summaryHints,
 		}},
 	}
 
@@ -1165,6 +1184,7 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 		return nil, err
 	}
 	c.LastSummary = summary
+	c.lastSummaryMemory = boundary.Content[0].ProviderHint
 	c.recordCompactResult(true, nil)
 	return out, nil
 }
@@ -1715,13 +1735,16 @@ func redactSecrets(s string) string {
 }
 
 type summaryTranscriptSegment struct {
-	index       int
-	order       int
-	key         string
-	text        string
-	minimum     string
-	user        bool
-	transaction summaryTransactionKind
+	index        int
+	order        int
+	key          string
+	text         string
+	minimum      string
+	user         bool
+	transaction  summaryTransactionKind
+	sources      []llm.ContentBlock
+	spans        []summarySourceSpan
+	minimumSpans []summarySourceSpan
 }
 
 type summaryTransactionKind uint8
@@ -1734,10 +1757,12 @@ const (
 )
 
 type summaryToolAtom struct {
-	order   int
-	kind    string
-	text    string
-	minimum string
+	order               int
+	kind                string
+	text                string
+	minimum             string
+	source              llm.ContentBlock
+	spans, minimumSpans []summarySourceSpan
 }
 
 // summaryToolTransaction is the atomic selection unit used by the local
@@ -1861,19 +1886,29 @@ func buildSummaryToolTransaction(txn summaryToolTransaction) summaryTranscriptSe
 		full.WriteString(missing)
 		minimum.WriteString(missing)
 	}
+	var spans, minimumSpans []summarySourceSpan
 	for _, atom := range txn.atoms {
+		spans = append(spans, shiftSummarySpans(atom.spans, full.Len())...)
+		minimumSpans = append(minimumSpans, shiftSummarySpans(atom.minimumSpans, minimum.Len())...)
 		full.WriteString(atom.text)
 		minimum.WriteString(atom.minimum)
 	}
 	full.WriteString(footer)
 	fmt.Fprintf(&minimum, "[END_TOOL_TRANSACTION_SKELETON id=%q]\n", txn.id)
 
+	sources := make([]llm.ContentBlock, 0, len(txn.atoms))
+	for _, atom := range txn.atoms {
+		sources = append(sources, atom.source)
+	}
 	return summaryTranscriptSegment{
-		order:       txn.latest,
-		key:         txn.key,
-		text:        full.String(),
-		minimum:     minimum.String(),
-		transaction: kind,
+		spans:        spans,
+		minimumSpans: minimumSpans,
+		sources:      sources,
+		order:        txn.latest,
+		key:          txn.key,
+		text:         full.String(),
+		minimum:      minimum.String(),
+		transaction:  kind,
 	}
 }
 
@@ -1920,9 +1955,14 @@ func fitSummaryTranscriptSegment(seg summaryTranscriptSegment, budget int) strin
 // guards while collapsing the old worst case of eight paid CollapseMiddle
 // calls plus a final summary into one provider request.
 func buildSummaryTranscript(messages []llm.Message, redact bool, maxTokens int) string {
+	return buildSummaryTranscriptWithSources(messages, redact, maxTokens, nil)
+}
+
+func buildSummaryTranscriptWithSources(messages []llm.Message, redact bool, maxTokens int, admitted *[]llm.ContentBlock) string {
 	segments := make([]summaryTranscriptSegment, 0, len(messages))
 	transactions := make(map[string]*summaryToolTransaction)
 	var full strings.Builder
+	var fullSources []llm.ContentBlock
 	order := 0
 	for i, m := range messages {
 		role := strings.ToUpper(string(m.Role))
@@ -1936,6 +1976,9 @@ func buildSummaryTranscript(messages []llm.Message, redact bool, maxTokens int) 
 				continue
 			}
 
+			for _, span := range summaryBlockSourceSpans(role, blk, redact) {
+				fullSources = append(fullSources, span.source)
+			}
 			var transactionKey string
 			switch blk.Type {
 			case "tool_use":
@@ -1953,9 +1996,11 @@ func buildSummaryTranscript(messages []llm.Message, redact bool, maxTokens int) 
 			}
 			if transactionKey == "" {
 				segments = append(segments, summaryTranscriptSegment{
-					order: order,
-					key:   fmt.Sprintf("block:%d:%d", i, blockIndex),
-					text:  text,
+					order:   order,
+					key:     fmt.Sprintf("block:%d:%d", i, blockIndex),
+					text:    text,
+					spans:   summaryBlockSourceSpans(role, blk, redact),
+					sources: []llm.ContentBlock{blk},
 					user: m.Role == llm.RoleUser && blk.Type == "text" &&
 						!blk.Synthetic && strings.TrimSpace(blk.Text) != "",
 				})
@@ -1969,9 +2014,12 @@ func buildSummaryTranscript(messages []llm.Message, redact bool, maxTokens int) 
 				}
 				transactions[transactionKey] = txn
 			}
+			minimumText := buildSummaryToolAtomMinimum(role, blk, redact)
+			atomSpans := summaryBlockSourceSpans(role, blk, redact)
 			txn.atoms = append(txn.atoms, summaryToolAtom{
 				order: order, kind: blk.Type, text: text,
-				minimum: buildSummaryToolAtomMinimum(role, blk, redact),
+				minimum: minimumText, source: blk,
+				spans: atomSpans, minimumSpans: summaryToolMinimumSpans(role, blk, redact, minimumText),
 			})
 			if order > txn.latest {
 				txn.latest = order
@@ -1989,6 +2037,9 @@ func buildSummaryTranscript(messages []llm.Message, redact bool, maxTokens int) 
 		}
 	}
 	if maxTokens <= 0 || estimateStringTokens(full.String()) <= maxTokens {
+		if admitted != nil {
+			*admitted = fullSources
+		}
 		return full.String()
 	}
 	for _, txn := range transactions {
@@ -2246,6 +2297,16 @@ func buildSummaryTranscript(messages []llm.Message, redact bool, maxTokens int) 
 	for {
 		result := render()
 		if estimateStringTokens(result) <= maxTokens {
+			if admitted != nil {
+				for _, seg := range segments {
+					if piece, ok := selected[seg.index]; ok && piece.text != "" {
+						spans := summarySegmentRetainedSpans(seg, piece.text)
+						for _, span := range spans {
+							*admitted = append(*admitted, span.source)
+						}
+					}
+				}
+			}
 			return result
 		}
 
@@ -2424,6 +2485,11 @@ func (c *Compactor) summaryWireLimits() (inputCap, outputCap int) {
 }
 
 func (c *Compactor) summarizeWithInstructions(ctx context.Context, messages []llm.Message, priorSummary, instructions string) (string, error) {
+	return c.summarizeWithSources(ctx, messages, priorSummary, instructions, nil, nil)
+}
+
+// Provenance is computed alongside the exact fitted payload, once for all retries.
+func (c *Compactor) summarizeWithSources(ctx context.Context, messages []llm.Message, priorSummary, instructions string, seedHints map[string]string, hints *map[string]string) (string, error) {
 	if c.SummaryTimeoutSeconds > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(c.SummaryTimeoutSeconds)*time.Second)
@@ -2477,8 +2543,17 @@ func (c *Compactor) summarizeWithInstructions(ctx context.Context, messages []ll
 		transcriptBudget -= fixed
 	}
 	transcript := ""
+	var admitted []llm.ContentBlock
 	if summaryInputCap <= 0 || transcriptBudget > 0 {
-		transcript = buildSummaryTranscript(messages, c.RedactSecrets, transcriptBudget)
+		transcript = buildSummaryTranscriptWithSources(messages, c.RedactSecrets, transcriptBudget, &admitted)
+	}
+	if useIterative && priorForPrompt != "" {
+		// A derived summary is opaque: any retained narrative can depend on all
+		// of its original sources, even when the seed itself is locally fitted.
+		admitted = append(admitted, llm.ContentBlock{ProviderHint: seedHints})
+	}
+	if hints != nil {
+		*hints = summaryMemoryHints([]llm.Message{{Content: admitted}})
 	}
 	var b strings.Builder
 	b.WriteString(prefix.String())

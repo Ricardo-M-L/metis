@@ -795,9 +795,9 @@ func toAnthropicWithFlags(req Request, model string, maxTokens int, antiDistill,
 // runtime). New callers pass []SystemSection to BuildSystemBlocksFromSections
 // instead of relying on boundary-marker parsing in buildSystemBlocks.
 //
-// Cache=true emits cache_control on this section's block. Volatile=true
-// overrides Cache and forces no-cache (used by sections that change
-// every call — current token budget, streaming-status injection).
+// Cache=true requests a prefix breakpoint after a stable run. Volatile=true
+// suppresses the marker on this block; it does NOT isolate downstream blocks
+// or conversation history from changes in this block's bytes.
 type SystemSection struct {
 	Name     string
 	Body     string
@@ -809,13 +809,10 @@ type SystemSection struct {
 // caller populated req.SystemSections, falling back to the legacy
 // boundary-marker string parser otherwise.
 //
-// The typed path wins because it preserves the Volatile flag —
-// flattening to text + re-parsing markers can't tell "this is dynamic,
-// never cache" from "this happens to be uncached today". Memory
-// context relies on Volatile=true so a memory update doesn't
-// invalidate the addendum cache (the bug the user hit:
-// every turn writes a memory entry → addendum cache thrashes →
-// no caching benefit at all).
+// The typed path preserves explicit prefix breakpoint intent. Volatile
+// suppresses a marker, not participation in the prefix hash. Anthropic has no
+// privileged in-history system role, so dynamic system state remains here
+// rather than being silently downgraded to a user message for cache benefit.
 func chooseSystemBlocks(req Request) []anthropicSystemBlock {
 	if len(req.SystemSections) > 0 {
 		secs := make([]SystemSection, 0, len(req.SystemSections))
@@ -882,11 +879,10 @@ const SystemPromptCacheBoundary = "<<<__METIS_CACHE_BOUNDARY__>>>"
 //	[env + project_ctx   ] ← dynamic, no cache
 //	[user addendum       ] ← cached (slot 2)
 //
-// Why two cache slots: the user addendum (~/.metis/system.md) is
-// user-level state that's stable across cwd changes, so caching it
-// separately survives `cd otherproj` even though the project_context
-// in the middle invalidates. Anthropic's 4-breakpoint budget covers:
-// last tool (1) + base (2) + addendum (3) + spare for last_user_msg.
+// Why two cache slots: each marker can reuse only an unchanged COMPLETE
+// prefix. A changed env/project middle also invalidates the addendum marker;
+// it never independently caches the addendum. The earlier base marker may
+// still hit. Budget: last tool + base + addendum + newest message (four).
 //
 // When this boundary is absent the addendum (if any) stays in the
 // dynamic middle — backwards-compatible with assemblers that don't

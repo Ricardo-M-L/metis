@@ -208,6 +208,11 @@ type providerModelSettingsProvider struct {
 	defaultOutput int
 }
 
+func (p providerModelSettingsProvider) DynamicContextCheckpoints() bool {
+	capability, ok := p.Provider.(interface{ DynamicContextCheckpoints() bool })
+	return ok && capability.DynamicContextCheckpoints()
+}
+
 func (p providerModelSettingsProvider) ContextCapabilities() llm.ContextCapabilities {
 	base := llm.ContextCapabilities{Window: p.Provider.MaxContextTokens(), Source: "unknown"}
 	if metadata, ok := p.Provider.(llm.ContextCapabilitiesProvider); ok {

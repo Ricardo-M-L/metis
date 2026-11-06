@@ -15,6 +15,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/memory"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/tools"
+	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 )
 
 // AgentLoopOptions bundles the inputs BuildAgentLoop needs. The struct
@@ -185,6 +186,13 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 	loop := agent.NewLoop(opts.Provider, opts.Registry, opts.Gate,
 		hookReg, opts.System, maxIter)
 	loop.ContinueOnIterationLimit = opts.ContinueOnIterationLimit
+	if opts.Registry != nil {
+		if tool, ok := opts.Registry.Get("MetisInfo"); ok {
+			if info, ok := tool.(builtin.MetisInfo); ok {
+				opts.Registry.Replace(info.WithCacheStats(loop.CacheStats))
+			}
+		}
+	}
 	loop.Model = opts.Model
 	// Plan instructions are live session state, not part of the stable boot
 	// prompt. Loop.buildRequest adds this body only while Loop.PlanMode is true

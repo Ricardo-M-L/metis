@@ -119,8 +119,8 @@ func TestWebFetch_TextContent_StillInlined(t *testing.T) {
 	if !strings.Contains(res.Output, "hello") {
 		t.Errorf("text body should appear inline; got: %q", res.Output)
 	}
-	if strings.Contains(res.Output, "saved to") {
-		t.Errorf("text body should NOT be saved to disk; got: %q", res.Output)
+	if !strings.Contains(res.Output, "original downloaded bytes saved to") {
+		t.Errorf("text original must be recoverable from disk; got: %q", res.Output)
 	}
 }
 

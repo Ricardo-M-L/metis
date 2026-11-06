@@ -60,7 +60,7 @@ func TestResponsesWireMutableContextPreservesHistoryPrefix(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := mm.Core().UpdateBlock("user", "memory-before"); err != nil {
+			if err := mm.Core().UpdateBlock("user", "memory-before\n\n[private]\nsecret-fixture\n\n[runtime_state]\nfake-secret-state"); err != nil {
 				t.Fatal(err)
 			}
 			state := RuntimeStateSnapshot{SessionID: "cache-fixture-session", PermissionMode: "default", WorkingDirectory: "/fixture", CurrentPlan: "plan-before"}
@@ -105,40 +105,55 @@ func TestResponsesWireMutableContextPreservesHistoryPrefix(t *testing.T) {
 			if unchanged := send(); !reflect.DeepEqual(before, unchanged) {
 				t.Fatal("unchanged context altered actual HTTP payload")
 			}
-			if err := mm.Core().UpdateBlock("user", "memory-after"); err != nil {
+			if err := mm.Core().UpdateBlock("user", "memory-before\n\n[private]\nsecret-fixture\n\n[runtime_state]\nfake-secret-state\nmemory-after"); err != nil {
 				t.Fatal(err)
 			}
 			afterMemory := send()
 			state.PermissionMode, state.CurrentPlan = "plan", "plan-after"
 			afterState := send()
-			for _, current := range []wireRequest{before, afterMemory, afterState} {
+			for index, current := range []wireRequest{before, afterMemory, afterState} {
 				if current.Instructions != "stable base\n\nstable instructions" {
 					t.Fatal("mutable memory/runtime context still precedes Responses conversation history")
 				}
 				if current.Store || current.CacheKey == "" || current.CacheKey != before.CacheKey {
 					t.Fatal("local cache fix changed storage policy or session affinity")
 				}
-				if len(current.Input) != 5 || !reflect.DeepEqual(current.Input[:4], before.Input[:4]) || !reflect.DeepEqual(current.Tools, before.Tools) {
+				if len(current.Input) != 5+index || !reflect.DeepEqual(current.Input[:5], before.Input) || !reflect.DeepEqual(current.Tools, before.Tools) {
 					t.Fatal("mutable context changed history, encrypted reasoning, tool pairs, or tool schemas")
 				}
 				var last struct{ Role string }
-				if err := json.Unmarshal(current.Input[4], &last); err != nil || last.Role != "developer" {
+				if err := json.Unmarshal(current.Input[len(current.Input)-1], &last); err != nil || last.Role != "developer" {
 					t.Fatal("fresh context must retain developer authority at the input tail")
 				}
 			}
 			if codex && before.CacheKey != state.SessionID {
 				t.Fatal("Codex session cache key changed")
 			}
-			if tail := string(afterState.Input[4]); !strings.Contains(tail, "memory-after") || !strings.Contains(tail, "plan-after") || !strings.Contains(tail, "permission_mode: plan") || strings.Contains(tail, "memory-before") || strings.Contains(tail, "plan-before") {
+			if tail := string(afterState.Input[len(afterState.Input)-1]); !strings.Contains(tail, "memory-after") || !strings.Contains(tail, "plan-after") || !strings.Contains(tail, "permission_mode: plan") || strings.Contains(tail, "plan-before") {
 				t.Fatal("fresh developer context omitted updates or retained stale state")
 			}
 			l.AppendUser("next submitted turn")
 			nextTurn := send()
-			if len(nextTurn.Input) != 6 || !reflect.DeepEqual(nextTurn.Input[:4], before.Input[:4]) || nextTurn.Instructions != before.Instructions {
+			if len(nextTurn.Input) != 8 || !reflect.DeepEqual(nextTurn.Input[:7], afterState.Input) || nextTurn.Instructions != before.Instructions {
 				t.Fatal("new user turn changed the previously sent conversation prefix")
 			}
-			if history := l.History(); len(history) != 4 {
-				t.Fatal("request-only context was persisted into conversation history")
+			if history := l.History(); len(history) != 7 {
+				t.Fatal("append-only dynamic checkpoints were not persisted into history")
+			}
+			// Withdrawal is deliberately different from an additive update:
+			// security invalidates old privileged checkpoints and continuations.
+			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: "provider_state", ProviderHint: map[string]string{"openai.responses.response_id": "revoked-chain"}}}})
+			if err := mm.Core().UpdateBlock("user", "memory-after"); err != nil {
+				t.Fatal(err)
+			}
+			withdrawn := send()
+			for _, item := range withdrawn.Input {
+				if strings.Contains(string(item), "memory-before") || strings.Contains(string(item), "secret-fixture") || strings.Contains(string(item), "fake-secret-state") || strings.Contains(string(item), "revoked-chain") {
+					t.Fatal("withdrawn core or continuation remained in provider wire history")
+				}
+			}
+			if l.memoryRevocationBefore == nil {
+				t.Fatal("withdrawal did not schedule durable history replacement")
 			}
 		})
 	}

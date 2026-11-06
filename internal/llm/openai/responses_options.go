@@ -209,12 +209,13 @@ func isMissingPreviousResponse(raw string) bool {
 			strings.Contains(message, "previous response"))
 }
 
-func stablePromptCacheKey(model, instructions string, tools []provider.ToolSpec) string {
+func stablePromptCacheKey(model, instructions string, _ []provider.ToolSpec) string {
+	// Without a session ID use stable instructions for coarse affinity. Tool
+	// schema changes still affect actual provider prefixes, not routing identity.
 	payload, _ := json.Marshal(struct {
 		Model        string
 		Instructions string
-		Tools        []provider.ToolSpec
-	}{model, instructions, tools})
+	}{model, instructions})
 	sum := sha256.Sum256(payload)
 	return "metis-" + hex.EncodeToString(sum[:16])
 }

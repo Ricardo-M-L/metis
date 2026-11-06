@@ -24,6 +24,7 @@ func build(opts transport.BuildOpts) (*transport.Result, error) {
 	}
 	p := New(opts.APIKey, opts.BaseURL, opts.Model, maxTokens, timeout, 0)
 	p.CatalogProvider = opts.CatalogProvider
+	p.TailSystemMessages = strings.EqualFold(strings.TrimSpace(opts.Extra["tail_system_messages"]), "true")
 	if opts.ContextWindow > 0 {
 		p.ContextWindow = opts.ContextWindow
 	}

@@ -1030,6 +1030,8 @@ configured shows up in the ACP session too.
 ## Architecture
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+For first-ingestion memory/tool budgets, multimodal resume and prompt-cache
+stability, see [`docs/context-management.md`](docs/context-management.md).
 
 ```
 cmd/metis/                       CLI composition and subcommands

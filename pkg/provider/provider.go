@@ -109,10 +109,15 @@ type ContentBlock struct {
 	// content=[{text}, {image}]; OpenAI-style adapters fan it out into
 	// the role="tool" textual content + a follow-up user message
 	// carrying the image_url parts. When empty, fall back to the
-	// ToolResult string above. Skipped in JSON persistence to keep
-	// the on-disk transcript format stable — vision payloads are
-	// large and not worth replaying.
-	ToolResultBlocks []ContentBlock `json:"-"`
+	// ToolResult string above. Session storage externalizes image bytes before
+	// persisting this ordered, provider-neutral projection.
+	ToolResultBlocks []ContentBlock `json:"tool_result_blocks,omitempty"`
+
+	// AttachmentHash is session-owned content identity, never provider wire data.
+	AttachmentHash string `json:"attachment_hash,omitempty"`
+	// TrustedResultSuffix is loop-owned hook/safety guidance retained inline by
+	// first-history budgeting. Tool output cannot confer this provenance.
+	TrustedResultSuffix string `json:"trusted_result_suffix,omitempty"`
 }
 
 // Message is a single turn in a conversation.

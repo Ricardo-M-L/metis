@@ -7,6 +7,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.111] - 2026-11-07
+
+CLI-only stable release. Desktop assets and the shared Desktop latest pointer are unchanged.
+
+### Added
+
+- Bound new memory recall and tool batches before first ingestion, with recoverable output storage and explicit failure when mandatory context cannot fit.
+- Persist content-addressed image attachments across resume, export/import and session deletion.
+- Report provider cache usage separately from local projected-request estimates.
+
+### Fixed
+
+- Track compaction memory dependencies through actual retained source ranges, including partial fitting, repeated summaries and direct reuse; invalidate withdrawn derived content without discarding unrelated summaries.
+- Keep Desktop memory bindings and execution/provider wrappers connected to snapshot authority and dynamic-context capabilities.
+- Separate live-history response anchors from projected token accounting, and count local dynamic checkpoints exactly once.
+- Use native image estimates rather than base64 text size for tool budgets; preserve trusted error-hook guidance and enforce budgets on denied plan transitions.
+- Reproject dynamic context safely when switching provider transports, and isolate pending revocations at session boundaries.
+- Clean HTML locally, resolve relative links against the final redirected URL, and exclude hidden table content; bound parallel search results while retaining source attribution.
+
+### Verification scope
+
+- Local regression and provider-encoder HTTP tests cover context, cache stability and persistence behavior. Real query results are release evidence, not a claim of guaranteed provider cache-hit gains or Desktop window acceptance.
+
 ## [0.4.110] - 2026-11-03
 
 ### Fixed

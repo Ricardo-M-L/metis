@@ -133,6 +133,9 @@ type OpenAI struct {
 	ContextBudgetPolicy   *llm.ContextBudgetPolicy
 	MaxTokens             int
 	Temperature           float64
+	// TailSystemMessages is an explicit gateway capability opt-in. Unknown
+	// compatible gateways must not silently move privileged instructions.
+	TailSystemMessages bool
 	// Model-specific canonical effort slots map to endpoint wire values.
 	// Runtime installs a detached map for this exact provider/model binding.
 	ReasoningEffortValues   map[string]string
@@ -871,6 +874,12 @@ func toOpenAI(req Request, model string, maxTokens int) oaiReq {
 	}
 	for _, m := range req.Messages {
 		switch m.Role {
+		case RoleSystem:
+			for _, b := range m.Content {
+				if b.Type == "text" && b.Text != "" {
+					out.Messages = append(out.Messages, oaiMessage{Role: "system", Content: b.Text})
+				}
+			}
 		case RoleUser:
 			// User message can contain text + tool_results + images.
 			// tool_results split off into role="tool" messages (OpenAI

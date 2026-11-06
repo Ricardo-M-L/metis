@@ -170,7 +170,7 @@ func (l *Loop) TrySyncContextCapabilities() {
 	l.ContextWindow = caps.Window
 	l.routingRevision++
 	l.invalidateActiveContextLocked()
-	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.Messages)) + l.requestOverheadTokens.Load())
+	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))) + l.requestOverheadTokens.Load())
 }
 
 // refreshCapabilitiesForRequest allows a brief status-sampler critical section
@@ -256,7 +256,7 @@ func (l *Loop) installContextCapabilities(ctx context.Context, model string, rev
 	l.ContextWindow = capabilities.Window
 	l.routingRevision++
 	l.invalidateActiveContextLocked()
-	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.Messages)) + l.requestOverheadTokens.Load())
+	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))) + l.requestOverheadTokens.Load())
 	return nil
 }
 

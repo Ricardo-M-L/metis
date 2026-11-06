@@ -117,16 +117,8 @@ func LastPlainUserIndex(msgs []llm.Message) int {
 	return -1
 }
 
-// Snapshot returns a defensive copy so callers can mutate freely without
-// affecting the source slice. Cheap because Message values are flat.
-func Snapshot(msgs []llm.Message) []llm.Message {
-	if len(msgs) == 0 {
-		return nil
-	}
-	out := make([]llm.Message, len(msgs))
-	copy(out, msgs)
-	return out
-}
+// Snapshot returns an independent recursive history copy.
+func Snapshot(msgs []llm.Message) []llm.Message { return DeepSnapshot(msgs) }
 
 // CountTurns counts how many user→assistant exchanges are in `msgs`.
 // Used by /history (Round 4) and /status to summarize session length.

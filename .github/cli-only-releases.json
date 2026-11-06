@@ -43,6 +43,12 @@
       "make_latest": false,
       "reason": "Formal CLI-only release of the compact Metis terminal icon; Desktop assets and the shared latest pointer remain unchanged."
     },
+    "v0.4.111": {
+      "channel": "cli-only-stable",
+      "prerelease": false,
+      "make_latest": false,
+      "reason": "User-authorized context, memory provenance and cache-stable accounting release; CLI only, with Desktop assets and shared latest unchanged."
+    },
     "v0.4.95": {
       "channel": "cli-only-stable",
       "prerelease": false,

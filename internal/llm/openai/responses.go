@@ -65,9 +65,9 @@ type Responses struct {
 	ReasoningEffortValues   map[string]string
 	ReasoningEffortDisabled bool
 	StateMode               ResponsesStateMode
-	// PromptCacheKey overrides the stable key derived from the non-volatile
-	// system prefix and function schema. It is sent only when the endpoint's
-	// capability profile allows prompt caching.
+	// PromptCacheKey overrides session affinity (or the stable model/system
+	// fallback). Schema identity affects actual prefixes, never session routing.
+	// Sent only when the capability profile allows prompt caching.
 	PromptCacheKey string
 	Capabilities   ResponsesCapabilities
 	HostedTools    []string
@@ -455,13 +455,14 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 		out.Instructions = "You are a helpful assistant."
 	}
 	if r.Capabilities.PromptCaching {
-		if r.Name() == "openai-codex" && strings.TrimSpace(req.SessionID) != "" {
+		if r.PromptCacheKey != "" {
+			out.PromptCacheKey = r.PromptCacheKey
+		} else if strings.TrimSpace(req.SessionID) != "" {
+			// Affinity is not content identity. New deferred schemas must not
+			// rotate an established session's routing key.
 			out.PromptCacheKey = strings.TrimSpace(req.SessionID)
 		} else {
-			out.PromptCacheKey = r.PromptCacheKey
-			if out.PromptCacheKey == "" {
-				out.PromptCacheKey = stablePromptCacheKey(r.Model, out.Instructions, req.Tools)
-			}
+			out.PromptCacheKey = stablePromptCacheKey(r.Model, out.Instructions, req.Tools)
 		}
 	}
 	if req.ResponseFormat != nil && r.Capabilities.StructuredOutputs {
@@ -486,9 +487,43 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 	var messages []provider.Message
 	out.PreviousResponseID, messages = r.previousResponse(req.Messages)
 
-	for _, m := range messages {
+	lastCheckpoint := -1
+	for i, m := range messages {
+		for _, b := range m.Content {
+			if m.Role == provider.RoleSystem && b.ProviderHint["metis.dynamic_context"] == "checkpoint" {
+				lastCheckpoint = i
+			}
+		}
+	}
+	currentDynamic := len(volatile) > 0
+	for _, section := range req.SystemSections {
+		if section.Name == "memory_index" || section.Name == "runtime_state" {
+			currentDynamic = true
+		}
+	}
+	if volatileInInstructions && currentDynamic {
+		// The loop supplied authoritative current dynamic sections. A resumed
+		// local checkpoint must not override these after switching transport.
+		lastCheckpoint = -1
+	}
+	for messageIndex, m := range messages {
 		switch m.Role {
 		case provider.RoleSystem:
+			// Durable dynamic checkpoints retain developer authority and replay
+			// in place. Ordinary legacy system messages keep their folding rule.
+			var checkpoint []responsesContentPart
+			for _, b := range m.Content {
+				if b.Type == "text" && b.ProviderHint["metis.dynamic_context"] == "checkpoint" {
+					checkpoint = append(checkpoint, responsesContentPart{Type: "input_text", Text: b.Text})
+				}
+			}
+			if len(checkpoint) > 0 && volatileInInstructions && messageIndex != lastCheckpoint {
+				continue // provider reset: replace old dynamic snapshots, don't accumulate
+			}
+			if len(checkpoint) > 0 && !volatileInInstructions {
+				out.Input = append(out.Input, responsesInputItem{Type: "message", Role: "developer", Content: checkpoint})
+				continue
+			}
 			// System messages are folded into instructions (defensive:
 			// callers normally use Request.System).
 			if len(m.Content) > 0 {
@@ -501,7 +536,7 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 					}
 				}
 			}
-		case provider.RoleUser:
+		case provider.RoleUser, provider.RoleTool:
 			var parts []responsesContentPart
 			flushParts := func() {
 				if len(parts) > 0 {
@@ -524,6 +559,19 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 						CallID: b.ToolUseID,
 						Output: &b.ToolResult,
 					})
+					// Function outputs remain strings for compatibility with older
+					// Responses backends. Replay the ordered multimodal body as a
+					// following user message, as Chat Completions does for vision.
+					for _, part := range b.ToolResultBlocks {
+						switch part.Type {
+						case "text":
+							parts = append(parts, responsesContentPart{Type: "input_text", Text: part.Text})
+						case "image":
+							if part.MediaType != "" && part.Data != "" {
+								parts = append(parts, responsesContentPart{Type: "input_image", ImageURL: "data:" + part.MediaType + ";base64," + part.Data})
+							}
+						}
+					}
 				case "image":
 					// Responses image parts use a different discriminant and field
 					// than Chat Completions: input_image + image_url.

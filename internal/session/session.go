@@ -173,6 +173,9 @@ func (s *Store) scanFeedback(id string, fn func(*FeedbackEntry)) error {
 type Store struct {
 	Dir string
 
+	// Test seam for attachment deletion failure/retry boundaries.
+	removeAttachments func(string) error
+
 	// mu serializes repair + append sequences for one Store. A normal append is
 	// one O_APPEND write, but recovering an unterminated trailing JSON record
 	// must inspect and possibly truncate the file before that write. Without a
@@ -275,6 +278,10 @@ func (s *Store) append(id string, e Entry) error {
 // true the entry is fsynced before success is reported; compaction uses this
 // for the history_replace commit record.
 func (s *Store) appendEntryLocked(id string, e Entry, durable bool) error {
+	e, err := s.externalizeEntry(id, e)
+	if err != nil {
+		return err
+	}
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -480,6 +487,10 @@ func (s *Store) Load(id string) (*Header, []llm.Message, error) {
 	}
 	if hdr == nil {
 		return nil, nil, errors.New("session header missing")
+	}
+	msgs, err = s.mapAttachments(id, msgs, true)
+	if err != nil {
+		return nil, nil, err
 	}
 	canonicalizeToolInputs(msgs)
 	return hdr, msgs, nil
@@ -866,17 +877,40 @@ func (s *Store) Snapshot(id, name string) error {
 	return os.WriteFile(filepath.Join(snapDir, id+"-"+name+".json"), b, 0o644)
 }
 
-// Export streams a session's raw JSONL to w. Output preserves the original
-// header line and every message entry; suitable for piping to a file or
-// `metis sessions import` on another machine.
+// Export streams self-contained JSONL, hydrating attachment references so the
+// transcript remains portable without copying private local sidecar paths.
 func (s *Store) Export(id string, w io.Writer) error {
 	f, err := os.Open(s.path(id))
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(w, f)
-	return err
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), resumeScannerMaxBytes())
+	enc := json.NewEncoder(w)
+	for sc.Scan() {
+		var e Entry
+		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
+			return fmt.Errorf("export: %w", err)
+		}
+		if e.Message != nil {
+			messages, err := s.mapAttachments(id, []llm.Message{*e.Message}, true)
+			if err != nil {
+				return err
+			}
+			e.Message = &messages[0]
+		}
+		if e.Messages != nil {
+			e.Messages, err = s.mapAttachments(id, e.Messages, true)
+			if err != nil {
+				return err
+			}
+		}
+		if err := enc.Encode(e); err != nil {
+			return err
+		}
+	}
+	return sc.Err()
 }
 
 // Import reads JSONL from r and writes a new session file. Returns the new

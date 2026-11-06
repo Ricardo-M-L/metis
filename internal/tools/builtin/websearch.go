@@ -2,23 +2,22 @@ package builtin
 
 // websearch.go — multi-backend WebSearch tool.
 //
-// Backend chain (first-match-wins, ordered by output quality):
+// Backend order determines deterministic merge ranking, not first-success:
+// Execute queries all configured backends plus DDG concurrently (see
+// websearch_budget.go); explicit sources can restrict this set.
 //
 //  1. TAVILY_API_KEY        → tavily.com (1k/mo free tier, richest snippets,
 //                              also returns relevance scores)
 //  2. BRAVE_SEARCH_API_KEY  → api.search.brave.com (2k/mo free, native index)
 //  3. SERPER_API_KEY        → google.serper.dev (paid, Google SERP)
-//  4. (zero-config fallback) → lite.duckduckgo.com HTML scrape
+//  4. (zero-config source) → lite.duckduckgo.com HTML scrape
 //
 // UX conventions, mirroring cli-web-search (only open-source project
 // surveyed 2026-05 that surfaces backend identity transparently):
 //
-//   - Every output ends with a "[via <backend>]" footer so the user
-//     and the model both know which tier produced the results.
-//   - When the preferred backend fails (rate-limit, 5xx, parse error),
-//     the footer also lists "fell back from X: <reason>" so the user
-//     can see WHY they're on the DDG floor and act on it (add an
-//     env var, retry later, change query).
+//   - Every output identifies successful sources in a "[via ...]" footer.
+//   - Source failures are reported alongside the merged successful results;
+//     they do not stop other configured sources from participating.
 //
 // Tool name is "WebSearch" not "Search" — claude-code's training-set
 // canonical name. Keeping it aligned avoids confusing the LLM about
@@ -53,9 +52,8 @@ import (
 )
 
 // WebSearch is the claude-code-named web search tool. Zero-config:
-// works without any API key via DuckDuckGo's lite HTML view. Upgrades
-// to richer backends when env vars are present, in the order:
-// TAVILY_API_KEY → BRAVE_SEARCH_API_KEY → SERPER_API_KEY.
+// works without any API key via DuckDuckGo's lite HTML view. Configured
+// keyed backends participate concurrently, with deterministic merge ranking.
 type WebSearch struct {
 	tools.BaseTool
 	gate *permission.Gate
@@ -66,10 +64,10 @@ func (WebSearch) Name() string { return "WebSearch" }
 func (WebSearch) Description() string {
 	return "Search the web by keywords for discovery, current information, or topics not tied to one known URL. " +
 		"Not for fetching a known URL; use WebFetch for that. Returns titles, snippets, and URLs for the top results. " +
-		"Works without any API key (DuckDuckGo fallback). For richer snippets and quotas, set one of: " +
+		"Works without any API key (DuckDuckGo source). For richer snippets and quotas, set one of: " +
 		"TAVILY_API_KEY (1k/mo free, tavily.com), BRAVE_SEARCH_API_KEY (2k/mo free, brave.com), " +
-		"or SERPER_API_KEY (paid Google SERP). Backends are tried in that priority order; " +
-		"the output footer always reports which backend served the request."
+		"or SERPER_API_KEY (paid Google SERP). All configured sources and DuckDuckGo run concurrently by default; " +
+		"results are merged with source citations and saved locally before output budgeting."
 }
 
 func (WebSearch) SearchHint() string { return "search web keywords current information" }
@@ -83,6 +81,9 @@ func (WebSearch) InputSchema() map[string]any {
 				"type":        "string",
 				"description": "Keywords or a natural-language search query; do not pass a URL to fetch.",
 			},
+			"max_output_tokens": map[string]any{"type": "integer", "description": "Conservative total output token ceiling (1024-16384, default 4096)."},
+			"sources":           map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"tavily", "brave", "serper", "ddg"}}, "description": "Optional sources to query concurrently and merge; omitted queries all configured sources plus DuckDuckGo."},
+			"fresh":             map[string]any{"type": "boolean", "description": "Bypass brief session-local successful-result reuse for time-sensitive searches."},
 			"max_results": map[string]any{
 				"type":        "integer",
 				"description": "Maximum number of results (1-20, default 10).",
@@ -103,7 +104,7 @@ func (s WebSearch) CanUse(_ context.Context, in map[string]any) (tools.Permissio
 	return mapDecision(d), src
 }
 
-// webSearchBackend is one entry in the priority fallback chain. envVar
+// webSearchBackend is one source in the parallel search set. envVar
 // empty means "no key required" — only DDG today, but the shape leaves
 // room for future zero-config backends (Ollama web search, SearXNG).
 type webSearchBackend struct {
@@ -141,12 +142,9 @@ func resolveSearchKey(b webSearchBackend) string {
 	return ""
 }
 
-// webSearchBackends is the ordered fallback chain. Order = quality
-// estimate (Tavily snippets are the longest + score-ranked; Brave is
-// a real index; Serper is paid Google; DDG is the zero-config floor).
-// Edit here to reorder or add backends; the dispatcher walks this
-// slice top-down and uses the first one whose env var is set (or
-// which has no env var requirement).
+// webSearchBackends orders deterministic merged results by source quality.
+// All configured entries participate concurrently by default; this table does
+// not impose a first-success fallback preference.
 //
 // nolint:gochecknoglobals — package-level table is the cleanest way
 // to expose the chain to both Execute() and the diag command, which
@@ -159,7 +157,13 @@ var webSearchBackends = []webSearchBackend{
 	{name: "ddg", envVar: "", search: ddgSearch},
 }
 
-func (WebSearch) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+func (s WebSearch) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	return executeBudgetedSearch(ctx, in, searchMultiple)
+}
+
+// executeSearch retains the legacy sequential adapter for compatibility tests;
+// the public Execute path always uses searchMultiple and parallel source merge.
+func (WebSearch) executeSearch(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	query, _ := in["query"].(string)
 	if strings.TrimSpace(query) == "" {
 		return &tools.Result{Output: "query is required", IsError: true}, nil
@@ -207,7 +211,7 @@ func (WebSearch) Execute(ctx context.Context, in map[string]any) (*tools.Result,
 			fallbacks = append(fallbacks, fmt.Sprintf("%s failed: %s", b.name, err.Error()))
 			continue
 		}
-		return &tools.Result{Output: formatSearchResults(query, results, b.name, fallbacks)}, nil
+		return &tools.Result{Output: formatBudgetedSearchResults(query, results, b.name, fallbacks, webOutputBudget(in))}, nil
 	}
 	// Should never happen — DDG has no env-var gate, so the loop
 	// always reaches it. If we did fall through, every backend
@@ -383,6 +387,7 @@ type webSearchResult struct {
 	Link     string
 	Snippet  string
 	Position int
+	Sources  []string
 }
 
 // User-Agent + Accept-Language randomization — DDG lite is a public
@@ -544,11 +549,10 @@ func cleanDDGRedirect(raw string) string {
 }
 
 // formatSearchResults renders the SERP for the model and tags the
-// output with the backend that produced it. The `via` tag lets the
-// model decide how much to trust the snippets (DDG snippets cap
-// around 150 chars; Tavily/Brave run 200-400; Serper varies). The
-// `fallbacks` log lists backends we tried before this one — empty
-// when the first-choice backend worked.
+// output with the successful backend(s). The `via` tag lets the
+// model assess snippet provenance. The historically named `fallbacks`
+// argument also records parallel source failures; it does not imply that
+// a failed source prevented other configured backends from running.
 func formatSearchResults(query string, results []webSearchResult, via string, fallbacks []string) string {
 	var sb strings.Builder
 	if len(results) == 0 {
@@ -557,6 +561,9 @@ func formatSearchResults(query string, results []webSearchResult, via string, fa
 		fmt.Fprintf(&sb, "WebSearch \"%s\" — %d results:\n\n", query, len(results))
 		for _, r := range results {
 			fmt.Fprintf(&sb, "%d. %s\n", r.Position, r.Title)
+			if len(r.Sources) > 0 {
+				fmt.Fprintf(&sb, "   [sources: %s]\n", strings.Join(r.Sources, ", "))
+			}
 			if r.Link != "" {
 				fmt.Fprintf(&sb, "   %s\n", r.Link)
 			}
@@ -579,10 +586,8 @@ func formatSearchResults(query string, results []webSearchResult, via string, fa
 	}
 	sb.WriteString("]")
 	if len(fallbacks) > 0 {
-		// Surface the failure trail so a paid backend's rate-limit
-		// or transient 5xx isn't invisible. Without this the user
-		// thinks they're on the backend they configured but
-		// silently got dropped to DDG.
+		// Report partial failures even when parallel peers succeeded.
+		// Keep the historical footer label for existing consumers.
 		sb.WriteString("\n[fallback: " + strings.Join(fallbacks, " → ") + "]")
 	}
 	return sb.String()

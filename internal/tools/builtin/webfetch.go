@@ -19,6 +19,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/security"
+	"github.com/Ricardo-M-L/metis/internal/spill"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -46,8 +47,10 @@ func (WebFetch) InputSchema() map[string]any {
 				"type":        "string",
 				"description": "Known absolute http(s) URL to fetch; not a keyword query.",
 			},
-			"max_bytes":  map[string]any{"type": "integer"},
-			"timeout_ms": map[string]any{"type": "integer"},
+			"max_bytes":         map[string]any{"type": "integer", "description": "Download byte ceiling (default 1 MiB, maximum 16 MiB); independent of output budget."},
+			"max_output_tokens": map[string]any{"type": "integer", "description": "Conservative output token ceiling including recovery path (1024-16384, default 4096)."},
+			"mode":              map[string]any{"type": "string", "enum": []string{"body", "raw"}, "description": "body (default) locally cleans HTML into Markdown; raw preserves downloaded text."},
+			"timeout_ms":        map[string]any{"type": "integer"},
 		},
 	}
 }
@@ -70,8 +73,19 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 		return nil, errors.New("url must start with http:// or https://")
 	}
-	maxBytes := intArg(in, "max_bytes", 256*1024)
+	maxBytes := intArg(in, "max_bytes", 1024*1024)
+	if maxBytes <= 0 || maxBytes > 16*1024*1024 {
+		return nil, errors.New("max_bytes must be between 1 and 16777216")
+	}
+	mode := strFromAny(in["mode"])
+	if mode != "" && mode != "body" && mode != "raw" {
+		return nil, errors.New("mode must be body or raw")
+	}
+	budget := webOutputBudget(in)
 	timeoutMs := intArg(in, "timeout_ms", 15000)
+	if timeoutMs <= 0 || timeoutMs > 120000 {
+		return nil, errors.New("timeout_ms must be between 1 and 120000")
+	}
 
 	client := w.http
 	if client == nil {
@@ -94,6 +108,7 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 		status       string
 		statusCode   int
 		responseHead http.Header
+		responseURL  string
 		body         []byte
 		bodyComplete bool
 	)
@@ -104,6 +119,7 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 		status = ""
 		statusCode = 0
 		responseHead = nil
+		responseURL = url
 		body = nil
 		bodyComplete = false
 		// A fresh request is required for each retry. GET has no body and is
@@ -119,7 +135,12 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 		}
 		status, statusCode = resp.Status, resp.StatusCode
 		responseHead = resp.Header.Clone()
-		body, err = io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)))
+		// Relative HTML links are based on the final redirect destination.
+		// Keep the requested URL as fallback for synthetic test transports.
+		if resp.Request != nil && resp.Request.URL != nil {
+			responseURL = resp.Request.URL.String()
+		}
+		body, err = io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)+1))
 		_ = resp.Body.Close()
 		if err != nil {
 			return err
@@ -151,8 +172,9 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 		}
 	}
 	truncatedSuffix := ""
-	if len(body) >= maxBytes {
-		truncatedSuffix = "\n\n[truncated at " + bytesString(maxBytes) + "]"
+	if len(body) > maxBytes {
+		body = body[:maxBytes]
+		truncatedSuffix = "\n[download truncated at " + bytesString(maxBytes) + "; saved file is NOT the full response]"
 	}
 
 	// Binary-content守门 (2026-05-18, user image #9 bug).
@@ -210,16 +232,30 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 			status, hintMime, bytesString(len(body)), savedPath,
 		)
 		return &tools.Result{
-			Output:  summary + truncatedSuffix,
+			Output:  webBudget(summary+truncatedSuffix, budget),
 			IsError: statusCode >= 400,
 		}, nil
 	}
 
+	// Persist original downloaded bytes before any irreversible extraction or
+	// previewing. spill uses private files and exclusive creation.
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	saved, saveErr := spill.Store(filepath.Join(config.Home(), "tool-results"), "webfetch-"+hex.EncodeToString(nonce[:]), string(body))
+	if saveErr != nil {
+		return &tools.Result{Output: "WebFetch: cannot safely save original response; output withheld", IsError: true}, nil
+	}
 	out := string(body)
-	return &tools.Result{
-		Output:  "HTTP " + status + "\n" + out + truncatedSuffix,
-		IsError: statusCode >= 400,
-	}, nil
+	if mode != "raw" && (mediaType == "text/html" || mediaType == "application/xhtml+xml") {
+		out = htmlMarkdown(out, responseURL)
+	}
+	header := fmt.Sprintf("HTTP %s\n[original downloaded bytes saved to %s — use Read tool with this exact path]%s\n", status, saved.Path, truncatedSuffix)
+	if webTokenEstimate(header) >= budget {
+		return &tools.Result{Output: "WebFetch: recovery metadata exceeds output budget; output withheld", IsError: true}, nil
+	}
+	return &tools.Result{Output: header + webBudget(out, budget-webTokenEstimate(header)), IsError: statusCode >= 400}, nil
 }
 
 // saveBinaryResponse writes a non-text WebFetch body to
@@ -233,7 +269,7 @@ func (w WebFetch) Execute(ctx context.Context, in map[string]any) (*tools.Result
 // Read at its discretion.
 func saveBinaryResponse(body []byte, mediaType, srcURL string) (string, error) {
 	dir := filepath.Join(config.Home(), "tool-results")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
 	var nonce [4]byte
@@ -244,8 +280,15 @@ func saveBinaryResponse(body []byte, mediaType, srcURL string) (string, error) {
 	ext := extensionForBinary(mediaType, srcURL)
 	name := fmt.Sprintf("webfetch-%s-%s%s", ts, hex.EncodeToString(nonce[:]), ext)
 	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, body, 0o644); err != nil {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
 		return "", err
+	}
+	_, werr := f.Write(body)
+	cerr := f.Close()
+	if werr != nil || cerr != nil {
+		_ = os.Remove(path)
+		return "", errors.Join(werr, cerr)
 	}
 	return path, nil
 }

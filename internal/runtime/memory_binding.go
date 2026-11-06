@@ -135,6 +135,32 @@ func (b *WorkspaceMemoryBinding) repository() memory.Repository {
 	return repository
 }
 
+// RecallSnapshot forwards authority, not merely the rendered context. Holding
+// the binding read lock also prevents workspace activation during consumption.
+func (b *WorkspaceMemoryBinding) RecallSnapshot() (generation, body string, err error) {
+	err = b.GuardRecallSnapshot(func(g, text string, _ []memory.Passage) error {
+		generation, body = g, text
+		return nil
+	})
+	return
+}
+
+func (b *WorkspaceMemoryBinding) GuardRecallSnapshot(consume func(string, string, []memory.Passage) error) error {
+	if b == nil {
+		return errMemoryRepositoryUnavailable
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if guarded, ok := b.current.(interface {
+		GuardRecallSnapshot(func(string, string, []memory.Passage) error) error
+	}); ok {
+		return guarded.GuardRecallSnapshot(consume)
+	}
+	// A plugin without authority cannot safely validate persisted provenance.
+	// Do not fabricate an authoritative generation from BuildContext.
+	return errMemoryRepositoryUnavailable
+}
+
 func (b *WorkspaceMemoryBinding) Root() string {
 	if b == nil {
 		return ""

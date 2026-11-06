@@ -60,8 +60,9 @@ type MetisInfo struct {
 	// Added 2026-05-17 after observing DeepSeek-V4 thought it had
 	// 200k when metis had already bumped its internal cap to 1M —
 	// the model couldn't see the bump without an introspection path.
-	provider llm.Provider
-	model    string
+	provider   llm.Provider
+	model      string
+	cacheStats interface{ CacheSummary() string }
 }
 
 // NewMetisInfo wires up the introspection tool. Pass nil for any
@@ -89,6 +90,13 @@ func (m MetisInfo) WithModel(p llm.Provider, modelID string) MetisInfo {
 	return m
 }
 
+// WithCacheStats attaches a read-only cache diagnostic source without importing
+// agent into the tool package. Values distinguish local estimates from usage.
+func (m MetisInfo) WithCacheStats(stats interface{ CacheSummary() string }) MetisInfo {
+	m.cacheStats = stats
+	return m
+}
+
 func (MetisInfo) Name() string { return "MetisInfo" }
 func (MetisInfo) Description() string {
 	return "Introspection: dump effective config, active model + context window, catalog freshness, providers, MCP servers, skills, hooks, permission mode, registered tools, and live background jobs as INI sections. Call when debugging \"why isn't tool X / skill Y / MCP Z working?\", \"what's my effective context limit on this model?\", or \"is my context window coming from catalog or a hardcoded fallback?\"."
@@ -100,7 +108,7 @@ func (MetisInfo) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"section": map[string]any{
 				"type":        "string",
-				"description": "Optional section filter — one of: model, catalog, providers, mcp, skills, tools, hooks, permission, jobs, options. Omit to dump everything.",
+				"description": "Optional section filter — one of: cache, model, catalog, providers, mcp, skills, tools, hooks, permission, jobs, options. Omit to dump everything.",
 			},
 		},
 	}
@@ -121,6 +129,9 @@ func (m MetisInfo) Execute(ctx context.Context, in map[string]any) (*tools.Resul
 	var b strings.Builder
 	want := func(name string) bool { return section == "" || section == name }
 
+	if want("cache") && m.cacheStats != nil {
+		b.WriteString(m.cacheStats.CacheSummary())
+	}
 	if want("config") {
 		m.writeConfigStaleness(&b)
 	}
