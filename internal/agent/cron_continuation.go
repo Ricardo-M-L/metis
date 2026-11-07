@@ -77,6 +77,10 @@ func validateContinuation(j *CronJob) error {
 	return nil
 }
 
+func ContinuationMatches(j *CronJob, i ContinuationIdentity) bool {
+	return j != nil && matchesContinuation(j, i)
+}
+
 func matchesContinuation(j *CronJob, i ContinuationIdentity) bool {
 	return i.SessionID != "" && j.Kind == CronKindContinuation && j.OriginSessionID == i.SessionID && continuationWorkDir(j.WorkDir) == continuationWorkDir(i.WorkDir) && j.Provider == i.Provider && j.Model == i.Model
 }

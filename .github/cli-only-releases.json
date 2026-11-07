@@ -72,6 +72,12 @@
       "prerelease": false,
       "make_latest": false,
       "reason": "Verified session wakeup release with portable fixtures and canonical workspace expectations; preserve v0.4.112/v0.4.113 failed-CI drafts and shared latest."
+    },
+    "v0.4.115": {
+      "channel": "cli-only-stable",
+      "prerelease": false,
+      "make_latest": false,
+      "reason": "Original-session wakeups with canonical runtime identity matching; preserve earlier failed CI drafts and Desktop shared latest."
     }
   }
 }

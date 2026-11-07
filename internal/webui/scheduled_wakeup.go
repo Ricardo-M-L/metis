@@ -35,7 +35,7 @@ func (s *Server) startScheduledWakeup(ctx context.Context, sessionID string) err
 	if run, ok := ctx.Value(scheduledWakeupKey{}).(*agent.ContinuationRun); ok {
 		identity, available := s.wakeupIdentity(sessionID)
 		j := run.Job
-		if !available || identity.SessionID != j.OriginSessionID || identity.WorkDir != j.WorkDir || identity.Provider != j.Provider || identity.Model != j.Model {
+		if !available || !agent.ContinuationMatches(j, identity) {
 			return fmt.Errorf("scheduled wakeup identity changed while queued; restore its original runtime")
 		}
 		return run.Start()

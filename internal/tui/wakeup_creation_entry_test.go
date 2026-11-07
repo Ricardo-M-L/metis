@@ -42,7 +42,7 @@ func TestScheduledWakeupTUITurnBindsVisibleToolCreatesThenConsumes(t *testing.T)
 		t.Fatal("tool failed to create")
 	}
 	job := jobs[0]
-	if job.OriginSessionID != m.sessionID || job.WorkDir != dir || job.Provider != "fake" || job.Model != m.model {
+	if !agent.ContinuationMatches(job, agent.ContinuationIdentity{SessionID: m.sessionID, WorkDir: dir, Provider: "fake", Model: m.model}) {
 		t.Fatalf("bad identity %+v", job)
 	}
 	if m.consumeScheduledWakeup(time.Now()) != nil {

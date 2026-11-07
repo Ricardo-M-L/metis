@@ -7,6 +7,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.115] - 2026-11-07
+
+CLI-only stable release of reliable session wakeups. Reuse canonical continuation identity matching at Desktop execution admission, preventing `/var`/`/private/var` aliases from rejecting the same workspace while still rejecting other sessions, models and workspaces. Earlier candidate tags/drafts remain unpublished.
+
 ## [0.4.114] - 2026-11-07
 
 CLI-only stable release of reliable session wakeups. Canonicalize macOS temporary workspace expectations in the creation-entry regression. v0.4.112 and v0.4.113 remain unpublished drafts after platform-specific fixture failures; tags and assets are preserved.
