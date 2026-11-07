@@ -24,6 +24,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/runtime"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/slash"
+	"github.com/Ricardo-M-L/metis/internal/tasks"
 	"github.com/Ricardo-M-L/metis/internal/themes"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
 	"github.com/Ricardo-M-L/metis/internal/tui/screen"
@@ -1445,6 +1446,8 @@ func (m *Model) handleSubmitWithUserInput(userInputBlocks []llm.ContentBlock, cr
 // continuations. It deliberately does not touch the editor or append a user
 // message: a job completion is already delivered by Loop's notification drain.
 func (m *Model) startAgentTurn(turnRunCtx context.Context) tea.Cmd {
+	m.bindWakeupContinuation()
+	turnRunCtx = tasks.WithSessionID(turnRunCtx, m.sessionID)
 	// 2026-05-25: do NOT wipe m.toolEvents on each new submit. Pre-fix
 	// behaviour cleared every prior turn's tool calls the moment the
 	// user typed a new prompt — the second turn collapsed to just the

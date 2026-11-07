@@ -31,21 +31,25 @@ func parseCronListOptions(args []string) (cronListOptions, error) {
 // clients. Keep timestamps as RFC3339 strings so JavaScript callers do not
 // depend on Go's time.Time JSON representation details.
 type cronListRecord struct {
-	ID            string             `json:"id"`
-	Name          string             `json:"name"`
-	Prompt        string             `json:"prompt"`
-	Schedule      agent.CronSchedule `json:"schedule"`
-	Enabled       bool               `json:"enabled"`
-	Paused        bool               `json:"paused"`
-	CreatedAt     string             `json:"createdAt,omitempty"`
-	LastRun       string             `json:"lastRun,omitempty"`
-	NextRun       string             `json:"nextRun,omitempty"`
-	RunCount      int                `json:"runCount"`
-	Repeat        int                `json:"repeat"`
-	Silent        bool               `json:"silent"`
-	SessionMode   string             `json:"sessionMode"`
-	AllowTools    []string           `json:"allowTools,omitempty"`
-	DisabledTools []string           `json:"disabledTools,omitempty"`
+	Kind              string             `json:"kind,omitempty"`
+	Status            string             `json:"status"`
+	OriginSessionID   string             `json:"originSessionId,omitempty"`
+	ContinuationRunID string             `json:"continuationRunId,omitempty"`
+	ID                string             `json:"id"`
+	Name              string             `json:"name"`
+	Prompt            string             `json:"prompt"`
+	Schedule          agent.CronSchedule `json:"schedule"`
+	Enabled           bool               `json:"enabled"`
+	Paused            bool               `json:"paused"`
+	CreatedAt         string             `json:"createdAt,omitempty"`
+	LastRun           string             `json:"lastRun,omitempty"`
+	NextRun           string             `json:"nextRun,omitempty"`
+	RunCount          int                `json:"runCount"`
+	Repeat            int                `json:"repeat"`
+	Silent            bool               `json:"silent"`
+	SessionMode       string             `json:"sessionMode"`
+	AllowTools        []string           `json:"allowTools,omitempty"`
+	DisabledTools     []string           `json:"disabledTools,omitempty"`
 }
 
 func writeCronList(w io.Writer, jobs []*agent.CronJob, opts cronListOptions) error {
@@ -90,8 +94,8 @@ func writeCronList(w io.Writer, jobs []*agent.CronJob, opts cronListOptions) err
 		if !job.NextRun.IsZero() {
 			next = job.NextRun.Format(time.RFC3339)
 		}
-		if _, err := fmt.Fprintf(w, "%s  enabled=%v paused=%v next=%s name=%q\n",
-			job.ID, job.Enabled, job.Paused, next, job.Name); err != nil {
+		if _, err := fmt.Fprintf(w, "%s  enabled=%v paused=%v next=%s status=%s name=%q\n",
+			job.ID, job.Enabled, job.Paused, next, agent.CronJobStatus(job, time.Now()), job.Name); err != nil {
 			return err
 		}
 		printed++
@@ -109,7 +113,8 @@ func cronRecord(job *agent.CronJob) cronListRecord {
 		mode = agent.SessionModeIsolated
 	}
 	record := cronListRecord{
-		ID:            job.ID,
+		ID:   job.ID,
+		Kind: job.Kind, Status: agent.CronJobStatus(job, time.Now()), OriginSessionID: job.OriginSessionID, ContinuationRunID: job.ContinuationRunID,
 		Name:          job.Name,
 		Prompt:        job.Prompt,
 		Schedule:      job.Schedule,

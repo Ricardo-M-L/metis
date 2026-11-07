@@ -7,6 +7,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.112] - 2026-11-07
+
+CLI-only stable release. Desktop assets and the shared Desktop latest pointer are unchanged.
+
+### Fixed
+
+- Bind scheduled wakeups to their verified original session and consume them through live-session continuations instead of silently requiring a separate cron daemon.
+- Keep headless CLI runs alive for pending wakeups and resume with host-originated context and the current permission gate.
+- Persist completion, failure and cancellation receipts separately from claims; report overdue work rather than confusing job creation with successful execution.
+- Route live interface wakeups to the owning session without concurrent turns or cross-session composer delivery.
+
+### Verification scope
+
+- Deterministic scheduler, original-session and process/HTTP regressions accompany the change. Live installed-command query results are separate release evidence, not a guarantee of unattended execution after the owning process closes.
+
 ## [0.4.111] - 2026-11-07
 
 CLI-only stable release. Desktop assets and the shared Desktop latest pointer are unchanged.

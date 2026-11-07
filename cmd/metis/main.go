@@ -678,6 +678,7 @@ func (r *runtime) prepareSessionRebindAt(sessionID, workDir string) (string, fun
 
 func (r *runtime) commitSessionRebindAt(sessionID, workDir string) {
 	r.sessionID = sessionID
+	r.bindWakeupContinuation()
 	if r.subAgentRoster != nil {
 		if store, _ := r.subAgentRoster.HandoffBinding(); store != nil {
 			r.subAgentRoster.BindHandoff(store, "session:"+sessionID)
@@ -2189,6 +2190,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// Fresh-session IDs are allocated after the registry is built. Bind Agent's
 	// durable child transcripts and parent metadata before any tool invocation.
 	builtin.RebindProviderTools(reg, prov, model, system, rt.sessionID, childRuntime)
+	rt.bindWakeupContinuation()
 	// Wire the same id into the LLM transport layer so dump-prompts
 	// (METIS_DUMP_PROMPTS=1) lands in dump-prompts/<sid>.jsonl
 	// instead of dump-prompts/default.jsonl.
@@ -2544,6 +2546,7 @@ func cmdChat(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	repl.CronService = rt.cronSvc
 	repl.ConfigureProviderSwitch(rt.cfg, rt.providerName)
 	repl.ConfigureSandbox(rt.sandbox)
 	repl.BeginMCPLaunch = beginExplicitMCP
@@ -2771,14 +2774,7 @@ func cmdRun(ctx context.Context, args []string) (returnErr error) {
 	events := make(chan agent.Event, 64)
 	done := make(chan error, 1)
 	go func() {
-		if worker != nil {
-			done <- runDesktopWorkerTurns(ctx, rt.loop, rt.subAgentRoster, rt.sessionID, events, checkpoint.Save)
-			close(events)
-			return
-		}
-		done <- rtpkg.RunWithTraceTurn(ctx, rt.sessionID, func(turnCtx context.Context) error {
-			return rt.loop.Run(turnCtx, events)
-		})
+		done <- runHeadlessWakeupTurns(ctx, rt, events, checkpoint.Save, worker != nil)
 		close(events)
 	}()
 

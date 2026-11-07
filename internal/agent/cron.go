@@ -67,16 +67,23 @@ type CronSchedule struct {
 // agent from accidentally invoking expensive tools (Agent sub-spawn,
 // WebFetch loops) without disabling them globally.
 type CronJob struct {
-	ID          string       `json:"id"`
-	Name        string       `json:"name"`
-	Prompt      string       `json:"prompt"`
-	Schedule    CronSchedule `json:"schedule"`
-	Enabled     bool         `json:"enabled"`
-	Paused      bool         `json:"paused"`
-	Repeat      int          `json:"repeat,omitempty"` // 0 = infinite
-	Skills      []string     `json:"skills,omitempty"`
-	SessionMode string       `json:"session_mode,omitempty"`
-	SessionRef  string       `json:"session_ref,omitempty"`
+	// Continuations are consumed only by their original session, never by the cron daemon.
+	Kind               string       `json:"kind,omitempty"`
+	OriginSessionID    string       `json:"origin_session_id,omitempty"`
+	Provider           string       `json:"provider,omitempty"`
+	Model              string       `json:"model,omitempty"`
+	ContinuationStatus string       `json:"continuation_status,omitempty"`
+	ContinuationRunID  string       `json:"continuation_run_id,omitempty"`
+	ID                 string       `json:"id"`
+	Name               string       `json:"name"`
+	Prompt             string       `json:"prompt"`
+	Schedule           CronSchedule `json:"schedule"`
+	Enabled            bool         `json:"enabled"`
+	Paused             bool         `json:"paused"`
+	Repeat             int          `json:"repeat,omitempty"` // 0 = infinite
+	Skills             []string     `json:"skills,omitempty"`
+	SessionMode        string       `json:"session_mode,omitempty"`
+	SessionRef         string       `json:"session_ref,omitempty"`
 	// WorkDir binds durable Desktop jobs to their creation workspace; empty preserves legacy CLI cwd behavior.
 	WorkDir       string   `json:"work_dir,omitempty"`
 	DisabledTools []string `json:"disabled_tools,omitempty"`
@@ -286,10 +293,21 @@ func (s *CronService) saveJob(job *CronJob) error {
 		_ = tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, s.path(job.ID))
+	if err := os.Rename(tmpPath, s.path(job.ID)); err != nil {
+		return err
+	}
+	if parent, err := os.Open(s.root); err == nil {
+		_ = parent.Sync()
+		_ = parent.Close()
+	}
+	return nil
 }
 
 // cloneCronJob returns a fully independent public snapshot. CronJob contains
@@ -312,6 +330,11 @@ func cloneCronJob(job *CronJob) *CronJob {
 func (s *CronService) Create(job *CronJob) error {
 	if job == nil {
 		return fmt.Errorf("cron job required")
+	}
+	if job.Kind == CronKindContinuation {
+		if err := validateContinuation(job); err != nil {
+			return err
+		}
 	}
 	if err := validateSchedule(job.Schedule); err != nil {
 		return fmt.Errorf("invalid schedule: %w", err)
@@ -380,7 +403,7 @@ func (s *CronService) FireDueEphemeral(now time.Time) []*CronJob {
 	defer s.mu.Unlock()
 	var fired []*CronJob
 	for id, j := range s.jobs {
-		if !j.Ephemeral || !j.Enabled || j.Paused || j.NextRun.IsZero() {
+		if !j.Ephemeral || j.Kind == CronKindContinuation || !j.Enabled || j.Paused || j.NextRun.IsZero() {
 			continue
 		}
 		if !j.ExpiresAt.IsZero() && now.After(j.ExpiresAt) {
@@ -500,6 +523,14 @@ func (s *CronService) updateJobLocked(id string, current *CronJob, patch func(*C
 	// Authorization and descriptive metadata updates must not postpone an
 	// already-scheduled fire. Recompute only when the timing/lifecycle change
 	// requires a new deadline (or a legacy job has none at all).
+	if job.Kind == CronKindContinuation {
+		if err := validateContinuation(job); err != nil {
+			return err
+		}
+	}
+	if job.Kind == CronKindContinuation && job.ContinuationStatus != "" && job.ContinuationStatus != "pending" {
+		job.Enabled = false // claimed/terminal work cannot be re-armed by Resume
+	}
 	scheduleChanged := job.Schedule != previousSchedule
 	becameEnabled := !wasEnabled && job.Enabled
 	resumed := wasPaused && !job.Paused
@@ -599,6 +630,9 @@ func (s *CronService) advanceJobLocked(id string, ranAt time.Time) (*CronJob, er
 	if !ok {
 		return nil, fmt.Errorf("job not found: %s", id)
 	}
+	if current.Kind == CronKindContinuation {
+		return nil, fmt.Errorf("continuation requires original-session acquisition")
+	}
 	job := cloneCronJob(current)
 	job.LastRun = ranAt
 	job.RunCount++
@@ -658,7 +692,7 @@ func (s *CronService) computeNextRun(job *CronJob) {
 		if err != nil {
 			return
 		}
-		if t.Before(now) {
+		if t.Before(now) && job.Kind != CronKindContinuation {
 			// "at" fired already — bump 24h so the same wall-clock
 			// time tomorrow is the next firing. Callers who want a
 			// one-shot should set Repeat=1 so RunCount disables it.
@@ -851,11 +885,27 @@ func (s *CronService) reapExpired() {
 	_ = s.refreshDurableState()
 }
 
-// reapExpiredLocked removes expired jobs from memory and disk. The caller
-// must hold the cross-process storage lock and s.mu for writing.
+// reapExpiredLocked removes ordinary expired cron jobs. Continuations retain
+// durable terminal history and active claims. The caller must hold the
+// cross-process storage lock and s.mu for writing.
 func (s *CronService) reapExpiredLocked(now time.Time) error {
 	for id, j := range s.jobs {
 		if !j.ExpiresAt.IsZero() && now.After(j.ExpiresAt) {
+			if j.Kind == CronKindContinuation {
+				// Continuation history and in-flight claim identities must survive
+				// expiry. A claimed turn still owns a completion receipt; deleting
+				// its job here would make Finish fail after real execution.
+				if j.ContinuationStatus == "" || j.ContinuationStatus == "pending" {
+					expired := cloneCronJob(j)
+					expired.Enabled = false
+					expired.ContinuationStatus = "expired"
+					if err := s.saveJob(expired); err != nil {
+						return err
+					}
+					s.jobs[id] = expired
+				}
+				continue
+			}
 			if !j.Ephemeral {
 				if err := os.Remove(s.path(id)); err != nil && !os.IsNotExist(err) {
 					return err
@@ -876,7 +926,7 @@ func (s *CronService) nextJob() (string, time.Time) {
 	now := time.Now()
 
 	for id, j := range s.jobs {
-		if !j.Enabled || j.Paused {
+		if j.Kind == CronKindContinuation || !j.Enabled || j.Paused {
 			continue
 		}
 		if j.NextRun.IsZero() {

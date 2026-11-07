@@ -1,23 +1,8 @@
 package builtin
 
-// wakeup.go — ScheduleWakeup tool. Lets the LLM self-pace a `/loop`-like
-// continuation by saying "wake me in N seconds with this prompt".
-//
-// Borrowed straight from claude-code's bundled/loop.ts (`ScheduleWakeup`)
-// — unlike a fixed-interval cron, this lets the model itself decide
-// when the next attempt should happen. Two big wins:
-//
-//   1. Cache alignment — Anthropic prompt cache TTL is 5 minutes, so
-//      delays under 270s keep the cache warm; jumping to 1200s+ amortizes
-//      a single cache miss across a long quiet period. The tool's
-//      schema text suggests these breakpoints in `delaySeconds`.
-//
-//   2. No blind polling — when an agent is mid-build it can wake every
-//      60s; when it's idle it can sleep 30 minutes. A static cron can't.
-//
-// Implementation: a wakeup is just a one-shot cron job (kind="at",
-// repeat=1). The cron service already handles firing + cleanup, so the
-// only new code is this tool that constructs the right CronJob shape.
+// ScheduleWakeup persists a one-shot original-session continuation. Its live
+// consumer uses claim/start/completion receipts; ordinary cron daemons must not
+// execute it. Cache retention remains provider-dependent.
 
 import (
 	"context"
@@ -27,6 +12,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tasks"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
@@ -35,8 +21,9 @@ import (
 // Register() at startup, scoped to the same session as the agent loop.
 type ScheduleWakeup struct {
 	tools.BaseTool
-	gate    *permission.Gate
-	service *agent.CronService
+	gate     *permission.Gate
+	service  *agent.CronService
+	identity agent.ContinuationIdentity
 }
 
 // NewScheduleWakeup is the runtime-side constructor — keeps the
@@ -47,19 +34,23 @@ func NewScheduleWakeup(gate *permission.Gate, svc *agent.CronService) ScheduleWa
 	return ScheduleWakeup{gate: gate, service: svc}
 }
 
+func (s ScheduleWakeup) WithContinuation(identity agent.ContinuationIdentity) ScheduleWakeup {
+	s.identity = identity
+	return s
+}
+
 func (ScheduleWakeup) Name() string { return "ScheduleWakeup" }
 
 func (ScheduleWakeup) Description() string {
 	return strings.TrimSpace(`
-Schedule a future wake-up where you (the agent) re-enter with a prompt.
-Use this to self-pace continuous work without blind polling.
+Schedule a future continuation in this original conversation, using its existing
+context and permissions. This is not an unattended cron task and grants no tool
+permissions. If the session is closed, the wakeup remains pending until that
+same session is resumed; no independent daemon is started.
 
-Picking delaySeconds:
-  - 60-270s: prompt cache (5min TTL) stays warm — right for active polling.
-  - 300-1200s: pay one cache miss; right when nothing's about to change soon.
-  - 1200s+: idle waiting; the user can interrupt sooner if they need you.
-
-Provide a concise reason — it shows in telemetry and the user's status bar.
+Choose a delay appropriate to the work (30 seconds to 24 hours). Cache retention
+is provider-dependent and is not guaranteed by scheduling a wakeup.
+Provide a concise reason — it is shown to the user.
 `)
 }
 
@@ -74,7 +65,7 @@ func (ScheduleWakeup) InputSchema() map[string]any {
 			},
 			"prompt": map[string]any{
 				"type":        "string",
-				"description": "The prompt to feed back into the agent on wake. Should be self-contained (the new turn won't see this turn's context).",
+				"description": "The prompt to continue in this original session on wake. Existing conversation context is preserved.",
 			},
 			"reason": map[string]any{
 				"type":        "string",
@@ -96,7 +87,12 @@ func (s ScheduleWakeup) CanUse(_ context.Context, in map[string]any) (tools.Perm
 	return mapDecision(d), "schedule"
 }
 
-func (s ScheduleWakeup) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (s ScheduleWakeup) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	// A turn-pinned session must agree with registry binding. Never redirect an
+	// old registry to whichever Desktop tab happens to be globally current.
+	if id := tasks.SessionIDFromContext(ctx); id != "" && s.identity.SessionID != "" && id != s.identity.SessionID {
+		return &tools.Result{Output: "ScheduleWakeup: original session binding mismatch", IsError: true}, nil
+	}
 	if s.service == nil {
 		return &tools.Result{
 			Output:  "ScheduleWakeup: cron service not initialized",
@@ -127,15 +123,22 @@ func (s ScheduleWakeup) Execute(_ context.Context, in map[string]any) (*tools.Re
 		delay = maxDelay
 	}
 
-	// One-shot via Kind=at + Repeat=1. The cron service flips Enabled
-	// to false after RunCount >= Repeat, so the wakeup self-cleans
-	// without an explicit Remove call.
+	// Persist pending work. Admission disables it atomically; Start counts actual
+	// execution and Finish records a terminal outcome without deleting history.
 	at := time.Now().Add(time.Duration(delay) * time.Second)
 	job := &agent.CronJob{
-		Name:    "wakeup: " + truncate(reason, 40),
-		Prompt:  prompt,
-		Enabled: true,
-		Repeat:  1,
+		Kind:               agent.CronKindContinuation,
+		OriginSessionID:    s.identity.SessionID,
+		WorkDir:            s.identity.WorkDir,
+		Provider:           s.identity.Provider,
+		Model:              s.identity.Model,
+		ContinuationStatus: "pending",
+		SessionMode:        agent.SessionModeMain,
+		SessionRef:         s.identity.SessionID,
+		Name:               "wakeup: " + truncate(reason, 40),
+		Prompt:             prompt,
+		Enabled:            true,
+		Repeat:             1,
 		Schedule: agent.CronSchedule{
 			Kind: "at",
 			At:   at.Format(time.RFC3339),
@@ -175,8 +178,12 @@ func requireSeconds(v any) (int, error) {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	if n <= 1 {
+		return "…"
+	}
+	return string(runes[:n-1]) + "…"
 }

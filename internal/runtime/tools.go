@@ -247,9 +247,9 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// configured. We always register it though — its description will
 	// just say "no channels available" until one is wired.
 	reg.Register(builtin.NewSendMessage(opts.Gate, opts.ChannelRegistry, opts.DefaultPlatform))
-	// ScheduleWakeup: lets the LLM self-pace via one-shot cron. Only
-	// makes sense when a CronService is alive (chat REPL); skipped for
-	// `metis run` one-shots where there's no scheduler ticking.
+	// ScheduleWakeup persists original-session continuations. Frontends bind
+	// the resolved identity after session creation; headless run retains its
+	// invocation context until pending continuations fire or the user cancels.
 	if opts.CronService != nil {
 		reg.Register(builtin.NewScheduleWakeup(opts.Gate, opts.CronService))
 		// CronCreate/List/Delete: claude-code-style conversational

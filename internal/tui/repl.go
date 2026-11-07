@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -102,7 +101,10 @@ type REPL struct {
 	// rl is the readline editor — handles prompt rendering, history (up/down),
 	// and tab completion for slash commands. Nil when stdin is not a TTY
 	// (CI, shell pipes); we fall back to a plain bufio.Reader in that case.
-	rl *readline.Instance
+	CronService    *agent.CronService
+	idleInput      <-chan replInputResult
+	lastStopReason string
+	rl             *readline.Instance
 
 	// streaming buffer: collect assistant text deltas to render markdown
 	// once at end of turn rather than re-rendering line-by-line.
@@ -284,7 +286,8 @@ func (r *REPL) Run(ctx context.Context) (runErr error) {
 		default:
 		}
 
-		text, err := r.readInput()
+		r.bindREPLWakeupContinuation()
+		text, err := r.readInputWithWakeups(ctx)
 		if err == io.EOF {
 			fmt.Fprintln(r.out)
 			fmt.Fprintln(r.out, r.Styles.Hint.Render("bye."))
@@ -754,8 +757,10 @@ func (r *REPL) printBanner() {
 	fmt.Fprintln(r.out)
 }
 
-func (r *REPL) readInput() (string, error) {
-	line, err := r.readSingleLine()
+func (r *REPL) readInput() (string, error) { return r.readInputUsing(r.readSingleLine) }
+
+func (r *REPL) readInputUsing(readLine func() (string, error)) (string, error) {
+	line, err := readLine()
 	if err != nil {
 		return line, err
 	}
@@ -772,7 +777,7 @@ func (r *REPL) readInput() (string, error) {
 		}
 		var b strings.Builder
 		for {
-			more, err := r.readSingleLine()
+			more, err := readLine()
 			if err != nil && more == "" {
 				return b.String(), err
 			}
@@ -792,6 +797,15 @@ func (r *REPL) readInput() (string, error) {
 // directly. It's the only place the editor and the bufio fallback
 // converge, so future input changes (paste handling, etc) live here.
 func (r *REPL) readSingleLine() (string, error) {
+	if r.idleInput != nil {
+		result := <-r.idleInput
+		r.idleInput = nil
+		return result.text, result.err
+	}
+	return r.readRawSingleLine()
+}
+
+func (r *REPL) readRawSingleLine() (string, error) {
 	if r.rl != nil {
 		line, err := r.rl.Readline()
 		if err == readline.ErrInterrupt {
@@ -836,6 +850,7 @@ func historyFilePath() string {
 }
 
 func (r *REPL) runTurn(ctx context.Context) (returnErr error) {
+	r.lastStopReason = ""
 	// Every exit joins the producer before saving. Keep a failed append in the
 	// result so Run displays it, while leaving the cursor and live transcript
 	// retryable at the next close/switch boundary.
@@ -910,6 +925,7 @@ func (r *REPL) runTurn(ctx context.Context) (returnErr error) {
 		case agent.EventContextCompacted:
 			r.resetTokenUsageAfterCompaction()
 		case agent.EventLoopDone:
+			r.lastStopReason = ev.StopReason
 			r.flushTextBeforeTool(turnStartedText)
 			fmt.Fprintln(r.out)
 			runErr := <-done
@@ -988,9 +1004,8 @@ func (r *REPL) askUser(ev agent.Event) string {
 	}
 	fmt.Fprintln(r.out)
 	fmt.Fprintln(r.out, r.Styles.PermissionBox.Render(b.String()))
-	in := bufio.NewReader(r.stdin)
 	fmt.Fprint(r.out, r.Styles.UserPrompt.Render("? "))
-	line, err := in.ReadString('\n')
+	line, err := r.readSingleLine()
 	if err != nil {
 		return ""
 	}
@@ -1012,10 +1027,9 @@ func (r *REPL) askPermission(ev agent.Event) agent.PermissionDecision {
 	prompt := fmt.Sprintf("permission: tool=%s\n  %s\nallow? (y)es / (n)o / (a)lways", ev.PermissionTool, string(argsJSON))
 	fmt.Fprintln(r.out)
 	fmt.Fprintln(r.out, r.Styles.PermissionBox.Render(prompt))
-	in := bufio.NewReader(r.stdin)
 	for {
 		fmt.Fprint(r.out, r.Styles.UserPrompt.Render("? "))
-		line, err := in.ReadString('\n')
+		line, err := r.readSingleLine()
 		if err != nil {
 			return agent.PermissionDecisionDeny
 		}

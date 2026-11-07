@@ -150,6 +150,10 @@ type Server struct {
 	openPath                func(path string) error
 	clipboardFiles          func() ([]desktop.ClipboardFile, error)
 	computerUse             func(context.Context, string) (computeruse.Status, error)
+	cronSvc                 *agent.CronService
+	wakeupMu                sync.Mutex
+	wakeupSessions          map[string]bool
+	wakeupWarnings          map[string]bool
 	automations             *automationManager
 	durableOps              *durableOperationsBridge
 	plugins                 *rtpkg.PluginRegistry
@@ -362,6 +366,7 @@ type RuntimeBindings struct {
 	// ComputerUse delegates fixed management actions to the shared runtime.
 	// The browser never supplies executable paths or helper download URLs.
 	ComputerUse func(context.Context, string) (computeruse.Status, error)
+	CronService *agent.CronService
 	Automations *AutomationOptions
 	// ShutdownToken and Shutdown are set only by the native Desktop shell.
 	// Browser mode intentionally leaves them empty so a normal WebUI process
@@ -411,6 +416,9 @@ func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...
 		}
 	}
 	server := &Server{
+		cronSvc:                 binding.CronService,
+		wakeupSessions:          map[string]bool{binding.InitialSessionID: true},
+		wakeupWarnings:          make(map[string]bool),
 		addr:                    addr,
 		loop:                    loop,
 		store:                   store,
@@ -813,6 +821,9 @@ func (s *Server) handleDesktopShutdown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	wakeupCtx, stopWakeups := context.WithCancel(ctx)
+	defer stopWakeups()
+	go s.watchScheduledWakeups(wakeupCtx)
 	s.automations.startConfigured()
 	defer s.automations.close()
 	server := &http.Server{Addr: s.addr, Handler: s.handler(), ReadHeaderTimeout: 5 * time.Second}
@@ -1684,6 +1695,8 @@ func (s *Server) handleSessionActivate(w http.ResponseWriter, r *http.Request) {
 		ID: body.ID, Title: hdr.Title, Model: hdr.Model, WorkDir: workspace.Path, WorkspaceID: workspace.ID,
 		Mode: hdr.Mode, Effort: hdr.Effort, Preset: hdr.Preset, Status: hdr.Status, Archived: s.store.IsArchived(body.ID), CreatedAt: hdr.CreatedAt, UpdatedAt: s.sessionUpdatedAt(body.ID, hdr.CreatedAt),
 	}, "messages": agent.PresentationHistory(history), "workspace": workspace}
+	s.rememberWakeupSession(body.ID)
+	payload["scheduledWakeups"] = s.scheduledWakeupStatus(body.ID, time.Now())
 	s.addPermissionStatus(payload, body.ID)
 	item := payload["session"].(sessionItem)
 	item.Mode, _ = payload["permissionMode"].(string)
@@ -2045,8 +2058,19 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	}
 	user.Content = append(user.Content, imgBlocks...)
 	if !body.Resume {
-		rtpkg.RecordUserInput(body.SessionID, user.Content)
-		if len(imgBlocks) > 0 {
+		_, scheduled := r.Context().Value(scheduledWakeupKey{}).(*agent.ContinuationRun)
+		if scheduled {
+			for i := range user.Content {
+				user.Content[i].Synthetic = true
+			}
+			rtpkg.RecordContextInput(body.SessionID, "scheduled-wakeup", input)
+			s.loop.AppendContext(modelInput)
+		} else {
+			rtpkg.RecordUserInput(body.SessionID, user.Content)
+		}
+		if scheduled {
+			// The context event was appended above, never a human input anchor.
+		} else if len(imgBlocks) > 0 {
 			modelBlocks := make([]llm.ContentBlock, 0, len(user.Content))
 			if modelInput != "" {
 				modelBlocks = append(modelBlocks, llm.ContentBlock{Type: "text", Text: modelInput})
@@ -2068,6 +2092,20 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = s.store.SetTitle(body.SessionID, string(title))
 	}
+	s.rememberWakeupSession(body.SessionID)
+	if run, scheduled := r.Context().Value(scheduledWakeupKey{}).(*agent.ContinuationRun); scheduled {
+		s.stateMu.RLock()
+		matches := s.activeSessionID == run.Job.OriginSessionID && s.activeWorkDir == run.Job.WorkDir && s.activeProviderName == run.Job.Provider && s.activeModel == run.Job.Model
+		s.stateMu.RUnlock()
+		if !matches {
+			writeError(w, http.StatusConflict, "scheduled wakeup active runtime does not match original identity")
+			return
+		}
+	}
+	if err := s.startScheduledWakeup(r.Context(), body.SessionID); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
 	text, runErr, status, mayContinue := s.runAndPersistTurn(turnCtx, body.SessionID, messageMetric, body.Resume)
 	if errors.Is(runErr, context.Canceled) {
 		writeJSON(w, http.StatusOK, map[string]any{"sessionId": body.SessionID, "text": text, "stopped": true})
@@ -2075,6 +2113,10 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	}
 	if runErr != nil {
 		writeTurnError(w, status, runErr)
+		return
+	}
+	if _, scheduled := r.Context().Value(scheduledWakeupKey{}).(*agent.ContinuationRun); scheduled && !mayContinue {
+		writeError(w, http.StatusBadGateway, "scheduled wakeup stopped before end_turn")
 		return
 	}
 	if mayContinue {
@@ -2160,11 +2202,28 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 		}
 	}
 
+	s.rememberWakeupSession(sessionID)
+	_, scheduledContext := r.Context().Value(scheduledWakeupKey{}).(*agent.ContinuationRun)
+	workerResume := len(resume) > 0 && resume[0]
+	if scheduledContext {
+		// Persist the internal event before the run receipt counts execution.
+		// The ordinary resume worker consumes that exact durable boundary.
+		if err := s.store.AppendMessage(sessionID, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: input, Synthetic: true}}}); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to persist scheduled context: "+err.Error())
+			return
+		}
+		rtpkg.RecordContextInput(sessionID, "scheduled-wakeup", input)
+		input, workerResume = "", true
+	}
+	if err := s.startScheduledWakeup(r.Context(), sessionID); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
 	result, err := s.isolatedRunner.Run(turnCtx, IsolatedTurnRequest{
 		SessionID: sessionID,
 		WorkDir:   workDir,
 		Input:     input,
-		Resume:    len(resume) > 0 && resume[0],
+		Resume:    workerResume,
 		Steer:     steer,
 		OnStatus:  func(status desktopipc.Status) { s.acceptWorkerStatus(sessionID, workerOwner, status) },
 		OnEvent: func(ev agent.Event) {
@@ -2244,6 +2303,8 @@ func latestAssistantText(history []llm.Message) string {
 // The caller owns runMu and the registered cancellation slot. A resumption does
 // not invent a user message; Loop remains the sole job-notification consumer.
 func (s *Server) runAndPersistTurn(turnCtx context.Context, sessionID string, messageMetric session.MessageMetric, resume ...bool) (string, error, int, bool) {
+	s.bindWakeupContinuation(sessionID)
+	turnCtx = tasks.WithSessionID(turnCtx, sessionID)
 	defer s.cancelSessionInteractions(sessionID)
 	// The user-facing prompt written above can intentionally differ from the
 	// loop-only message (for example a synthetic plan reminder). Anchor the
@@ -4054,7 +4115,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	planItems, planTurn, planTurnStartedAt := planningStatus(activeSessionID)
 	executionStrategy := executionStrategyForStatus(len(planItems), subAgents, namedAgents)
 	payload := map[string]any{
-		"subAgents": subAgents, "backgroundTasks": backgroundTasks, "workspace": workspace,
+		"scheduledWakeups": s.scheduledWakeupStatus(viewSessionID, time.Now()),
+		"subAgents":        subAgents, "backgroundTasks": backgroundTasks, "workspace": workspace,
 		"checkpoint":        s.checkpointStatusForView(viewSessionID, selectedWorkDir),
 		"activeWorkspaceId": workspaceIDForPath(selectedWorkDir),
 		"agents":            agentDetails, "jobs": jobDetails,

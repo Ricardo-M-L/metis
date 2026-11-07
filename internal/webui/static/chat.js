@@ -4818,7 +4818,7 @@ function appendHistoryEntries(history, historySessionId, initialTurn = 0, source
       ? m.content
       : (m.content != null ? [{ type: 'text', text: String(m.content) }] : []);
     if (role === 'user' && blocks.some(b => {
-      if (!b || b.type !== 'text') return false;
+      if (!b || b.type !== 'text' || b.synthetic) return false;
       const text = String(b.text || '');
       return text.trim() && !text.startsWith('[user steer mid-turn] ') && visibleTranscriptText(text).trim();
     })) historyTurn++;
@@ -4830,8 +4830,8 @@ function appendHistoryEntries(history, historySessionId, initialTurn = 0, source
         const rawShown = role === 'user' && String(b.text).startsWith('[user steer mid-turn] ')
           ? String(b.text).slice('[user steer mid-turn] '.length) : b.text;
         const shown = visibleTranscriptText(rawShown);
-        if (shown.trim()) addMessage(role, shown, false, sourceStart + sourceOffset, historyTurn,
-          role === 'user' && String(b.text).startsWith('[user steer mid-turn] '));
+        if (shown.trim()) addMessage(b.synthetic ? 'info' : role, shown, false, sourceStart + sourceOffset, historyTurn,
+          !b.synthetic && role === 'user' && String(b.text).startsWith('[user steer mid-turn] '));
       } else if (role === 'assistant' && b.type === 'thinking' && (b.text || '').trim()) {
         try {
           appendThinkingRow(b.text);

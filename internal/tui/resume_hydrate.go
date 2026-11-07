@@ -99,8 +99,12 @@ func (m *Model) hydrateFromLoopHistory() {
 				if visibleText == "" {
 					continue
 				}
+				blockRole := role
+				if blk.Synthetic {
+					blockRole = "info"
+				}
 				m.messages = append(m.messages, Message{
-					Role:      role,
+					Role:      blockRole,
 					Content:   visibleText,
 					Timestamp: tsNext(),
 					ID:        m.nextID(),

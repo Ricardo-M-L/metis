@@ -174,8 +174,13 @@ func (m *Model) stopForegroundTurnForClose() error {
 	m.spinnerActive = false
 	// An idle UI can still have an unsaved completed turn. Its cursor remains
 	// at the last successful write, so this retry also preserves partial writes.
-	if err := m.persistTail(); err != nil {
-		return fmt.Errorf("persist foreground turn for session %s: %w", shortID(m.sessionID), err)
+	persistErr := m.persistTail()
+	if m.wakeupRun != nil {
+		m.turnCancelledByUser = true
+		m.finishScheduledWakeup(context.Canceled, persistErr)
+	}
+	if persistErr != nil {
+		return fmt.Errorf("persist foreground turn for session %s: %w", shortID(m.sessionID), persistErr)
 	}
 	return nil
 }

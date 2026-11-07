@@ -937,6 +937,7 @@ func (m *Model) finalizeTurn(err error) {
 	// and cursor for retry, and stop unattended continuation until the user
 	// can respond. Session close/switch retries this same tail independently.
 	persistErr := m.persistTail()
+	m.finishScheduledWakeup(err, persistErr)
 	if persistErr != nil {
 		m.warnSessionSave(persistErr)
 	}

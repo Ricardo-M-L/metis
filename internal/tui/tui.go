@@ -198,11 +198,13 @@ type Model struct {
 	// cronSvc backs the in-session scheduler (cron_scheduler.go) — the same
 	// CronService the CronCreate/List/Delete tools mutate, so session-only
 	// jobs the model schedules mid-chat fire here. nil ⇒ no in-session ticks.
-	cronSvc   *agent.CronService
-	gate      *permission.Gate
-	slash     *slash.Registry
-	session   *session.Store
-	sessionID string
+	cronSvc        *agent.CronService
+	wakeupRun      *agent.ContinuationRun
+	wakeupWarnings map[string]bool
+	gate           *permission.Gate
+	slash          *slash.Registry
+	session        *session.Store
+	sessionID      string
 	// sessionTitle is the human-friendly label set via /rename or /title
 	// (persisted in the session header by session.Store.SetTitle).
 	// Used to drive the terminal window title (bubbletea's

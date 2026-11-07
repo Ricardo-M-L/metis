@@ -94,6 +94,7 @@ func cmdDesktop(ctx context.Context, args []string) error {
 	}
 	defer os.RemoveAll(agentSlotDir)
 	bindings := webui.RuntimeBindings{
+		CronService:             rt.cronSvc,
 		InitialSessionID:        rt.sessionID,
 		ProviderName:            rt.providerName,
 		PresetName:              presetName,

@@ -238,11 +238,9 @@ func (c CronList) Execute(_ context.Context, _ map[string]any) (*tools.Result, e
 		if j.Ephemeral {
 			scope = "session-only"
 		}
-		state := "enabled"
-		if j.Paused {
-			state = "paused"
-		} else if !j.Enabled {
-			state = "disabled"
+		state := agent.CronJobStatus(j, time.Now())
+		if j.Kind == agent.CronKindContinuation {
+			scope = "original-session:" + j.OriginSessionID
 		}
 		next := "—"
 		if !j.NextRun.IsZero() {

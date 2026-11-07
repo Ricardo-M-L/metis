@@ -48,6 +48,9 @@ func (m *Model) handleCronTick(now time.Time) (tea.Model, tea.Cmd) {
 	}
 	due := m.cronSvc.FireDueEphemeral(now)
 	cmds := []tea.Cmd{cronTickCmd()} // always re-arm, even if nothing fired
+	if cmd := m.consumeScheduledWakeup(now); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
 	for _, job := range due {
 		// Make the fire visible — the user must see the chat didn't type
 		// this itself. notify too, in case they've tabbed away.
