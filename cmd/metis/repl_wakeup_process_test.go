@@ -25,7 +25,7 @@ func TestWakeupREPLProcessHelper(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	if err := dispatch(ctx, []string{"chat", "--bare", "--mode", "bypassPermissions"}); err != nil {
+	if err := dispatch(ctx, []string{"chat", "--bare", "--mode", "fullAccess"}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

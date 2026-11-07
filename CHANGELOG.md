@@ -7,6 +7,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.113] - 2026-11-07
+
+CLI-only stable release of the session wakeup fixes below. Uses platform-portable process fixtures rather than requiring bypassPermissions sandbox support on Windows. The v0.4.112 tag and draft remain unchanged after its Windows CI fixture failure; it was not publicly published.
+
 ## [0.4.112] - 2026-11-07
 
 CLI-only stable release. Desktop assets and the shared Desktop latest pointer are unchanged.

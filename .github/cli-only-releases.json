@@ -43,6 +43,12 @@
       "make_latest": false,
       "reason": "Formal CLI-only release of the compact Metis terminal icon; Desktop assets and the shared latest pointer remain unchanged."
     },
+    "v0.4.113": {
+      "channel": "cli-only-stable",
+      "prerelease": false,
+      "make_latest": false,
+      "reason": "Session wakeup release with cross-platform process verification; preserve the failed Windows CI v0.4.112 tag/draft and Desktop shared latest."
+    },
     "v0.4.112": {
       "channel": "cli-only-stable",
       "prerelease": false,

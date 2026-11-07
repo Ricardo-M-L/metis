@@ -24,7 +24,7 @@ func TestWakeupCLIProcessHelper(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	if err := dispatch(ctx, []string{"run", "--bare", "--mode", "bypassPermissions", "schedule the authorized continuation"}); err != nil {
+	if err := dispatch(ctx, []string{"run", "--bare", "--mode", "fullAccess", "schedule the authorized continuation"}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
