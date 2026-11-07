@@ -2058,13 +2058,16 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	}
 	user.Content = append(user.Content, imgBlocks...)
 	if !body.Resume {
-		_, scheduled := r.Context().Value(scheduledWakeupKey{}).(*agent.ContinuationRun)
+		run, scheduled := r.Context().Value(scheduledWakeupKey{}).(*agent.ContinuationRun)
 		if scheduled {
 			for i := range user.Content {
 				user.Content[i].Synthetic = true
+				if run.Job.TaskPlanID != "" {
+					user.Content[i].ProviderHint = map[string]string{agent.TaskPlanHint: run.Job.TaskPlanID}
+				}
 			}
 			rtpkg.RecordContextInput(body.SessionID, "scheduled-wakeup", input)
-			s.loop.AppendContext(modelInput)
+			s.loop.AppendContextForTaskPlan(modelInput, run.Job.TaskPlanID)
 		} else {
 			rtpkg.RecordUserInput(body.SessionID, user.Content)
 		}
@@ -2095,7 +2098,7 @@ func (s *Server) handleTurn(w http.ResponseWriter, r *http.Request) {
 	s.rememberWakeupSession(body.SessionID)
 	if run, scheduled := r.Context().Value(scheduledWakeupKey{}).(*agent.ContinuationRun); scheduled {
 		s.stateMu.RLock()
-		matches := s.activeSessionID == run.Job.OriginSessionID && s.activeWorkDir == run.Job.WorkDir && s.activeProviderName == run.Job.Provider && s.activeModel == run.Job.Model
+		matches := agent.ContinuationMatches(run.Job, agent.ContinuationIdentity{SessionID: s.activeSessionID, WorkDir: s.activeWorkDir, Provider: s.activeProviderName, Model: s.activeModel})
 		s.stateMu.RUnlock()
 		if !matches {
 			writeError(w, http.StatusConflict, "scheduled wakeup active runtime does not match original identity")
@@ -2203,12 +2206,16 @@ func (s *Server) handleIsolatedTurn(w http.ResponseWriter, r *http.Request, sess
 	}
 
 	s.rememberWakeupSession(sessionID)
-	_, scheduledContext := r.Context().Value(scheduledWakeupKey{}).(*agent.ContinuationRun)
+	wakeupRun, scheduledContext := r.Context().Value(scheduledWakeupKey{}).(*agent.ContinuationRun)
 	workerResume := len(resume) > 0 && resume[0]
 	if scheduledContext {
 		// Persist the internal event before the run receipt counts execution.
 		// The ordinary resume worker consumes that exact durable boundary.
-		if err := s.store.AppendMessage(sessionID, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: input, Synthetic: true}}}); err != nil {
+		block := llm.ContentBlock{Type: "text", Text: input, Synthetic: true}
+		if wakeupRun.Job.TaskPlanID != "" {
+			block.ProviderHint = map[string]string{agent.TaskPlanHint: wakeupRun.Job.TaskPlanID}
+		}
+		if err := s.store.AppendMessage(sessionID, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{block}}); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to persist scheduled context: "+err.Error())
 			return
 		}

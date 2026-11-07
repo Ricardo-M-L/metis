@@ -115,7 +115,7 @@ func (m *Model) consumeScheduledWakeup(now time.Time) tea.Cmd {
 	if err != nil || run == nil {
 		return nil
 	}
-	m.loop.AppendContext(run.Job.Prompt)
+	m.loop.AppendContextForTaskPlan(run.Job.Prompt, run.Job.TaskPlanID)
 	runtime.RecordContextInput(m.sessionID, "scheduled-wakeup", run.Job.Prompt)
 	m.messages = append(m.messages, Message{Role: "info", Content: run.Job.Prompt, Timestamp: now})
 	if err := m.persistTail(); err != nil {
@@ -127,6 +127,7 @@ func (m *Model) consumeScheduledWakeup(now time.Time) tea.Cmd {
 		_ = run.Finish("failed", "scheduled wakeup start failed", "", err)
 		return nil
 	}
+	m.wakeupHistoryStart = len(m.loop.History())
 	m.wakeupRun = run
 	return m.startAgentTurn(m.ctx)
 }
@@ -135,7 +136,9 @@ func (m *Model) finishScheduledWakeup(runErr, persistErr error) {
 		return
 	}
 	run := m.wakeupRun
+	historyStart := m.wakeupHistoryStart
 	m.wakeupRun = nil
+	m.wakeupHistoryStart = 0
 	err := errors.Join(runErr, persistErr)
 	status := "succeeded"
 	if err != nil || !m.backgroundResumeAllowed {
@@ -150,7 +153,16 @@ func (m *Model) finishScheduledWakeup(runErr, persistErr error) {
 	summary := "scheduled wakeup " + status
 	output := ""
 	if m.loop != nil && m.sessionID == run.Job.OriginSessionID {
-		for _, message := range m.loop.History() {
+		history := m.loop.History()
+		// A failed/cancelled turn may append no assistant message. Missing or
+		// invalidated boundaries must therefore produce an empty output instead
+		// of borrowing the previous session answer.
+		if historyStart <= 0 || historyStart > len(history) {
+			history = nil
+		} else {
+			history = history[historyStart:]
+		}
+		for _, message := range history {
 			if message.Role == "assistant" {
 				output = ""
 				for _, block := range message.Content {

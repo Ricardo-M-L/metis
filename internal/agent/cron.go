@@ -70,6 +70,7 @@ type CronJob struct {
 	// Continuations are consumed only by their original session, never by the cron daemon.
 	Kind               string       `json:"kind,omitempty"`
 	OriginSessionID    string       `json:"origin_session_id,omitempty"`
+	TaskPlanID         string       `json:"task_plan_id,omitempty"`
 	Provider           string       `json:"provider,omitempty"`
 	Model              string       `json:"model,omitempty"`
 	ContinuationStatus string       `json:"continuation_status,omitempty"`

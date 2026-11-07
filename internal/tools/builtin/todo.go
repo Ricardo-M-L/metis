@@ -27,14 +27,15 @@ type Todo struct {
 
 func (Todo) Name() string { return "TodoWrite" }
 func (Todo) Description() string {
-	return `Manage the session task list. Persists to ~/.metis/tasks/.
+	return `Manage the CURRENT WORK PLAN, not every task ever discussed in this session. Completed or replaced plans are archived; never copy unrelated historical tasks into a new plan. Persists to ~/.metis/tasks/.
 
 ## How to call it
 
-PREFERRED: pass a ` + "`todos`" + ` array containing the COMPLETE list every
+PREFERRED: pass a ` + "`todos`" + ` array containing the COMPLETE CURRENT PLAN every
 time, each item {content, status, priority?}. This REPLACES the whole
-list, so you restate every task and its current status on each call —
+current plan, so you restate its tasks and statuses on each call —
 which is exactly what stops earlier tasks from being left half-done.
+For a different user task, set new_plan=true. A completely disjoint replacement list also starts a new plan automatically. Follow-up work on the same task keeps its plan; do not add archived tasks merely to close them.
 Example: marking task 2 done → send all tasks, with task 1 completed,
 task 2 completed, task 3 pending. Keep exactly ONE task in_progress for
 a serial plan. Independent parallel sub-agents may each own an in_progress
@@ -145,8 +146,10 @@ func (Todo) InputSchema() map[string]any {
 			"todos": map[string]any{
 				"type":        "array",
 				"items":       todoItem,
-				"description": "The COMPLETE, current task list. Pass EVERY task on every call with its up-to-date status — this REPLACES the whole list. Restating all tasks each time is what prevents earlier tasks from being silently left half-done. This is the form you want; prefer it over the single-task fields below.",
+				"description": "The COMPLETE list for the CURRENT WORK PLAN only. Restate its tasks with their current status; do not include unrelated session history. A disjoint replacement list starts a new plan. Restating all tasks each time is what prevents earlier tasks from being silently left half-done. This is the form you want; prefer it over the single-task fields below.",
 			},
+			"new_plan": map[string]any{"type": "boolean", "description": "Start a separate work plan and archive the current plan without marking its unfinished tasks completed. Use for a different user task, even if some step names overlap."},
+			"plan_id":  map[string]any{"type": "string", "description": "Explicitly resume an archived plan ID returned by TodoRead(include_archived=true). Omit during ordinary current-plan updates."},
 			// Legacy single-task upsert (back-compat). Updates/creates one
 			// task matched by content (or id). Kept working but discouraged
 			// — it's easy to forget to close earlier tasks this way.
@@ -160,7 +163,18 @@ func (Todo) InputSchema() map[string]any {
 		},
 	}
 }
-func (Todo) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
+func (Todo) Concurrency(in map[string]any) tools.Concurrency {
+	if _, ok := in["todos"]; ok {
+		return tools.ConcurrencyExclusive
+	}
+	if in["new_plan"] == true {
+		return tools.ConcurrencyExclusive
+	}
+	if id, _ := in["plan_id"].(string); strings.TrimSpace(id) != "" {
+		return tools.ConcurrencyExclusive
+	}
+	return tools.ConcurrencySafe
+}
 
 // CanUse: TodoWrite is purely an internal task-tracker — writes JSON to
 // ~/.metis/tasks/, does nothing destructive externally. Default-allow
@@ -172,15 +186,38 @@ func (t Todo) CanUse(_ context.Context, _ map[string]any) (tools.Permission, str
 }
 
 func (Todo) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
-	sessionID := tasks.SessionIDFromContext(ctx)
 	// Preferred path: a `todos` array IS the entire list (Claude Code
 	// semantics). Every major model is trained on this declarative form,
 	// and replacing the whole list each call means a task can never be
 	// left stuck mid-status because the model "forgot" to close it
 	// (2026-06-14 bug). Falls through to the legacy single-task upsert
 	// only when no array is given.
-	if raw, ok := in["todos"].([]any); ok && len(raw) > 0 {
-		return replaceTodoList(sessionID, raw)
+	if raw, ok := in["todos"].([]any); ok {
+		newPlan, _ := in["new_plan"].(bool)
+		if id, _ := in["plan_id"].(string); strings.TrimSpace(id) != "" {
+			if newPlan {
+				return &tools.Result{Output: "TodoWrite: choose either new_plan or plan_id, not both", IsError: true}, nil
+			}
+			valid := len(raw) == 0
+			for _, value := range raw {
+				if item, ok := value.(map[string]any); ok {
+					if content, ok := item["content"].(string); ok && strings.TrimSpace(content) != "" {
+						valid = true
+						break
+					}
+				}
+			}
+			if !valid {
+				return &tools.Result{Output: "TodoWrite: `todos` array had no items with content.", IsError: true}, nil
+			}
+			if err := tasks.ActivatePlanForContext(ctx, id); err != nil {
+				return &tools.Result{Output: err.Error(), IsError: true}, nil
+			}
+			// Explicit resume must keep that scope even if the caller restates
+			// only a subset of the historical plan.
+			return replaceTodoListForContext(tasks.FreezePlanContext(ctx), raw, false)
+		}
+		return replaceTodoListForContext(ctx, raw, newPlan)
 	}
 
 	content, _ := in["content"].(string)
@@ -190,8 +227,13 @@ func (Todo) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 	id, _ := in["id"].(string)
 	status, _ := in["status"].(string)
 	priority, _ := in["priority"].(string)
+	if newPlan, _ := in["new_plan"].(bool); newPlan {
+		if _, err := tasks.ReplaceAllForContext(ctx, nil, true); err != nil {
+			return nil, err
+		}
+	}
 
-	saved, err := tasks.Upsert(sessionID, tasks.Item{
+	saved, err := tasks.UpsertForContext(ctx, tasks.Item{
 		ID: id, Content: content, Status: status, Priority: priority,
 	})
 	if err != nil {
@@ -207,7 +249,7 @@ func (Todo) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 	}
 	prioIcon := map[string]string{"high": "🔴", "medium": "🟡", "low": "🟢"}[saved.Priority]
 	out := fmt.Sprintf("%s %s [%s] %s", icon, prioIcon, saved.ID, saved.Content)
-	if nudge := todoVerifierNudge(sessionID, saved.Status); nudge != "" {
+	if nudge := todoVerifierNudgeForContext(ctx, saved.Status); nudge != "" {
 		out += "\n\n" + nudge
 	}
 	return &tools.Result{Output: out}, nil
@@ -217,6 +259,10 @@ func (Todo) Execute(ctx context.Context, in map[string]any) (*tools.Result, erro
 // todos array, replace the entire stored list, and render it back so
 // the model sees every task's resulting status in one place.
 func replaceTodoList(sessionID string, raw []any) (*tools.Result, error) {
+	return replaceTodoListForContext(tasks.WithSessionID(context.Background(), sessionID), raw, false)
+}
+
+func replaceTodoListForContext(ctx context.Context, raw []any, newPlan bool) (*tools.Result, error) {
 	items := make([]tasks.Item, 0, len(raw))
 	for _, r := range raw {
 		m, ok := r.(map[string]any)
@@ -232,10 +278,10 @@ func replaceTodoList(sessionID string, raw []any) (*tools.Result, error) {
 		id, _ := m["id"].(string)
 		items = append(items, tasks.Item{ID: id, Content: content, Status: status, Priority: priority})
 	}
-	if len(items) == 0 {
+	if len(raw) > 0 && len(items) == 0 {
 		return &tools.Result{Output: "TodoWrite: `todos` array had no items with content.", IsError: true}, nil
 	}
-	tl, err := tasks.ReplaceAll(sessionID, items)
+	tl, err := tasks.ReplaceAllForContext(ctx, items, newPlan)
 	if err != nil {
 		return &tools.Result{Output: "TodoWrite: " + err.Error(), IsError: true}, nil
 	}
@@ -244,9 +290,12 @@ func replaceTodoList(sessionID string, raw []any) (*tools.Result, error) {
 		fmt.Fprintf(&b, "%s [%s] %s\n", todoStatusIcon(it.Status), it.Status, it.Content)
 	}
 	out := strings.TrimRight(b.String(), "\n")
+	if len(tl.Items) == 0 {
+		out = "(current plan is empty)"
+	}
 	// Reuse the verify-step advisory: it reads the freshly-saved list,
 	// so it works identically for the full-list form.
-	if nudge := todoVerifierNudge(sessionID, "completed"); nudge != "" {
+	if nudge := todoVerifierNudgeForContext(ctx, "completed"); nudge != "" {
 		out += "\n\n" + nudge
 	}
 	return &tools.Result{Output: out}, nil
@@ -282,16 +331,19 @@ func todoStatusIcon(status string) string {
 // than the TaskStore version since `tasks.Item` has no separate
 // owner field.
 func todoVerifierNudge(sessionID, justSetStatus string) string {
+	return todoVerifierNudgeForContext(tasks.WithSessionID(context.Background(), sessionID), justSetStatus)
+}
+func todoVerifierNudgeForContext(ctx context.Context, justSetStatus string) string {
 	if justSetStatus != "completed" {
 		return ""
 	}
-	tl, err := tasks.Load(sessionID)
-	if err != nil || tl == nil {
+	items, err := tasks.PlanningItemsForContext(ctx)
+	if err != nil {
 		return ""
 	}
 	completed := 0
 	hasVerify := false
-	for _, it := range tl.Items {
+	for _, it := range items {
 		if isVerifyTodoContent(it.Content) {
 			hasVerify = true
 		}
@@ -335,21 +387,23 @@ type TodoRead struct {
 	gate *permission.Gate
 }
 
-func (TodoRead) Name() string                                 { return "TodoRead" }
-func (TodoRead) Description() string                          { return "List all tasks in the current session's task list." }
+func (TodoRead) Name() string { return "TodoRead" }
+func (TodoRead) Description() string {
+	return "List the current work plan. Set include_archived=true only to inspect earlier plans; archived tasks must not be copied into current work."
+}
 func (TodoRead) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
 func (TodoRead) InputSchema() map[string]any {
-	return map[string]any{"type": "object", "properties": map[string]any{}}
+	return map[string]any{"type": "object", "properties": map[string]any{"include_archived": map[string]any{"type": "boolean", "description": "Inspect archived plans separately without making them current."}}}
 }
 func (t TodoRead) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
 	return tools.PermissionAllow, "read-only"
 }
-func (TodoRead) Execute(ctx context.Context, _ map[string]any) (*tools.Result, error) {
-	items, err := tasks.PlanningItems(tasks.SessionIDFromContext(ctx))
+func (TodoRead) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	items, err := tasks.PlanningItemsForContext(ctx)
 	if err != nil {
 		return &tools.Result{Output: "TodoRead: " + err.Error(), IsError: true}, nil
 	}
-	if len(items) == 0 {
+	if len(items) == 0 && in["include_archived"] != true {
 		return &tools.Result{Output: "(no tasks yet — call TodoWrite to create one)"}, nil
 	}
 	// Format: `<icon> <status> <content>`. Matches claude-code's
@@ -375,6 +429,18 @@ func (TodoRead) Execute(ctx context.Context, _ map[string]any) (*tools.Result, e
 			owner = "  (owner: " + it.Owner + ")"
 		}
 		fmt.Fprintf(&b, "%s %-11s  %s%s\n", icon, it.Status, it.Content, owner)
+	}
+	if include, _ := in["include_archived"].(bool); include {
+		history, err := tasks.PlanHistory(tasks.SessionIDFromContext(ctx))
+		if err != nil {
+			return nil, err
+		}
+		for _, plan := range history {
+			fmt.Fprintf(&b, "\nArchived plan %s (historical; not current work):\n", plan.ID)
+			for _, item := range plan.Items {
+				fmt.Fprintf(&b, "%s [%s] %s\n", todoStatusIcon(item.Status), item.Status, item.Content)
+			}
+		}
 	}
 	return &tools.Result{Output: strings.TrimRight(b.String(), "\n")}, nil
 }

@@ -342,6 +342,10 @@ type Loop struct {
 	// it a model that keeps stopping without updating the list would loop.
 	// Reset at the top of Run.
 	todoReconciledThisTurn bool
+	// A human submission may retire a finished task plan. Internal wakeups and
+	// child turns retain their original plan instead of opening a new one.
+	taskPlanInputPending bool
+	taskPlanID           string
 
 	// haltSignal carries a "stop after this iteration" signal raised
 	// by a PreToolUse hook returning Halt=true (claude-code parity:
@@ -611,6 +615,7 @@ func NewLoop(p llm.Provider, r *tools.Registry, g *permission.Gate, h *HookRegis
 func (l *Loop) AppendUser(text string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.taskPlanInputPending = true
 	// The previous turn's frozen index/recall must never be reused by context
 	// estimation or direct request inspection after a new prompt is appended.
 	l.clearTurnMemoryLocked()
@@ -641,6 +646,12 @@ func (l *Loop) AppendUserBlocks(blocks []llm.ContentBlock) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	for _, block := range blocks {
+		if !block.Synthetic {
+			l.taskPlanInputPending = true
+			break
+		}
+	}
 	l.clearTurnMemoryLocked()
 	// Concatenate text-only blocks for trigger detection.
 	var textBuf strings.Builder
@@ -1481,6 +1492,8 @@ func (l *Loop) ResetSession(messages []llm.Message) {
 	l.todoWriteIter = 0
 	l.todoReminderIter = 0
 	l.todoReconciledThisTurn = false
+	l.taskPlanInputPending = false
+	l.taskPlanID = ""
 	l.haltRequested = false
 	l.haltReason = ""
 	l.steerBuf = nil
@@ -1671,6 +1684,16 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	// inspect another session while this turn or one of its sub-agents is still
 	// running; tool calls must continue writing to the originating session.
 	ctx = tasks.WithSessionID(ctx, tasks.SessionIDFromContext(ctx))
+	var taskPlanErr error
+	ctx, taskPlanErr = l.prepareTaskPlan(ctx)
+	if taskPlanErr != nil {
+		return fmt.Errorf("prepare current task plan: %w", taskPlanErr)
+	}
+	defer func() {
+		l.mu.Lock()
+		l.taskPlanID = tasks.PlanIDFromContext(ctx)
+		l.mu.Unlock()
+	}()
 	var artifactEditErr error
 	ctx, artifactEditErr = l.bindArtifactEditContext(ctx)
 	if artifactEditErr != nil {
@@ -1768,6 +1791,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	// This deliberately runs outside l.mu; a slow disk or optional reranker
 	// must not freeze Desktop status, stop, or session-navigation paths.
 	l.prepareTurnMemory(ctx)
+	l.syncTaskPlanNotice(ctx)
 
 	tc := HookContext{SessionID: tasks.SessionIDFromContext(ctx), Model: l.Model, Turn: l.turnIdx}
 	l.Hooks.EmitSessionStart(ctx, tc, l.System, l.Model)
@@ -2004,6 +2028,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		}
 		requestWithoutTools := l.rescueNoToolsSnapshot()
 		transport.RecordTiming(ctx, "request_build_start")
+		l.syncTaskPlanNotice(ctx)
 		req, contextAnchor := l.buildRequestWithContext(specs)
 		transport.RecordTiming(ctx, "request_build_end")
 		if err := l.checkpointRequestHistory(); err != nil {

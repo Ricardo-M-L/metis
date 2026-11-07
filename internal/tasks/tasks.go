@@ -50,8 +50,11 @@ type Item struct {
 
 // List is the on-disk task list for one session.
 type List struct {
-	SessionID string `json:"session"`
-	Items     []Item `json:"items"`
+	SessionID     string         `json:"session"`
+	Items         []Item         `json:"items"`
+	PlanID        string         `json:"plan_id,omitempty"`
+	LegacyPlanID  string         `json:"legacy_plan_id,omitempty"`
+	ArchivedPlans []ArchivedPlan `json:"archived_plans,omitempty"`
 }
 
 var mu sync.Mutex
@@ -95,6 +98,35 @@ func Save(tl *List) error {
 	if tl == nil {
 		return fmt.Errorf("tasks: nil list")
 	}
+	unlock, err := lockTaskMutation(tl.SessionID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	current, err := Load(tl.SessionID)
+	if err != nil {
+		return err
+	}
+	if current.PlanID != "" {
+		if tl.PlanID == "" {
+			current.Items = tl.Items
+			return saveLocked(current)
+		}
+		if tl.PlanID != current.PlanID {
+			if _, err := planList(current, tl.PlanID); err != nil {
+				return err
+			}
+			installPlanList(current, tl)
+			return saveLocked(current)
+		}
+	}
+	return saveLocked(tl)
+}
+
+func saveLocked(tl *List) error {
+	if tl == nil {
+		return fmt.Errorf("tasks: nil list")
+	}
 	if err := os.MkdirAll(Dir(), 0o755); err != nil {
 		return err
 	}
@@ -102,7 +134,25 @@ func Save(tl *List) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path(tl.SessionID), b, 0o644)
+	f, err := os.CreateTemp(Dir(), ".tasks-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	defer os.Remove(name)
+	if err = f.Chmod(0o644); err == nil {
+		_, err = f.Write(b)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(name, path(tl.SessionID))
 }
 
 // Delete removes both todo persistence formats owned by sessionID: the
@@ -113,9 +163,12 @@ func Delete(sessionID string) error {
 		return fmt.Errorf("tasks: invalid session id")
 	}
 
-	mu.Lock()
+	unlock, err := lockTaskMutation(sessionID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	simpleErr := os.Remove(path(sessionID))
-	mu.Unlock()
 	if errors.Is(simpleErr, os.ErrNotExist) {
 		simpleErr = nil
 	}
@@ -147,11 +200,33 @@ func validSessionID(sessionID string) bool {
 // content string > append new. Status / Priority preserved when caller
 // leaves them empty.
 func Upsert(sessionID string, in Item) (Item, error) {
-	mu.Lock()
-	defer mu.Unlock()
-	tl, err := Load(sessionID)
+	return UpsertForContext(WithSessionID(context.Background(), sessionID), in)
+}
+
+func UpsertForContext(ctx context.Context, in Item) (Item, error) {
+	sessionID := SessionIDFromContext(ctx)
+	unlock, err := lockTaskMutation(sessionID)
 	if err != nil {
 		return Item{}, err
+	}
+	defer unlock()
+	envelope, err := Load(sessionID)
+	if err != nil {
+		return Item{}, err
+	}
+	ensurePlan(envelope)
+	planID := planIDForContext(ctx, envelope.PlanID)
+	tl, err := planList(envelope, planID)
+	if err != nil {
+		return Item{}, err
+	}
+	save := func() error {
+		installPlanList(envelope, tl)
+		if err := saveLocked(envelope); err != nil {
+			return err
+		}
+		setContextPlanID(ctx, planID)
+		return nil
 	}
 	now := time.Now()
 
@@ -204,7 +279,7 @@ func Upsert(sessionID string, in Item) (Item, error) {
 		}
 		tl.Items[idx].UpdatedAt = now
 		out := tl.Items[idx]
-		return out, Save(tl)
+		return out, save()
 	}
 
 	if in.ID == "" {
@@ -220,7 +295,7 @@ func Upsert(sessionID string, in Item) (Item, error) {
 	in.UpdatedAt = now
 	tl.Items = append(tl.Items, in)
 	tl.SessionID = sessionID
-	return in, Save(tl)
+	return in, save()
 }
 
 // ReplaceAll replaces the entire task list with `items` — the Claude
@@ -236,11 +311,34 @@ func Upsert(sessionID string, in Item) (Item, error) {
 // the same ladder as Upsert) so a task keeps its id + CreatedAt across
 // calls instead of churning a fresh id every time.
 func ReplaceAll(sessionID string, items []Item) (*List, error) {
-	mu.Lock()
-	defer mu.Unlock()
-	old, err := Load(sessionID)
+	return ReplaceAllForContext(WithSessionID(context.Background(), sessionID), items, false)
+}
+
+func ReplaceAllForContext(ctx context.Context, items []Item, newPlan bool) (*List, error) {
+	sessionID := SessionIDFromContext(ctx)
+	unlock, err := lockTaskMutation(sessionID)
 	if err != nil {
 		return nil, err
+	}
+	defer unlock()
+	envelope, err := Load(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	ensurePlan(envelope)
+	planID := planIDForContext(ctx, envelope.PlanID)
+	old, err := planList(envelope, planID)
+	if err != nil {
+		return nil, err
+	}
+	if newPlan && (planContextFrozen(ctx) || planID != envelope.PlanID) {
+		return nil, fmt.Errorf("tasks: only the current root plan may start a new work plan")
+	}
+	currentItems := planningItemsForList(envelope, planID, false)
+	if planID == envelope.PlanID && !planContextFrozen(ctx) && ((newPlan && len(currentItems) > 0) || plansDisjoint(currentItems, items) || (len(items) == 0 && len(currentItems) > 0)) {
+		rotatePlan(envelope)
+		planID = envelope.PlanID
+		old = &List{SessionID: sessionID, PlanID: planID}
 	}
 	now := time.Now()
 	// claimed tracks old IDs already matched in THIS call so two new
@@ -273,8 +371,13 @@ func ReplaceAll(sessionID string, items []Item) (*List, error) {
 		in.UpdatedAt = now
 		out = append(out, in)
 	}
-	tl := &List{SessionID: sessionID, Items: out}
-	return tl, Save(tl)
+	tl := &List{SessionID: sessionID, PlanID: planID, Items: out}
+	installPlanList(envelope, tl)
+	if err := saveLocked(envelope); err != nil {
+		return nil, err
+	}
+	setContextPlanID(ctx, planID)
+	return tl, nil
 }
 
 // findExisting locates the item in `old` matching `in` by the same

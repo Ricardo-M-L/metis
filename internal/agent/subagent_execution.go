@@ -22,6 +22,7 @@ type SubAgentExecutionConfig struct {
 	WorkDir             string   `json:"workDir"`
 	System              string   `json:"system"`
 	Profile             string   `json:"profile,omitempty"`
+	TaskPlanID          string   `json:"taskPlanId,omitempty"`
 	Tools               []string `json:"tools"`
 	PermissionMode      string   `json:"permissionMode"`
 	PermissionRulesHash string   `json:"permissionRulesHash,omitempty"`

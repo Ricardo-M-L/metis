@@ -25,7 +25,7 @@ func (r *REPL) bindREPLWakeupContinuation() {
 	}
 	cwd, _ := os.Getwd()
 	identity := agent.ContinuationIdentity{SessionID: r.SessionID, WorkDir: cwd, Provider: r.providerName, Model: r.model}
-	if h.WorkDir != "" && h.WorkDir != cwd {
+	if h.WorkDir != "" && !agent.ContinuationWorkspaceMatches(h.WorkDir, cwd) {
 		identity = agent.ContinuationIdentity{}
 	}
 	r.Loop.Registry.Replace(builtin.NewScheduleWakeup(r.Gate, r.CronService).WithContinuation(identity))
@@ -82,7 +82,7 @@ func (r *REPL) consumeREPLWakeup(ctx context.Context) error {
 		return err
 	}
 	cwd, _ := os.Getwd()
-	if header.WorkDir != "" && cwd != header.WorkDir {
+	if header.WorkDir != "" && !agent.ContinuationWorkspaceMatches(header.WorkDir, cwd) {
 		return fmt.Errorf("scheduled wakeup pending: resume original workspace %q", header.WorkDir)
 	}
 	identity := agent.ContinuationIdentity{SessionID: r.SessionID, WorkDir: cwd, Provider: r.providerName, Model: r.model}
@@ -93,7 +93,7 @@ func (r *REPL) consumeREPLWakeup(ctx context.Context) error {
 	if err != nil || run == nil {
 		return err
 	}
-	r.Loop.AppendContext(run.Job.Prompt)
+	r.Loop.AppendContextForTaskPlan(run.Job.Prompt, run.Job.TaskPlanID)
 	runtime.RecordContextInput(r.SessionID, "scheduled-wakeup", run.Job.Prompt)
 	err = r.persistTail()
 	if err == nil {

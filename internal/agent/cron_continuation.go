@@ -65,6 +65,14 @@ func continuationWorkDir(path string) string {
 	return filepath.Clean(path)
 }
 
+// ContinuationWorkspaceMatches compares the workspace identity used by both
+// session admission and continuation ownership. A stored symlink spelling
+// (such as macOS /var) must not reject the same current directory before the
+// full session/provider/model identity is checked.
+func ContinuationWorkspaceMatches(stored, current string) bool {
+	return continuationWorkDir(stored) == continuationWorkDir(current)
+}
+
 func validateContinuation(j *CronJob) error {
 	if j.OriginSessionID == "" || j.WorkDir == "" || j.Provider == "" || j.Model == "" {
 		return fmt.Errorf("continuation requires original session, workspace, provider and model identity")
@@ -82,7 +90,7 @@ func ContinuationMatches(j *CronJob, i ContinuationIdentity) bool {
 }
 
 func matchesContinuation(j *CronJob, i ContinuationIdentity) bool {
-	return i.SessionID != "" && j.Kind == CronKindContinuation && j.OriginSessionID == i.SessionID && continuationWorkDir(j.WorkDir) == continuationWorkDir(i.WorkDir) && j.Provider == i.Provider && j.Model == i.Model
+	return i.SessionID != "" && j.Kind == CronKindContinuation && j.OriginSessionID == i.SessionID && ContinuationWorkspaceMatches(j.WorkDir, i.WorkDir) && j.Provider == i.Provider && j.Model == i.Model
 }
 
 // ContinuationRun owns a durable, at-most-once admission. Start is separate from

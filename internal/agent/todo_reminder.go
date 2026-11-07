@@ -44,7 +44,7 @@ func (l *Loop) injectTodoReminder(ctx context.Context, out chan<- Event) {
 		return
 	}
 
-	items, err := tasks.PlanningItems(tasks.SessionIDFromContext(ctx))
+	items, err := tasks.PlanningItemsForContext(ctx)
 	if err != nil || len(items) == 0 {
 		return
 	}
@@ -75,7 +75,7 @@ func (l *Loop) noteTodoWriteActivity(cur int) {
 // non-completed item, else nil. Drives the end-of-turn reconciliation in
 // Run (loop.go no_tool_calls branch).
 func (l *Loop) incompleteTodos(ctx context.Context) []tasks.Item {
-	items, err := tasks.PlanningItems(tasks.SessionIDFromContext(ctx))
+	items, err := tasks.PlanningItemsForContext(ctx)
 	if err != nil || len(items) == 0 {
 		return nil
 	}
@@ -97,7 +97,7 @@ func endOfTurnTodoReminder(items []tasks.Item) string {
 	b.WriteString("Call TodoWrite now to mark every task you've finished as completed (including any you just described as done). ")
 	b.WriteString("If an item genuinely isn't finished or is blocked on the user, leave it and briefly say so — but don't leave a finished task showing in_progress. ")
 	b.WriteString("Do NOT mention this reminder to the user.\n\n")
-	b.WriteString("Current unified task list:\n")
+	b.WriteString("Current work plan (previous plans are archived; do not copy them into this list):\n")
 	for i, it := range items {
 		fmt.Fprintf(&b, "%d. [%s] %s\n", i+1, it.Status, it.Content)
 	}
@@ -124,7 +124,7 @@ func formatTodoReminder(items []tasks.Item) string {
 	b.WriteString("The TodoWrite tool hasn't been used in a while and your task list still has open items. ")
 	b.WriteString("Update it (mark finished tasks completed; keep one in_progress for serial work, or one per independent owner for parallel work) so it reflects reality — and finish the still-open items below before claiming the work is done. ")
 	b.WriteString("Do NOT mention this reminder to the user.\n\n")
-	b.WriteString("Current unified task list:\n")
+	b.WriteString("Current work plan (previous plans are archived; do not copy them into this list):\n")
 	for i, it := range items {
 		fmt.Fprintf(&b, "%d. [%s] %s\n", i+1, it.Status, it.Content)
 	}

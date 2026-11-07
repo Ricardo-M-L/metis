@@ -129,6 +129,7 @@ func (s ScheduleWakeup) Execute(ctx context.Context, in map[string]any) (*tools.
 	job := &agent.CronJob{
 		Kind:               agent.CronKindContinuation,
 		OriginSessionID:    s.identity.SessionID,
+		TaskPlanID:         tasks.PlanIDFromContext(ctx),
 		WorkDir:            s.identity.WorkDir,
 		Provider:           s.identity.Provider,
 		Model:              s.identity.Model,

@@ -22,6 +22,9 @@ func withTempMcpHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// Pin the application root too: an outer isolated METIS_HOME must not
+	// redirect Load away from the fixture this test writes under home.
+	t.Setenv("METIS_HOME", filepath.Join(home, ".metis"))
 	if runtime.GOOS == "windows" {
 		t.Setenv("USERPROFILE", home)
 	}

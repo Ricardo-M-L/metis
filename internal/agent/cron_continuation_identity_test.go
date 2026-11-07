@@ -30,4 +30,14 @@ func TestContinuationMatchesCanonicalWorkspaceIdentity(t *testing.T) {
 	if ContinuationMatches(job, identity) {
 		t.Fatal("other session accepted")
 	}
+	identity.SessionID = "session"
+	identity.Provider = "other"
+	if ContinuationMatches(job, identity) {
+		t.Fatal("other provider accepted")
+	}
+	identity.Provider = "provider"
+	identity.Model = "other"
+	if ContinuationMatches(job, identity) {
+		t.Fatal("other model accepted")
+	}
 }

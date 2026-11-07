@@ -25,7 +25,7 @@ func (r *runtime) bindWakeupContinuation() {
 	if _, ok := r.registry.Get("ScheduleWakeup"); ok {
 		identity := r.continuationIdentity()
 		if r.store != nil {
-			if h, _, err := r.store.LoadHeader(r.sessionID); err != nil || h == nil || (h.WorkDir != "" && h.WorkDir != identity.WorkDir) {
+			if h, _, err := r.store.LoadHeader(r.sessionID); err != nil || h == nil || (h.WorkDir != "" && !agent.ContinuationWorkspaceMatches(h.WorkDir, identity.WorkDir)) {
 				fmt.Fprintln(os.Stderr, "[wakeup] scheduling disabled: resume the original session workspace before creating continuations")
 				identity = agent.ContinuationIdentity{}
 			}
@@ -118,7 +118,7 @@ func runHeadlessWakeupTurns(ctx context.Context, rt *runtime, output chan<- agen
 		}
 		run = next
 		// Context, not forged user input. Persist before Start/provider admission.
-		rt.loop.AppendContext(fmt.Sprintf("<scheduled_wakeup id=%q>\n%s\n</scheduled_wakeup>", run.Job.ID, run.Job.Prompt))
+		rt.loop.AppendContextForTaskPlan(fmt.Sprintf("<scheduled_wakeup id=%q>\n%s\n</scheduled_wakeup>", run.Job.ID, run.Job.Prompt), run.Job.TaskPlanID)
 		if checkpoint != nil {
 			err = checkpoint()
 		}
@@ -143,7 +143,7 @@ func runHeadlessWakeupTurns(ctx context.Context, rt *runtime, output chan<- agen
 func awaitHeadlessWakeup(ctx context.Context, rt *runtime) (*agent.ContinuationRun, error) {
 	identity := rt.continuationIdentity()
 	if rt.store != nil {
-		if h, _, err := rt.store.LoadHeader(rt.sessionID); err == nil && h.WorkDir != "" && h.WorkDir != identity.WorkDir {
+		if h, _, err := rt.store.LoadHeader(rt.sessionID); err == nil && h.WorkDir != "" && !agent.ContinuationWorkspaceMatches(h.WorkDir, identity.WorkDir) {
 			return nil, fmt.Errorf("scheduled wakeup pending: resume the original workspace %q (current workspace %q)", h.WorkDir, identity.WorkDir)
 		}
 	}

@@ -111,9 +111,9 @@ func TestRenderTodoSnapshot_EmptyOrMissing(t *testing.T) {
 	}
 }
 
-// renderTodoSnapshotWith is a test-only wrapper that lets the test
-// inject a fixed task list instead of reading from disk. Production
-// renderTodoSnapshot reads via tasksFullList.
+// renderTodoSnapshotWith is a test-only wrapper for the shared task row
+// presentation. Production TodoWrite snapshots decode the tool event;
+// the current-plan panel independently reads tasksFullList.
 func renderTodoSnapshotWith(items []TaskItem) string {
 	if tasksRuntimeSessionID() == "" {
 		return ""

@@ -11,6 +11,7 @@ package tui
 // everything else gets a line-capped output preview.
 
 import (
+	"encoding/json"
 	"fmt"
 	"image/color"
 	"regexp"
@@ -303,7 +304,7 @@ func renderToolEventBlock(te ToolEvent, expanded bool, width int, showBody bool)
 		case "Write":
 			s.WriteString(renderWritePreviewAtWidth(te.Input, expanded, width))
 		case "TodoWrite":
-			s.WriteString(renderTodoSnapshot())
+			s.WriteString(renderTodoSnapshot(te))
 		case "SubAgentOutput":
 			// SubAgentOutput's LLM-facing body starts with a machine KV
 			// header ("agent_id=agt-XXX name=YYY status=running …")
@@ -1645,27 +1646,96 @@ func formatToolPreviewLine(toolName, ln string) string {
 	}
 }
 
-// renderTodoSnapshot is the body for a TodoWrite tool result — every
-// task in the current session's list, rendered in claude-code's style:
-// a tree-leaf glyph at the top, then one row per task with strikethrough
-// for completed and bold for the in-progress one. Mirrors the image #57
-// the user shared.
-//
-// We re-read the persisted task file (rather than parsing TodoWrite's
-// own input) because a single TodoWrite call may only touch one row,
-// but the visual the user expects is the WHOLE list. Reading from disk
-// keeps the rendered snapshot consistent regardless of which row the
-// LLM most recently touched.
-func renderTodoSnapshot() string {
-	sid := tasksCurrentSessionID()
-	if sid == "" {
-		return ""
+// renderTodoSnapshot renders only this call's task snapshot. Reading the live
+// task store here would rewrite history after a new plan, session switch, or
+// cache invalidation. The live task panel separately reads tasksFullList.
+func renderTodoSnapshot(te ToolEvent) string {
+	return renderTaskItems(todoSnapshotItems(te))
+}
+
+// TodoWrite's result rows describe accepted statuses. The optional priority
+// marker and bracketed ID are the legacy single-task result format. Stop at
+// the end of those rows so internal hook/verifier reminders are never tasks.
+var todoSnapshotResultLine = regexp.MustCompile(`^([●◐○])\s+(?:[🔴🟡🟢]\s+)?\[([^\]]+)\]\s+(.+)$`)
+
+func todoSnapshotResultItems(output string) []TaskItem {
+	var items []TaskItem
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		match := todoSnapshotResultLine.FindStringSubmatch(strings.TrimSpace(line))
+		if match == nil {
+			break
+		}
+		item := TaskItem{Content: match[3]}
+		switch match[2] {
+		case "pending", "in_progress", "completed":
+			item.Status = match[2]
+		default:
+			item.ID = match[2]
+			switch match[1] {
+			case "●":
+				item.Status = "completed"
+			case "◐":
+				item.Status = "in_progress"
+			default:
+				item.Status = "pending"
+			}
+		}
+		items = append(items, item)
 	}
-	items := tasksFullList(sid)
-	if len(items) == 0 {
-		return ""
+	return items
+}
+
+func todoSnapshotItems(te ToolEvent) []TaskItem {
+	accepted := todoSnapshotResultItems(te.Output)
+	var items []TaskItem
+	if raw, exists := te.Input["todos"]; exists {
+		// Decode the event's JSON-compatible input instead of assuming []any;
+		// restored events and tests may carry typed slices. An explicit empty
+		// array remains an empty snapshot, even when a later plan exists.
+		data, err := json.Marshal(raw)
+		if err == nil && json.Unmarshal(data, &items) == nil {
+			return acceptedTodoSnapshotItems(items, accepted)
+		}
+	} else if content, _ := te.Input["content"].(string); strings.TrimSpace(content) != "" {
+		id, _ := te.Input["id"].(string)
+		status, _ := te.Input["status"].(string)
+		owner, _ := te.Input["owner"].(string)
+		return acceptedTodoSnapshotItems([]TaskItem{{ID: id, Content: content, Status: status, Owner: owner}}, accepted)
 	}
-	return renderTaskItems(items)
+	// Result-only historical/forwarded events can still show the rows saved
+	// with that result; absence of usable data must never fall back to disk.
+	return accepted
+}
+
+func acceptedTodoSnapshotItems(input, accepted []TaskItem) []TaskItem {
+	// Result rows preserve the submitted list order. Keep a queue per title:
+	// distinct task IDs may intentionally share a title and different states.
+	// A single value per title would silently assign the last state to both.
+	rows := make(map[string][]TaskItem, len(accepted))
+	for _, item := range accepted {
+		key := strings.TrimSpace(item.Content)
+		rows[key] = append(rows[key], item)
+	}
+	items := make([]TaskItem, 0, len(input))
+	for _, item := range input {
+		if strings.TrimSpace(item.Content) == "" {
+			continue
+		}
+		key := strings.TrimSpace(item.Content)
+		if matches := rows[key]; len(matches) > 0 {
+			saved := matches[0]
+			rows[key] = matches[1:]
+			item.Status = saved.Status
+			if saved.ID != "" {
+				item.ID = saved.ID
+			}
+		}
+		if item.Status != "completed" && item.Status != "in_progress" {
+			item.Status = "pending"
+		}
+		items = append(items, item)
+	}
+	return items
 }
 
 // renderTaskItems is the pure presentation half of the snapshot — takes

@@ -37,6 +37,7 @@ const (
 // Task is the persisted task record.
 type Task struct {
 	ID          string         `json:"id"`
+	PlanID      string         `json:"plan_id,omitempty"`
 	Subject     string         `json:"subject"`
 	Description string         `json:"description"`
 	ActiveForm  string         `json:"active_form,omitempty"`
@@ -134,6 +135,14 @@ func (s *TaskStore) Create(subject, description, activeForm string, metadata map
 // CreateOwned atomically creates a task with an optional teammate owner. The
 // legacy Create wrapper remains for callers that do not coordinate a team.
 func (s *TaskStore) CreateOwned(subject, description, activeForm, owner string, metadata map[string]any) (*Task, error) {
+	planID, err := CurrentPlanID(s.sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return s.CreateOwnedInPlan(planID, subject, description, activeForm, owner, metadata)
+}
+
+func (s *TaskStore) CreateOwnedInPlan(planID, subject, description, activeForm, owner string, metadata map[string]any) (*Task, error) {
 	subject = strings.TrimSpace(subject)
 	if subject == "" {
 		return nil, fmt.Errorf("subject is required")
@@ -148,6 +157,7 @@ func (s *TaskStore) CreateOwned(subject, description, activeForm, owner string, 
 	now := time.Now()
 	t := &Task{
 		ID:          id,
+		PlanID:      planID,
 		Subject:     subject,
 		Description: description,
 		ActiveForm:  activeForm,
@@ -259,6 +269,11 @@ func (s *TaskStore) updateLocked(id string, patch TaskPatch) (*Task, error) {
 	if !ok {
 		return nil, fmt.Errorf("task %s not found", id)
 	}
+	// Mutate a private copy until persistence succeeds. A failed completion
+	// must not make auto-archiving observe success that is absent on disk.
+	previous := t
+	t = cloneTaskForUpdate(t)
+	s.tasks[id] = t
 	if patch.Subject != nil {
 		t.Subject = *patch.Subject
 	}
@@ -300,10 +315,44 @@ func (s *TaskStore) updateLocked(id string, patch TaskPatch) (*Task, error) {
 	}
 	t.UpdatedAt = time.Now()
 	if err := s.saveLocked(); err != nil {
+		s.tasks[id] = previous
 		return nil, err
 	}
 	cp := *t
 	return &cp, nil
+}
+
+func cloneTaskForUpdate(task *Task) *Task {
+	copy := *task
+	copy.Blocks = append([]string(nil), task.Blocks...)
+	copy.BlockedBy = append([]string(nil), task.BlockedBy...)
+	if task.Metadata != nil {
+		copy.Metadata = cloneTaskMetadata(task.Metadata)
+	}
+	return &copy
+}
+func cloneTaskMetadata(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = cloneTaskMetadataValue(v)
+	}
+	return out
+}
+func cloneTaskMetadataValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		return cloneTaskMetadata(v)
+	case []any:
+		out := make([]any, len(v))
+		for i, child := range v {
+			out[i] = cloneTaskMetadataValue(child)
+		}
+		return out
+	case []string:
+		return append([]string(nil), v...)
+	default:
+		return value
+	}
 }
 
 func mergeUnique(have, add []string) []string {

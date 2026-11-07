@@ -20,6 +20,7 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/jobs"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/tasks"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	bashbuiltin "github.com/Ricardo-M-L/metis/internal/tools/builtin/bash"
 	worktreepkg "github.com/Ricardo-M-L/metis/internal/worktree"
@@ -1103,6 +1104,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			activityRecorder, _ = agent.NewSubAgentActivityRecorder(a.sessionDir, teammate.AgentID)
 			if resumedSnapshot == nil || resumedSnapshot.Execution == nil {
 				execution := a.subAgentExecution(sub, subCwd, subSystem, subagentType, subRegistry, subGate)
+				execution.TaskPlanID = tasks.PlanIDFromContext(ctx)
 				execution.LegacyMigration = resumedSnapshot != nil && resumedSnapshot.Handoff != nil
 				if err := transcript.AppendExecution(execution); err != nil {
 					_ = transcript.Close()
@@ -1177,9 +1179,12 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 	// subAgentNotify key is explicitly cleared (nil) so the child
 	// loop's tools don't see the grandparent's notify channel.
 	baseCtx := agent.WithSubAgentNotify(
-		agent.WithCwd(context.WithValue(ctx, agentDepthKey{}, depth+1), subCwd),
+		agent.WithCwd(context.WithValue(tasks.FreezePlanContext(ctx), agentDepthKey{}, depth+1), subCwd),
 		nil,
 	)
+	if resumedSnapshot != nil && resumedSnapshot.Execution != nil && resumedSnapshot.Execution.TaskPlanID != "" {
+		baseCtx = tasks.FreezePlanContext(tasks.WithPlanID(baseCtx, resumedSnapshot.Execution.TaskPlanID))
+	}
 	baseCtx = agent.WithSubAgentUsageRecorder(baseCtx, usageRecorder)
 	baseCtx = agent.WithSubAgentActivityRecorder(baseCtx, activityRecorder)
 	// A child loop owns an internal events channel, but it has no human reply

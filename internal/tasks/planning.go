@@ -1,7 +1,5 @@
 package tasks
 
-import "strings"
-
 // PlanningItems is the canonical read projection for task progress. METIS has
 // two persisted input formats for backward compatibility (TodoWrite's compact
 // list and Task*'s structured owner/dependency records); every UI and reminder
@@ -12,11 +10,7 @@ func PlanningItems(sessionID string) ([]Item, error) {
 	if err != nil {
 		return nil, err
 	}
-	var structured []*Task
-	if store := TaskStoreForSession(sessionID); store != nil {
-		structured = store.List(false)
-	}
-	return mergePlanningItems(todos.Items, structured), nil
+	return planningItemsForList(todos, todos.PlanID, false), nil
 }
 
 // PlanningItemsSnapshot reads the display projection from disk, including
@@ -28,13 +22,7 @@ func PlanningItemsSnapshot(sessionID string) ([]Item, error) {
 	if err != nil {
 		return nil, err
 	}
-	var structured []*Task
-	if strings.TrimSpace(sessionID) != "" {
-		// Construction only loads the existing file; it does not create or
-		// persist a store until a mutating task operation is requested.
-		structured = NewTaskStore(sessionID).List(false)
-	}
-	return mergePlanningItems(todos.Items, structured), nil
+	return planningItemsForList(todos, todos.PlanID, true), nil
 }
 
 func mergePlanningItems(todos []Item, structured []*Task) []Item {

@@ -37,13 +37,14 @@ type TaskCreate struct {
 
 func (TaskCreate) Name() string { return "TaskCreate" }
 func (TaskCreate) Description() string {
-	return "Create a structured task entry. Use this to plan multi-step work; mark in_progress when starting and completed when done."
+	return "Create a task in the current work plan. For a different user task, set new_plan=true on the first TaskCreate to archive the previous plan without pretending unfinished tasks are completed. Subsequent tasks and sub-agents share the current plan."
 }
 func (TaskCreate) InputSchema() map[string]any {
 	return map[string]any{
 		"type":     "object",
 		"required": []string{"subject", "description"},
 		"properties": map[string]any{
+			"new_plan":    map[string]any{"type": "boolean", "description": "Start a separate work plan before adding this first task; not needed for subsequent steps of the same plan."},
 			"subject":     map[string]any{"type": "string", "description": "brief title (imperative)"},
 			"description": map[string]any{"type": "string", "description": "what needs to be done"},
 			"activeForm":  map[string]any{"type": "string", "description": "present-continuous form for the spinner (e.g. \"Running tests\")"},
@@ -52,7 +53,12 @@ func (TaskCreate) InputSchema() map[string]any {
 		},
 	}
 }
-func (TaskCreate) Concurrency(map[string]any) tools.Concurrency { return tools.ConcurrencySafe }
+func (TaskCreate) Concurrency(in map[string]any) tools.Concurrency {
+	if in["new_plan"] == true {
+		return tools.ConcurrencyExclusive
+	}
+	return tools.ConcurrencySafe
+}
 func (t TaskCreate) CanUse(_ context.Context, _ map[string]any) (tools.Permission, string) {
 	d, src := t.gate.Check(context.Background(), "TaskCreate", "")
 	return mapDecision(d), src
@@ -63,6 +69,14 @@ func (t TaskCreate) Execute(ctx context.Context, in map[string]any) (*tools.Resu
 		return nil, err
 	}
 	subj, _ := in["subject"].(string)
+	if strings.TrimSpace(subj) == "" {
+		return nil, fmt.Errorf("subject is required")
+	}
+	if newPlan, _ := in["new_plan"].(bool); newPlan {
+		if _, err := taskstore.ReplaceAllForContext(ctx, nil, true); err != nil {
+			return nil, err
+		}
+	}
 	desc, _ := in["description"].(string)
 	active, _ := in["activeForm"].(string)
 	owner, _ := in["owner"].(string)
@@ -70,7 +84,14 @@ func (t TaskCreate) Execute(ctx context.Context, in map[string]any) (*tools.Resu
 	if m, ok := in["metadata"].(map[string]any); ok {
 		meta = m
 	}
-	tk, err := store.CreateOwned(subj, desc, active, owner, meta)
+	planID := taskstore.PlanIDFromContext(ctx)
+	if planID == "" {
+		planID, err = taskstore.CurrentPlanID(taskstore.SessionIDFromContext(ctx))
+		if err != nil {
+			return nil, err
+		}
+	}
+	tk, err := store.CreateOwnedInPlan(planID, subj, desc, active, owner, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -147,13 +168,14 @@ type TaskList struct {
 
 func (TaskList) Name() string { return "TaskList" }
 func (TaskList) Description() string {
-	return "List all tasks in id order. Returns id + subject + status + owner + blockedBy summary per row."
+	return "List tasks in the current work plan in id order. Set includeArchived=true only to inspect historical tasks. Explicit TaskGet/TaskUpdate IDs remain valid for archived tasks."
 }
 func (TaskList) InputSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"includeDeleted": map[string]any{"type": "boolean", "description": "include tombstoned tasks (default false)"},
+			"includeArchived": map[string]any{"type": "boolean", "description": "Include historical plans without making them active."},
+			"includeDeleted":  map[string]any{"type": "boolean", "description": "include tombstoned tasks (default false)"},
 		},
 	}
 }
@@ -169,6 +191,12 @@ func (t TaskList) Execute(ctx context.Context, in map[string]any) (*tools.Result
 	}
 	includeDel, _ := in["includeDeleted"].(bool)
 	all := store.List(includeDel)
+	if includeArchived, _ := in["includeArchived"].(bool); !includeArchived {
+		all, err = taskstore.TasksForContext(ctx, all)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(all) == 0 {
 		return &tools.Result{Output: "(no tasks)"}, nil
 	}
@@ -257,6 +285,16 @@ func (t TaskUpdate) Execute(ctx context.Context, in map[string]any) (*tools.Resu
 	}
 	if err != nil {
 		return nil, err
+	}
+	if snapshot != nil {
+		planID, scopeErr := taskstore.TaskPlanID(taskstore.SessionIDFromContext(ctx), snapshot.Task)
+		if scopeErr != nil {
+			return nil, scopeErr
+		}
+		snapshot.Tasks, err = taskstore.TasksForContext(taskstore.WithPlanID(ctx, planID), snapshot.Tasks)
+		if err != nil {
+			return nil, err
+		}
 	}
 	out := fmt.Sprintf("Updated task #%s status", tk.ID)
 	if nudge := verifierNudge(snapshot); nudge != "" {
