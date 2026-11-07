@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,11 @@ func TestScheduledWakeupActualDesktopTurnCreatesThenConsumes(t *testing.T) {
 	svc, _ := agent.NewCronService(root)
 	store, _ := session.NewStore(t.TempDir())
 	dir := t.TempDir()
+	// Desktop activation canonicalizes workspace symlinks (notably /var on macOS).
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_ = store.WriteHeaderFull(session.Header{ID: "original", Provider: "fake", Model: "model", WorkDir: dir, Mode: string(permission.ModeAsk)})
 	gate := permission.New(permission.ModeAsk)
 	reg := tools.NewRegistry()

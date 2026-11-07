@@ -66,6 +66,12 @@
       "prerelease": false,
       "make_latest": false,
       "reason": "User-authorized CLI display fix for multiline tool titles, indented command expansion and Unicode width boundaries; Desktop assets and the shared latest pointer remain unchanged."
+    },
+    "v0.4.114": {
+      "channel": "cli-only-stable",
+      "prerelease": false,
+      "make_latest": false,
+      "reason": "Verified session wakeup release with portable fixtures and canonical workspace expectations; preserve v0.4.112/v0.4.113 failed-CI drafts and shared latest."
     }
   }
 }

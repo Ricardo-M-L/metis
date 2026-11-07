@@ -7,6 +7,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.114] - 2026-11-07
+
+CLI-only stable release of reliable session wakeups. Canonicalize macOS temporary workspace expectations in the creation-entry regression. v0.4.112 and v0.4.113 remain unpublished drafts after platform-specific fixture failures; tags and assets are preserved.
+
 ## [0.4.113] - 2026-11-07
 
 CLI-only stable release of the session wakeup fixes below. Uses platform-portable process fixtures rather than requiring bypassPermissions sandbox support on Windows. The v0.4.112 tag and draft remain unchanged after its Windows CI fixture failure; it was not publicly published.
