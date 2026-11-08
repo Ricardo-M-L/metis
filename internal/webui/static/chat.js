@@ -785,7 +785,7 @@ function refreshActivityGroupLanguage() {
       const title = row.querySelector('.think-title');
       if (title) title.textContent = uiText('Think', '思考');
       if (row.classList.contains('redacted')) {
-        const summary = row.querySelector('.think-summary');
+        const summary = row.querySelector('.think-preview-text');
         if (summary) summary.textContent = uiText('Reasoning redacted by provider', '推理内容已由提供方隐藏');
       }
     });
@@ -834,8 +834,8 @@ const REDACTED_THINKING_PLACEHOLDER = 'Reasoning redacted by provider';
 function thinkPreview(text, running) {
   const normalized = String(text || '').trim();
   if (!normalized) return '';
-  const split = running ? normalized.lastIndexOf('\n') : normalized.indexOf('\n');
-  return (split < 0 ? normalized : running ? normalized.slice(split + 1) : normalized.slice(0, split)).trim();
+  const lines = normalized.split(/[\r\n\u2028\u2029]+/);
+  return (running ? lines[lines.length - 1] : lines[0]).trim();
 }
 
 // One renderer is shared by live streaming and persisted-history replay so
@@ -862,14 +862,14 @@ function appendThinkingRow(text, options = {}) {
           ${redacted ? '' : '<svg class="think-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6.5 5 3 3-3 3"/></svg>'}
         </span>
         <span class="think-title">${uiText('Think', '思考')}</span>
-        <span class="think-summary"></span>
+        <span class="think-summary"><span class="think-preview-viewport"><span class="think-preview-text"></span></span></span>
         <span class="think-time"></span>
       </${headTag}>
       ${redacted ? '' : '<div class="think-body"></div>'}
     </div>`);
   const row = area.lastElementChild;
   const body = row.querySelector('.think-body');
-  const summary = row.querySelector('.think-summary');
+  const summary = row.querySelector('.think-preview-text');
   if (body) body.textContent = String(text || '');
   if (summary) summary.textContent = redacted
     ? uiText(REDACTED_THINKING_PLACEHOLDER, '推理内容已由提供方隐藏')
@@ -902,7 +902,7 @@ function renderThinkingDelta() {
       node.appendData(thinkingText.slice(node.data.length));
     } else body.textContent = thinkingText;
   }
-  const summary = thinkingEl.querySelector('.think-summary');
+  const summary = thinkingEl.querySelector('.think-preview-text');
   if (summary) summary.textContent = thinkPreview(thinkingText, true);
   scheduleActivityGroupFollow(thinkingEl.closest('.activity-group'));
   autoScroll();
@@ -940,7 +940,7 @@ function finishThinking() {
   if (thinkingEl) {
     thinkingEl.removeAttribute('data-running');
     // DSH parity: once done, the collapsed preview shows the FIRST line.
-    const summary = thinkingEl.querySelector('.think-summary');
+    const summary = thinkingEl.querySelector('.think-preview-text');
     if (summary) summary.textContent = thinkPreview(thinkingText, false);
     if (thinkStartMs) {
       const t = thinkingEl.querySelector('.think-time');

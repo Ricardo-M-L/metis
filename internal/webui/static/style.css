@@ -4423,8 +4423,29 @@ a.tc-web-title:focus-visible,
   font-size: 14px;
   line-height: 24px;
 }
+/* The viewport follows the end of a live logical line, even when the model
+   streams a long paragraph without newlines. Flex alignment avoids per-delta
+   scrollWidth reads or scroll writes, and keeps the disclosure height stable. */
+.think-summary { display: flex; align-items: center; }
+.think-preview-viewport {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.think-row[data-running] .think-preview-viewport {
+  display: flex;
+  justify-content: flex-end;
+  text-overflow: clip;
+}
+.think-row[data-running] .think-preview-text {
+  flex: 0 0 auto;
+  min-width: 100%;
+}
 .think-summary::before {
   content: '';
+  flex: none;
   display: inline-block;
   width: 2px;
   height: 2px;

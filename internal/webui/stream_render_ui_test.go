@@ -15,7 +15,7 @@ func TestStreamingRenderBrowserBehavior(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, scenario := range []string{"batch", "stream-frame-follow", "stream-frame-pause", "thinking-frame-follow", "terminal", "terminal-noop-dom", "terminal-changed-paused", "terminal-changed-follow", "terminal-anchor-guards", "thinking-boundary", "text-thinking-text", "filter", "session", "scroll", "scroll-anchoring", "scroll-keyboard", "scroll-pointer", "scroll-touch", "history", "markdown-frontier"} {
+	for _, scenario := range []string{"batch", "stream-frame-follow", "stream-frame-pause", "thinking-frame-follow", "thinking-preview", "terminal", "terminal-noop-dom", "terminal-changed-paused", "terminal-changed-follow", "terminal-anchor-guards", "thinking-boundary", "text-thinking-text", "filter", "session", "scroll", "scroll-anchoring", "scroll-keyboard", "scroll-pointer", "scroll-touch", "history", "markdown-frontier"} {
 		t.Run(scenario, func(t *testing.T) {
 			cmd := exec.Command(node, "-e", streamingRenderBrowserHarness, scenario)
 			cmd.Stdin = bytes.NewReader(source)
@@ -105,7 +105,7 @@ c.startStreamingMessage=()=>{
 };
 c.appendThinkingRow=(text,options={})=>{
   const row=new Element(), body=new Element(), summary=new Element(), time=new Element();
-  row.nodes.set('.think-body',body);row.nodes.set('.think-summary',summary);row.nodes.set('.think-time',time);
+  row.nodes.set('.think-body',body);row.nodes.set('.think-preview-text',summary);row.nodes.set('.think-summary',new Element());row.nodes.set('.think-time',time);
   row.parentElement=area; body.textContent=text; row.attrs['data-running']=String(!!options.running);
   thinkRows.push({row,body,summary,time});return row;
 };
@@ -249,6 +249,22 @@ if(scenario==='batch') {
   evaluate('followOutput=true');assert.equal(c.captureStreamingReadAnchor(box),null);c.restoreStreamingReadAnchor(saved);
   assert.equal(area.scrollWrites,0,'an old reading anchor cannot override resumed following');evaluate('followOutput=false');
   c.restoreStreamingReadAnchor(saved);assert.equal(area.scrollTop,400);
+} else if(scenario==='thinking-preview') {
+  const opening='Kimi K3.1 Pro = engine/car? ', more='继续分析同一个长段落。'.repeat(100)+' LATEST_TAIL_001';
+  c.handleThinkingDelta({delta:opening});
+  c.handleThinkingDelta({delta:more});flushAll();
+  assert.equal(thinkRows[0].summary.textContent,opening+more,'live preview retains the newest suffix inside its tail-aligned viewport');
+  assert.equal(thinkRows[0].body.textContent,opening+more,'collapsed presentation keeps complete reasoning');
+  for(const separator of ['\n','\r','\r\n','\u2028','\u2029']) {
+    const content='First line'+separator+'Latest line'+separator;
+    assert.equal(c.thinkPreview(content,true),'Latest line','live preview follows each supported line boundary');
+    assert.equal(c.thinkPreview(content,false),'First line','settled preview remains the first line');
+  }
+  c.handleThinkingDelta({delta:'\r\n最新一行'});flushAll();
+  assert.equal(thinkRows[0].summary.textContent,'最新一行');
+  c.finishThinking();
+  assert.equal(thinkRows[0].summary.textContent,opening+more,'settling restores first-line preview');
+  assert.equal(thinkRows[0].body.textContent,opening+more+'\r\n最新一行','settling must retain all reasoning');
 } else if(scenario==='thinking-boundary') {
   c.handleThinkingDelta({delta:'First line'});
   assert.equal(thinkRows.length,1);assert.equal(thinkRows[0].body.textContent,'First line');

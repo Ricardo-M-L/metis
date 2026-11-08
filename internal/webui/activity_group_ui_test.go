@@ -136,6 +136,10 @@ class Element {
     } else if (node.classList.contains('think-row')) {
       for (const name of ['think-summary', 'think-body', 'think-time']) {
         const child = new Element(); child.className = name; node.appendChild(child);
+        if (name === 'think-summary') {
+          const viewport = new Element(); viewport.className = 'think-preview-viewport'; child.appendChild(viewport);
+          const text = new Element(); text.className = 'think-preview-text'; viewport.appendChild(text);
+        }
       }
     } else if (node.classList.contains('message')) {
       const content = new Element(); content.className = node.classList.contains('message-user') ? 'message-bubble' : 'message-content';
