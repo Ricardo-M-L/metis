@@ -7,12 +7,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-## [0.4.116] - 2026-11-08
+## [0.4.117] - 2026-11-08
 
 Full CLI and Desktop release incorporating the changes since v0.4.110.
 
 ### Fixed
 
+- Follow the latest reasoning text in collapsed previews while streaming, and
+  keep the first-line preview and redaction behavior after a response finishes.
 - Keep active task plans isolated within a session, retain archived task states,
   and preserve TodoWrite history snapshots when plans change or resume.
 - Deliver scheduled wakeups to their original live sessions and match canonical
@@ -21,6 +23,11 @@ Full CLI and Desktop release incorporating the changes since v0.4.110.
   cache-aware accounting, and retain image attachments across session recovery.
 - Load deferred tools within provider limits and keep Desktop memory and
   execution bindings connected to the active session context.
+
+## [0.4.116] - 2026-11-08
+
+Prepared as a draft but not publicly released; its changes are included in
+v0.4.117.
 
 ## [0.4.115] - 2026-11-07
 
