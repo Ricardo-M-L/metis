@@ -7,6 +7,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.116] - 2026-11-08
+
+Full CLI and Desktop release incorporating the changes since v0.4.110.
+
+### Fixed
+
+- Keep active task plans isolated within a session, retain archived task states,
+  and preserve TodoWrite history snapshots when plans change or resume.
+- Deliver scheduled wakeups to their original live sessions and match canonical
+  workspace identities across equivalent macOS paths.
+- Improve context compaction, memory provenance, tool-result budgeting and
+  cache-aware accounting, and retain image attachments across session recovery.
+- Load deferred tools within provider limits and keep Desktop memory and
+  execution bindings connected to the active session context.
+
 ## [0.4.115] - 2026-11-07
 
 CLI-only stable release of reliable session wakeups. Reuse canonical continuation identity matching at Desktop execution admission, preventing `/var`/`/private/var` aliases from rejecting the same workspace while still rejecting other sessions, models and workspaces. Earlier candidate tags/drafts remain unpublished.
