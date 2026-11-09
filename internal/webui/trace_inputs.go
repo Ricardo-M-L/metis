@@ -15,6 +15,7 @@ import (
 
 type historyTraceInputSpan struct {
 	text    string
+	images  []session.TraceImage
 	anchors [][]string
 	closed  bool
 }
@@ -76,7 +77,7 @@ func restoreMissingTraceUserInputs(sid string, nodes []session.TracedNode, messa
 	promptCounts := make(map[string]int)
 	for _, message := range messages {
 		if text := historyTraceUserInput(message); text != "" {
-			spans = append(spans, historyTraceInputSpan{text: text})
+			spans = append(spans, historyTraceInputSpan{text: text, images: historyTraceImages(message.Content)})
 			promptCounts[text]++
 		}
 		if message.Role == llm.RoleUser && len(spans) > 0 && len(spans[len(spans)-1].anchors) > 0 {
@@ -192,21 +193,65 @@ func restoreMissingTraceUserInputs(sid string, nodes []session.TracedNode, messa
 		}
 	}
 	insertions := make(map[int]session.TracedNode)
+	// Existing legacy USER rows can regain image metadata only after the same
+	// unique, monotonic content anchors establish their exact history message.
+	// Turn numbers or compacted history positions alone are not associations.
+	projected := nodes
 	for i, turns := range candidates {
 		turn := uniqueTraceInputTurn(turns)
-		if turn == 0 || hasUser[turn] || automaticTurn[turn] {
+		if turn == 0 || automaticTurn[turn] {
+			continue
+		}
+		if hasUser[turn] {
+			if len(spans[i].images) > 0 {
+				match := -1
+				for index, node := range nodes {
+					ev := node.Event
+					if node.Depth != 0 || ev.Kind != "user" || ev.Turn != turn || ev.SubAgentOf != "" || ev.TraceParentInvocationID != "" || len(ev.Images) != 0 {
+						continue
+					}
+					keys := traceInputTextKeys("user", ev.Text)
+					for _, key := range traceInputTextKeys("user", spans[i].text) {
+						found := false
+						for _, existing := range keys {
+							if key == existing {
+								found = true
+								break
+							}
+						}
+						if !found {
+							continue
+						}
+						if match >= 0 {
+							match = -2
+							break
+						}
+						match = index
+						break
+					}
+					if match == -2 {
+						break
+					}
+				}
+				if match >= 0 {
+					if len(projected) > 0 && &projected[0] == &nodes[0] {
+						projected = append([]session.TracedNode(nil), nodes...)
+					}
+					projected[match].Event.Images = spans[i].images
+				}
+			}
 			continue
 		}
 		insertions[firstNode[turn]] = session.TracedNode{Event: session.TraceEvent{
 			ID: fmt.Sprintf("history-user-%s-%d", sid, turn), SessionID: sid,
-			Turn: turn, Kind: "user", Source: "history-reconstructed", Text: spans[i].text,
+			Turn: turn, Kind: "user", Source: "history-reconstructed", Text: spans[i].text, Images: spans[i].images,
 		}}
 	}
 	if len(insertions) == 0 {
-		return nodes
+		return projected
 	}
 	out := make([]session.TracedNode, 0, len(nodes)+len(insertions))
-	for i, node := range nodes {
+	for i, node := range projected {
 		if recovered, ok := insertions[i]; ok {
 			out = append(out, recovered)
 		}

@@ -597,6 +597,7 @@ func (a Agent) CanUse(ctx context.Context, in map[string]any) (tools.Permission,
 }
 
 func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	ctx = agent.WithImageAttachmentRootCall(ctx)
 	// Capture the parent's posture at the actual execution boundary. CanUse
 	// runs after PreToolUse hooks, but the UI can still change modes before a
 	// queued/background call reaches Execute. A call that starts in Plan must

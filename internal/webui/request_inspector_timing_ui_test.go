@@ -53,12 +53,12 @@ for (const diagnostics of [[early], [late], [early, late]]) {
   assert.equal(actual.html.usage, baseline.html.usage, 'usage must not change');
   assert.deepEqual(actual.rows.filter(x => x.kind !== 'request_timing'), baseline.rows, 'existing rows must not change');
   const diagnosticRows = actual.rows.filter(x => x.kind === 'request_timing');
-  assert.equal(diagnosticRows.length, diagnostics.length, 'diagnostic rows remain available');
-  diagnosticRows.forEach((row, i) => {
-    assert.equal(row.text, diagnostics[i].text);
-    assert.equal(row.ts, diagnostics[i].ts);
-    assert.ok(c.rowText(row).includes(diagnostics[i].text), 'diagnostic ledger text remains readable');
-    assert.ok(c.inspectorBody(row, 'raw').includes(c.escHtml(c.formatTracePayload(diagnostics[i].text))), 'diagnostic raw inspector remains readable');
+  assert.equal(diagnosticRows.length, 1, 'unattributed legacy phases use one honest diagnostic group instead of flooding the ledger');
+  assert.equal(JSON.stringify(diagnosticRows[0].rawEvents), JSON.stringify(diagnostics), 'every original phase remains available');
+  const raw = c.inspectorBody(diagnosticRows[0], 'events');
+  diagnostics.forEach(record => {
+    assert.ok(raw.includes(c.escHtml(record.ts)), 'the original occurrence timestamp remains readable');
+    assert.ok(raw.includes(record.text.includes('pre_request_start') ? 'pre_request_start' : 'request_complete'), 'the original diagnostic phase remains readable');
   });
 }
 // Preserve the existing text + loop_done behavior: only one displayed timestamp.

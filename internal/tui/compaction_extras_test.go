@@ -18,6 +18,7 @@ import (
 // truthful percentage.
 func TestCompactionExtras_LayoutMatchesImage19(t *testing.T) {
 	m := minimalModel(200_000)
+	m.loop.Compactor = agent.NewCompactor(agent.DefaultCompactionConfig(), "test", 200_000, m.loop.Provider)
 	m.spinnerActive = true
 	m.compactionStartedAt = time.Now().Add(-2 * time.Second)
 	m.spinnerVerb = "thinking" // would normally render
@@ -47,7 +48,7 @@ func TestCompactionExtras_LayoutMatchesImage19(t *testing.T) {
 
 	// Row 3: literal sub-line announcing the auto-window threshold and
 	// the configure command (matches CC image #19).
-	if !strings.Contains(out, "└ Compacting at auto window (170k tokens) · /autocompact to configure") {
+	if !strings.Contains(out, "└ Auto-compaction threshold (170k tokens) · /autocompact to configure") {
 		t.Fatalf("expected sub-line with 170k auto window; got:\n%s", out)
 	}
 }
@@ -60,7 +61,7 @@ func TestCompactionExtras_UsesAuthoritativeEffectiveInputBoundary(t *testing.T) 
 
 	out := stripANSI(renderCompactionExtras(m))
 	// (200K context - 20K response reserve) * 85% = 153K.
-	if !strings.Contains(out, "auto window (153k tokens)") {
+	if !strings.Contains(out, "Auto-compaction threshold (153k tokens)") {
 		t.Fatalf("expected authoritative 153k auto window; got:\n%s", out)
 	}
 }

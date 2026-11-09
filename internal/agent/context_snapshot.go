@@ -41,6 +41,7 @@ type ContextBreakdown struct {
 // until a concrete request or its preflight established the complete prefix.
 type ContextUsage struct {
 	Used             int
+	CompactionStage  string
 	Breakdown        *ContextBreakdown
 	Capabilities     llm.ContextCapabilities
 	CompactThreshold float64
@@ -112,8 +113,10 @@ func (l *Loop) cacheContextPrefixLocked(systemTokens, toolTokens int) {
 	l.contextPrefix = contextPrefixEstimate{valid: true, systemTokens: systemTokens, toolTokens: toolTokens,
 		historyRevision: l.historyRevision, routingRevision: l.routingRevision,
 		provider: identifyContextProvider(l.Provider), model: l.Model}
+	previousEpoch := l.contextUsageEpoch.Load()
 	l.contextUsageEpoch.Add(1)
 	l.contextUsageCache.Store(nil)
+	l.refreshContextCompactionDisplayPrefixLocked(previousEpoch)
 }
 
 // contextProviderIdentity distinguishes both a logical provider/model and a

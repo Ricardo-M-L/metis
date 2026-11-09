@@ -110,7 +110,7 @@ func cmdCtx(r *REPL, args string) string {
 
 	// Live token estimate from the loop — same source the bottom status
 	// bar reads.
-	used := loop.EstimateContextTokens()
+	used := loop.DisplayContextTokens()
 	b.WriteString(fmt.Sprintf("  current tokens:  %s\n", fmtThousands(used)))
 
 	switch {

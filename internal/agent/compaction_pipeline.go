@@ -21,9 +21,9 @@ type CompactOptions struct {
 	Emergency    bool
 	Instructions string
 	// EstimatedContextTokens is the non-mutating request preflight total
-	// (history plus system/state/memory/tools). Zero falls back to history-only
-	// behavior for direct/manual callers. It affects only the auto decision;
-	// result token deltas continue to describe the history being replaced.
+	// (history plus system/state/memory/tools). A positive value is authoritative
+	// for the auto decision; it must not be raised by a local history estimate.
+	// Zero falls back to model-visible history plus cached request overhead.
 	EstimatedContextTokens int
 
 	// Persist, when non-nil, must durably commit the final replacement before
@@ -41,9 +41,11 @@ type CompactResult struct {
 	Trigger        string
 	BeforeMessages int
 	AfterMessages  int
-	BeforeTokens   int
-	AfterTokens    int
-	History        []llm.Message
+	// BeforeTokens and AfterTokens estimate model-visible history, excluding
+	// request-prefix overhead, image transport bytes and omitted checkpoints.
+	BeforeTokens int
+	AfterTokens  int
+	History      []llm.Message
 }
 
 // ErrCompactionInProgress is returned when a second compaction reaches the
@@ -113,12 +115,20 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	model, turn := l.Model, l.turnIdx
 	routingRevision := l.routingRevision
 	requestOverhead := int(l.requestOverheadTokens.Load())
+	// Keep the transport projection stable while provider callbacks run without
+	// Loop.mu. The persisted source remains the exact raw history; compaction
+	// budgets and its summarizer only see history the next request can replay.
+	projection := &Loop{Provider: l.Provider}
+	historyTokens := func(history []llm.Message) int {
+		return estimateActiveHistoryTokens(projection.projectDynamicCheckpoints(history))
+	}
+	beforeVisible := projection.projectDynamicCheckpoints(l.Messages)
 
 	result.BeforeMessages = len(l.Messages)
-	result.BeforeTokens = estimateTokens(l.Messages)
-	decisionTokens := result.BeforeTokens
-	if opts.EstimatedContextTokens > decisionTokens {
-		decisionTokens = opts.EstimatedContextTokens
+	result.BeforeTokens = estimateActiveHistoryTokens(beforeVisible)
+	decisionTokens := opts.EstimatedContextTokens
+	if decisionTokens <= 0 {
+		decisionTokens = max(result.BeforeTokens+requestOverhead, 0)
 	}
 	if !opts.Force && !compactor.ShouldCompactTokens(decisionTokens) {
 		result.AfterMessages = result.BeforeMessages
@@ -127,7 +137,7 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 		l.mu.Unlock()
 		return result, nil
 	}
-	if len(l.Messages) <= 2 || compactor.CircuitTripped() {
+	if len(beforeVisible) <= 2 || compactor.CircuitTripped() {
 		result.AfterMessages = result.BeforeMessages
 		result.AfterTokens = result.BeforeTokens
 		result.History = cloneMessages(l.Messages)
@@ -137,10 +147,36 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 
 	beforeIdentity := l.Messages
 	before := cloneMessages(l.Messages)
+	beforeVisible = cloneMessages(beforeVisible)
+	beforeActiveContext, beforePrefix := l.activeContext, l.contextPrefix
+	beforeSessionGeneration, beforePrincipal := l.autoCompactSessionGeneration, l.principalIdentity
+	beforeDisplay := l.beginContextCompactionDisplayLocked()
 	priorSummary := compactor.LastSummary
 	priorSummaryMemory := compactor.lastSummaryMemory
 	priorFailures := compactor.consecutiveFailures
 	l.mu.Unlock()
+	displayFinished := false
+	finishDisplay := func() {
+		if displayFinished {
+			return
+		}
+		displayFinished = true
+		l.finishContextCompactionDisplay()
+	}
+	defer finishDisplay()
+	restoreSourceContextLocked := func() {
+		// A failed candidate install must restore the provider anchor as well
+		// as raw history. Appends after that anchor are still counted once.
+		// A session/history replacement or provider rebind owns its own state.
+		if l.autoCompactSessionGeneration == beforeSessionGeneration && l.principalIdentity == beforePrincipal &&
+			l.routingRevision == routingRevision && historyHasPrefix(l.Messages, before) {
+			l.activeContext = beforeActiveContext
+			l.activeContext.historyRevision = l.historyRevision
+			l.contextPrefix = beforePrefix
+			l.contextPrefix.historyRevision = l.historyRevision
+			l.contextUsageSnapshotLocked()
+		}
+	}
 
 	restoreCompactorState := func() {
 		compactor.LastSummary = priorSummary
@@ -149,7 +185,7 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	}
 	setResultHistory := func(history []llm.Message) {
 		result.AfterMessages = len(history)
-		result.AfterTokens = estimateTokens(history)
+		result.AfterTokens = historyTokens(history)
 		result.History = cloneMessages(history)
 	}
 	currentHistory := func() []llm.Message {
@@ -207,6 +243,7 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	emitCompact(Event{Kind: EventCompactionStart, Info: trigger})
 	defer func() {
 		closeProgress()
+		finishDisplay()
 		emitCompact(Event{Kind: EventCompactionEnd, Info: trigger, Err: err})
 	}()
 	// Emit is an arbitrary external callback. It may inspect or even mutate the
@@ -230,7 +267,7 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	// Provider summarization may take seconds and may itself call back into the
 	// loop. compactMu protects Compactor state while Loop.mu remains available.
 	candidate, compactErr := compactor.compactWithRequestOverhead(
-		compactCtx, before, opts.Instructions, requestOverhead, decisionTokens, opts.Force,
+		compactCtx, beforeVisible, opts.Instructions, requestOverhead, decisionTokens, opts.Force,
 	)
 	// Drain all provider progress callbacks before the history CAS. Otherwise a
 	// queued callback could mutate history between the check and installation.
@@ -263,13 +300,15 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	// that transcript can make a stateful Responses endpoint reject the turn.
 	candidate = stripProviderState(candidate)
 	result.AfterMessages = len(candidate)
-	result.AfterTokens = estimateTokens(candidate)
-	if opts.Emergency && result.AfterTokens >= result.BeforeTokens && result.AfterMessages >= result.BeforeMessages {
-		candidate = compactor.SnipAll(before)
+	result.AfterTokens = historyTokens(candidate)
+	// Omitted checkpoints remain part of raw persistence statistics, but their
+	// removal alone cannot free model context or justify an overflow retry.
+	if opts.Emergency && result.AfterTokens >= result.BeforeTokens && result.AfterMessages >= len(beforeVisible) {
+		candidate = compactor.SnipAll(beforeVisible)
 		result.AfterMessages = len(candidate)
-		result.AfterTokens = estimateTokens(candidate)
+		result.AfterTokens = historyTokens(candidate)
 	}
-	if result.AfterTokens >= result.BeforeTokens && result.AfterMessages >= result.BeforeMessages {
+	if result.AfterTokens >= result.BeforeTokens && result.AfterMessages >= len(beforeVisible) {
 		restoreCompactorState()
 		result.AfterMessages = result.BeforeMessages
 		result.AfterTokens = result.BeforeTokens
@@ -294,7 +333,9 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 		return result, fmt.Errorf("compact: history changed while summary was being generated")
 	}
 	l.Messages = candidate
+	previousDisplayEpoch := l.contextUsageEpoch.Load()
 	l.storeContextEstimateFromHistory(result.AfterTokens)
+	l.advanceContextCompactionDisplayLocked("checking", previousDisplayEpoch)
 	candidateIdentity := l.Messages
 	candidateSnapshot := cloneMessages(candidate)
 	l.mu.Unlock()
@@ -343,17 +384,18 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	var peerCheckpointErr error
 	final, peerCheckpointErr = l.retainAssignedPeerCheckpoint(ctx, before, final)
 	if historyCap, constrained, budgetErr := compactor.postCompactHistoryCap(requestOverhead); budgetErr != nil ||
-		peerCheckpointErr != nil || (constrained && estimateTokens(final) >= historyCap) {
+		peerCheckpointErr != nil || (constrained && historyTokens(final) >= historyCap) {
 		if peerCheckpointErr != nil {
 			budgetErr = peerCheckpointErr
 		}
 		if budgetErr == nil {
 			budgetErr = fmt.Errorf("compact: post-compact hook/suffix exceeds effective history budget (%d >= %d tokens; request overhead=%d)",
-				estimateTokens(final), historyCap, requestOverhead)
+				historyTokens(final), historyCap, requestOverhead)
 		}
 		l.Messages = rollbackBase
 		live := cloneMessages(l.Messages)
-		l.storeContextEstimateFromHistory(estimateTokens(live))
+		l.storeContextEstimateFromHistory(historyTokens(live))
+		restoreSourceContextLocked()
 		l.mu.Unlock()
 		restoreCompactorState()
 		setResultHistory(live)
@@ -361,8 +403,10 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	}
 	l.Messages = final
 	result.AfterMessages = len(final)
-	result.AfterTokens = estimateTokens(final)
+	result.AfterTokens = historyTokens(final)
+	previousDisplayEpoch = l.contextUsageEpoch.Load()
 	l.storeContextEstimateFromHistory(result.AfterTokens)
+	l.advanceContextCompactionDisplayLocked("saving", previousDisplayEpoch)
 	finalIdentity := l.Messages
 	l.mu.Unlock()
 
@@ -389,17 +433,23 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 		// while rolling the failed compacted prefix back to its raw source.
 		l.mu.Lock()
 		live := l.Messages
+		restoredSourceContext := false
 		switch {
 		case sameHistoryIdentity(live, finalIdentity) || historiesEqual(live, final):
 			l.Messages = rollbackBase
+			restoredSourceContext = true
 		case historyHasPrefix(live, final):
 			persistSuffix := cloneMessages(live[len(final):])
 			l.Messages = append(cloneMessages(rollbackBase), persistSuffix...)
+			restoredSourceContext = true
 			// A concurrent Restore is authoritative. Leaving it untouched is safer
 			// than replacing it with either side of this stale transaction.
 		}
 		live = cloneMessages(l.Messages)
-		l.storeContextEstimateFromHistory(estimateTokens(live))
+		l.storeContextEstimateFromHistory(historyTokens(live))
+		if restoredSourceContext {
+			restoreSourceContextLocked()
+		}
 		l.mu.Unlock()
 		restoreCompactorState()
 		setResultHistory(live)
@@ -426,7 +476,7 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 				setResultHistory(live)
 				return result, fmt.Errorf("compact: history replaced while compacted checkpoint was persisted")
 			}
-			l.storeContextEstimateFromHistory(estimateTokens(live))
+			l.storeContextEstimateFromHistory(historyTokens(live))
 			l.compactCircuitNoticeSent = false
 			l.mu.Unlock()
 			final = live
@@ -474,6 +524,8 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	l.InvalidateRuntimeState()
 	result.Applied = true
 	setResultHistory(final)
+	finishDisplay()
+	afterDisplay := l.ContextDisplaySnapshot()
 	// Drain progress before publishing the applied checkpoint. Besides making
 	// event order deterministic, this prevents a late progress event from
 	// racing the success/end lifecycle at non-thread-safe consumers.
@@ -481,13 +533,13 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	emitCompact(Event{
 		Kind:                  EventContextCompacted,
 		Info:                  trigger,
-		PreviousContextTokens: result.BeforeTokens,
-		ContextTokens:         result.AfterTokens,
+		PreviousContextTokens: beforeDisplay.Used,
+		ContextTokens:         afterDisplay.Used,
 	})
 	emitCompact(Event{
 		Kind: EventInfo,
 		Info: fmt.Sprintf("context compacted (%s): %d -> %d messages | ~%d -> ~%d tokens",
-			trigger, result.BeforeMessages, result.AfterMessages, result.BeforeTokens, result.AfterTokens),
+			trigger, result.BeforeMessages, result.AfterMessages, beforeDisplay.Used, afterDisplay.Used),
 	})
 	return result, nil
 }

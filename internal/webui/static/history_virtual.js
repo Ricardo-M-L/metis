@@ -22,8 +22,10 @@ function buildHistoryTurnIndex(history, sessionId, options = {}) {
   (Array.isArray(history) ? history : []).forEach((message, sourceIndex) => {
     const entries = Array.isArray(message && message.content) ? message.content
       : message && message.content != null ? [{ type: 'text', text: String(message.content) }] : [];
-    const startsTurn = message && message.role === 'user' && entries.some(block => {
-      if (!block || block.type !== 'text') return false;
+    const startsTurn = message && message.role === 'user' && !message.synthetic && entries.some(block => {
+      if (!block || block.synthetic) return false;
+      if (block.type === 'image') return true;
+      if (block.type !== 'text') return false;
       const text = String(block.text || '');
       return !text.startsWith('[user steer mid-turn] ') && String(visible(text)).trim();
     });
@@ -37,6 +39,13 @@ function buildHistoryTurnIndex(history, sessionId, options = {}) {
     current.entries.push(message);
     current.entrySourceIndices.push(sourceIndex);
     current.sourceEnd = sourceIndex + 1;
+    const imageCount = entries.filter(block => block && block.type === 'image').length;
+    if (imageCount) {
+      // A single attachment uses the full preview; multiple attachments share
+      // thumbnail rows. Reserve their space before the image load measurement.
+      const rows = Math.ceil(imageCount / 3);
+      current.estimatedHeight += 48 + (imageCount === 1 ? 180 : rows * 112 + (rows - 1) * 8);
+    }
     entries.forEach(block => {
       if (!block || typeof block !== 'object') return;
       if (block.type === 'text') {

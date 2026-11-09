@@ -30,6 +30,10 @@ const addMessage = (role,text) => rows.push({role,text});
 const pendingToolRows = () => [];
 const handleToolResult = () => {};
 const toolDetails = {};
+const turnStart = source.indexOf('function todoHistoryStartsUserTurn(');
+const turnEnd = source.indexOf('function restoreTodoPlanFromHistory(', turnStart);
+assert.ok(turnStart >= 0 && turnEnd > turnStart);
+eval(source.slice(turnStart,turnEnd));
 eval(source.slice(start,end));
 const turn = appendHistoryEntries([
  {role:'user',content:[{type:'text',text:'human'}]},

@@ -3662,6 +3662,104 @@ function newChat() {
 // Pasted images ride the same ContentBlock{type:"image"} channel the TUI
 // uses; the server forwards them into AppendUserBlocks.
 let attachments = [];
+let messageImagePreview = null;
+
+// Composer snapshots use mediaType; restored ContentBlocks use media_type.
+// Both resolve from persisted bytes, never from an expired clipboard URL.
+function messageImageSource(image) {
+  const mediaType = String(image && (image.media_type || image.mediaType) || '').toLowerCase();
+  const data = String(image && image.data || '').replace(/[\r\n]/g, '');
+  if (!/^image\/[a-z0-9][a-z0-9.+-]*$/.test(mediaType) || !data ||
+      !/^[a-zA-Z0-9+/]+={0,2}$/.test(data)) return '';
+  return 'data:' + mediaType + ';base64,' + data;
+}
+
+function messageImagesMarkup(images) {
+  if (!Array.isArray(images) || !images.length) return '';
+  const columns = Math.min(3, images.length);
+  const width = images.length === 1 ? 240 : columns * 112 + (columns - 1) * 8;
+  const label = uiText('Attached images', '附加图片');
+  return `<div class="message-images${images.length === 1 ? ' message-images-single' : ''}" role="group" aria-label="${escAttr(label)}" style="--message-image-columns:${columns};--message-image-width:${width}px">` + images.map((image, index) => {
+    const source = messageImageSource(image);
+    const alt = uiText('Attached image ', '附加图片 ') + (index + 1);
+    if (!source) return `<span class="message-image-card message-image-unavailable" role="img" aria-label="${escAttr(alt)}">${escHtml(uiText('Image unavailable', '图片不可用'))}</span>`;
+    return `<button type="button" class="message-image-card" aria-label="${escAttr(uiText('Preview image ', '预览图片 ') + (index + 1))}" onclick="openMessageImagePreview(this)">` +
+      `<img class="message-image" src="${escAttr(source)}" alt="${escAttr(alt)}" loading="lazy" decoding="async" onerror="messageImageFailed(this)">` +
+      '<span class="message-image-expand" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></span></button>';
+  }).join('') + '</div>';
+}
+
+function messageImageFailed(image) {
+  const card = image && image.closest('.message-image-card');
+  if (!card) return;
+  image.hidden = true;
+  card.dataset.imageFailed = 'true';
+  if (!card.querySelector('.message-image-error')) {
+    const error = document.createElement('span');
+    error.className = 'message-image-error';
+    error.textContent = uiText('Unable to display image. Click to retry.', '图片无法显示，点击重试。');
+    card.appendChild(error);
+  }
+}
+
+function openMessageImagePreview(trigger) {
+  const image = trigger && trigger.querySelector('.message-image');
+  if (!image) return;
+  if (trigger.dataset.imageFailed === 'true') {
+    trigger.querySelector('.message-image-error')?.remove();
+    delete trigger.dataset.imageFailed;
+    image.hidden = false;
+    image.src = image.getAttribute('src');
+    return;
+  }
+  const source = image.getAttribute('src') || '';
+  if (!source.startsWith('data:image/')) return;
+  closeMessageImagePreview(false);
+  const overlay = document.createElement('div');
+  overlay.className = 'message-image-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-labelledby', 'messageImagePreviewTitle');
+  overlay.innerHTML = '<div class="message-image-dialog"><header class="message-image-toolbar"><h2 id="messageImagePreviewTitle">' +
+    escHtml(uiText('Image preview', '图片预览')) + '</h2><button type="button" class="message-image-close" aria-label="' +
+    escAttr(uiText('Close image preview', '关闭图片预览')) + '"><span aria-hidden="true">×</span></button></header>' +
+    '<div class="message-image-stage"><img alt=""></div></div>';
+  const fullImage = overlay.querySelector('.message-image-stage img');
+  fullImage.src = source;
+  fullImage.alt = image.alt || uiText('Attached image', '附加图片');
+  fullImage.addEventListener('error', () => {
+    fullImage.hidden = true;
+    const error = document.createElement('p');
+    error.className = 'message-image-preview-error';
+    error.textContent = uiText('Unable to display this image.', '无法显示这张图片。');
+    fullImage.parentElement.appendChild(error);
+  }, { once: true });
+  messageImagePreview = { overlay, trigger, sessionId: String(currentSessionId || '') };
+  const close = overlay.querySelector('.message-image-close');
+  close.addEventListener('click', () => closeMessageImagePreview());
+  overlay.addEventListener('click', event => { if (event.target === overlay) closeMessageImagePreview(); });
+  overlay.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeMessageImagePreview();
+    } else if (event.key === 'Tab') {
+      event.preventDefault();
+      event.stopPropagation();
+      close.focus();
+    }
+  });
+  document.body.appendChild(overlay);
+  close.focus();
+}
+
+function closeMessageImagePreview(restoreFocus = true) {
+  if (!messageImagePreview) return;
+  const { overlay, trigger } = messageImagePreview;
+  messageImagePreview = null;
+  overlay.remove();
+  if (restoreFocus && trigger && trigger.isConnected) trigger.focus();
+}
 
 function attachImage(dataUrl, mediaType) {
   if (attachments.length >= 6) { showToast('At most 6 images per message'); return; }
@@ -4369,9 +4467,9 @@ async function runTurnItem(item) {
   const welcome = document.getElementById('welcomeScreen');
   if (welcome) welcome.remove();
 
-  // Add user message (image attachments render as placeholder thumbnails)
+  // Use the same attachment renderer for the live input and restored history.
   resumeAutoScroll();
-  if (!item.skipAddMessage && !item.resume) addMessage('user', text || '(image attached)');
+  if (!item.skipAddMessage && !item.resume) addMessage('user', text, true, -1, 0, false, images);
   beginUserTurn();
   setTurnRunning(true, turnSessionId);
   document.getElementById('sendBtn').disabled = true;
@@ -4590,11 +4688,11 @@ function flushHistoryMessageBatch() {
   if (area) area.insertAdjacentHTML('beforeend', html);
 }
 
-function addMessage(role, content, remember = true, idx = -1, historyTurn = 0, activitySteer = false) {
+function addMessage(role, content, remember = true, idx = -1, historyTurn = 0, activitySteer = false, images = []) {
   if (role === 'user' && remember && !activitySteer && typeof virtualHistoryBeginLiveTurn === 'function') virtualHistoryBeginLiveTurn(content);
   finishActivityGroup();
   const now = remember ? new Date() : null;
-  if (remember) messages.push({ role, content, time: now });
+  if (remember) messages.push({ role, content, time: now, ...(images.length ? { images: images.slice() } : {}) });
   const index = idx >= 0 ? idx : (remember ? messages.length - 1 : -1);
   const area = document.getElementById('chatArea');
   const idxAttr = index >= 0 ? ` data-idx="${index}"` + (remember ? ' data-live-uncommitted="true"' : ` data-source-message-index="${index}"`) : '';
@@ -4612,7 +4710,8 @@ function addMessage(role, content, remember = true, idx = -1, historyTurn = 0, a
       ? artifactAnnotationMessageMarkup(content) : null;
     append(`
       <div class="message message-user"${idxAttr}${turnAttr}${steerAttr}>
-        <div class="message-bubble">${artifactEditMarkup === null ? escHtml(content) : artifactEditMarkup}</div>
+        ${messageImagesMarkup(images)}
+        ${String(content || '').trim() ? `<div class="message-bubble">${artifactEditMarkup === null ? escHtml(content) : artifactEditMarkup}</div>` : ''}
         ${messageActionsMarkup('user', now)}
       </div>`);
   } else {
@@ -4817,16 +4916,19 @@ function appendHistoryEntries(history, historySessionId, initialTurn = 0, source
     const blocks = Array.isArray(m.content)
       ? m.content
       : (m.content != null ? [{ type: 'text', text: String(m.content) }] : []);
-    if (role === 'user' && blocks.some(b => {
-      if (!b || b.type !== 'text' || b.synthetic) return false;
-      const text = String(b.text || '');
-      return text.trim() && !text.startsWith('[user steer mid-turn] ') && visibleTranscriptText(text).trim();
-    })) historyTurn++;
+    if (todoHistoryStartsUserTurn(m, blocks)) historyTurn++;
     activityHistoryTurn = historyTurn;
+    const images = role === 'user' && !m.synthetic ? blocks.filter(b => b && b.type === 'image' && !b.synthetic) : [];
+    if (images.length) {
+      const text = blocks.filter(b => b && b.type === 'text' && !b.synthetic)
+        .map(b => visibleTranscriptText(String(b.text || ''))).filter(text => text.trim()).join('\n');
+      addMessage('user', text, false, sourceStart + sourceOffset, historyTurn, false, images);
+    }
     blocks.forEach(b => {
       if (!b || typeof b !== 'object') return;
       if (b.type !== 'text') flushHistoryMessageBatch();
       if (b.type === 'text' && (b.text || '').trim()) {
+        if (images.length && !b.synthetic) return;
         const rawShown = role === 'user' && String(b.text).startsWith('[user steer mid-turn] ')
           ? String(b.text).slice('[user steer mid-turn] '.length) : b.text;
         const shown = visibleTranscriptText(rawShown);
@@ -5233,6 +5335,7 @@ function renderVirtualHistoryMessages(history) {
 }
 
 function renderHistoryMessages(history) {
+  if (messageImagePreview && messageImagePreview.sessionId !== String(currentSessionId || '')) closeMessageImagePreview(false);
   const area = document.getElementById('chatArea');
   if (typeof HistoryVirtualViewport === 'function' && area && area.childNodes && typeof area.insertBefore === 'function' &&
       typeof area.getBoundingClientRect === 'function' && typeof document.createDocumentFragment === 'function') {

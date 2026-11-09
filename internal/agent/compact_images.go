@@ -1,53 +1,10 @@
 package agent
 
-// compact_images.go — keep-N-most-recent-images pass for the
-// compactor pipeline. Mirrors:
-//
-//   * Anthropic computer-use-demo's `_maybe_filter_to_n_most_recent_images`
-//     (computer-use-demo/computer_use_demo/loop.py:193) — the official
-//     reference says image attachments in older tool results should be
-//     dropped once they fall outside the most-recent window.
-//   * claude-code's services/compact/microCompact `keepRecent` (default
-//     5) which replaces older tool_result content with the literal text
-//     "[Old tool result content cleared]".
-//
-// Why we need this in metis. cu workloads attach a fresh screenshot
-// to every state-changing tool_result by default (after_action.go,
-// matching Anthropic's reference). A typical Kimi session at 262k
-// ctx + 5-6 screenshots ×130KB JPEG ≈ 200k tokens of image alone
-// blows the model's input limit before the agent can finish the
-// task. Session 87e366f post-mortem (2026-05-27, Safari search via
-// Kimi): hit `Invalid request: Your request exceeded model token
-// limit: 262144 (requested: 351175)` on step 6.
-//
-// Design constraints
-//
-//   * Don't touch the most recent N image blocks — those are what
-//     the model needs to act on right now.
-//   * Don't touch tool_use / tool_result framing — only the image
-//     content INSIDE a tool_result block. The model's plan-tracking
-//     depends on seeing which tool emitted which result; throwing
-//     away the tool_use_id pairing would confuse it more than
-//     keeping the image would.
-//   * Preserve a textual marker so the model knows "there was an
-//     image here, it's been cleared because it's old" rather than
-//     silently disappearing the data. Mirrors claude-code's
-//     "[Old tool result content cleared]" sentinel.
-//   * Idempotent: running PruneOldImages twice in a row on the
-//     same history is a no-op. The compactor pipeline calls Snip /
-//     Microcompact / Compact sequentially; image pruning can be
-//     interleaved without compounding the prune.
-//
-// Out of scope for this pass (deliberately):
-//
-//   * Cache invalidation. Replacing image bytes deep in history
-//     does invalidate any prompt-cache breakpoint that lived after
-//     the replacement; the 5-minute Anthropic cache TTL ages those
-//     out anyway. The Anthropic demo opts to disable image pruning
-//     entirely when caching is on; we keep it on because (a) cu
-//     screenshots eat context faster than caching saves it, and
-//     (b) metis users who care about caching can set
-//     KeepRecentImageBlocks = 0 to opt out.
+// Legacy explicit newest-N helpers. The automatic compactor no longer uses
+// this window mapping: compact_image_policy.go selects native visual evidence
+// by actual context pressure, task relevance and visual/wire budgets. Keeping
+// these helpers preserves the explicit API without rewriting cached history
+// merely because a fourth screenshot arrived.
 
 import (
 	"fmt"
@@ -55,27 +12,15 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 )
 
-// DefaultKeepRecentImageBlocks is the fallback fan-out when we can't
-// read the active model's context window (early boot, tests). Sits
-// between claude-code's 5 (IDE sessions, 200k+ models) and Anthropic
-// computer-use-demo's typical 3 (cu workloads).
+// DefaultKeepRecentImageBlocks is retained for callers of the legacy explicit
+// count-based helper. The automatic compactor uses the budget policy instead.
 const DefaultKeepRecentImageBlocks = 3
 
-// keepRecentImagesFor returns how many image blocks to retain given
-// the model's max context window. Image base64 is near-1:1 against
-// the tokeniser, so each 130KB JPEG screenshot ≈ 90-100k tokens of
-// real server-side budget. Smaller windows have to prune more
-// aggressively or every multi-step GUI task instantly hits the cap.
+// keepRecentImagesFor is the legacy explicit keep-N mapping. Native image
+// cost is independent of base64 transport length; this mapping must not be
+// used for automatic context-pressure or summary-admission decisions.
 //
-// Mapping (empirical from session 87e366f / Kimi):
-//
-//	maxCtx < 300k  → keep 1   (Kimi-K2.6 = 262k, GPT-4o = 128k)
-//	300k–600k      → keep 2
-//	>= 600k        → keep 3   (Claude 200k+, MiniMax 1M, Gemini 2M)
-//
-// 0 is a valid override that disables pruning entirely (cache-
-// sensitive users on huge windows can pass it). maxCtx <= 0 means
-// "I don't know" and falls back to DefaultKeepRecentImageBlocks.
+// Unknown windows keep the historical fallback for API compatibility.
 func keepRecentImagesFor(maxCtx int) int {
 	if maxCtx <= 0 {
 		return DefaultKeepRecentImageBlocks
@@ -90,11 +35,8 @@ func keepRecentImagesFor(maxCtx int) int {
 	}
 }
 
-// ImagePruneSentinel is the placeholder text the model sees in
-// place of a pruned image. Names BOTH the original media type and
-// the rough byte budget so the model can reason about "ok, there
-// was a 130KB screenshot here" without us re-shipping the bytes.
-// Format chosen for easy grep-ability in transcripts.
+// ImagePruneSentinelTemplate is the legacy count-based placeholder. Its byte
+// count describes transport size, never the image's native visual token cost.
 const ImagePruneSentinelTemplate = "[image cleared by compactor — %s, was %d bytes base64; %d most recent screenshots kept in context]"
 
 // PruneOldImages walks `messages` from newest to oldest, counts
@@ -119,10 +61,9 @@ func PruneOldImages(messages []llm.Message, keepN int) ([]llm.Message, int) {
 	return pruneImages(messages, keepN)
 }
 
-// PruneAllImages is the full-checkpoint variant. Automatic lightweight image
-// pruning keeps a few recent screenshots for active visual work, but a paid
-// full compaction must be able to meet its post-compact budget even when one
-// recent base64 image would otherwise consume hundreds of thousands of tokens.
+// PruneAllImages is a legacy explicit count-based operation. Automatic
+// compaction uses fitImagesToContextBudget and retains every image that fits
+// the native visual allowance, regardless of its base64 transport length.
 func PruneAllImages(messages []llm.Message) ([]llm.Message, int) {
 	return pruneImages(messages, 0)
 }

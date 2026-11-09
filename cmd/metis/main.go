@@ -1265,6 +1265,7 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	// sub-agents) lands in ~/.metis/traces/<session>.jsonl, searchable
 	// via the SessionEventRead / SessionEventSearch / SessionTrace tools.
 	rtpkg.InstallTrace(filepath.Join(cfg.Session.Dir, "..", "traces"))
+	rtpkg.SetTraceAttachmentStore(store)
 	resumeTarget, err := resolveResumeTarget(flags, store)
 	if err != nil {
 		return nil, err
@@ -1950,7 +1951,8 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 
 	loop := rtpkg.BuildAgentLoop(cfg, rtpkg.AgentLoopOptions{
 		Provider: prov, Registry: reg, Gate: gate,
-		System: system, SystemSections: systemSections,
+		ImageAttachments: store,
+		System:           system, SystemSections: systemSections,
 		Model: model, MaxOutputTokens: pbuild.MaxOutputTokens, MaxIter: maxIter,
 		ContinueOnIterationLimit: flags.maxIter == 0,
 		MemoryManager:            memoryMgr,

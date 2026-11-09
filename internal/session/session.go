@@ -58,7 +58,7 @@ type FeedbackEntry struct {
 }
 
 type Entry struct {
-	Type     string         `json:"type"` // "header" | "message" | "history_replace" | "feedback"
+	Type     string         `json:"type"` // "header" | "message" | "history_replace" | "feedback" | "image_attachment"
 	Header   *Header        `json:"header,omitempty"`
 	Message  *llm.Message   `json:"message,omitempty"`
 	Messages []llm.Message  `json:"messages,omitempty"`
@@ -830,6 +830,10 @@ func (s *Store) Branch(id string, messages []llm.Message) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	images, err := s.branchImageAttachments(id, messages)
+	if err != nil {
+		return "", err
+	}
 	newID := s.NewSessionID()
 	newHdr := Header{
 		ID:               newID,
@@ -848,7 +852,12 @@ func (s *Store) Branch(id string, messages []llm.Message) (string, error) {
 	if err := s.WriteHeaderFull(newHdr); err != nil {
 		return "", err
 	}
-	for _, m := range messages {
+	for i, m := range messages {
+		if images != nil {
+			if err := s.RecordImageAttachments(newID, images[i]); err != nil {
+				return "", err
+			}
+		}
 		if err := s.AppendMessage(newID, m); err != nil {
 			return "", err
 		}
@@ -949,9 +958,9 @@ func (s *Store) Import(r io.Reader, preferredID string) (string, error) {
 			return "", fmt.Errorf("import: line decode: %w", err)
 		}
 		switch e.Type {
-		case "message":
+		case "message", "image_attachment":
 			if e.Message == nil {
-				return "", errors.New("import: message entry missing message")
+				return "", fmt.Errorf("import: %s entry missing message", e.Type)
 			}
 		case "history_replace":
 			// Empty messages is a valid clear snapshot.

@@ -21,12 +21,16 @@ let traceTotalEvents = 0;
 let traceLoadingOlder = false;
 let traceLoadGeneration = 0;
 let traceSessionId = '';
+let traceInitialContext = null;
+let traceImagePreview = null;
 const TRACE_REDACTED_THINKING_PLACEHOLDER = 'Reasoning redacted by provider';
 
 // DSH kind palette: tag label, tag color class, timeline lane.
 const KIND_META = {
   user:               { label: 'USER',       cls: 'k-user',      lane: 0 },
   context:            { label: 'CONTEXT',    cls: 'k-context',   lane: 0 },
+  initial_context:    { label: 'CONTEXT',    cls: 'k-context',   lane: 0 },
+  request_timing:     { label: 'DIAGNOSTIC', cls: 'k-system',    lane: 1 },
   thinking:           { label: 'THINK',      cls: 'k-thinking',  lane: 1 },
   thinking_redacted:  { label: 'THINK',      cls: 'k-thinking',  lane: 1 },
   text:               { label: 'ASSISTANT',  cls: 'k-assistant', lane: 1 },
@@ -54,6 +58,7 @@ function metaOf(kind) {
 }
 
 function switchView(view) {
+  if (view !== 'trace') closeTraceImagePreview(false);
   if (currentView === 'chat' && view !== 'chat' && typeof virtualHistorySaveViewport === 'function') virtualHistorySaveViewport();
   if (view !== 'artifacts' && typeof leaveArtifactsPanel === 'function') {
     leaveArtifactsPanel();
@@ -83,10 +88,12 @@ function invalidateTraceLoads() {
 }
 
 function resetTraceForSession() {
+  closeTraceImagePreview(false);
   invalidateTraceLoads();
   traceSessionId = String(currentSessionId || '');
   traceEvents = [];
   traceRows = [];
+  traceInitialContext = null;
   traceNextCursor = '';
   traceTotalEvents = 0;
   traceSelectedIdx = -1;
@@ -185,13 +192,88 @@ function toggleTraceAssistant(idx) {
 
 // --- Row model ----------------------------------------------------------
 
+function traceText(en, zh) {
+  return typeof document !== 'undefined' && document.documentElement?.lang === 'zh-CN' ? zh : en;
+}
+
+function traceOwnerKey(ev) {
+  return JSON.stringify([ev.sessionId || '', ev.turn || 0, ev.traceInvocationID || '',
+    ev.traceParentInvocationID || '', ev.subAgentOf || '', ev.parentID || '', ev.depth || 0]);
+}
+
+function addTraceRawEvents(target, source) {
+  target.rawEvents = [...(target.rawEvents || []), ...(source.rawEvents || [source])];
+  if (source.truncated) target.truncated = true;
+  if (source.limitation && !target.limitation) target.limitation = source.limitation;
+}
+
+function traceTimingRecord(ev) {
+  if (ev.requestTiming && typeof ev.requestTiming === 'object') return { ...ev.requestTiming };
+  const text = String(ev.text || '');
+  try {
+    const value = JSON.parse(text);
+    if (value && typeof value === 'object' && value.phase) return value;
+  } catch (_) { /* Older traces used a fixed, readable diagnostic string. */ }
+  const record = { phase: text.split(/\s+/)[0] || 'unknown', at: ev.ts };
+  const fields = { request: 'request_id', call: 'provider_call', attempt: 'attempt', elapsed_ms: 'elapsed_ms', outcome: 'outcome', status: 'status_code' };
+  for (const [legacy, field] of Object.entries(fields)) {
+    const match = new RegExp('(?:^|\\s)' + legacy + '=([^\\s]*)').exec(text);
+    if (match) record[field] = ['provider_call', 'attempt', 'elapsed_ms', 'status_code'].includes(field) ? Number(match[1]) : match[1];
+  }
+  return record;
+}
+
+// Project streaming fragments without rewriting the raw ledger. Diagnostics
+// are buffered independently by the runtime, so they cannot split a response.
+function coalesceTraceSemanticEvents(events) {
+  const display = [], diagnostics = new Map();
+  let stream = null;
+  for (const original of events) {
+    const ev = { ...original };
+    if (ev.kind === 'request_timing') {
+      const timing = traceTimingRecord(ev);
+      const key = traceOwnerKey(ev) + '|' + String(timing.request_id || 'legacy-unattributed');
+      let group = diagnostics.get(key);
+      if (!group) {
+        group = { ...ev, requestTimingRecords: [], rawEvents: [] };
+        diagnostics.set(key, group);
+        display.push(group);
+      }
+      group.requestTimingRecords.push(timing);
+      addTraceRawEvents(group, ev);
+      continue;
+    }
+    if (ev.kind === 'text' || ev.kind === 'thinking') {
+      const key = traceOwnerKey(ev) + '|' + ev.kind + '|' + (ev.source || '') + '|' + (ev.streamID || '') + '|' + (ev.requestID || '');
+      if (stream && stream.key === key) {
+        stream.event.text = String(stream.event.text || '') + String(ev.text || '');
+        stream.event.endTS = ev.endTS || ev.ts;
+        stream.event.sequenceEnd = ev.sequence;
+        stream.event.legacyMerged = !ev.streamID;
+        addTraceRawEvents(stream.event, ev);
+        const duration = Date.parse(stream.event.endTS) - Date.parse(stream.event.ts);
+        if (Number.isFinite(duration) && duration >= 0) stream.event.elapsedMs = duration;
+      } else {
+        display.push(ev);
+        stream = { key, event: ev };
+      }
+      continue;
+    }
+    // Keep even invisible turn_end/loop_done records until after this pass:
+    // they are real response boundaries for legacy traces without stream IDs.
+    stream = null;
+    display.push(ev);
+  }
+  return display;
+}
+
 // Runtime compaction can emit dozens of byte-progress samples. Keep those
 // events in the saved trace, but present each lifecycle as one readable row.
 function coalesceTraceCompactions(events) {
   const display = [];
   const active = new Map();
   const completed = new Map();
-  const keyOf = ev => String(ev.turn || 0);
+  const keyOf = traceOwnerKey;
   const runningText = 'Compacting context…';
   const completeText = 'Conversation history compacted';
 
@@ -214,12 +296,17 @@ function coalesceTraceCompactions(events) {
       }
       aggregate.ts = ev.ts || aggregate.ts;
       aggregate.elapsedMs = ev.elapsedMs || aggregate.elapsedMs;
+      addTraceRawEvents(aggregate, ev);
       continue;
     }
     if (ev.kind === 'context_compacted') {
       let aggregate = active.get(key);
       const text = !ev.text || ev.text === 'auto' ? completeText : ev.text;
-      if (aggregate) Object.assign(aggregate, ev, { kind: 'context_compacted', text });
+      if (aggregate) {
+        const rawEvents = aggregate.rawEvents;
+        Object.assign(aggregate, ev, { kind: 'context_compacted', text, rawEvents });
+        addTraceRawEvents(aggregate, ev);
+      }
       else {
         aggregate = Object.assign({}, ev, { text });
         display.push(aggregate);
@@ -231,14 +318,19 @@ function coalesceTraceCompactions(events) {
     if (ev.kind === 'compaction_end') {
       const aggregate = active.get(key);
       if (aggregate) {
+        const rawEvents = aggregate.rawEvents;
         if (ev.isError) Object.assign(aggregate, ev, { kind: 'error', text: ev.text || 'Context compaction failed' });
         else {
           Object.assign(aggregate, ev, { kind: 'context_compacted', text: completeText });
           completed.set(key, aggregate);
         }
+        aggregate.rawEvents = rawEvents;
+        addTraceRawEvents(aggregate, ev);
         active.delete(key);
       } else if (ev.isError) {
         display.push(Object.assign({}, ev, { kind: 'error', text: ev.text || 'Context compaction failed' }));
+      } else if (completed.has(key)) {
+        addTraceRawEvents(completed.get(key), ev);
       }
       continue;
     }
@@ -247,6 +339,7 @@ function coalesceTraceCompactions(events) {
       if (aggregate) {
         const summary = String(ev.text || '').replace(/^context compacted\s*(?:\(auto\))?\s*:\s*/i, '');
         aggregate.text = completeText + (summary ? ' · ' + summary : '');
+        addTraceRawEvents(aggregate, ev);
         continue;
       }
     }
@@ -260,6 +353,9 @@ function coalesceTraceCompactions(events) {
 function traceToolMatchRank(a, b) {
   if ((a.turn || 0) !== (b.turn || 0) ||
       (a.traceInvocationID && b.traceInvocationID && a.traceInvocationID !== b.traceInvocationID)) return 0;
+  for (const field of ['sessionId', 'traceParentInvocationID', 'subAgentOf']) {
+    if (a[field] && b[field] && a[field] !== b[field]) return 0;
+  }
   if (a.traceCallID && b.traceCallID) return a.traceCallID === b.traceCallID ? 4 : 0;
   const aID = a.toolUseID || '';
   const bID = b.toolUseID || (b.kind === 'tool_result' ? b.parentID : '') || '';
@@ -280,7 +376,7 @@ function traceMatchTool(candidates, ev, eventOf = value => value) {
 }
 
 function inheritTraceToolIdentity(dst, src) {
-  for (const key of ['toolName', 'toolUseID', 'traceInvocationID', 'traceCallID']) {
+  for (const key of ['toolName', 'toolUseID', 'traceInvocationID', 'traceCallID', 'sessionId', 'traceParentInvocationID', 'subAgentOf']) {
     if (!dst[key] && src[key]) dst[key] = src[key];
   }
 }
@@ -297,7 +393,7 @@ function coalesceTraceToolArguments(events) {
         partial = { event: ev, text: '', consumed: false, resultSeen: false };
         active.add(partial);
         slots.push({ partial });
-      }
+      } else addTraceRawEvents(partial.event, ev);
       partial.text += ev.text || '';
       inheritTraceToolIdentity(partial.event, ev);
       continue;
@@ -309,6 +405,7 @@ function coalesceTraceToolArguments(events) {
         inheritTraceToolIdentity(ev, partial.event);
         if (ev.kind === 'tool_start') {
           partial.consumed = true;
+          addTraceRawEvents(ev, partial.event);
           if (partial.text && ['', '{}', 'null'].includes(String(ev.text || '').trim())) ev.text = partial.text;
         } else {
           partial.resultSeen = true;
@@ -326,8 +423,11 @@ function coalesceTraceToolArguments(events) {
   });
 }
 
-function buildTraceRows(events) {
-  const displayEvents = coalesceTraceToolArguments(coalesceTraceCompactions(events));
+function buildTraceRows(events, initialContext = null) {
+  const originals = Array.isArray(events) ? events : [];
+  const order = new Map(originals.map((ev, index) => [ev, index]));
+  const decorated = originals.map(ev => ({ ...ev, rawEvents: [ev] }));
+  const displayEvents = coalesceTraceToolArguments(coalesceTraceCompactions(coalesceTraceSemanticEvents(decorated)));
   const rows = [];
   const pendingTool = new Set();
   for (let i = 0; i < displayEvents.length; i++) {
@@ -340,6 +440,7 @@ function buildTraceRows(events) {
         target.resultText = ev.text || '';
         target.resultIsError = !!ev.isError;
         target.hasResult = true;
+        addTraceRawEvents(target, ev);
         target.resultIdx = i;
         if (ev.elapsedMs) target.elapsedMs = ev.elapsedMs;
         inheritTraceToolIdentity(target, ev);
@@ -363,7 +464,20 @@ function buildTraceRows(events) {
       toolName: ev.toolName || '',
       toolUseID: ev.toolUseID || '',
       traceInvocationID: ev.traceInvocationID || '',
+      traceParentInvocationID: ev.traceParentInvocationID || '',
       traceCallID: ev.traceCallID || '',
+      sessionId: ev.sessionId || '',
+      subAgentOf: ev.subAgentOf || '',
+      streamID: ev.streamID || '',
+      requestID: ev.requestID || '',
+      endTS: ev.endTS || '',
+      sequenceEnd: ev.sequenceEnd,
+      legacyMerged: !!ev.legacyMerged,
+      truncated: !!ev.truncated,
+      limitation: ev.limitation || '',
+      rawEvents: (ev.rawEvents || []).slice(),
+      requestTimingRecords: ev.requestTimingRecords || [],
+      images: Array.isArray(ev.images) ? ev.images.slice() : [],
       text: ev.kind === 'thinking_redacted'
         ? TRACE_REDACTED_THINKING_PLACEHOLDER
         : (ev.kind === 'tool_result' ? '' : (ev.text || '')),
@@ -385,11 +499,177 @@ function buildTraceRows(events) {
     }
     rows.push(row);
   }
+  for (const row of rows) {
+    row.rawEvents = [...new Set(row.rawEvents)].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0))
+      .map(ev => ev.kind === 'thinking_redacted'
+        ? { id: ev.id, kind: ev.kind, turn: ev.turn, sequence: ev.sequence, ts: ev.ts, text: TRACE_REDACTED_THINKING_PLACEHOLDER }
+        : ev);
+  }
+  if (initialContext && typeof initialContext === 'object') {
+    const snapshot = { kind: 'initial_context', turn: null, contextSnapshot: initialContext, rawEvents: [], images: [],
+      text: traceContextLabel(initialContext), lane: 0, ts: '', elapsedMs: 0, tokens: null, source: initialContext.source || '' };
+    const firstUser = rows.findIndex(row => row.kind === 'user');
+    rows.splice(firstUser < 0 ? 0 : firstUser, 0, snapshot);
+  }
+  rows.forEach((row, index) => { row.idx = index; });
   return rows;
 }
 
 function isToolRow(r) {
   return r.kind === 'tool_start' || r.kind === 'tool_result';
+}
+
+function traceContextLabel(snapshot = {}) {
+  if (!snapshot.available) return traceText('Request context unavailable', '请求上下文未记录');
+  const turn = Number(snapshot.turn) || 1;
+  return turn > 1
+    ? traceText('First recorded request · Turn ', '首个已记录请求 · 第 ') + turn + traceText('', ' 轮')
+    : traceText('Initial request · System and tools', '初始请求 · System 与 Tools');
+}
+
+function traceOwnerLabel(row) {
+  if (row.subAgentOf) return traceText('Child ', '子 Agent ') + row.subAgentOf;
+  if (row.depth > 0 && row.traceInvocationID) return traceText('Child ', '子 Agent ') + row.traceInvocationID;
+  if (row.depth > 0) return traceText('Nested event · depth ', '嵌套事件 · 深度 ') + row.depth;
+  return '';
+}
+
+function traceMilliseconds(value) {
+  return Number(value) === 0 ? '0ms' : fmtMs(Number(value));
+}
+
+function traceTimingMetrics(row) {
+  const records = row.requestTimingRecords || [];
+  const first = phase => records.filter(record => record.phase === phase && Number.isFinite(Number(record.elapsed_ms)))
+    .sort((a, b) => Number(a.elapsed_ms) - Number(b.elapsed_ms))[0];
+  return { text: first('first_nonempty_text_delta'), reasoning: first('first_reasoning_delta'),
+    byte: first('http_first_response_byte'), duration: Math.max(0, ...records.map(record => Number(record.elapsed_ms) || 0)) };
+}
+
+function traceDiagnosticSummary(row) {
+  const records = row.requestTimingRecords || [];
+  const request = records.find(record => record.request_id)?.request_id;
+  const metrics = traceTimingMetrics(row);
+  let text = request ? traceText('Request ', '请求 ') + request : traceText('Legacy timing · request identity unavailable', '旧版诊断 · 请求身份未记录');
+  text += ' · ' + records.length + traceText(' phases', ' 个阶段');
+  if (metrics.text) text += ' · TTFT ' + traceMilliseconds(metrics.text.elapsed_ms);
+  else if (metrics.byte) text += ' · ' + traceText('First byte ', '首字节 ') + traceMilliseconds(metrics.byte.elapsed_ms);
+  if (metrics.duration) text += ' · ' + traceMilliseconds(metrics.duration);
+  return text;
+}
+
+function traceDiagnosticsHtml(row) {
+  const records = row.requestTimingRecords || [];
+  const groups = new Map();
+  for (const record of records) {
+    const key = (Number(record.provider_call) || 0) + ':' + (Number(record.attempt) || 0);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(record);
+  }
+  const metrics = traceTimingMetrics(row);
+  let html = '<div class="tt-diagnostic-note">' + escHtml(traceText(
+    'Local request diagnostics. TTFT is request start to first text; first-byte and phase offsets share the request clock. These records do not change turn duration or usage.',
+    '本地请求诊断。TTFT 从请求开始计至首段文字；首字节与各阶段偏移使用同一请求时钟。这些记录不改变轮次耗时和用量。')) + '</div>';
+  if (metrics.text) html += '<div class="tt-diagnostic-metric">TTFT ' + escHtml(traceMilliseconds(metrics.text.elapsed_ms)) + '</div>';
+  for (const records of groups.values()) {
+    const first = records[0];
+    const label = Number(first.provider_call) > 0
+      ? traceText('Call ', '调用 ') + first.provider_call + ' · ' + traceText('Attempt ', '尝试 ') + (Number(first.attempt) || 0)
+      : traceText('Request preparation', '请求准备');
+    html += '<details class="tt-diagnostic-call"><summary>' + escHtml(label) + ' · ' + records.length + traceText(' phases', ' 个阶段') + '</summary>' +
+      '<ol class="tt-diagnostic-phases">' + records.map(record => '<li><code>' + escHtml(record.phase || 'unknown') + '</code><span>+' +
+        escHtml(traceMilliseconds(record.elapsed_ms || 0)) + '</span>' +
+        (record.outcome || record.status_code ? '<small>' + escHtml([record.outcome, record.status_code || ''].filter(Boolean).join(' · ')) + '</small>' : '') + '</li>').join('') + '</ol></details>';
+  }
+  return html;
+}
+
+function traceRawEventsHtml(row) {
+  if (!(row.rawEvents || []).length) return '<p class="tt-no-payload">' + escHtml(traceText('No original event recorded', '没有原始事件记录')) + '</p>';
+  return '<div class="tt-raw-events">' + row.rawEvents.map(event => '<details><summary>' +
+    escHtml('#' + (event.sequence ?? '?') + ' · ' + event.kind + (event.ts ? ' · ' + fmtTimestamp(event.ts) : '')) +
+    '</summary><pre class="tt-payload">' + escHtml(JSON.stringify(event, null, 2)) + '</pre></details>').join('') + '</div>';
+}
+
+function traceImageSource(image) {
+  if (!image || image.available === false) return '';
+  const source = String(image.url || '');
+  if (!source.startsWith('/api/trace/image?') || /[\\\u0000-\u0020]/.test(source)) return '';
+  try {
+    const url = new URL(source, 'http://metis.local');
+    if (url.origin !== 'http://metis.local' || url.pathname !== '/api/trace/image' || url.hash ||
+        !url.searchParams.get('session_id') || !url.searchParams.get('hash')) return '';
+    return source;
+  } catch (_) { return ''; }
+}
+
+function traceImagesHtml(row) {
+  const images = Array.isArray(row.images) ? row.images : [];
+  if (!images.length) return row.kind === 'user' && /\[image attachment\]/i.test(row.text || '')
+    ? '<p class="tt-attachment-note">' + escHtml(traceText('The image preview is unavailable in this older trace; the original attachment could not be uniquely recovered.', '这条旧轨迹无法唯一恢复原附件，图片预览不可用。')) + '</p>' : '';
+  return '<div class="tt-image-gallery">' + images.map((image, index) => {
+    const source = traceImageSource(image), name = image.name || traceText('Image ', '图片 ') + (index + 1);
+    const dimensions = Number(image.width) > 0 && Number(image.height) > 0 ? image.width + ' × ' + image.height : '';
+    const metadata = [dimensions, Number(image.bytes) > 0 ? Math.ceil(image.bytes / 1024) + ' KB' : '', image.mediaType || ''].filter(Boolean).join(' · ');
+    const caption = '<span class="tt-image-caption"><span>' + escHtml(name) + '</span><small>' + escHtml(metadata) + '</small></span>';
+    if (!source) return '<span class="tt-image-card tt-image-unavailable"><span class="tt-image-placeholder" aria-hidden="true">▧</span>' + caption +
+      '<small class="tt-image-limitation">' + escHtml(image.limitation || traceText('Preview unavailable', '预览不可用')) + '</small></span>';
+    return '<button type="button" class="tt-image-card" data-trace-image-src="' + escAttr(source) + '" data-trace-image-name="' + escAttr(name) +
+      '" aria-label="' + escAttr(traceText('Preview ', '预览 ') + name) + '" onclick="event.stopPropagation();openTraceImagePreview(this)">' +
+      '<img src="' + escAttr(source) + '" alt="' + escAttr(name) + '" width="48" height="48" loading="lazy" decoding="async" onerror="traceImageFailed(this)">' + caption + '</button>';
+  }).join('') + '</div>';
+}
+
+function traceImageFailed(image) {
+  if (!image) return;
+  image.hidden = true;
+  const card = image.closest('.tt-image-card');
+  if (card && !card.querySelector('.tt-image-limitation')) {
+    const note = document.createElement('small');
+    note.className = 'tt-image-limitation';
+    note.textContent = traceText('Preview unavailable', '预览不可用');
+    card.appendChild(note);
+  }
+}
+
+function openTraceImagePreview(trigger) {
+  const source = traceImageSource({ url: trigger?.dataset.traceImageSrc });
+  if (!source) return;
+  closeTraceImagePreview(false);
+  const overlay = document.createElement('div');
+  overlay.className = 'tt-image-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-label', traceText('Image preview', '图片预览'));
+  const name = trigger.dataset.traceImageName || traceText('Attached image', '附加图片');
+  overlay.innerHTML = '<div class="tt-image-dialog"><header><span>' + escHtml(name) + '</span><button type="button" aria-label="' +
+    escAttr(traceText('Close image preview', '关闭图片预览')) + '">×</button></header><div class="tt-image-stage"><img alt=""></div></div>';
+  const image = overlay.querySelector('img'), close = overlay.querySelector('button');
+  image.src = source;
+  image.alt = name;
+  image.addEventListener('error', () => {
+    image.hidden = true;
+    const note = document.createElement('p');
+    note.textContent = traceText('The image preview is unavailable.', '图片预览不可用。');
+    image.parentElement.appendChild(note);
+  }, { once: true });
+  close.addEventListener('click', () => closeTraceImagePreview());
+  overlay.addEventListener('click', event => { if (event.target === overlay) closeTraceImagePreview(); });
+  overlay.addEventListener('keydown', event => {
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeTraceImagePreview(); }
+    if (event.key === 'Tab') { event.preventDefault(); event.stopPropagation(); close.focus(); }
+  });
+  traceImagePreview = { overlay, trigger, sessionId: String(currentSessionId || '') };
+  document.body.appendChild(overlay);
+  close.focus();
+}
+
+function closeTraceImagePreview(restoreFocus = true) {
+  if (!traceImagePreview) return;
+  const { overlay, trigger } = traceImagePreview;
+  traceImagePreview = null;
+  overlay.remove();
+  if (restoreFocus && trigger?.isConnected) trigger.focus();
 }
 
 function toolChildren(r) {
@@ -406,6 +686,8 @@ function toolChildren(r) {
 }
 
 function rowText(r) {
+  if (r.kind === 'initial_context') return traceContextLabel(r.contextSnapshot);
+  if (r.kind === 'request_timing') return traceDiagnosticSummary(r);
   if (r.kind === 'thinking_redacted') return TRACE_REDACTED_THINKING_PLACEHOLDER;
   if (isToolRow(r)) {
     const name = r.toolName || r.kind.toUpperCase();
@@ -422,7 +704,8 @@ function rowText(r) {
 
 function rowMatches(r) {
   if (!traceSearchQuery) return true;
-  const hay = (rowText(r) + ' ' + (r.toolName || '') + ' ' + metaOf(r.kind).label + ' ' + (r.text || '')).toLowerCase();
+  const hay = (rowText(r) + ' ' + (r.toolName || '') + ' ' + metaOf(r.kind).label + ' ' + (r.text || '') + ' ' +
+    traceOwnerLabel(r) + ' ' + traceOwnerKey(r) + ' ' + JSON.stringify(r.requestTimingRecords || []) + ' ' + JSON.stringify(r.contextSnapshot || {})).toLowerCase();
   return hay.includes(traceSearchQuery);
 }
 
@@ -431,6 +714,7 @@ function traceRowHasResult(r) {
 }
 
 function rowState(r) {
+  if (r.kind === 'request_timing') return 'complete'; // diagnostics never decide business outcome
   if (r.isError || r.resultIsError) return 'error';
   if (isToolRow(r) && r.kind === 'tool_start' && !traceRowHasResult(r)) return 'running';
   return 'complete';
@@ -444,7 +728,47 @@ function statusLabel(state) {
 
 function traceEventKey(ev) {
   if (ev.id) return 'id:' + ev.id;
-  return [ev.sequence, ev.ts, ev.kind, ev.toolUseID, ev.parentID].join('|');
+  return [traceOwnerKey(ev), ev.sequence, ev.ts, ev.kind, ev.streamID, ev.toolUseID, ev.parentID, ev.text].join('|');
+}
+
+function traceRowStableKey(row) {
+  if (!row) return '';
+  const owner = traceOwnerKey(row);
+  if (row.kind === 'initial_context') {
+    const snapshot = row.contextSnapshot || {};
+    return 'context|' + [snapshot.available, snapshot.requestID || '', snapshot.capturedAt || '', snapshot.turn || 0].join('|');
+  }
+  if (row.kind === 'request_timing') return owner + '|timing|' + ((row.requestTimingRecords || []).find(record => record.request_id)?.request_id || 'legacy-unattributed');
+  if (row.streamID) return owner + '|' + row.kind + '|stream:' + row.streamID;
+  if (row.traceCallID) return owner + '|tool:' + row.traceCallID;
+  const first = row.rawEvents?.[0];
+  return first ? owner + '|' + row.kind + '|' + traceEventKey(first) : '';
+}
+
+function traceSelectionSnapshot() {
+  const describe = row => row ? { key: traceRowStableKey(row), owner: traceOwnerKey(row), kind: row.kind,
+    records: new Set((row.rawEvents || []).map(traceEventKey)) } : null;
+  return { sessionId: String(traceSessionId || currentSessionId || ''), request: traceSelectedReq,
+    row: describe(traceRows[traceSelectedIdx]),
+    folded: traceRows.filter(row => traceFoldedAssistants.has(row.idx)).map(describe) };
+}
+
+function restoreTraceSelection(snapshot) {
+  traceSelectedIdx = -1;
+  traceSelectedReq = -1;
+  if (!snapshot || snapshot.sessionId !== String(traceSessionId || currentSessionId || '')) return;
+  const find = saved => {
+    if (!saved) return -1;
+    const exact = saved.key ? traceRows.findIndex(row => traceRowStableKey(row) === saved.key) : -1;
+    if (exact >= 0) return exact;
+    // Loading an earlier page can extend a legacy row backwards and change
+    // its first ID. Shared original records still identify the same object.
+    return traceRows.findIndex(row => row.kind === saved.kind && traceOwnerKey(row) === saved.owner &&
+      (row.rawEvents || []).some(event => saved.records.has(traceEventKey(event))));
+  };
+  traceSelectedIdx = find(snapshot.row);
+  if (traceSelectedIdx < 0 && snapshot.request >= 0 && traceRows.some(row => row.turn === snapshot.request)) traceSelectedReq = snapshot.request;
+  traceFoldedAssistants = new Set((snapshot.folded || []).map(find).filter(index => index >= 0).map(index => traceRows[index].idx));
 }
 
 function mergeTraceEvents(older, current) {
@@ -483,6 +807,7 @@ async function loadTrace(loadOlder = false, sessionId = currentSessionId, should
     if (!res.ok) throw new Error('trace: ' + res.status);
     const data = await res.json();
     if (!isLatest()) return;
+    const selection = traceSelectionSnapshot();
     if (!loadOlder) {
       traceNextCursor = '';
       traceTotalEvents = 0;
@@ -497,14 +822,20 @@ async function loadTrace(loadOlder = false, sessionId = currentSessionId, should
     traceEvents = loadOlder
       ? mergeTraceEvents(data.events || [], traceEvents)
       : (data.events || []);
+    traceInitialContext = data.initialContext || traceInitialContext || { available: false,
+      limitation: traceText('No initial system or tool snapshot was recorded for this session.', '此会话未记录初始 System 或 Tools 快照。') };
     traceNextCursor = data.nextCursor || '';
     traceTotalEvents = Number(data.totalEvents) || traceEvents.length;
-    traceRows = buildTraceRows(traceEvents);
-    traceSelectedIdx = -1;
-    traceSelectedReq = -1;
+    traceRows = buildTraceRows(traceEvents, traceInitialContext);
+    restoreTraceSelection(selection);
     renderTrace();
   } catch (e) {
     if (!isLatest()) return;
+    if (traceRows.length) {
+      renderTrace();
+      if (typeof showToast === 'function') showToast(traceText('Unable to refresh trajectory: ', '无法刷新轨迹：') + e.message);
+      return;
+    }
     if (!loadOlder) resetTraceForSession();
     track.innerHTML = '';
     body.innerHTML = '<tr><td colspan="2"><div class="tt-empty">Failed to load trajectory: ' + escHtml(e.message) + '</div></td></tr>';
@@ -527,23 +858,25 @@ function spanKindOf(r) {
 
 function renderTimeline() {
   const track = document.getElementById('traceTrack');
-  if (!traceRows.length) {
+  const timedRows = traceRows.map((row, index) => ({ row, index }))
+    .filter(({ row }) => row.kind !== 'request_timing' && row.kind !== 'initial_context');
+  if (!timedRows.length) {
     track.innerHTML = '<span class="tt-track-empty">No timing data</span>';
     return;
   }
   let html = '';
-  const times = traceRows.map(r => Date.parse(r.ts));
-  const finite = times.filter(Number.isFinite);
+  const times = timedRows.map(({ row }) => Date.parse(row.ts));
+  const finite = timedRows.flatMap(({ row }) => [Date.parse(row.ts), Date.parse(row.endTS)]).filter(Number.isFinite);
   const min = finite.length ? Math.min(...finite) : 0;
   const max = finite.length ? Math.max(...finite) : 1;
   const span = Math.max(max - min, 1);
 
-  traceRows.forEach((r, i) => {
+  timedRows.forEach(({ row: r, index }, i) => {
     const isErr = r.isError || r.resultIsError;
     const kind = spanKindOf(r);
     let left, width;
     if (!traceDurMode) {
-      left = (i / traceRows.length) * 100;
+      left = (i / timedRows.length) * 100;
       width = 8;
     } else {
       const t = times[i];
@@ -551,17 +884,17 @@ function renderTimeline() {
       left = ((t - min) / span) * 100;
       width = Math.max((r.elapsedMs / span) * 100, 0.25);
     }
-    const cur = i === traceSelectedIdx ? 'true' : undefined;
-    html += `<span class="tt-span" data-kind="${kind}"${isErr ? ' data-error="true"' : ''}${cur ? ' data-current="true"' : ''} title="${escAttr(metaOf(r.kind).label + (r.toolName ? ' ' + r.toolName : '') + (r.elapsedMs ? ' (' + fmtMs(r.elapsedMs) + ')' : ''))}" style="--lane:${r.lane};left:${left.toFixed(2)}%;width:${Math.max(width, 2).toFixed(2)}px" onclick="selectTraceRow(${i}, true)"></span>`;
+    const cur = index === traceSelectedIdx ? 'true' : undefined;
+    html += `<span class="tt-span" data-kind="${kind}"${isErr ? ' data-error="true"' : ''}${cur ? ' data-current="true"' : ''} title="${escAttr(metaOf(r.kind).label + (r.toolName ? ' ' + r.toolName : '') + (r.elapsedMs ? ' (' + fmtMs(r.elapsedMs) + ')' : ''))}" style="--lane:${r.lane};left:${left.toFixed(2)}%;width:${Math.max(width, 2).toFixed(2)}px" onclick="selectTraceRow(${index}, true)"></span>`;
   });
 
   // Turn boundaries: a 1px tick where each turn starts.
   let lastTurn = null;
-  traceRows.forEach((r, i) => {
+  timedRows.forEach(({ row: r }, i) => {
     if (r.turn !== lastTurn) {
       lastTurn = r.turn;
       let left;
-      if (!traceDurMode) left = (i / traceRows.length) * 100;
+      if (!traceDurMode) left = (i / timedRows.length) * 100;
       else {
         const t = Date.parse(r.ts);
         if (!Number.isFinite(t)) return;
@@ -631,7 +964,7 @@ function renderTrace() {
   let reqNo = 0;
   for (let i = 0; i < traceRows.length; i++) {
     const r = traceRows[i];
-    const turnStart = r.turn !== curTurn;
+    const turnStart = r.kind !== 'initial_context' && r.turn !== curTurn;
     if (turnStart) { curTurn = r.turn; reqNo++; }
     if (!visible.has(i) && !turnStart) continue;
 
@@ -661,7 +994,7 @@ function renderTrace() {
     const turnActive = activeTurn !== null && r.turn === activeTurn;
     const isErr = rowState(r) === 'error';
 
-    html += `<tr data-kind="${isToolRow(r) ? (sub ? 'subtool' : 'tool') : r.kind}"${sub ? ' data-sub="true"' : ''}${turnStart ? ' data-turn-start="true"' : ''}${isErr ? ' data-error="true"' : ''}${sel ? ' data-selected="true"' : ''} tabindex="0" onclick="selectTraceRow(${i}, false)">
+    html += `<tr data-kind="${isToolRow(r) ? (sub ? 'subtool' : 'tool') : r.kind}"${sub ? ' data-sub="true"' : ''}${turnStart ? ' data-turn-start="true"' : ''}${isErr ? ' data-error="true"' : ''}${sel ? ' data-selected="true"' : ''} tabindex="0" onclick="selectTraceRow(${i}, false)" onkeydown="if(event.target===this&&event.key==='Enter'){event.preventDefault();selectTraceRow(${i}, false)}">
       <td class="tt-event">
         ${turnStart ? `<button class="tt-req-dot${traceSelectedReq === r.turn ? ' active' : ''}" data-label="Request #${reqNo}" title="Request #${reqNo}" onclick="event.stopPropagation();selectTraceRequest(${r.turn}, ${reqNo})"></button>` : ''}
         ${turnActive ? `<span class="tt-turn-rail"></span>` : ''}
@@ -690,6 +1023,11 @@ function collapsedRowHtml(r, summary, kind, key) {
 }
 
 function contentHtml(r) {
+  if (r.kind === 'request_timing') return '<details class="tt-diagnostics" onclick="event.stopPropagation()"><summary>' + escHtml(traceDiagnosticSummary(r)) + '</summary>' + traceDiagnosticsHtml(r) + '</details>';
+  if (r.kind === 'initial_context') return '<span class="tt-content-text tt-context-label">' + escHtml(traceContextLabel(r.contextSnapshot)) + '</span>' +
+    '<small class="tt-context-hint">' + escHtml(r.contextSnapshot.available
+      ? traceText('Captured logical request · inspect System and Tools', '已捕获逻辑请求 · 点击查看 System 与 Tools')
+      : r.contextSnapshot.limitation || traceText('No historical snapshot was recorded', '未记录历史快照')) + '</small>';
   if (isToolRow(r)) {
     const name = r.toolName ? `<span class="tt-tool-name">${escHtml(r.toolName)}</span>` : '';
     const args = oneLine(r.text);
@@ -701,7 +1039,9 @@ function contentHtml(r) {
     return `<span class="tt-result-preview"><span class="tt-result-request">${head}</span><span class="tt-inline-result${r.resultIsError ? ' err' : ''}"><span class="arrow">\u2192</span><span class="tt-inline-result-text">${escHtml(resText)}</span></span></span>`;
   }
   const text = rowText(r);
-  return `<span class="tt-content-text${r.isError ? ' is-error' : ''}">${escHtml(text)}</span>`;
+  const owner = traceOwnerLabel(r);
+  return (owner ? '<small class="tt-owner-label">' + escHtml(owner) + '</small>' : '') +
+    `<span class="tt-content-text${r.isError ? ' is-error' : ''}">${escHtml(text)}</span>` + traceImagesHtml(r);
 }
 
 // --- Selection / inspector ----------------------------------------------
@@ -740,13 +1080,16 @@ function closeTraceInspector(shouldRender = true) {
 }
 
 function inspectorTabsFor(r) {
-  if (isToolRow(r)) return [['summary', 'Summary'], ['payload', 'Payload'], ['result', 'Result'], ['timing', 'Timing']];
+  const events = ['events', traceText('Raw events', '原始事件')];
+  if (r.kind === 'initial_context') return [['summary', traceText('Summary', '概览')], ['system', 'System'], ['tools', 'Tools'], ['raw', traceText('Raw', '原始数据')]];
+  if (r.kind === 'request_timing') return [['summary', traceText('Summary', '概览')], ['timing', traceText('Phases', '阶段')], events];
+  if (isToolRow(r)) return [['summary', 'Summary'], ['payload', 'Payload'], ['result', 'Result'], ['timing', 'Timing'], events];
   if (r.kind === 'thinking_redacted') return [['summary', 'Summary']];
   if (r.kind === 'user' || r.kind === 'thinking' || r.kind === 'text' || r.kind === 'plan') {
-    return [['summary', 'Summary'], ['preview', 'Preview'], ['raw', 'Raw']];
+    return [['summary', 'Summary'], ['preview', 'Preview'], ['raw', 'Raw'], events];
   }
-  if (r.kind === 'tokens') return [['summary', 'Summary'], ['raw', 'Raw']];
-  return [['summary', 'Summary'], ['raw', 'Raw']];
+  if (r.kind === 'tokens') return [['summary', 'Summary'], ['raw', 'Raw'], events];
+  return [['summary', 'Summary'], ['raw', 'Raw'], events];
 }
 
 function renderTraceInspector() {
@@ -761,7 +1104,8 @@ function renderTraceInspector() {
   const meta = metaOf(r.kind);
   const tabs = inspectorTabsFor(r);
   if (!tabs.some(t => t[0] === traceTab)) traceTab = tabs[0][0];
-  const location = `Turn ${r.turn}${r.source ? ' \u00B7 ' + r.source : ''}${r.toolName ? ' \u00B7 ' + r.toolName : ''}`;
+  const location = r.kind === 'initial_context' ? traceContextLabel(r.contextSnapshot)
+    : `Turn ${r.turn}${traceOwnerLabel(r) ? ' · ' + traceOwnerLabel(r) : ''}${r.source ? ' \u00B7 ' + r.source : ''}${r.toolName ? ' \u00B7 ' + r.toolName : ''}`;
   const title = isToolRow(r)
     ? `<span class="tt-kind ${meta.cls}"><span class="k-label">${r.toolName ? 'TOOL' : meta.label}</span></span>`
     : `<span class="tt-kind ${meta.cls}"><span class="k-label">${meta.label}</span></span>`;
@@ -800,7 +1144,10 @@ async function copyTraceInspector() {
   } else {
     const row = traceRows[traceSelectedIdx];
     if (!row) return;
-    if (traceTab === 'result') payload = formatTracePayload(row.resultText);
+    if (row.kind === 'initial_context') payload = traceTab === 'system' ? row.contextSnapshot.system || '' : JSON.stringify(traceTab === 'tools' ? row.contextSnapshot.tools || [] : row.contextSnapshot, null, 2);
+    else if (traceTab === 'events') payload = JSON.stringify(row.rawEvents, null, 2);
+    else if (row.kind === 'thinking_redacted') payload = TRACE_REDACTED_THINKING_PLACEHOLDER;
+    else if (traceTab === 'result') payload = formatTracePayload(row.resultText);
     else if (['raw', 'payload', 'preview'].includes(traceTab)) payload = formatTracePayload(row.text);
     else payload = JSON.stringify(row, null, 2);
   }
@@ -813,16 +1160,56 @@ async function copyTraceInspector() {
 }
 
 function inspectorBody(r, tab) {
+  const snapshot = r.kind === 'initial_context' ? r.contextSnapshot || {} : null;
+  const incomplete = !!(r.truncated || snapshot?.truncated);
+  const limitation = snapshot?.available ? snapshot.limitation : r.limitation;
+  const note = incomplete
+    ? traceText('Incomplete capture. ', '记录不完整。') + (limitation || traceText('The saved stream exceeded its capture limit; retained records do not contain the omitted content.', '已保存的流超过捕获上限，保留的记录不含被省略的内容。'))
+    : limitation || '';
+  return (note ? '<p class="tt-capture-limitation" role="note">' + escHtml(note) + '</p>' : '') + traceInspectorBody(r, tab);
+}
+
+function traceInspectorBody(r, tab) {
   const state = rowState(r);
+  if (tab === 'events') return traceRawEventsHtml(r);
+  if (r.kind === 'initial_context') {
+    const snapshot = r.contextSnapshot || {};
+    const unavailable = snapshot.limitation || traceText('No request snapshot was recorded. Current settings cannot reconstruct historical system prompts or tools.', '未记录请求快照，当前配置无法还原当时的 System 与 Tools。');
+    if (tab === 'system') return snapshot.available
+      ? '<pre class="tt-payload">' + escHtml(snapshot.system || traceText('(empty system prompt)', '（System 为空）')) + '</pre>'
+      : '<p class="tt-no-payload">' + escHtml(unavailable) + '</p>';
+    if (tab === 'tools') return snapshot.available
+      ? '<div class="tt-snapshot-tools">' + (snapshot.tools || []).map(tool => '<details><summary>' + escHtml(tool.name || 'Tool') + '</summary><p>' +
+          escHtml(tool.description || '') + '</p><pre class="tt-payload">' + escHtml(JSON.stringify(tool.inputSchema || {}, null, 2)) + '</pre></details>').join('') +
+          (!(snapshot.tools || []).length ? '<p class="tt-no-payload">' + escHtml(traceText('No tools in this recorded request', '此已记录请求未包含 Tools')) + '</p>' : '') + '</div>'
+      : '<p class="tt-no-payload">' + escHtml(unavailable) + '</p>';
+    if (tab === 'raw') return '<pre class="tt-payload">' + escHtml(JSON.stringify(snapshot, null, 2)) + '</pre>';
+    return '<dl class="tt-overview">' + kvRow(traceText('Snapshot', '快照'), escHtml(traceContextLabel(snapshot))) +
+      kvRow(traceText('Source', '来源'), escHtml(snapshot.source || traceText('Not recorded', '未记录'))) +
+      (snapshot.available ? kvRow(traceText('Captured', '捕获时间'), snapshot.capturedAt ? fmtTimestamp(snapshot.capturedAt) : traceText('Not recorded', '未记录')) +
+        kvRow(traceText('Recorded tools', '已记录 Tools'), String((snapshot.tools || []).length)) : '') +
+      (snapshot.model ? kvRow(traceText('Model', '模型'), escHtml(snapshot.model)) : '') + '</dl>' +
+      '<p class="tt-diagnostic-note">' + escHtml(snapshot.available
+        ? traceText('Captured logical request before transport serialization; this is not a saved HTTP wire body.', '这是传输序列化前捕获的逻辑请求快照，并非保存的 HTTP 请求体。')
+        : unavailable) + '</p>' +
+      (snapshot.turn > 1 ? '<p class="tt-diagnostic-note">' + escHtml(traceText('Earlier request snapshots were not recorded. This is the first available capture, from turn ', '更早轮次未记录快照；这里展示第一个可用记录，捕获于第 ') + snapshot.turn + traceText('.', ' 轮。')) + '</p>' : '');
+  }
+  if (r.kind === 'request_timing' && (tab === 'timing' || tab === 'summary')) {
+    return '<h4 class="tt-diagnostic-heading">' + escHtml(traceDiagnosticSummary(r)) + '</h4>' + traceDiagnosticsHtml(r);
+  }
   if (tab === 'summary') {
     let html = `<dl class="tt-overview">`;
     html += kvRow('Status', `<span class="${state === 'error' ? 'err' : ''}">${statusLabel(state)}</span>`);
     html += kvRow('Turn', String(r.turn));
     if (r.source) html += kvRow('Source', escHtml(r.source));
+    if (traceOwnerLabel(r)) html += kvRow(traceText('Owner', '归属'), escHtml(traceOwnerLabel(r)));
+    if (r.traceInvocationID) html += kvRow('Invocation', escHtml(r.traceInvocationID));
+    if (r.streamID) html += kvRow(traceText('Response', '响应'), escHtml(r.streamID));
     if (r.source && r.source.startsWith('history-reconstructed')) html += kvRow('Record', 'Recovered from saved history; original timestamp unavailable');
     html += kvRow('Started', fmtTimestamp(r.ts));
     html += kvRow('Duration', r.elapsedMs ? fmtMs(r.elapsedMs) : '\u2014');
-    html += kvRow('Sequence', '#' + r.seq);
+    html += kvRow('Sequence', '#' + r.seq + (r.sequenceEnd && r.sequenceEnd !== r.seq ? '–#' + r.sequenceEnd : ''));
+    if ((r.rawEvents || []).length > 1) html += kvRow(traceText('Original records', '原始记录'), String(r.rawEvents.length));
     if (r.toolName) html += kvRow('Tool', escHtml(r.toolName));
     if (r.tokens) {
       const t = r.tokens;
@@ -834,10 +1221,12 @@ function inspectorBody(r, tab) {
     }
     if (state === 'error') html += kvRow('Error', '<span class="err">' + escHtml(oneLine(r.resultText || r.text)) + '</span>');
     html += `</dl>`;
+    if (r.legacyMerged) html += '<p class="tt-diagnostic-note">' + escHtml(traceText('Adjacent legacy fragments were grouped. Their original response identity was not recorded; the raw events remain available.', '已合并相邻旧版片段；原始响应身份未记录，可在原始事件中查看各片段。')) + '</p>';
+    html += traceImagesHtml(r);
     return html;
   }
   if (tab === 'preview') {
-    return `<div class="tt-markdown">${formatContent(r.text)}</div>`;
+    return traceImagesHtml(r) + `<div class="tt-markdown">${formatContent(r.text)}</div>`;
   }
   if (tab === 'raw') {
     return `<pre class="tt-payload${state === 'error' ? ' err' : ''}">${escHtml(formatTracePayload(r.text))}</pre>`;
@@ -872,12 +1261,12 @@ function renderRequestInspector(insp) {
     return acc;
   }, { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 });
   const calls = tr.filter(isToolRow).length;
-  const ts = tr.filter(x => x.kind !== 'request_timing').map(x => Date.parse(x.ts)).filter(Number.isFinite);
+  const ts = tr.filter(x => x.kind !== 'request_timing').flatMap(x => [Date.parse(x.ts), Date.parse(x.endTS)]).filter(Number.isFinite);
   const started = ts.length ? new Date(Math.min(...ts)).toISOString() : null;
   const dur = ts.length > 1 ? Math.max(...ts) - Math.min(...ts) : 0;
   const hasError = tr.some(x => rowState(x) === 'error');
   const state = hasError ? 'error' : (tr.some(x => rowState(x) === 'running') ? 'running' : 'complete');
-  const reqNo = [...new Set(traceRows.map(x => x.turn))].indexOf(turn) + 1;
+  const reqNo = [...new Set(traceRows.filter(x => x.turn !== null).map(x => x.turn))].indexOf(turn) + 1;
   if (!['summary', 'usage', 'timing'].includes(traceTab)) traceTab = 'summary';
   insp.style.display = 'flex';
   insp.innerHTML = `

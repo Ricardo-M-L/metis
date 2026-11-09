@@ -3,14 +3,18 @@ package builtin
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/imageprep"
 	"github.com/Ricardo-M-L/metis/internal/permission"
+	"github.com/Ricardo-M-L/metis/internal/sessionfiles/blob"
 	"github.com/Ricardo-M-L/metis/internal/tools"
 	pubtool "github.com/Ricardo-M-L/metis/pkg/tool"
 )
@@ -44,11 +48,11 @@ type ViewImage struct {
 func (ViewImage) Name() string { return "ViewImage" }
 
 func (ViewImage) ShortDescription() string {
-	return "Open an image file from disk and deliver it to the model as a vision content block. Use after WebFetch saves a binary, or when the user @-references a local image and you need to actually SEE the contents."
+	return "Inspect a local image path or a stable attachment_id from the current session as a native vision content block. Use attachment_id to re-read an older image after context compaction."
 }
 
 func (ViewImage) Description() string {
-	return `View an image file from disk by attaching it to the next turn's
+	return `View an image from a local file or this session's saved attachment by attaching it to the next turn's
 tool_result as a vision content block. The agent loop bridges the
 bytes from disk into the provider-specific image shape (Anthropic:
 ` + "`{type:image,source:{type:base64,...}}`" + `; OpenAI: ` + "`image_url`" + ` data URI).
@@ -58,6 +62,9 @@ When to use:
     you need to describe the contents.
   - The user mentioned an image path the chat composer didn't auto-inline.
   - You just generated an image with another tool and want to inspect it.
+  - Context compaction kept an attachment_id for an older image: pass that
+    attachment_id to inspect the saved visual content again, even if its
+    original temporary file was deleted. The current session must own it.
 
 When NOT to use:
   - Reading text/code → use Read.
@@ -67,6 +74,9 @@ When NOT to use:
     see the textual summary. Check the model's capabilities first.
 
 Hard requirements:
+  - Supply exactly one of ` + "`path`" + ` or ` + "`attachment_id`" + `.
+  - attachment_id is the full lowercase SHA-256 of decoded image bytes.
+    Only current-session image references are readable; remote URLs are not.
   - ` + "`path`" + ` MUST be a regular file. Relative paths are resolved against
     the agent's cwd; the response always echoes the absolute path.
   - Supported MIME: png, jpeg, gif, webp. Other types are rejected.
@@ -85,12 +95,19 @@ succeeded.`
 
 func (ViewImage) InputSchema() map[string]any {
 	return map[string]any{
-		"type":     "object",
-		"required": []string{"path"},
+		"type": "object",
+		"oneOf": []any{
+			map[string]any{"required": []string{"path"}},
+			map[string]any{"required": []string{"attachment_id"}},
+		},
 		"properties": map[string]any{
 			"path": map[string]any{
 				"type":        "string",
 				"description": "Image file path (PNG/JPEG/GIF/WebP). Absolute preferred; relative paths are resolved against the agent's cwd.",
+			},
+			"attachment_id": map[string]any{
+				"type":        "string",
+				"description": "Full lowercase SHA-256 image attachment ID referenced in this session. Re-opens the saved image after compaction or restart. Mutually exclusive with path; not a URL or another session's ID.",
 			},
 		},
 	}
@@ -102,6 +119,13 @@ func (ViewImage) Concurrency(map[string]any) tools.Concurrency {
 
 func (v ViewImage) CanUse(ctx context.Context, in map[string]any) (tools.Permission, string) {
 	path := strFromAny(in["path"])
+	if id := strFromAny(in["attachment_id"]); id != "" {
+		if path != "" || !validViewImageAttachmentID(id) || !agent.HasImageAttachmentSession(ctx) {
+			return tools.PermissionDeny, "invalid or unbound image attachment"
+		}
+		d, src := v.gate.Check(ctx, "ViewImage", "attachment_id="+id)
+		return mapDecision(d), src
+	}
 	target := resolvePathAgainstAgentCWD(ctx, path)
 	d, src := v.gate.CheckPath(ctx, "ViewImage", path, target)
 	return mapDecision(d), src
@@ -109,25 +133,42 @@ func (v ViewImage) CanUse(ctx context.Context, in map[string]any) (tools.Permiss
 
 func (ViewImage) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
 	rawPath, _ := in["path"].(string)
-	if rawPath == "" {
-		return nil, errors.New("path required")
+	attachmentID, _ := in["attachment_id"].(string)
+	if (rawPath == "") == (attachmentID == "") {
+		return nil, errors.New("exactly one of path or attachment_id is required")
 	}
-	abs := resolvePathAgainstAgentCWD(ctx, rawPath)
-	if !filepath.IsAbs(abs) {
-		if resolved, err := filepath.Abs(abs); err == nil {
-			abs = resolved
+	var raw []byte
+	var err error
+	abs := "attachment_id=" + attachmentID
+	if attachmentID != "" {
+		if !validViewImageAttachmentID(attachmentID) {
+			return nil, errors.New("attachment_id must be a full lowercase SHA-256 image ID")
 		}
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return nil, fmt.Errorf("stat: %w", err)
-	}
-	if info.IsDir() {
-		return nil, fmt.Errorf("%s is a directory, not a file", abs)
-	}
-	raw, err := os.ReadFile(abs)
-	if err != nil {
-		return nil, fmt.Errorf("read: %w", err)
+		raw, err = agent.ReadImageAttachment(ctx, attachmentID)
+		if err != nil {
+			return nil, fmt.Errorf("read session image attachment: %w", err)
+		}
+	} else {
+		abs = resolvePathAgainstAgentCWD(ctx, rawPath)
+		if !filepath.IsAbs(abs) {
+			if resolved, err := filepath.Abs(abs); err == nil {
+				abs = resolved
+			}
+		}
+		info, statErr := os.Stat(abs)
+		if statErr != nil {
+			return nil, fmt.Errorf("stat: %w", statErr)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("%s is a directory, not a file", abs)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s is not a regular image file", abs)
+		}
+		raw, err = os.ReadFile(abs)
+		if err != nil {
+			return nil, fmt.Errorf("read: %w", err)
+		}
 	}
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("%s is empty", abs)
@@ -185,14 +226,19 @@ func (ViewImage) Execute(ctx context.Context, in map[string]any) (*tools.Result,
 		encoded = reEncoded
 		return &tools.Result{
 			Output: fmt.Sprintf(
-				"ViewImage: %s (%d bytes raw → %d bytes after auto-resize to ≤1568px, %s)",
-				abs, len(raw), len(outBytes), outMime,
+				"ViewImage: %s (%d bytes raw → %d bytes after auto-resize to ≤1568px, %s; attachment_id=%s)",
+				abs, len(raw), len(outBytes), outMime, blob.Sum(outBytes),
 			),
 			Images: []pubtool.ImageAttachment{{MediaType: outMime, Data: encoded}},
 		}, nil
 	}
 	return &tools.Result{
-		Output: fmt.Sprintf("ViewImage: %s (%d bytes, %s)", abs, len(outBytes), outMime),
+		Output: fmt.Sprintf("ViewImage: %s (%d bytes, %s; attachment_id=%s)", abs, len(outBytes), outMime, blob.Sum(outBytes)),
 		Images: []pubtool.ImageAttachment{{MediaType: outMime, Data: encoded}},
 	}, nil
+}
+
+func validViewImageAttachmentID(id string) bool {
+	decoded, err := hex.DecodeString(id)
+	return err == nil && len(decoded) == 32 && strings.ToLower(id) == id
 }

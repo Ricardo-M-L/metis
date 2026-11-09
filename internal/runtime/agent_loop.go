@@ -26,6 +26,9 @@ type AgentLoopOptions struct {
 	Registry *tools.Registry
 	Gate     *permission.Gate
 	System   string
+	// ImageAttachments is the actual configured session store. It is static
+	// for this loop; Run binds the current session in its invocation context.
+	ImageAttachments agent.ImageAttachmentReader
 	// SystemSections is the typed-section form of System. When
 	// non-empty, BuildAgentLoop attaches it to the Loop so per-iteration
 	// requests can carry per-section cache_control hints to the
@@ -185,6 +188,7 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 
 	loop := agent.NewLoop(opts.Provider, opts.Registry, opts.Gate,
 		hookReg, opts.System, maxIter)
+	loop.ImageAttachments = opts.ImageAttachments
 	loop.ContinueOnIterationLimit = opts.ContinueOnIterationLimit
 	if opts.Registry != nil {
 		if tool, ok := opts.Registry.Get("MetisInfo"); ok {

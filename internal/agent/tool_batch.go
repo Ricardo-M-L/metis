@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -98,15 +100,25 @@ func (l *Loop) projectToolBatch(blocks []llm.ContentBlock) ([]llm.ContentBlock, 
 
 // commitToolBatch is the single first-history boundary, including early stops.
 func (l *Loop) commitToolBatch(blocks []llm.ContentBlock) error {
+	return l.commitToolBatchWithContext(context.Background(), blocks)
+}
+
+func (l *Loop) commitToolBatchWithContext(ctx context.Context, blocks []llm.ContentBlock) error {
 	if steer := l.drainSteer(); steer != "" {
 		blocks = append(append([]llm.ContentBlock(nil), blocks...), llm.ContentBlock{Type: "text", Text: "[user steer mid-turn] " + steer})
 	}
 	projected, budgetErr := l.projectToolBatch(blocks)
+	projected = canonicalImageReferenceBlocks(projected)
 	l.mu.Lock()
 	l.Messages = append(l.Messages, llm.Message{Role: llm.RoleUser, Content: projected})
 	l.mu.Unlock()
-	if err := l.checkpointHistory(); err != nil {
-		return err
+	attachmentErr := recordInvocationImageAttachments(ctx, projected)
+	checkpointErr := l.checkpointHistory()
+	if attachmentErr != nil {
+		return errors.Join(fmt.Errorf("checkpoint image attachments: %w", attachmentErr), checkpointErr, budgetErr)
+	}
+	if checkpointErr != nil {
+		return checkpointErr
 	}
 	return budgetErr
 }

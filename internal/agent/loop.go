@@ -220,6 +220,11 @@ type Loop struct {
 	// read live history from a consumer's EventTurnEnd notification instead.
 	HistoryCheckpoint func(history []llm.Message) error
 
+	// ImageAttachments is the actual session store supplied at loop assembly.
+	// Run freezes its session owner in each tool context; UI/trace rebinding
+	// never changes an invocation's attachment authority. Configure before Run.
+	ImageAttachments ImageAttachmentReader
+
 	// Budget enforces the session-level USD cap (claude-code's
 	// maxBudgetUsd). nil = no cap. Sub-agent loops receive the SAME
 	// tracker pointer as their parent, so child spend draws down one
@@ -296,10 +301,11 @@ type Loop struct {
 	// requestOverheadTokens caches the most recent non-history request cost
 	// (system/state/memory/tool schemas). Render paths add this without doing
 	// filesystem reads, memory retrieval or registry hydration every frame.
-	requestOverheadTokens atomic.Int64
-	contextPrefix         contextPrefixEstimate // protected by mu
-	contextUsageCache     atomic.Pointer[ContextUsage]
-	contextUsageEpoch     atomic.Uint64
+	requestOverheadTokens    atomic.Int64
+	contextPrefix            contextPrefixEstimate // protected by mu
+	contextUsageCache        atomic.Pointer[ContextUsage]
+	contextUsageEpoch        atomic.Uint64
+	contextCompactionDisplay atomic.Pointer[contextCompactionDisplay]
 	// activeContext is the provider-authoritative active-window snapshot from
 	// the most recently completed response. Unlike EventTokens/Budget usage it
 	// is replaced, never accumulated. Protected by mu; estTokens remains the
@@ -668,7 +674,7 @@ func (l *Loop) AppendUserBlocks(blocks []llm.ContentBlock) {
 	}
 	l.Messages = append(l.Messages, llm.Message{
 		Role:    llm.RoleUser,
-		Content: blocks,
+		Content: canonicalImageReferenceBlocks(blocks),
 	})
 }
 
@@ -922,10 +928,13 @@ func (l *Loop) storeContextEstimateFromHistory(historyTokens int) {
 	// history (including CompactNow's temporary/final/rollback installations).
 	// Ordinary appends intentionally do not advance the revision: their token
 	// growth is what re-arms a pressure-pinned automatic checkpoint.
+	// Callers can supply a raw transcript statistic. The replacement watermark
+	// must use the same projected, image-aware history as current context usage.
+	historyTokens = estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))
 	l.invalidateActiveContextLocked()
 	l.historyRevision++
 	l.historyReplacementTokens = historyTokens
-	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))) + l.requestOverheadTokens.Load())
+	l.estTokens.Store(int64(historyTokens) + l.requestOverheadTokens.Load())
 }
 
 // EstimateRequestContextTokens preflights the input that the next provider
@@ -1454,7 +1463,7 @@ func (l *Loop) restoreMessagesLocked(messages []llm.Message) {
 	if messages == nil {
 		l.Messages = nil
 	} else {
-		clone := append([]llm.Message(nil), messages...)
+		clone := canonicalImageReferences(messages)
 		l.Messages = RepairOrphanedToolUses(clone)
 	}
 	l.turnIdx = 0
@@ -1684,6 +1693,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	// inspect another session while this turn or one of its sub-agents is still
 	// running; tool calls must continue writing to the originating session.
 	ctx = tasks.WithSessionID(ctx, tasks.SessionIDFromContext(ctx))
+	if l.ImageAttachments != nil {
+		ctx = WithImageAttachmentSession(ctx, l.ImageAttachments, tasks.SessionIDFromContext(ctx))
+	}
 	var taskPlanErr error
 	ctx, taskPlanErr = l.prepareTaskPlan(ctx)
 	if taskPlanErr != nil {
@@ -2152,7 +2164,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					assistant[i].ProviderHint["metis.partial"] = "true"
 				}
 				l.mu.Lock()
-				l.Messages = append(l.Messages, llm.Message{Role: llm.RoleAssistant, Content: assistant})
+				l.Messages = append(l.Messages, llm.Message{Role: llm.RoleAssistant, Content: canonicalImageReferenceBlocks(assistant)})
 				l.storeContextEstimateFromHistory(estimateTokens(l.Messages))
 				l.mu.Unlock()
 			}
@@ -2218,6 +2230,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		}
 		retainAssistant := len(assistant) > 0
 		if retainAssistant {
+			assistant = canonicalImageReferenceBlocks(assistant)
 			l.mu.Lock()
 			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleAssistant, Content: assistant})
 			l.storeActiveContextSnapshotLocked(usage, contextAnchor)
@@ -2681,7 +2694,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					results = append(results, llm.ContentBlock{Type: "text", Text: pendingContractReminder})
 					pendingContractReminder = ""
 				}
-				if err := l.commitToolBatch(results); err != nil {
+				if err := l.commitToolBatchWithContext(ctx, results); err != nil {
 					stopReason = "error"
 					emit(ctx, out, Event{Kind: EventError, Err: err})
 					return err
@@ -2845,7 +2858,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				results = append(results, llm.ContentBlock{Type: "text", Text: pendingContractReminder})
 				pendingContractReminder = ""
 			}
-			if err := l.commitToolBatch(results); err != nil {
+			if err := l.commitToolBatchWithContext(ctx, results); err != nil {
 				stopReason = "error"
 				emit(ctx, out, Event{Kind: EventError, Err: err})
 				return err
@@ -2945,7 +2958,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				})
 				pendingContractReminder = ""
 			}
-			if err := l.commitToolBatch(results); err != nil {
+			if err := l.commitToolBatchWithContext(ctx, results); err != nil {
 				stopReason = "error"
 				emit(ctx, out, Event{Kind: EventError, Err: err})
 				return err
@@ -2989,7 +3002,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				pendingContractReminder = ""
 			}
 			stopReason = "halted_by_hook"
-			if err := l.commitToolBatch(results); err != nil {
+			if err := l.commitToolBatchWithContext(ctx, results); err != nil {
 				stopReason = "error"
 				emit(ctx, out, Event{Kind: EventError, Err: err})
 				return err
@@ -3024,7 +3037,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			})
 			pendingContractReminder = ""
 		}
-		if err := l.commitToolBatch(results); err != nil {
+		if err := l.commitToolBatchWithContext(ctx, results); err != nil {
 			stopReason = "error"
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err

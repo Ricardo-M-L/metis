@@ -394,9 +394,13 @@ type RuntimeBindings struct {
 }
 
 func NewServer(addr string, loop *agent.Loop, store *session.Store, bindings ...RuntimeBindings) *Server {
+	rtpkg.BindImageAttachmentStore(loop, store)
 	binding := RuntimeBindings{}
 	if len(bindings) > 0 {
 		binding = bindings[0]
+	}
+	if binding.TraceAdapter != nil {
+		binding.TraceAdapter.SetAttachmentStore(store)
 	}
 
 	launchWorkDir, _ := os.Getwd()
@@ -746,6 +750,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/plugins/remove", s.handlePluginRemove)
 	mux.HandleFunc("/api/routing", s.handleRouting)
 	mux.HandleFunc("/api/trace", s.handleTrace)
+	mux.HandleFunc("/api/trace/image", s.handleTraceImage)
 	mux.HandleFunc("/api/trace/export", s.handleTraceExport)
 	mux.HandleFunc("/api/subagents", s.handleSubAgents)
 	mux.HandleFunc("/api/subagents/", s.handleSubAgentDetail)
@@ -2927,6 +2932,7 @@ type contextStatusSnapshot struct {
 	source                                                 string
 	compactThreshold                                       float64
 	compactAtTokens                                        int
+	compactionStage                                        string
 	sessionID                                              string
 }
 
@@ -3712,7 +3718,7 @@ func traceFromHistory(s *Server, sid string) []session.TracedNode {
 	for _, msg := range messages {
 		if input := historyTraceUserInput(msg); input != "" {
 			turn++
-			add(0, session.TraceEvent{Kind: "user", Text: input})
+			add(0, session.TraceEvent{Kind: "user", Text: input, Images: historyTraceImages(msg.Content)})
 		}
 		if source, text := historyTraceContext(msg); text != "" {
 			kind := "context"
@@ -4060,12 +4066,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			windowKind: workerContext.WindowKind, modelWindow: workerContext.ModelWindow, modelMaxInputTokens: workerContext.ModelMaxInputTokens, modelMaxOutputTokens: workerContext.ModelMaxOutputTokens, modelSource: workerContext.ModelSource,
 			requestedWindow: workerContext.RequestedWindow, limitSource: workerContext.LimitSource, budgetSource: workerContext.BudgetSource, providerID: workerContext.ProviderID, model: workerContext.Model, routeKey: workerContext.RouteKey,
 			compactThreshold: workerContext.CompactThreshold, compactAtTokens: workerContext.CompactAtTokens,
-			sessionID: selectedContextSessionID,
+			compactionStage: workerContext.CompactionStage,
+			sessionID:       selectedContextSessionID,
 		}
 	} else if s.loop != nil {
 		contextStatus = s.readContextStatus(func() contextStatusSnapshot {
 			s.loop.TrySyncContextCapabilities()
-			usage := s.loop.ContextUsageSnapshot()
+			usage := s.loop.ContextDisplaySnapshot()
 			caps, threshold, trigger := usage.Capabilities, usage.CompactThreshold, usage.CompactAtTokens
 			var breakdown *desktopipc.ContextBreakdown
 			if parts := usage.Breakdown; parts != nil {
@@ -4077,7 +4084,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				maxInputTokens: caps.MaxInputTokens, maxOutputTokens: caps.MaxOutputTokens, source: caps.Source,
 				windowKind: caps.WindowKind, modelWindow: caps.ModelWindow, modelMaxInputTokens: caps.ModelMaxInputTokens, modelMaxOutputTokens: caps.ModelMaxOutputTokens, modelSource: caps.ModelSource,
 				requestedWindow: caps.RequestedWindow, limitSource: caps.LimitSource, budgetSource: caps.BudgetSource, providerID: caps.ProviderID, model: caps.Model, routeKey: caps.RouteKey,
-				compactThreshold: threshold, compactAtTokens: trigger}
+				compactThreshold: threshold, compactAtTokens: trigger, compactionStage: usage.CompactionStage}
 		})
 	}
 	if s.loop != nil && s.loop.Registry != nil {
@@ -4134,8 +4141,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"contextMaxInputTokens": contextStatus.maxInputTokens, "contextMaxOutputTokens": contextStatus.maxOutputTokens, "contextSource": contextStatus.source,
 		"contextWindowKind": contextStatus.windowKind, "contextModelWindow": contextStatus.modelWindow, "contextModelMaxInputTokens": contextStatus.modelMaxInputTokens, "contextModelMaxOutputTokens": contextStatus.modelMaxOutputTokens, "contextModelSource": contextStatus.modelSource,
 		"contextRequestedWindow": contextStatus.requestedWindow, "contextLimitSource": contextStatus.limitSource, "contextBudgetSource": contextStatus.budgetSource, "contextProviderId": contextStatus.providerID, "contextModel": contextStatus.model, "contextRouteKey": contextStatus.routeKey,
-		"compactAtTokens": contextStatus.compactAtTokens,
-		"turnRunning":     turnRunning, "runningSessionId": runningSessionID, "isolatedTurnSessions": workerSessions,
+		"compactAtTokens":        contextStatus.compactAtTokens,
+		"contextCompactionStage": contextStatus.compactionStage,
+		"turnRunning":            turnRunning, "runningSessionId": runningSessionID, "isolatedTurnSessions": workerSessions,
 		"isolatedTurnsEnabled": s.isolatedRunner != nil,
 		"activeSessionId":      activeSessionID,
 		"planItems":            planItems,
@@ -5202,21 +5210,28 @@ func validWebSettingValue(key, value string) bool {
 
 // traceEventView is the wire shape of one trajectory node for the web UI.
 type traceEventView struct {
-	ID                string `json:"id"`
-	Kind              string `json:"kind"`
-	Turn              int    `json:"turn"`
-	Sequence          int64  `json:"sequence"`
-	TS                string `json:"ts"`
-	ToolName          string `json:"toolName,omitempty"`
-	ToolUseID         string `json:"toolUseID,omitempty"`
-	TraceInvocationID string `json:"traceInvocationID,omitempty"`
-	TraceCallID       string `json:"traceCallID,omitempty"`
-	ParentID          string `json:"parentID,omitempty"`
-	Text              string `json:"text,omitempty"`
-	Source            string `json:"source,omitempty"`
-	IsError           bool   `json:"isError,omitempty"`
-	ElapsedMs         int64  `json:"elapsedMs,omitempty"`
-	Depth             int    `json:"depth"`
+	ID                      string                  `json:"id"`
+	Kind                    string                  `json:"kind"`
+	Turn                    int                     `json:"turn"`
+	Sequence                int64                   `json:"sequence"`
+	TS                      string                  `json:"ts"`
+	ToolName                string                  `json:"toolName,omitempty"`
+	ToolUseID               string                  `json:"toolUseID,omitempty"`
+	TraceInvocationID       string                  `json:"traceInvocationID,omitempty"`
+	TraceCallID             string                  `json:"traceCallID,omitempty"`
+	SessionID               string                  `json:"sessionId,omitempty"`
+	SubAgentOf              string                  `json:"subAgentOf,omitempty"`
+	TraceParentInvocationID string                  `json:"traceParentInvocationID,omitempty"`
+	StreamID                string                  `json:"streamID,omitempty"`
+	Truncated               bool                    `json:"truncated,omitempty"`
+	Images                  []session.TraceImage    `json:"images,omitempty"`
+	RequestTiming           *transport.TimingRecord `json:"requestTiming,omitempty"`
+	ParentID                string                  `json:"parentID,omitempty"`
+	Text                    string                  `json:"text,omitempty"`
+	Source                  string                  `json:"source,omitempty"`
+	IsError                 bool                    `json:"isError,omitempty"`
+	ElapsedMs               int64                   `json:"elapsedMs,omitempty"`
+	Depth                   int                     `json:"depth"`
 }
 
 type traceStats struct {
@@ -5532,9 +5547,13 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		}
 		cursorEnd = parsed
 	}
-	store := rtpkg.CurrentTraceStore()
+	store := s.traceStore
 	if store == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "events": []any{}})
+		store = rtpkg.CurrentTraceStore()
+	}
+	if store == nil {
+		_, initialContext := splitInitialTraceContext(nil)
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "events": []any{}, "initialContext": initialContext})
 		return
 	}
 
@@ -5550,6 +5569,7 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		nodes = traceFromHistory(s, sid)
 		source = "history"
 	}
+	nodes, initialContext := splitInitialTraceContext(nodes)
 	nodes = coalesceTraceToolArgs(nodes)
 	turnMetrics := []traceTurnMetricView{}
 	if source == "live" {
@@ -5669,21 +5689,28 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 			stats.CacheWrite += cw
 		}
 		events = append(events, traceEventView{
-			ID:                ev.ID,
-			Kind:              ev.Kind,
-			Turn:              ev.Turn,
-			Sequence:          ev.Sequence,
-			TS:                traceDisplayTimestamp(ev.TS),
-			ToolName:          ev.ToolName,
-			ToolUseID:         ev.ToolUseID,
-			TraceInvocationID: ev.TraceInvocationID,
-			TraceCallID:       ev.TraceCallID,
-			ParentID:          ev.ParentID,
-			Text:              redactTraceText(ev.Text),
-			Source:            ev.Source,
-			IsError:           ev.IsError,
-			ElapsedMs:         ev.ElapsedMs,
-			Depth:             n.Depth,
+			ID:                      ev.ID,
+			Kind:                    ev.Kind,
+			Turn:                    ev.Turn,
+			Sequence:                ev.Sequence,
+			TS:                      traceDisplayTimestamp(ev.TS),
+			ToolName:                ev.ToolName,
+			ToolUseID:               ev.ToolUseID,
+			TraceInvocationID:       ev.TraceInvocationID,
+			TraceCallID:             ev.TraceCallID,
+			SessionID:               ev.SessionID,
+			SubAgentOf:              ev.SubAgentOf,
+			TraceParentInvocationID: ev.TraceParentInvocationID,
+			StreamID:                ev.StreamID,
+			Truncated:               ev.Truncated,
+			Images:                  traceImagesForView(s, sid, ev.Images),
+			RequestTiming:           ev.RequestTiming,
+			ParentID:                ev.ParentID,
+			Text:                    redactTraceText(ev.Text),
+			Source:                  ev.Source,
+			IsError:                 ev.IsError,
+			ElapsedMs:               ev.ElapsedMs,
+			Depth:                   n.Depth,
 		})
 	}
 	stats.ToolMs = activeTraceToolDuration(measuredNodes)
@@ -5788,15 +5815,16 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		nextCursor = base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(pageStart)))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled":     true,
-		"sessionId":   sid,
-		"source":      source,
-		"events":      pageEvents,
-		"stats":       &stats,
-		"turnMetrics": turnMetrics,
-		"totalEvents": len(events),
-		"hasMore":     pageStart > 0,
-		"nextCursor":  nextCursor,
+		"enabled":        true,
+		"sessionId":      sid,
+		"source":         source,
+		"events":         pageEvents,
+		"initialContext": initialContext,
+		"stats":          &stats,
+		"turnMetrics":    turnMetrics,
+		"totalEvents":    len(events),
+		"hasMore":        pageStart > 0,
+		"nextCursor":     nextCursor,
 	})
 }
 

@@ -333,6 +333,8 @@ context = {
   openSubAgentDetails: (id, trigger, owner) => context.openedAgents.push({id, trigger, owner}),
 };
 vm.createContext(context);
+vm.runInContext(extract('let messageImagePreview = null;', 'function attachImage('), context);
+vm.runInContext(extract('function todoHistoryStartsUserTurn(', 'function restoreTodoPlanFromHistory('), context);
 vm.runInContext(extract('let streamRenderFrame =', 'let effortState ='), context);
 vm.runInContext(extract('function scheduleStreamingRender()', 'const foregroundRequests ='), context);
 vm.runInContext(extract('function flushHistoryMessageBatch()', 'function addMessage('), context);

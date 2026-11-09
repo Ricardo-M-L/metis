@@ -9,6 +9,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/llm/transport"
+	"github.com/google/uuid"
 )
 
 // Timing never enters the UI channel and never performs trace IO on a delta.
@@ -50,6 +51,20 @@ func refreshCapabilitiesTimed(ctx context.Context, refresh func(context.Context)
 }
 
 func timedProviderStream(ctx context.Context, p llm.Provider, req llm.Request) (llm.StreamReader, error) {
+	// The request has passed tool selection and prompt assembly. Observe its
+	// actual logical context before the provider translates it; only the trace
+	// hook receives this boundary, never a UI delta channel.
+	model := req.Model
+	if model == "" {
+		model = p.ModelID()
+	}
+	notifyTimingHook(Event{Kind: EventRequestContext,
+		TraceInvocationID: TraceInvocationIDFromContext(ctx),
+		SubAgentParentID:  ParentToolUseIDFromContext(ctx),
+		TraceStreamID:     uuid.NewString(),
+		RequestContext: &TraceRequestContext{System: req.System, SystemSections: req.SystemSections,
+			Tools: req.Tools, Model: model, Provider: p.Name()},
+	})
 	if !transport.TimingEnabled(ctx) {
 		return p.Stream(ctx, req)
 	}

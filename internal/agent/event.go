@@ -169,6 +169,9 @@ const (
 	EventRequestTiming
 	EventRequestTimingBind
 	EventRequestTimingUnbind
+	// Trace-only logical request boundary. Its whitelisted context excludes
+	// messages, attachment payloads and transport/authentication fields.
+	EventRequestContext
 )
 
 // agentNameKey carries the current agent's team identity (the `name` param
@@ -532,8 +535,10 @@ func PlanControllerFromContext(ctx context.Context) PlanController {
 
 // Event is the discriminated union streamed from Loop.Run.
 type Event struct {
-	Kind          EventKind
-	RequestTiming *transport.TimingRecord
+	Kind           EventKind
+	RequestTiming  *transport.TimingRecord
+	RequestContext *TraceRequestContext `json:"-"`
+	TraceStreamID  string               `json:"-"`
 
 	// Text events
 	TextDelta string

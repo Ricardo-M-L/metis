@@ -57,6 +57,7 @@ func (b *ContextBreakdown) Valid() bool {
 
 type ContextPressure struct {
 	Breakdown            *ContextBreakdown `json:"contextBreakdown,omitempty"`
+	CompactionStage      string            `json:"compactionStage,omitempty"`
 	Used                 int               `json:"used"`
 	Window               int               `json:"window"`
 	WindowKind           string            `json:"windowKind,omitempty"`

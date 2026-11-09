@@ -231,6 +231,8 @@ const c = {
   turnStatusEl: null, turnStatusTimer: null,
 };
 vm.createContext(c);
+vm.runInContext(extract('let messageImagePreview = null;', 'function attachImage('), c);
+vm.runInContext(extract('function todoHistoryStartsUserTurn(', 'function restoreTodoPlanFromHistory('), c);
 vm.runInContext(extract('let streamRenderFrame =', 'let effortState ='), c);
 vm.runInContext(extract('function scheduleStreamingRender()', 'const foregroundRequests ='), c);
 vm.runInContext(extract('function flushHistoryMessageBatch()', 'function addMessage('), c);

@@ -26,18 +26,22 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
+	"unicode/utf8"
 
 	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/security"
 	"github.com/Ricardo-M-L/metis/internal/session"
 	"github.com/Ricardo-M-L/metis/internal/tools/builtin"
+	"github.com/google/uuid"
 )
 
 // TraceAdapter converts agent.Events into session.TraceEvents for the
 // active session, buffering typed streaming bursts and tracking turn starts.
 type TraceAdapter struct {
-	store *session.TraceStore
+	store           *session.TraceStore
+	attachmentStore *session.Store
 
 	mu        sync.Mutex
 	sessionID string
@@ -55,6 +59,8 @@ type TraceAdapter struct {
 	turnUsage         map[traceTurnKey]session.CostSnapshot
 	resolvedObserver  func(ResolvedTraceEvent)
 	timingOrigins     map[string]traceOrigin
+	requestContexts   map[string]bool
+	streamIDs         map[traceOrigin]string
 
 	// Streaming deltas are coalesced, but the buffer must carry its immutable
 	// owner. A background child can outlive the parent turn or a session switch;
@@ -65,6 +71,9 @@ type TraceAdapter struct {
 	burstTurn           int
 	burstSubAgentOf     string
 	burstInvocationID   string
+	burstStreamID       string
+	burstTS             time.Time
+	burstTruncated      bool
 	burstBuf            strings.Builder
 	learningFullResults bool
 }
@@ -127,6 +136,8 @@ func NewTraceAdapter(store *session.TraceStore) *TraceAdapter {
 		legacyChildOrigin:   make(map[legacyTraceKey]traceOrigin),
 		activeTurns:         make(map[string]int),
 		turnUsage:           make(map[traceTurnKey]session.CostSnapshot),
+		requestContexts:     make(map[string]bool),
+		streamIDs:           make(map[traceOrigin]string),
 	}
 }
 
@@ -241,7 +252,7 @@ func RecordUserInput(sessionID string, blocks []llm.ContentBlock) {
 		}
 	}
 	text := strings.Join(parts, "\n")
-	recordSubmittedTraceInput(sessionID, "user", "", text)
+	recordSubmittedTraceInputWithImages(sessionID, "user", "", text, collectTraceImages(sessionID, blocks))
 }
 
 // RecordContextInput records an explicit automatic prompt (for example a cron
@@ -252,6 +263,10 @@ func RecordContextInput(sessionID, source, text string) {
 }
 
 func recordSubmittedTraceInput(sessionID, kind, source, text string) {
+	recordSubmittedTraceInputWithImages(sessionID, kind, source, text, nil)
+}
+
+func recordSubmittedTraceInputWithImages(sessionID, kind, source, text string, images []session.TraceImage) {
 	adapterMu.RLock()
 	a := currentTraceAdapter
 	adapterMu.RUnlock()
@@ -265,7 +280,8 @@ func recordSubmittedTraceInput(sessionID, kind, source, text string) {
 	}
 	origin := traceOrigin{sessionID: sessionID, turn: a.ensureTurnLocked(sessionID)}
 	a.flushBurstLocked()
-	a.appendLocked(origin, kind, agent.Event{Source: source}, TraceExtra{Text: strings.TrimSpace(text)})
+	delete(a.streamIDs, origin)
+	a.appendLocked(origin, kind, agent.Event{Source: source}, TraceExtra{Text: strings.TrimSpace(text), Images: images})
 	// Publish the task boundary before a worker waits for its provider. The
 	// Desktop parent must not need a later token or loop_done to retire the
 	// previous task's completed checklist. This flushes userspace buffering;
@@ -341,6 +357,15 @@ func (a *TraceAdapter) OnEvent(ev agent.Event) {
 	// ends when its type OR immutable owner changes, or at the first non-delta
 	// event, preserving provider order without combining parent/child streams.
 	switch ev.Kind {
+	case agent.EventRequestContext:
+		a.flushBurstLocked()
+		streamID := ev.TraceStreamID
+		if streamID == "" {
+			streamID = uuid.NewString()
+		}
+		a.streamIDs[origin] = streamID
+		a.recordRequestContextLocked(origin, ev)
+		return
 	case agent.EventRequestTiming:
 		if ev.RequestTiming == nil {
 			return
@@ -361,6 +386,7 @@ func (a *TraceAdapter) OnEvent(ev agent.Event) {
 		return
 	case agent.EventToolStart:
 		a.flushBurstLocked()
+		delete(a.streamIDs, origin)
 		inputJSON, _ := json.Marshal(ev.ToolInput)
 		parent := ev.SubAgentParentID
 		a.appendLocked(origin, "tool_start", ev, TraceExtra{
@@ -391,6 +417,7 @@ func (a *TraceAdapter) OnEvent(ev agent.Event) {
 		}
 	case agent.EventToolResult:
 		a.flushBurstLocked()
+		delete(a.streamIDs, origin)
 		var out string
 		var isErr bool
 		if ev.ToolResult != nil {
@@ -413,12 +440,14 @@ func (a *TraceAdapter) OnEvent(ev agent.Event) {
 		}
 	case agent.EventTurnEnd:
 		a.flushBurstLocked()
+		delete(a.streamIDs, origin)
 		a.appendLocked(origin, "turn_end", ev, TraceExtra{})
 		if ev.SubAgentParentID == "" {
 			a.syncSessionLocked(origin.sessionID)
 		}
 	case agent.EventLoopDone:
 		a.flushBurstLocked()
+		delete(a.streamIDs, origin)
 		a.appendLocked(origin, "loop_done", ev, TraceExtra{Text: ev.StopReason})
 		a.syncSessionLocked(origin.sessionID)
 		if ev.SubAgentParentID == "" {
@@ -437,6 +466,7 @@ func (a *TraceAdapter) OnEvent(ev agent.Event) {
 		a.syncSessionLocked(origin.sessionID)
 	case agent.EventError:
 		a.flushBurstLocked()
+		delete(a.streamIDs, origin)
 		a.appendLocked(origin, "error", ev, TraceExtra{
 			Text: fmt.Sprint(ev.Err), IsError: true,
 		})
@@ -711,6 +741,7 @@ type TraceExtra struct {
 	IsError   bool
 	ElapsedMs int64
 	ParentID  string
+	Images    []session.TraceImage
 }
 
 func (a *TraceAdapter) appendLocked(origin traceOrigin, kind string, ev agent.Event, x TraceExtra) {
@@ -739,6 +770,7 @@ func (a *TraceAdapter) appendLocked(origin traceOrigin, kind string, ev agent.Ev
 		TraceInvocationID:       origin.invocationID,
 		TraceParentInvocationID: ev.TraceParentInvocationID,
 		TraceCallID:             ev.TraceCallID,
+		Images:                  x.Images,
 	}
 	if kind == "context" {
 		te.Source = agent.NormalizeContextSource(ev.Source)
@@ -782,7 +814,58 @@ func (a *TraceAdapter) bufferDeltaLocked(origin traceOrigin, kind, delta string)
 	a.burstTurn = origin.turn
 	a.burstSubAgentOf = origin.subAgent
 	a.burstInvocationID = origin.invocationID
+	if a.burstTS.IsZero() {
+		a.burstTS = time.Now()
+		a.burstStreamID = a.streamIDs[origin]
+		if a.burstStreamID == "" {
+			a.burstStreamID = uuid.NewString()
+			a.streamIDs[origin] = a.burstStreamID
+		}
+	}
+	remaining := maxTraceStreamBytes - a.burstBuf.Len()
+	if len(delta) > remaining {
+		a.burstTruncated = true
+		delta = traceUTF8Prefix(delta, remaining)
+	}
 	a.burstBuf.WriteString(delta)
+}
+
+const maxTraceStreamBytes = 2 * 1024 * 1024
+
+// JSON escapes control characters to six bytes. Keep the encoded text below
+// the reader's 8 MiB row budget even when the raw 2 MiB burst is all controls.
+const maxTraceStreamEncodedBytes = 6 * 1024 * 1024
+
+func boundTraceStreamText(text string) (string, bool) {
+	raw, _ := json.Marshal(text)
+	if len(raw) <= maxTraceStreamEncodedBytes {
+		return text, false
+	}
+	lower, upper := 0, len(text)
+	for lower < upper {
+		mid := lower + (upper-lower+1)/2
+		prefix := traceUTF8Prefix(text, mid)
+		raw, _ = json.Marshal(prefix)
+		if len(raw) <= maxTraceStreamEncodedBytes {
+			lower = mid
+		} else {
+			upper = mid - 1
+		}
+	}
+	return traceUTF8Prefix(text, lower), true
+}
+
+func traceUTF8Prefix(text string, limit int) string {
+	if limit >= len(text) {
+		return text
+	}
+	if limit <= 0 {
+		return ""
+	}
+	for limit > 0 && !utf8.RuneStart(text[limit]) {
+		limit--
+	}
+	return text[:limit]
 }
 
 // flushBurstLocked emits the accumulated typed delta burst as one event.
@@ -796,16 +879,21 @@ func (a *TraceAdapter) flushBurstLocked() {
 	turn := a.burstTurn
 	subAgentOf := a.burstSubAgentOf
 	invocationID := a.burstInvocationID
-	text := strings.TrimSpace(a.burstBuf.String())
+	streamID, ts, truncated := a.burstStreamID, a.burstTS, a.burstTruncated
+	text := a.burstBuf.String()
 	a.clearBurstLocked()
 	if text == "" || sid == "" || turn <= 0 {
 		return
 	}
+	text, encodedTruncated := boundTraceStreamText(security.RedactSubprocessText(text))
 	if err := a.store.Append(&session.TraceEvent{
 		SessionID:         sid,
 		Turn:              turn,
 		Kind:              kind,
-		Text:              truncateTrace(security.RedactSubprocessText(text), 2000),
+		Text:              text,
+		TS:                ts,
+		StreamID:          streamID,
+		Truncated:         truncated || encodedTruncated,
 		SubAgentOf:        subAgentOf,
 		TraceInvocationID: invocationID,
 	}); err != nil {
@@ -820,6 +908,9 @@ func (a *TraceAdapter) clearBurstLocked() {
 	a.burstTurn = 0
 	a.burstSubAgentOf = ""
 	a.burstInvocationID = ""
+	a.burstStreamID = ""
+	a.burstTS = time.Time{}
+	a.burstTruncated = false
 }
 
 func eventKindLabel(k agent.EventKind) string {

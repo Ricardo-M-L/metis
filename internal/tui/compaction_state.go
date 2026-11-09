@@ -2,6 +2,19 @@ package tui
 
 import "github.com/Ricardo-M-L/metis/internal/session"
 
+func compactionDisplayStage(stage string) string {
+	switch stage {
+	case "summarizing":
+		return "generating summary"
+	case "checking":
+		return "checking compacted context"
+	case "saving":
+		return "saving compacted context"
+	default:
+		return ""
+	}
+}
+
 // resetTokenUsageAfterCompaction drops only the most-recent provider usage
 // captured before a successful context rewrite. Those last-call fields no
 // longer describe the active window; cumulative token/cost counters still

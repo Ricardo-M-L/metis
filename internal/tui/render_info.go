@@ -17,6 +17,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/config"
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/themes"
@@ -664,14 +665,13 @@ func renderPRComments(prNum string) string {
 //	                  Estimated usage by category
 //	                  ⛁ System prompt: N tokens (X%)
 //	                  ⛁ System tools:  N tokens (X%)
-//	                  ⛁ Skills:        N tokens (X%)
 //	                  ⛁ Messages:      N tokens (X%)
 //	                  ⛶ Free space:    N (Y%)
 //
 // Per-category numbers are best-effort estimates — the provider's
 // usage event reports a single combined `input_tokens`, not a
-// breakdown. We approximate from byte counts (chars/4) on the
-// assembled system / tool-spec / message bodies.
+// breakdown. The display snapshot estimates the projected request's system,
+// tool specs and messages independently of that provider usage total.
 func renderContext(m *Model) string {
 	const (
 		cellsW   = 20
@@ -683,80 +683,38 @@ func renderContext(m *Model) string {
 	)
 
 	cap := 0
-	if m.loop != nil && m.loop.Provider != nil {
-		cap = m.loop.Provider.MaxContextTokens()
-	}
 	used := m.totalTokens.ContextUsage()
+	var displayUsage agent.ContextUsage
 	if m.loop != nil {
 		// Keep the rich /context view on the same canonical source as the
 		// status bar and Desktop: latest provider snapshot plus only the local
 		// messages appended after that snapshot. This must never fall back to
 		// session-cumulative spend, which grows across calls and caused >100%.
-		used = m.loop.EstimateContextTokens()
+		displayUsage = m.loop.ContextDisplaySnapshot()
+		used, cap = displayUsage.Used, displayUsage.Capabilities.Window
 	}
 
-	// Per-category estimates (chars/4 ≈ tokens, the same heuristic
-	// the agent loop uses internally). Totals don't always sum to
-	// `used` exactly — the provider counts cache_read + cache_create
-	// separately and the LLM tokenizer differs from our chars/4 — but
-	// the breakdown remains useful for "where is my context going".
+	// Use the same committed snapshot for every category. History and tool
+	// schemas may already contain an uncommitted compaction candidate; reading
+	// them here would show smaller details before the headline can change.
 	systemEst := 0
 	toolsEst := 0
-	skillsEst := 0
 	msgsEst := 0
-	if m.loop != nil {
-		systemEst = roughTokens(m.loop.System)
-		// Tools schema: every tool's name + description + serialized
-		// JSON schema. Approximate by summing description bytes —
-		// schema marshalling is too heavy for a status command.
-		if reg := m.loop.Registry; reg != nil {
-			for _, t := range reg.SortedForCache() {
-				toolsEst += roughTokens(t.Name())
-				toolsEst += roughTokens(t.Description())
-				// Per claude-code's calibration, schema bodies in JSON
-				// add ~30% overhead on top of description bytes.
-				toolsEst += roughTokens(t.Description()) * 30 / 100
-			}
-		}
-		// Messages: total of every content block in the running
-		// history. estimateTokens isn't exported from the agent
-		// package; replicate via roughTokens on flattened content.
-		for _, msg := range m.loop.History() {
-			for _, c := range msg.Content {
-				msgsEst += roughTokens(c.Text)
-				msgsEst += roughTokens(c.ToolResult)
-			}
-		}
-	}
-	// Skills are part of the system prompt's project_context section
-	// in metis but are interesting on their own — peel an estimate
-	// off the system prompt for display.
-	if m.loop != nil && strings.Contains(m.loop.System, "<available_skills>") {
-		if start := strings.Index(m.loop.System, "<available_skills>"); start >= 0 {
-			if end := strings.Index(m.loop.System[start:], "</available_skills>"); end >= 0 {
-				skillsEst = roughTokens(m.loop.System[start : start+end+len("</available_skills>")])
-				// Don't double-count: the same bytes are in systemEst.
-				if skillsEst > systemEst {
-					skillsEst = systemEst
-				}
-			}
-		}
+	if parts := displayUsage.Breakdown; parts != nil {
+		systemEst, toolsEst, msgsEst = parts.SystemTokens, parts.ToolTokens, parts.MessageTokens
 	}
 
 	// Build the 20×10 grid. Each cell is filled when the cumulative
 	// token count up to that cell index is ≤ used. claude-code
 	// distinguishes system / tools / messages with different colours;
 	// metis uses a single accent colour to keep the renderer light.
-	cellSize := 1
+	usedCells := 0
 	if cap > 0 {
-		cellSize = cap / cellsTot
+		cellSize := cap / cellsTot
 		if cellSize < 1 {
 			cellSize = 1
 		}
-	}
-	usedCells := used / cellSize
-	if usedCells > cellsTot {
-		usedCells = cellsTot
+		usedCells = min(used/cellSize, cellsTot)
 	}
 
 	usedStyle := lipgloss.NewStyle().Foreground(themes.Current().AccentBlue)
@@ -765,27 +723,28 @@ func renderContext(m *Model) string {
 	// Right-side annotations: line index → annotation text.
 	annotations := make([]string, cellsH)
 	annotations[0] = m.model
+	annotations[1] = "window unknown"
+	annotations[2] = fmt.Sprintf("%s tokens used (occupancy unknown)", fmtThousands(used))
 	if cap > 0 {
 		annotations[1] = fmt.Sprintf("%s window", fmtThousands(cap))
-	}
-	pct := 0
-	if cap > 0 {
-		pct = used * 100 / cap
+		pct := used * 100 / cap
 		if pct > 100 {
 			pct = 100
 		}
+		annotations[2] = fmt.Sprintf("%s/%s tokens (%d%%)", fmtThousands(used), fmtThousands(cap), pct)
 	}
-	annotations[2] = fmt.Sprintf("%s/%s tokens (%d%%)", fmtThousands(used), fmtThousands(cap), pct)
 
 	// Categories rendered on rows 3-7 (rows 0-2 are headline).
 	annotations[3] = "─ by category"
+	if displayUsage.Breakdown != nil && displayUsage.Breakdown.Estimated {
+		annotations[3] += " (estimated)"
+	}
 	cats := []struct {
 		label string
 		toks  int
 	}{
 		{"System prompt", systemEst},
 		{"System tools", toolsEst},
-		{"Skills", skillsEst},
 		{"Messages", msgsEst},
 	}
 	for i, c := range cats {
@@ -793,12 +752,15 @@ func renderContext(m *Model) string {
 		if row >= cellsH {
 			break
 		}
-		catPct := 0
-		if cap > 0 {
-			catPct = c.toks * 100 / cap
+		if displayUsage.Breakdown == nil {
+			annotations[row] = c.label + ": unknown"
+			continue
 		}
-		annotations[row] = fmt.Sprintf("%s: %s tokens (%d%%)",
-			c.label, fmtThousands(c.toks), catPct)
+		annotations[row] = fmt.Sprintf("%s: %s tokens", c.label, fmtThousands(c.toks))
+		if cap > 0 {
+			catPct := c.toks * 100 / cap
+			annotations[row] += fmt.Sprintf(" (%d%%)", catPct)
+		}
 	}
 	// Row 8-9: leave the grid showing remaining free space —
 	// no separate "free space" annotation since the ⛶ cells are visible.
@@ -809,7 +771,9 @@ func renderContext(m *Model) string {
 	for r := 0; r < cellsH; r++ {
 		var row strings.Builder
 		for c := 0; c < cellsW; c++ {
-			if cell < usedCells {
+			if cap <= 0 {
+				row.WriteString(styleDim.Render("·"))
+			} else if cell < usedCells {
 				row.WriteString(usedStyle.Render(usedGlyph))
 			} else {
 				row.WriteString(freeStyle.Render(freeGlyph))
@@ -833,9 +797,15 @@ func renderContext(m *Model) string {
 	// long sessions can scroll to the section they care about.
 	s.WriteString("\n")
 	s.WriteString(renderContextCacheBlock(m))
-	s.WriteString(renderContextMCPBlock(m))
-	s.WriteString(renderContextMemoryBlock(m))
-	s.WriteString(renderContextSkillsBlock(m))
+	if displayUsage.CompactionStage != "" {
+		// These inventories describe live resources, not the frozen request.
+		// Defer their schema/file reads until the replacement is committed.
+		s.WriteString(styleDim.Render("Resource details available after compaction is saved.") + "\n")
+	} else {
+		s.WriteString(renderContextMCPBlock(m))
+		s.WriteString(renderContextMemoryBlock(m))
+		s.WriteString(renderContextSkillsBlock(m))
+	}
 	return s.String()
 }
 

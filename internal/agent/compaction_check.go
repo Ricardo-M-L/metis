@@ -134,11 +134,10 @@ func (l *Loop) deferRepeatedAutoCompact(pressureTokens int) bool {
 		l.clearAutoCompactPressureLocked()
 		return false
 	}
-	currentHistoryTokens := estimateTokens(l.Messages)
+	currentHistoryTokens := estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))
 	currentOverheadTokens := pressureTokens - currentHistoryTokens
-	if currentOverheadTokens < 0 {
-		currentOverheadTokens = 0
-	}
+	// This residual also includes provider/local estimator differences. Keep it
+	// signed so a lower authoritative preflight is never raised to a local floor.
 	if l.historyRevision != l.autoCompactHistoryRevision {
 		// Another CompactNow/Restore/Rewind replaced the transcript. Treat that
 		// successful replacement as the new irreducible-pressure checkpoint,
@@ -184,9 +183,6 @@ func (l *Loop) noteAutoCompactPressure(result CompactResult, pressureTokens int,
 		return
 	}
 	overheadTokens := pressureTokens - result.BeforeTokens
-	if overheadTokens < 0 {
-		overheadTokens = 0
-	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.Compactor == nil {
@@ -195,7 +191,7 @@ func (l *Loop) noteAutoCompactPressure(result CompactResult, pressureTokens int,
 	if l.autoCompactSessionGeneration != sessionGeneration || !historyHasPrefix(l.Messages, result.History) {
 		return
 	}
-	postPressure := result.AfterTokens + overheadTokens
+	postPressure := max(result.AfterTokens+overheadTokens, 0)
 	pinned := postPressure >= l.Compactor.TriggerTokens()
 	l.autoCompactPressurePinned = pinned
 	if pinned {

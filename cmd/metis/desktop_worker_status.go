@@ -84,7 +84,7 @@ func (s *desktopWorkerStatusSampler) snapshot(final bool) desktopipc.Status {
 	}
 	if !final && s.loop != nil {
 		s.loop.TrySyncContextCapabilities()
-		usage := s.loop.ContextUsageSnapshot()
+		usage := s.loop.ContextDisplaySnapshot()
 		caps, threshold, trigger := usage.Capabilities, usage.CompactThreshold, usage.CompactAtTokens
 		// An active unknown automatic window replaces an earlier manual
 		// budget. Retaining the last nonzero value would falsely claim that
@@ -97,7 +97,7 @@ func (s *desktopWorkerStatusSampler) snapshot(final bool) desktopipc.Status {
 			WindowKind: caps.WindowKind, ModelWindow: caps.ModelWindow, ModelMaxInputTokens: caps.ModelMaxInputTokens, ModelMaxOutputTokens: caps.ModelMaxOutputTokens, ModelSource: caps.ModelSource,
 			RequestedWindow: caps.RequestedWindow, LimitSource: caps.LimitSource, BudgetSource: caps.BudgetSource,
 			ProviderID: caps.ProviderID, Model: caps.Model, RouteKey: caps.RouteKey,
-			CompactThreshold: threshold, CompactAtTokens: trigger,
+			CompactThreshold: threshold, CompactAtTokens: trigger, CompactionStage: usage.CompactionStage,
 		}
 		if usage.Breakdown != nil {
 			parts := usage.Breakdown
@@ -105,6 +105,13 @@ func (s *desktopWorkerStatusSampler) snapshot(final bool) desktopipc.Status {
 				ToolTokens: parts.ToolTokens, MessageTokens: parts.MessageTokens, Estimated: parts.Estimated}
 		}
 		s.lastContext = &pressure
+	}
+	if final && s.lastContext != nil && s.lastContext.CompactionStage != "" {
+		// Cleanup has ended the worker. Preserve its last complete reading,
+		// but do not leave a live transaction phase in the terminal frame.
+		finished := *s.lastContext
+		finished.CompactionStage = ""
+		s.lastContext = &finished
 	}
 	status.Context = s.lastContext
 	if s.roster != nil {

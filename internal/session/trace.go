@@ -64,7 +64,11 @@ type TraceEvent struct {
 	// own. Empty preserves compatibility with traces written before v0.4.34.
 	TraceCallID string `json:"trace_call_id,omitempty"`
 	// Timing rows are appended at Run exit, with TS set to occurrence time.
-	RequestTiming *transport.TimingRecord `json:"request_timing,omitempty"`
+	RequestTiming  *transport.TimingRecord `json:"request_timing,omitempty"`
+	RequestContext *TraceRequestContext    `json:"request_context,omitempty"`
+	Images         []TraceImage            `json:"images,omitempty"`
+	StreamID       string                  `json:"stream_id,omitempty"`
+	Truncated      bool                    `json:"truncated,omitempty"`
 }
 
 // traceWriter pairs a session's buffered writer with its underlying

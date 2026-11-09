@@ -125,7 +125,7 @@ func renderCurrentSession(store *session.Store, sessionID string, loop *agent.Lo
 		rows = append(rows, infoRow{Key: "quick output", Value: fmt.Sprintf("%t", loop.FastEnabled())})
 		rows = append(rows, infoRow{Key: "plan mode", Value: fmt.Sprintf("%t", loop.IsPlanMode())})
 
-		used := loop.EstimateContextTokens()
+		used := loop.DisplayContextTokens()
 		limit, _, _ := loop.ContextStatusSnapshot()
 		contextValue := fmt.Sprintf("~%s tokens", fmtThousands(used))
 		contextHint := "window unknown"

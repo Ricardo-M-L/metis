@@ -7,7 +7,6 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -423,7 +422,7 @@ func (c *Compactor) effectiveInputCap() int {
 // rewriting prefix-cache anchors over a small session just because the
 // user-configured max_tokens is low. MinimumTokens=0 disables this guard.
 func (c *Compactor) ShouldCompact(messages []llm.Message) bool {
-	return c.ShouldCompactTokens(estimateTokens(messages))
+	return c.ShouldCompactTokens(estimateActiveHistoryTokens(messages))
 }
 
 // ShouldCompactTokens applies the automatic-compaction policy to an already
@@ -477,7 +476,7 @@ func (c *Compactor) ShouldSnip(messages []llm.Message) bool {
 	if c.SnipThreshold <= 0 {
 		return false
 	}
-	rough := estimateTokens(messages)
+	rough := estimateActiveHistoryTokens(messages)
 	return float64(rough) >= float64(c.effectiveInputCap())*c.SnipThreshold
 }
 
@@ -498,7 +497,7 @@ func (c *Compactor) ShouldCollapse(messages []llm.Message) bool {
 	if len(messages) < c.ProtectFirst+c.CollapseFoldWindow+1 {
 		return false
 	}
-	rough := estimateTokens(messages)
+	rough := estimateActiveHistoryTokens(messages)
 	return float64(rough) >= float64(c.effectiveInputCap())*c.CollapseThreshold
 }
 
@@ -584,7 +583,7 @@ func (c *Compactor) ShouldMicrocompact(messages []llm.Message) bool {
 	if c.SnipThreshold <= 0 {
 		return false
 	}
-	rough := estimateTokens(messages)
+	rough := estimateActiveHistoryTokens(messages)
 	return float64(rough) >= float64(c.effectiveInputCap())*c.SnipThreshold
 }
 
@@ -989,40 +988,20 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 	// candidate really falls below the trigger; CompactNow still installs and
 	// persists that candidate, avoiding the old 85% -> 75% clone-only bug.
 	// Forced trigger surfaces continue through the semantic summary below.
-	beforePreparationTokens := estimateTokens(messages)
 	beforePreparationActiveTokens := estimateActiveHistoryTokens(messages)
-	if keepN := keepRecentImagesFor(c.MaxContextTokens); keepN > 0 {
-		if pruned, n := PruneOldImages(messages, keepN); n > 0 {
-			messages = pruned
-		}
-	}
+	// Images must reach the checkpoint model before they can be replaced by
+	// visual facts. A fixed newest-N pass both discarded active attachments
+	// and rewrote cached prefixes even when every native image still fit.
 	if c.MicrocompactDir != "" {
 		messages = c.Microcompact(messages)
 	}
-	preparedTokens := estimateTokens(messages)
 	preparedActiveTokens := estimateActiveHistoryTokens(messages)
-	rawReduction := max(beforePreparationTokens-preparedTokens, 0)
 	activeReduction := max(beforePreparationActiveTokens-preparedActiveTokens, 0)
-	// decisionTokens may be an active provider snapshot, where native images
-	// cost a bounded tile allowance instead of their stored base64 byte size.
-	// Subtracting the raw/base64 reduction from that pressure mixes units and
-	// can turn a still-full 170K window into a false zero. The smaller of the
-	// two reductions is conservative for both active and fallback preflights.
-	localReduction := min(rawReduction, activeReduction)
-	if !force && rawReduction > 0 {
-		postPreparationPressure := decisionTokens - localReduction
-		if postPreparationPressure < 0 {
-			postPreparationPressure = 0
-		}
-		// A provider-authoritative preflight may sit above the local history
-		// estimate. Subtract only the conservative locally measured reduction
-		// from that pressure; never replace it with the prepared estimate.
-		// Conversely, stale/low usage cannot undercut the concrete request that
-		// will carry prepared history plus current system/tool overhead.
-		preparedFloor := preparedTokens + requestOverhead
-		if postPreparationPressure < preparedFloor {
-			postPreparationPressure = preparedFloor
-		}
+	if !force && activeReduction > 0 {
+		// Carry the authoritative request pressure through the local change in
+		// model-visible history. Base64 bytes do not consume text tokens, and a
+		// local history estimate must not override lower provider usage either.
+		postPreparationPressure := max(decisionTokens-activeReduction, 0)
 		if postPreparationPressure < c.TriggerTokens() {
 			c.recordCompactResult(true, nil)
 			return messages, nil
@@ -1144,20 +1123,21 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 	}
 	out = append(out, keepLast...)
 	out = c.EnforcePostCompactBudget(out)
-	postTokens := estimateTokens(out)
-	// A retained base64 screenshot can dwarf the entire textual checkpoint
-	// (one real Desktop report stayed at ~226K tokens after its text had been
-	// reduced to a few KB). Keep recent images during ordinary work, but once a
-	// full checkpoint still exceeds the post-compact budget, replace every
-	// remaining image payload with a recoverable/reattach sentinel.
+	postTokens := estimateActiveHistoryTokens(out)
+	// Retain native images when their visual allowance fits the checkpoint.
+	// Prune them only when model-visible context still exceeds the budget.
 	if postTokens >= PostCompactTokenBudget || (constrained && postTokens >= historyCap) {
-		if pruned, count := PruneAllImages(out); count > 0 {
+		imageBudget := PostCompactTokenBudget - 1
+		if constrained {
+			imageBudget = min(imageBudget, historyCap-1)
+		}
+		if pruned, count := fitImagesToContextBudget(out, imageBudget); count > 0 {
 			out = pruned
-			postTokens = estimateTokens(out)
+			postTokens = estimateActiveHistoryTokens(out)
 		}
 	}
 	if postTokens >= PostCompactTokenBudget || (constrained && postTokens >= historyCap) {
-		if guarded := c.SnipAll(out); estimateTokens(guarded) < postTokens {
+		if guarded := c.SnipAll(out); estimateActiveHistoryTokens(guarded) < postTokens {
 			out = guarded
 		}
 	}
@@ -1165,8 +1145,8 @@ func (c *Compactor) compact(ctx context.Context, messages []llm.Message, instruc
 	// Fail closed when a provider produced a checkpoint that does not
 	// actually free context. Installing a same-size/larger replacement would
 	// immediately retrigger compaction and can create an endless paid loop.
-	beforeTokens := estimateTokens(messages)
-	afterTokens := estimateTokens(out)
+	beforeTokens := estimateActiveHistoryTokens(messages)
+	afterTokens := estimateActiveHistoryTokens(out)
 	if constrained && afterTokens >= historyCap {
 		err := fmt.Errorf("compact: checkpoint exceeds effective history budget (%d >= %d tokens; request overhead=%d)",
 			afterTokens, historyCap, requestOverhead)
@@ -1289,7 +1269,7 @@ func (c *Compactor) selectRecentTailCutForCap(messages []llm.Message, historyCap
 	// histories far below the automatic threshold. Never let a window-derived
 	// tail budget consume the entire transcript in that case; reserve at least
 	// roughly two thirds for the checkpoint candidate.
-	if total := estimateTokens(messages); total > 0 {
+	if total := estimateActiveHistoryTokens(messages); total > 0 {
 		if forceBudget := total / 3; forceBudget > 0 && budget > forceBudget {
 			budget = forceBudget
 		}
@@ -1301,7 +1281,7 @@ func (c *Compactor) selectRecentTailCutForCap(messages []llm.Message, historyCap
 	}
 	cut := len(messages)
 	for i := len(messages) - 1; i >= 0; i-- {
-		used += estimateTokens(messages[i : i+1])
+		used += estimateActiveHistoryTokens(messages[i : i+1])
 		retainedMessages++
 		if messageHasRealUserText(messages[i]) {
 			userMessages++
@@ -1328,7 +1308,7 @@ func (c *Compactor) selectRecentTailCutForCap(messages []llm.Message, historyCap
 		// verbatim tail is valid: the bounded checkpoint anchor preserves the
 		// latest real user intent.
 		for cut < len(messages) {
-			fits := estimateTokens(messages[cut:]) < historyCap
+			fits := estimateActiveHistoryTokens(messages[cut:]) < historyCap
 			balanced := adjustCutForBalancedToolPairs(messages, cut) == cut
 			if fits && balanced {
 				break
@@ -2508,6 +2488,10 @@ func (c *Compactor) summarizeWithSources(ctx context.Context, messages []llm.Mes
 	if useIterative {
 		system = SummarySystemPromptMerge
 	}
+	imageCandidates := compactImageCandidates(messages)
+	if len(imageCandidates) > 0 {
+		system += summaryImageInstructions
+	}
 	priorForPrompt := maybeRedact(priorSummary, c.RedactSecrets)
 	instructionsForPrompt := instructions
 	if summaryInputCap > 0 {
@@ -2542,32 +2526,54 @@ func (c *Compactor) summarizeWithSources(ctx context.Context, messages []llm.Mes
 		fixed := estimateStringTokens(system) + estimateStringTokens(prefix.String()) + estimateStringTokens(suffix.String()) + 32
 		transcriptBudget -= fixed
 	}
+	imageEvidence := summaryImageEvidence{}
+	if len(imageCandidates) > 0 {
+		imageAllowance := 0 // an unknown window still gets the bounded local visual budget
+		if summaryInputCap > 0 {
+			imageAllowance = max(transcriptBudget, 1)
+		}
+		imageEvidence = planSummaryImageEvidence(messages, c.Provider, imageAllowance)
+		if summaryInputCap > 0 {
+			transcriptBudget -= estimateStringTokens(imageEvidence.manifest) + estimateActiveHistoryTokens([]llm.Message{{Content: imageEvidence.content}})
+		}
+		if summaryOutputCap > 0 && estimateStringTokens(imageEvidence.manifest) >= summaryOutputCap {
+			return "", fmt.Errorf("summarize: image references exceed summary output budget; attachments remain in original history")
+		}
+	}
 	transcript := ""
 	var admitted []llm.ContentBlock
 	if summaryInputCap <= 0 || transcriptBudget > 0 {
-		transcript = buildSummaryTranscriptWithSources(messages, c.RedactSecrets, transcriptBudget, &admitted)
+		transcriptMessages := messages
+		if len(imageCandidates) > 0 {
+			transcriptMessages = summaryTranscriptImageReferences(messages)
+		}
+		transcript = buildSummaryTranscriptWithSources(transcriptMessages, c.RedactSecrets, transcriptBudget, &admitted)
 	}
 	if useIterative && priorForPrompt != "" {
 		// A derived summary is opaque: any retained narrative can depend on all
 		// of its original sources, even when the seed itself is locally fitted.
 		admitted = append(admitted, llm.ContentBlock{ProviderHint: seedHints})
 	}
+	admitted = append(admitted, imageEvidence.sources...)
 	if hints != nil {
 		*hints = summaryMemoryHints([]llm.Message{{Content: admitted}})
 	}
 	var b strings.Builder
 	b.WriteString(prefix.String())
 	b.WriteString(transcript)
+	b.WriteString(imageEvidence.manifest)
 	b.WriteString(suffix.String())
+	content := []llm.ContentBlock{{Type: "text", Text: b.String()}}
+	content = append(content, imageEvidence.content...)
 
 	req := llm.Request{
 		Model:     c.Model,
 		System:    system,
-		Messages:  []llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: b.String()}}}},
-		MaxTokens: summaryOutputCap,
+		Messages:  []llm.Message{{Role: llm.RoleUser, Content: content}},
+		MaxTokens: summaryOutputCap - estimateStringTokens(imageEvidence.manifest),
 	}
 	if summaryInputCap > 0 {
-		fed := estimateStringTokens(req.System) + estimateTokens(req.Messages)
+		fed := estimateStringTokens(req.System) + estimateActiveHistoryTokens(req.Messages)
 		if fed > summaryInputCap {
 			return "", fmt.Errorf("summarize: fixed prompt exceeds input budget (%d > %d tokens)", fed, summaryInputCap)
 		}
@@ -2593,7 +2599,7 @@ func (c *Compactor) summarizeWithSources(ctx context.Context, messages []llm.Mes
 		}
 		out, err := c.summarizeOnce(ctx, req)
 		if err == nil && strings.TrimSpace(out) != "" {
-			return out, nil
+			return summaryWithImageReferences(out, imageEvidence.manifest), nil
 		}
 		if err != nil {
 			lastErr = err
@@ -2625,7 +2631,7 @@ func (c *Compactor) summarizeWithSources(ctx context.Context, messages []llm.Mes
 	}
 	for _, blk := range resp.Content {
 		if blk.Type == "text" && strings.TrimSpace(blk.Text) != "" {
-			return strings.TrimSpace(blk.Text), nil
+			return summaryWithImageReferences(strings.TrimSpace(blk.Text), imageEvidence.manifest), nil
 		}
 	}
 	if lastErr != nil {
@@ -2810,8 +2816,11 @@ func writeSummaryContentBlock(b *strings.Builder, role string, blk llm.ContentBl
 			writeSummaryContentBlock(b, role+" tool_result_part", sub, redact)
 		}
 	case "image":
-		digest := sha256.Sum256([]byte(blk.Data))
-		fmt.Fprintf(b, "%s image media_type=%q bytes=%d sha256=%x\n", role, blk.MediaType, len(blk.Data), digest[:8])
+		id := canonicalImageAttachmentID(blk)
+		if id == "" {
+			id = "unavailable"
+		}
+		fmt.Fprintf(b, "%s image attachment_id=%s media_type=%q; visual content unparsed in text transcript; inspect supplied native evidence or re-read with ViewImage attachment_id\n", role, id, blk.MediaType)
 	default:
 		// Unknown provider blocks are intentionally represented by type so
 		// the checkpoint records that evidence existed without guessing its
@@ -2877,7 +2886,9 @@ func extractPriorSummary(m llm.Message) (string, bool) {
 	return "", false
 }
 
-// estimateTokens is a rough token estimator.
+// estimateTokens is a raw serialized-history size heuristic. Context-window
+// decisions must use estimateActiveHistoryTokens (and the transport projection)
+// instead: native image data is not tokenized as base64 text by the model.
 //
 // Counts everything that gets serialized to the wire: text bodies, tool_use
 // inputs (the JSON arg blob), and tool_result content. Earlier the estimator
@@ -2923,12 +2934,9 @@ func estimateContentBlockTokens(c llm.ContentBlock) int {
 		total += len(k) / 4
 		total += approxValueLen(v) / 4
 	}
-	// Image data: base64 is near-1:1 against the model tokeniser
-	// (high-entropy alphabet, no whitespace, no language-model-
-	// friendly prefixes). 4 chars/token underestimates by ~3x on
-	// the server side, which is what made Kimi sessions silently
-	// blow through the 262k cap. The 0.75 multiplier puts the
-	// estimate closer to the actual tiktoken-cl100k cost.
+	// Preserve the raw base64 size signal for serialization diagnostics. The
+	// active estimator replaces this with a native visual allowance; this raw
+	// value must never be a lower bound on provider context pressure.
 	if c.Type == "image" && len(c.Data) > 0 {
 		total += int(float64(len(c.Data)) * 0.75)
 	}

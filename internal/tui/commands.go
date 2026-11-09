@@ -505,7 +505,7 @@ func cmdContext(r *REPL, args string) string {
 	// headless fallback; its session-cumulative counters are reserved for /cost.
 	used := r.totalTokens.ContextUsage()
 	if r.Loop != nil {
-		used = r.Loop.EstimateContextTokens()
+		used = r.Loop.DisplayContextTokens()
 	}
 	maxCtx := 1_000_000
 	if r.Loop != nil && r.Loop.Provider != nil {
@@ -1638,7 +1638,7 @@ func cmdCompact(r *REPL, args string) string {
 	if before <= 2 {
 		return fmt.Sprintf("compact: nothing to compact (only %d messages)", before)
 	}
-	beforeTokens := r.Loop.EstimateContextTokens()
+	beforeTokens := r.Loop.DisplayContextTokens()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	instructions := strings.TrimSpace(args)

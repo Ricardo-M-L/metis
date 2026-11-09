@@ -165,6 +165,7 @@ async function initDesktopPreferences() {
 const DESKTOP_I18N = {
   en: {
     contextOccupancy: 'Context used', contextSystem: 'System prompt', contextTools: 'Tool definitions', contextMessages: 'Conversation messages', contextEstimateNote: 'Category estimates may differ from the total.', contextTechnicalDetails: 'Technical details',
+    contextBeforeCompaction: 'Used before compaction', contextCompactionSummarizing: 'Generating summary', contextCompactionChecking: 'Checking compacted context', contextCompactionSaving: 'Saving compacted context',
     newSession: 'New session', workspaces: 'Workspaces', searchSessions: 'Search sessions…', settings: 'Settings', checkUpdates: 'Check for updates',
     searchSessionsLabel: 'Search sessions', collapseSidebar: 'Collapse sidebar', expandSidebar: 'Expand sidebar',
     context: 'Context', contextDetails: 'Context details', contextOpenDetails: 'Click to view details', contextUsed: 'Used', contextWindow: 'Active window', contextDefaultWindow: 'Endpoint default window', contextMaxWindow: 'Maximum supported', contextMaxInput: 'Maximum input', contextMaxOutput: 'Maximum output', contextSource: 'Data source', contextSourceEndpoint: 'Endpoint', contextSourceCatalog: 'Model catalog', contextSourceConfigured: 'Explicit configuration', contextSourceFallback: 'Conservative fallback', contextSourceUnknown: 'Unconfirmed', autoCompactAt: 'Auto-compact at', subAgents: 'sub-agents', backgroundTasks: 'background tasks',
@@ -179,6 +180,7 @@ const DESKTOP_I18N = {
   },
   'zh-CN': {
     contextOccupancy: '上下文已用', contextSystem: '系统提示词', contextTools: '工具定义', contextMessages: '对话消息', contextEstimateNote: '分项为本地估算，可能与总量不同。', contextTechnicalDetails: '技术详情',
+    contextBeforeCompaction: '压缩前已用', contextCompactionSummarizing: '生成摘要中', contextCompactionChecking: '校验压缩结果中', contextCompactionSaving: '保存压缩结果中',
     newSession: '新会话', workspaces: '工作区', searchSessions: '搜索会话…', settings: '设置', checkUpdates: '检查更新',
     searchSessionsLabel: '搜索会话', collapseSidebar: '收起侧栏', expandSidebar: '展开侧栏',
     context: '上下文', contextDetails: '上下文详情', contextOpenDetails: '点击查看详情', contextUsed: '已使用', contextWindow: '当前窗口', contextDefaultWindow: '端点默认窗口', contextMaxWindow: '最大支持', contextMaxInput: '最大输入', contextMaxOutput: '最大输出', contextSource: '数据来源', contextSourceEndpoint: '接入端点', contextSourceCatalog: '模型目录', contextSourceConfigured: '显式配置', contextSourceFallback: '保守回退', contextSourceUnknown: '未确认', autoCompactAt: '自动压缩阈值', subAgents: '子代理', backgroundTasks: '后台任务',
@@ -625,6 +627,14 @@ function renderContextMeter(d, dict) {
   const fraction = used / limit;
   const percent = Math.max(0, Math.min(100, Math.round(fraction * 100)));
   const percentLabel = used > 0 && fraction < 0.01 ? '<1%' : percent + '%';
+  // The backend retains the committed usage until compaction is saved. Keep
+  // that value visible and distinguish it from the candidate being prepared.
+  const compactionStage = String(d.contextCompactionStage || '');
+  const compactionLabel = compactionStage === 'summarizing' ? dict.contextCompactionSummarizing
+    : compactionStage === 'checking' ? dict.contextCompactionChecking
+      : compactionStage === 'saving' ? dict.contextCompactionSaving : '';
+  const usedLabel = compactionLabel ? dict.contextBeforeCompaction : dict.contextUsed;
+  const occupancyLabel = compactionLabel ? dict.contextBeforeCompaction : dict.contextOccupancy;
   const compactAtTokens = Number(d.compactAtTokens) || 0;
   const compactAt = compactAtTokens > 0 ? compactAtTokens / limit : Number(d.compactThreshold) || 0;
   const locale = document.documentElement.lang === 'en' ? 'en' : 'zh-CN';
@@ -637,9 +647,9 @@ function renderContextMeter(d, dict) {
   };
   meter.style.display = '';
   meter.style.setProperty('--context-progress', percent + '%');
-  meter.innerHTML = `<span class="context-meter-ring" aria-hidden="true"></span><span>${escHtml(percentLabel)}</span>`;
+  meter.innerHTML = `<span class="context-meter-ring" aria-hidden="true"></span><span>${escHtml(percentLabel)}${compactionLabel ? ' · ' + escHtml(compactionLabel) : ''}</span>`;
   meter.removeAttribute('title');
-  meter.setAttribute('aria-label', dict.context + ' ' + percentLabel + ' · ' + dict.contextOpenDetails);
+  meter.setAttribute('aria-label', dict.context + ' ' + percentLabel + (compactionLabel ? ' · ' + usedLabel + ' · ' + compactionLabel : '') + ' · ' + dict.contextOpenDetails);
   meter.classList.toggle('warn', compactAt > 0 && used >= Math.max(0, compactAtTokens > 0 ? compactAtTokens * 0.9 : limit * (compactAt - 0.1)));
   popover.classList.toggle('warn', meter.classList.contains('warn'));
   const compactRow = compactAt > 0
@@ -687,9 +697,9 @@ function renderContextMeter(d, dict) {
   const previousSummary = popover.querySelector?.('.context-meter-technical > summary');
   const restoreSummaryFocus = previousSummary && document.activeElement === previousSummary;
   popover.setAttribute('aria-label', dict.contextDetails);
-  popover.innerHTML = `<div class="context-meter-summary"><span>${escHtml(dict.contextOccupancy)} <strong>${escHtml(percentLabel)}</strong></span><span class="context-meter-total" aria-label="${escHtml(dict.contextUsed + ' ' + exactTokens(used) + ' / ' + exactTokens(limit))}">≈${escHtml(compactTokens(used))} / ${escHtml(compactTokens(limit))}</span></div>
+  popover.innerHTML = `<div class="context-meter-summary"><span>${escHtml(occupancyLabel)} <strong>${escHtml(percentLabel)}</strong></span><span class="context-meter-total" aria-label="${escHtml(usedLabel + ' ' + exactTokens(used) + ' / ' + exactTokens(limit))}">≈${escHtml(compactTokens(used))} / ${escHtml(compactTokens(limit))}</span></div>
     <div class="context-meter-progress" aria-hidden="true"><span class="context-meter-fill" style="width:${Math.max(0, Math.min(100, fraction * 100))}%">${segments}</span></div>
-    ${compositionRows}<details class="context-meter-technical"${popover.dataset.detailsOpen === 'true' ? ' open' : ''} ontoggle="contextMeterDetailsToggled(this)"><summary>${escHtml(dict.contextTechnicalDetails)}</summary><dl class="context-meter-details"><div><dt>${escHtml(dict.contextUsed)}</dt><dd>${exactTokens(used)}</dd></div>
+    ${compactionLabel ? `<p class="context-meter-estimate-note">${escHtml(compactionLabel)}</p>` : ''}${compositionRows}<details class="context-meter-technical"${popover.dataset.detailsOpen === 'true' ? ' open' : ''} ontoggle="contextMeterDetailsToggled(this)"><summary>${escHtml(dict.contextTechnicalDetails)}</summary><dl class="context-meter-details"><div><dt>${escHtml(usedLabel)}</dt><dd>${exactTokens(used)}</dd></div>
     <div><dt>${escHtml(d.contextWindowKind === 'input' ? dict.contextInputBudget : dict.contextWindow)}</dt><dd>${exactTokens(limit)}</dd></div>${capabilityRows}${compactRow}</dl></details>`;
   if (restoreSummaryFocus && !popover.hidden) popover.querySelector?.('.context-meter-technical > summary')?.focus();
   syncComposerRuntimeDock();

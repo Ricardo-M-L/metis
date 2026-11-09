@@ -14,6 +14,7 @@ import (
 	"charm.land/lipgloss/v2"
 	xansi "github.com/charmbracelet/x/ansi"
 
+	"github.com/Ricardo-M-L/metis/internal/agent"
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	tuilist "github.com/Ricardo-M-L/metis/internal/tui/list"
 	"github.com/Ricardo-M-L/metis/internal/version"
@@ -274,6 +275,12 @@ func renderSpinnerStatus(m *Model) string {
 	// that don't drive events) fall back to the firstStreamAt + buffer
 	// heuristic so historical behavior holds.
 	if compacting {
+		if m.loop != nil {
+			usage := m.loop.ContextDisplaySnapshot()
+			if stage := compactionDisplayStage(usage.CompactionStage); stage != "" {
+				parts = append(parts, stage)
+			}
+		}
 		// EventCompactionProgress carries cumulative UTF-8 output bytes, not
 		// provider token usage. Surface a clearly approximate summary-output
 		// count instead of leaking LastIn/LastOut from the parent turn.
@@ -470,7 +477,7 @@ func renderDreamingExtras(m *Model) string {
 // during LLM-driven compaction:
 //
 //	▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱
-//	└ Compacting at auto window (170k tokens) · /autocompact to configure
+//	└ Auto-compaction threshold (170k tokens) · /autocompact to configure
 //
 // The progress is a time-driven, left-to-right visual estimate. The
 // compactor reports cumulative output bytes but not the final summary
@@ -506,17 +513,13 @@ func renderCompactionExtras(m *Model) string {
 	// Use the same authoritative boundary as ShouldCompact. In production the
 	// effective input cap reserves the provider's response budget, so copying
 	// Threshold × MaxContextTokens here can advertise a later, unsafe trigger.
-	// Fall back to 85% of the provider cap only for legacy callers/tests that
-	// have no Compactor.
+	// A zero boundary stays disabled/unavailable; do not invent an enabled
+	// default when the configured compactor explicitly disabled its threshold.
 	autoWindow := 0
+	var usage agent.ContextUsage
 	if m.loop != nil {
-		if m.loop.Compactor != nil {
-			autoWindow = m.loop.Compactor.TriggerTokens()
-		} else if m.loop.Provider != nil {
-			if cap := m.loop.Provider.MaxContextTokens(); cap > 0 {
-				autoWindow = int(float64(cap) * 0.85)
-			}
-		}
+		usage = m.loop.ContextDisplaySnapshot()
+		autoWindow = usage.CompactAtTokens
 	}
 
 	var s strings.Builder
@@ -529,9 +532,9 @@ func renderCompactionExtras(m *Model) string {
 	// than that, desyncing the renderer's per-frame line accounting —
 	// the debris in the user's screenshot came from this row.
 	if autoWindow > 0 {
-		s.WriteString(clampLine("  "+styleDim.Render(fmt.Sprintf("└ Compacting at auto window (%s tokens) · /autocompact to configure", formatTokens(autoWindow))), m.width))
+		s.WriteString(clampLine("  "+styleDim.Render(fmt.Sprintf("└ Auto-compaction threshold (%s tokens) · /autocompact to configure", formatTokens(autoWindow))), m.width))
 	} else {
-		s.WriteString(clampLine("  "+styleDim.Render("└ Compacting at auto window · /autocompact to configure"), m.width))
+		s.WriteString(clampLine("  "+styleDim.Render("└ Auto-compaction threshold unavailable · /autocompact to configure"), m.width))
 	}
 	s.WriteString("\n")
 	return s.String()
@@ -672,13 +675,15 @@ func renderStatusBar(m *Model) string {
 	// matches claude-code's statusline rendering.
 	var right string
 	used := m.totalTokens.ContextUsage()
+	var displayUsage agent.ContextUsage
 	// Loop owns the canonical active-context value: a validated latest usage
 	// snapshot plus only the messages appended after it. Do not max this with
 	// raw tokenTracker data. A malformed compatibility gateway may report an
 	// impossible cache count; the loop deliberately rejects it, and letting the
 	// raw tracker win here would resurrect the >100% bug in the status bar.
 	if m.loop != nil {
-		used = m.loop.EstimateContextTokens()
+		displayUsage = m.loop.ContextDisplaySnapshot()
+		used = displayUsage.Used
 	}
 	if used > 0 {
 		right = formatTokensRaw(used) + " tokens"
@@ -688,9 +693,12 @@ func renderStatusBar(m *Model) string {
 			// Do not re-query the provider while painting an idle frame: besides
 			// wasting work, a catalog-backed implementation could observe a
 			// different route than the one bound to this session.
-			if _, _, cap := m.loop.ProviderModelSnapshot(); cap > 0 {
+			if cap := displayUsage.Capabilities.Window; cap > 0 {
 				right = fmt.Sprintf("%s (%s)", right, formatContextPct(used, cap))
 			}
+		}
+		if displayUsage.CompactionStage != "" {
+			right = "before compaction · " + right
 		}
 		// Cost estimate (claude-code's statusline shows a $ figure).
 		// Best-effort: catalog price × tokens. Skipped silently when

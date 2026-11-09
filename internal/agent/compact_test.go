@@ -149,47 +149,62 @@ func TestCompact_ProducesBoundaryWithSummary(t *testing.T) {
 	}
 }
 
-func TestCompact_DropsRetainedImageWhenCheckpointWouldRemainOverBudget(t *testing.T) {
-	p := &fakeSummarizer{}
-	cfg := DefaultCompactionConfig()
-	cfg.RetainMinMessages = 3
-	cfg.RetainMinUserMessages = 1
-	c := NewCompactor(cfg, "large-window", 1_000_000, p)
+func TestCompact_RetainedImageUsesNativeContextBudget(t *testing.T) {
+	for _, maxContext := range []int{1_000_000, 1_500} {
+		t.Run(istr(maxContext), func(t *testing.T) {
+			p := &fakeSummarizer{}
+			cfg := DefaultCompactionConfig()
+			cfg.MaxSummarizeInputTokens = 0
+			cfg.RetainMinMessages = 3
+			cfg.RetainMinUserMessages = 1
+			c := NewCompactor(cfg, "vision-window", maxContext, p)
 
-	msgs := []llm.Message{msg(llm.RoleUser, "old request")}
-	for i := 0; i < 8; i++ {
-		msgs = append(msgs,
-			msg(llm.RoleAssistant, "old assistant "+istr(i)),
-			msg(llm.RoleUser, "old user "+istr(i)),
-		)
-	}
-	msgs = append(msgs, llm.Message{
-		Role: llm.RoleUser,
-		Content: []llm.ContentBlock{
-			{Type: "text", Text: "inspect this screenshot"},
-			{Type: "image", MediaType: "image/png", Data: strings.Repeat("A", 100_000)},
-		},
-	})
+			msgs := []llm.Message{msg(llm.RoleUser, "old request")}
+			for i := 0; i < 8; i++ {
+				msgs = append(msgs,
+					msg(llm.RoleAssistant, "old assistant "+istr(i)),
+					msg(llm.RoleUser, "old user "+istr(i)),
+				)
+			}
+			msgs = append(msgs, llm.Message{
+				Role: llm.RoleUser,
+				Content: []llm.ContentBlock{
+					{Type: "text", Text: "inspect this screenshot"},
+					{Type: "image", MediaType: "image/png", Data: strings.Repeat("A", 100_000)},
+				},
+			})
 
-	out, err := c.Compact(context.Background(), msgs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := estimateTokens(out); got >= PostCompactTokenBudget {
-		t.Fatalf("checkpoint still exceeds post-compact budget: %d tokens", got)
-	}
-	for _, m := range out {
-		for _, block := range m.Content {
-			if block.Type == "image" || block.Data != "" {
-				t.Fatal("oversized checkpoint retained raw image payload")
+			out, err := c.Compact(context.Background(), msgs)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if strings.Contains(block.Text, "image cleared by compactor") && !strings.Contains(block.Text, "0 most recent screenshots kept") {
-				t.Fatalf("full-checkpoint sentinel does not explain that images were cleared: %q", block.Text)
+			if got := estimateActiveHistoryTokens(out); got >= PostCompactTokenBudget {
+				t.Fatalf("checkpoint still exceeds post-compact budget: %d tokens", got)
 			}
-		}
-	}
-	if !historyHasText(out, "image cleared by compactor") {
-		t.Fatal("checkpoint removed image payload without leaving a reattach sentinel")
+			if cap, constrained, err := c.postCompactHistoryCap(0); err != nil || (constrained && estimateActiveHistoryTokens(out) >= cap) {
+				t.Fatalf("checkpoint exceeds native input budget: tokens=%d cap=%d err=%v", estimateActiveHistoryTokens(out), cap, err)
+			}
+			images := 0
+			for _, m := range out {
+				for _, block := range m.Content {
+					if block.Type == "image" {
+						images++
+						if block.Data != strings.Repeat("A", 100_000) {
+							t.Fatal("retained native image payload changed")
+						}
+					}
+				}
+			}
+			if maxContext > estimatedNativeVisionTokensPerImage && images != 1 {
+				t.Fatal("image whose native visual cost fits was removed because of base64 length")
+			}
+			if maxContext < estimatedNativeVisionTokensPerImage && images != 0 {
+				t.Fatal("image whose native visual cost exceeds the input budget was retained")
+			}
+			if !historyHasText(out, "inspect this screenshot") {
+				t.Fatal("checkpoint lost the active screenshot request")
+			}
+		})
 	}
 }
 

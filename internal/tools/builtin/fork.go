@@ -148,6 +148,7 @@ type forkDepthKey struct{}
 const defaultMaxForkDepth = 1
 
 func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	ctx = agent.WithImageAttachmentRootCall(ctx)
 	directive, _ := in["directive"].(string)
 	if strings.TrimSpace(directive) == "" {
 		return nil, errors.New("directive is required")
