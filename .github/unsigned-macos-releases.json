@@ -109,5 +109,8 @@
   },
   "v0.4.109": {
     "reason": "Owner-authorized ad-hoc signed CLI and Desktop release; formal Developer ID signing will be handled separately on the owner signing Mac. Apple notarization is not claimed."
+  },
+  "v0.4.118": {
+    "reason": "Owner-authorized ad-hoc signed CLI and Desktop release; formal Developer ID signing will be handled separately on the owner signing Mac. Apple notarization is not claimed."
   }
 }

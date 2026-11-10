@@ -7,6 +7,25 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.118] - 2026-11-10
+
+Full CLI and Desktop release. macOS packages use the owner-authorized ad-hoc
+signing channel and are not Apple notarized.
+
+### Fixed
+
+- Count native images by visual estimates and valid provider usage instead of
+  base64 text length, keeping context pressure and displayed usage consistent.
+- Preserve session-scoped image references across compaction, child agents,
+  branches and restarts; reopen saved images by attachment ID.
+- Summarize older native images with text, retain useful visual facts and
+  attachment references, and explicitly mark images that were not parsed.
+- Publish context totals and category estimates only after compaction is saved,
+  retaining the previous reading while generating, checking and saving.
+- Restore image thumbnails and previews in conversation history and traces;
+  group streamed output and timing diagnostics, and expose captured initial
+  request System and Tools details.
+
 ## [0.4.117] - 2026-11-08
 
 Full CLI and Desktop release incorporating the changes since v0.4.110.
