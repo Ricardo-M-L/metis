@@ -7,6 +7,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.119] - 2026-11-10
+
+Full CLI and Desktop release. macOS packages continue the owner-authorized
+ad-hoc signing channel and are not Apple notarized.
+
+### Fixed
+
+- Preserve memory-source dependencies through rewind and fitted summaries,
+  including duplicate source text, partial fitting and direct summary reuse.
+- Apply provider replay policies consistently to context estimates and usage
+  validation, and recheck the assembled request when memory changes before
+  dispatch without changing response-history anchors.
+- Store large tool results by content identity and verify existing spill files,
+  preventing repeated or colliding tool-call IDs from reusing unrelated output.
+- Read oversized files in bounded UTF-8 byte pages. Grant whole-file overwrite
+  permission only after the current unredacted content has actually reached the
+  model; retain credential redaction and allow verified complete page coverage.
+- Keep historical TodoWrite cards independent of the active plan, and show main
+  plan steps separately from expandable execution tasks in CLI and Desktop.
+
 ## [0.4.118] - 2026-11-10
 
 Full CLI and Desktop release. macOS packages use the owner-authorized ad-hoc
