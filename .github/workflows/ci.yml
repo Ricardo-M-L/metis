@@ -168,8 +168,11 @@ jobs:
       # modes, /bin/bash, and slash-root paths). Linux and macOS run it above;
       # Windows exercises the CLI plus the platform-specific install/update
       # lifecycle while go vet/build still cover every package.
+      # The CLI package includes hundreds of process/Git fixtures; Windows
+      # cold runs already take about three minutes before slower-runner jitter.
+      # Keep a bounded package timeout without cutting fixture coverage.
       - name: Test Windows CLI and lifecycle
-        run: go test -count=1 -timeout 180s ./cmd/metis ./install ./internal/artifact ./internal/update
+        run: go test -count=1 -timeout 600s ./cmd/metis ./install ./internal/artifact ./internal/update
 
       - name: Test Windows process cleanup lifecycle
         run: go test -count=1 -timeout 180s ./internal/jobs -run 'TestProcessGroup(Cleaner|Cleanup)'
