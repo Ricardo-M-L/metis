@@ -37,7 +37,7 @@ type TaskCreate struct {
 
 func (TaskCreate) Name() string { return "TaskCreate" }
 func (TaskCreate) Description() string {
-	return "Create a task in the current work plan. For a different user task, set new_plan=true on the first TaskCreate to archive the previous plan without pretending unfinished tasks are completed. Subsequent tasks and sub-agents share the current plan."
+	return "Create a task in the current work plan. When TodoWrite already defines the main steps, do not recreate those steps here; use TaskCreate for independently assigned execution work that needs its own status or owner. Additional execution tasks are displayed separately from the main steps. For a different user task, set new_plan=true on the first TaskCreate to archive the previous plan without pretending unfinished tasks are completed. Subsequent tasks and sub-agents share the current plan."
 }
 func (TaskCreate) InputSchema() map[string]any {
 	return map[string]any{

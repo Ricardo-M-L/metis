@@ -1,5 +1,41 @@
 package tasks
 
+// PlanPresentation separates the declared steps from additional execution
+// records without changing the canonical plan consumed by runtime checks.
+type PlanPresentation struct {
+	Steps          []Item
+	ExecutionItems []Item
+}
+
+func PlanningPresentation(sessionID string) (PlanPresentation, error) {
+	return planningPresentation(sessionID, false)
+}
+
+func PlanningPresentationSnapshot(sessionID string) (PlanPresentation, error) {
+	return planningPresentation(sessionID, true)
+}
+
+func planningPresentation(sessionID string, snapshot bool) (PlanPresentation, error) {
+	view := PlanPresentation{Steps: []Item{}, ExecutionItems: []Item{}}
+	todos, err := Load(sessionID)
+	if err != nil {
+		return view, err
+	}
+	items := planningItemsForList(todos, todos.PlanID, snapshot)
+	primary := len(todos.Items)
+	if primary == 0 {
+		// A Task*-only plan still needs an ordinary visible progress list.
+		view.Steps = append(view.Steps, items...)
+		return view, nil
+	}
+	// mergePlanningItems preserves the compact list's identities and order,
+	// then appends only unmatched structured records. Partition that result,
+	// rather than guessing whether differently worded tasks mean the same thing.
+	view.Steps = append(view.Steps, items[:primary]...)
+	view.ExecutionItems = append(view.ExecutionItems, items[primary:]...)
+	return view, nil
+}
+
 // PlanningItems is the canonical read projection for task progress. METIS has
 // two persisted input formats for backward compatibility (TodoWrite's compact
 // list and Task*'s structured owner/dependency records); every UI and reminder

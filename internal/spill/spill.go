@@ -10,13 +10,15 @@
 // intercepts at the dispatch layer instead, the moment the result is
 // produced.
 //
-// Mirrors claude-code's toolResultStorage.ts (maybePersistLargeToolResult
-// + buildLargeToolResultMessage): same tool-results store, 2k preview,
-// and write-once-per-tool_use_id idempotency via O_EXCL.
+// Uses a bounded preview and immutable content-addressed recovery files.
+// Provider tool IDs can be repeated across turns, so they are labels rather
+// than unique storage identities.
 package spill
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,11 +37,10 @@ type Result struct {
 	HasMore      bool
 }
 
-// Store persists content under dir/<toolUseID>.txt and returns the
-// stub ingredients. The write uses O_EXCL: tool_use_id is unique per
-// invocation and content is deterministic for a given id, so an
-// existing file means a prior turn already persisted it — fall through
-// to the preview without rewriting (claude-code's 'wx' flag pattern).
+// Store returns a preview whose recovery file contains exactly content.
+// A content digest disambiguates repeated/sanitized provider IDs. Publishing
+// only a complete file keeps concurrent callers from observing partial writes;
+// an existing destination is reused only after its contents are validated.
 func Store(dir, toolUseID, content string) (*Result, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("spill: no directory configured")
@@ -50,27 +51,16 @@ func Store(dir, toolUseID, content string) (*Result, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	// ".spill.txt" suffix, NOT bare "<id>.txt": spill shares its
-	// directory with the Compactor's Microcompact offload, which
-	// writes "<id>.txt" via os.WriteFile (truncating). If both keyed
-	// the same filename, a Microcompact pass over the spill stub
-	// (possible if MicrocompactMinChars is ever tuned below the stub
-	// size) would truncate the full content this file holds — a
-	// self-referential data loss (2026-06-11 review). Separate
-	// namespaces keep the two offload paths from clobbering each other.
-	path := filepath.Join(dir, SanitizeID(toolUseID)+".spill.txt")
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err == nil {
-		_, werr := f.WriteString(content)
-		cerr := f.Close()
-		if werr != nil || cerr != nil {
-			os.Remove(path) // partial write is worse than no cache
-			if werr == nil {
-				werr = cerr
-			}
-			return nil, werr
-		}
-	} else if !os.IsExist(err) {
+	// Keep the separate .spill.txt namespace used by older recovery files.
+	// Bound the readable label so arbitrary provider IDs cannot exceed the
+	// filesystem's filename limit. The full digest identifies the body.
+	label := SanitizeID(toolUseID)
+	if len(label) > 48 {
+		label = label[:48]
+	}
+	digest := sha256.Sum256([]byte(content))
+	path := filepath.Join(dir, fmt.Sprintf("%s-%x.spill.txt", label, digest))
+	if err := publishResult(dir, path, content); err != nil {
 		return nil, err
 	}
 	preview, hasMore := makePreview(content, PreviewChars)
@@ -80,6 +70,70 @@ func Store(dir, toolUseID, content string) (*Result, error) {
 		Preview:      preview,
 		HasMore:      hasMore,
 	}, nil
+}
+
+func publishResult(dir, path, content string) error {
+	// Most repeated results already exist. Validate them without allocating or
+	// writing another full copy, and fail closed if they have been corrupted.
+	if _, err := os.Lstat(path); err == nil {
+		return verifyResult(path, content)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".spill-publish-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}()
+	if _, err := f.WriteString(content); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// Link is an atomic publish-if-absent operation. Rename would replace an
+	// existing recovery file; O_EXCL followed by writes would expose an empty
+	// or partially written file to concurrent readers.
+	if err := os.Link(f.Name(), path); err != nil && !os.IsExist(err) {
+		return err
+	}
+	return verifyResult(path, content)
+}
+
+func verifyResult(path, content string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("spill: recovery file is not a regular file")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, opened) || opened.Size() != int64(len(content)) {
+		return fmt.Errorf("spill: recovery file changed or has incorrect size")
+	}
+	full, err := io.ReadAll(io.LimitReader(f, int64(len(content))+1))
+	if err != nil {
+		return err
+	}
+	if string(full) != content {
+		return fmt.Errorf("spill: recovery file content does not match result")
+	}
+	return nil
 }
 
 // Stub renders the model-facing replacement body. Wording follows the

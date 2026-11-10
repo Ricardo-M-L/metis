@@ -60,6 +60,38 @@ type contextPrefixEstimate struct {
 	model                   string
 }
 
+// contextMeteringMessages applies the adapter's replay policy only to token
+// accounting. The durable/request history must retain display-only reasoning
+// and provider_state (which a managed Responses adapter uses to resume its
+// server-owned chain even though that marker is not itself model input).
+func contextMeteringMessages(provider llm.Provider, messages []llm.Message) []llm.Message {
+	policy, ok := provider.(llm.ContextHistoryPolicy)
+	if !ok {
+		return messages
+	}
+	projected := make([]llm.Message, 0, len(messages))
+	for _, message := range messages {
+		if message.Role == llm.RoleAssistant {
+			blocks := make([]llm.ContentBlock, 0, len(message.Content))
+			for _, block := range message.Content {
+				if policy.ContextIncludesAssistantBlock(block) {
+					blocks = append(blocks, block)
+				}
+			}
+			if len(blocks) == 0 {
+				continue
+			}
+			message.Content = blocks
+		}
+		projected = append(projected, message)
+	}
+	return projected
+}
+
+func (l *Loop) contextHistoryMessages(messages []llm.Message) []llm.Message {
+	return contextMeteringMessages(l.Provider, l.projectDynamicCheckpoints(messages))
+}
+
 // ContextUsageSnapshot never assembles a request, hydrates tools, retrieves
 // memory or consumes one-shot request flags. A busy writer returns the last
 // complete reading from this epoch rather than mixing independent samples.
@@ -79,7 +111,7 @@ func (l *Loop) ContextUsageSnapshot() ContextUsage {
 
 func (l *Loop) contextUsageSnapshotLocked() ContextUsage {
 	overhead := int(l.requestOverheadTokens.Load())
-	used := estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages)) + overhead
+	used := estimateActiveHistoryTokens(l.contextHistoryMessages(l.Messages)) + overhead
 	if base, ok := l.activeContextBaseLocked(); ok {
 		used = max(base+overhead, 0)
 	}
@@ -94,7 +126,7 @@ func (l *Loop) contextUsageSnapshotLocked() ContextUsage {
 		prefix.routingRevision == l.routingRevision && prefix.model == l.Model &&
 		prefix.provider == identifyContextProvider(l.Provider) {
 		snapshot.Breakdown = &ContextBreakdown{SystemTokens: prefix.systemTokens,
-			ToolTokens: prefix.toolTokens, MessageTokens: estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages)) + prefix.pendingCheckpointTokens, Estimated: true}
+			ToolTokens: prefix.toolTokens, MessageTokens: estimateActiveHistoryTokens(l.contextHistoryMessages(l.Messages)) + prefix.pendingCheckpointTokens, Estimated: true}
 	}
 	l.estTokens.Store(int64(used))
 	l.contextUsageCache.Store(&snapshot)
@@ -141,11 +173,15 @@ type contextRequestAnchor struct {
 	requestOverhead int
 	// Captured from the actual projected request, independently of the live
 	// history position used to attribute the response.
-	requestUsageFloor int
-	maxContext        int
-	windowKind        string
-	maxInput          int
-	maxOutput         int
+	requestUsageFloor    int
+	requestContextTokens int
+	cacheRefreshNonce    string
+	rescueWithoutTools   bool
+	sessionGeneration    uint64
+	maxContext           int
+	windowKind           string
+	maxInput             int
+	maxOutput            int
 }
 
 func identifyContextProvider(provider llm.Provider) contextProviderIdentity {
@@ -196,6 +232,10 @@ func (l *Loop) contextRequestAnchorLocked(provider llm.Provider, req llm.Request
 		// an installed window always wins over a newer provider-cache version.
 		maxContext = provider.MaxContextTokens()
 	}
+	pressure := estimateActiveHistoryTokens(contextMeteringMessages(provider, req.Messages)) + overhead
+	if base, ok := l.activeContextBaseLocked(); ok {
+		pressure = max(base+overhead, 0)
+	}
 	return contextRequestAnchor{
 		valid:        true,
 		provider:     provider,
@@ -203,15 +243,17 @@ func (l *Loop) contextRequestAnchorLocked(provider llm.Provider, req llm.Request
 		requestModel: req.Model,
 		// Adapter projection can omit host checkpoints without changing live
 		// history. Usage is installed after appending to that history, not wire input.
-		messageCount:      len(l.Messages),
-		historyRevision:   l.historyRevision,
-		routingRevision:   l.routingRevision,
-		requestOverhead:   overhead,
-		requestUsageFloor: estimateUsageFloor(req.Messages),
-		maxContext:        maxContext,
-		windowKind:        l.contextCapabilities.WindowKind,
-		maxInput:          l.contextCapabilities.MaxInputTokens,
-		maxOutput:         l.contextCapabilities.MaxOutputTokens,
+		messageCount:         len(l.Messages),
+		historyRevision:      l.historyRevision,
+		routingRevision:      l.routingRevision,
+		requestOverhead:      overhead,
+		requestUsageFloor:    estimateUsageFloor(contextMeteringMessages(provider, req.Messages)),
+		requestContextTokens: pressure,
+		sessionGeneration:    l.autoCompactSessionGeneration,
+		maxContext:           maxContext,
+		windowKind:           l.contextCapabilities.WindowKind,
+		maxInput:             l.contextCapabilities.MaxInputTokens,
+		maxOutput:            l.contextCapabilities.MaxOutputTokens,
 	}
 }
 
@@ -421,7 +463,7 @@ func (l *Loop) storeActiveContextSnapshotLocked(usage *usageTotals, anchor conte
 		usageClearlyUnderreports(tokens, estimatedAnchorTokens) ||
 		!contextUsageFitsAnchor(usage, promptTokens, tokens, anchor) {
 		l.invalidateProviderContextLocked()
-		l.estTokens.Store(int64(estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))) + l.requestOverheadTokens.Load())
+		l.estTokens.Store(int64(estimateActiveHistoryTokens(l.contextHistoryMessages(l.Messages))) + l.requestOverheadTokens.Load())
 		return
 	}
 	l.activeContext = activeContextSnapshot{
@@ -473,8 +515,8 @@ func (l *Loop) activeContextBaseLocked() (int, bool) {
 	// Project the complete history before selecting the live-position delta:
 	// checkpoint removal (including obsolete continuation markers) depends on
 	// surrounding history, not just the newly appended suffix.
-	projected := l.projectDynamicCheckpoints(l.Messages)
-	projectedPrefix := l.projectDynamicCheckpoints(l.Messages[:snapshot.messageCount])
+	projected := l.contextHistoryMessages(l.Messages)
+	projectedPrefix := l.contextHistoryMessages(l.Messages[:snapshot.messageCount])
 	delta := estimateActiveHistoryTokens(projected) - estimateActiveHistoryTokens(projectedPrefix)
 	return snapshot.tokens + delta - snapshot.requestOverhead, true
 }

@@ -4126,7 +4126,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			jobDetails = append(jobDetails, map[string]any{"id": item.ID, "description": item.Description, "status": item.Status, "startedAt": item.StartedAt})
 		}
 	}
-	planItems, planTurn, planTurnStartedAt := planningStatus(activeSessionID)
+	planView, planTurn, planTurnStartedAt := planningStatusPresentation(activeSessionID)
+	planItems := append(append([]tasks.Item{}, planView.Steps...), planView.ExecutionItems...)
 	executionStrategy := executionStrategyForStatus(len(planItems), subAgents, namedAgents)
 	payload := map[string]any{
 		"scheduledWakeups": s.scheduledWakeupStatus(viewSessionID, time.Now()),
@@ -4147,6 +4148,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"isolatedTurnsEnabled": s.isolatedRunner != nil,
 		"activeSessionId":      activeSessionID,
 		"planItems":            planItems,
+		"planSteps":            planView.Steps,
+		"executionItems":       planView.ExecutionItems,
 		"planTurn":             planTurn,
 		"planTurnStartedAt":    planTurnStartedAt,
 		"executionStrategy":    executionStrategy,

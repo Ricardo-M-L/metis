@@ -1066,6 +1066,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	toolCtx = WithParentToolUseID(toolCtx, blk.ToolUseID)
 	toolCtx = WithTraceInvocationID(toolCtx, traceInvocationID)
 	toolCtx = tools.WithInvocationID(toolCtx, traceCallID)
+	toolCtx = tools.WithResultProjection(toolCtx)
 
 	// Honor InterruptBlock: tools that declare InterruptBlock want to
 	// finish their current invocation even if the parent ctx gets

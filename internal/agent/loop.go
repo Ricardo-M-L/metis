@@ -911,7 +911,7 @@ func (l *Loop) EstimateContextTokens() int {
 		if base, ok := l.activeContextBaseLocked(); ok {
 			v = max(base+overhead, 0)
 		} else {
-			v = estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages)) + overhead
+			v = estimateActiveHistoryTokens(l.contextHistoryMessages(l.Messages)) + overhead
 		}
 		l.mu.RUnlock()
 		l.estTokens.Store(int64(v))
@@ -930,7 +930,7 @@ func (l *Loop) storeContextEstimateFromHistory(historyTokens int) {
 	// growth is what re-arms a pressure-pinned automatic checkpoint.
 	// Callers can supply a raw transcript statistic. The replacement watermark
 	// must use the same projected, image-aware history as current context usage.
-	historyTokens = estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))
+	historyTokens = estimateActiveHistoryTokens(l.contextHistoryMessages(l.Messages))
 	l.invalidateActiveContextLocked()
 	l.historyRevision++
 	l.historyReplacementTokens = historyTokens
@@ -951,7 +951,7 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 	// pixels/tiles, not by tokenizing their base64 transport bytes. Counting
 	// base64 here can turn one screenshot into more than a million fake tokens
 	// and trigger destructive compaction before the provider sees the image.
-	historyTokens := estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))
+	historyTokens := estimateActiveHistoryTokens(l.contextHistoryMessages(l.Messages))
 	messages := append([]llm.Message(nil), l.Messages...)
 	checkpointCapable := false
 	if capability, ok := l.Provider.(interface{ DynamicContextCheckpoints() bool }); ok {
@@ -985,10 +985,6 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 		}
 		system += planPrompt
 	}
-	memoryManager := l.Memory
-	autoRetrieveK := l.AutoRetrieveK
-	query := lastUserTextLocked(l.Messages)
-	turnMemoryPrepared := l.turnMemoryPrepared
 	turnMemoryContext := l.turnMemoryContext
 	turnMemoryRecall := l.turnMemoryRecall
 	turnMemoryRecallAttached := l.turnMemoryRecallAttached
@@ -1003,20 +999,13 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 	rescueWithoutTools := l.rescueNoTools
 	historyRevision, routingRevision := l.historyRevision, l.routingRevision
 	contextEpoch := l.contextUsageEpoch.Load()
-	providerID := identifyContextProvider(l.Provider)
+	provider := l.Provider
+	providerID := identifyContextProvider(provider)
 	l.mu.RUnlock()
 
 	memBody, retrieveBody := turnMemoryContext, turnMemoryRecall
 	if turnMemoryRecallAttached {
 		retrieveBody = ""
-	}
-	if !turnMemoryPrepared && memoryManager != nil {
-		memBody = memoryManager.BuildContext()
-		if autoRetrieveK > 0 {
-			// Preflight deliberately uses the local BM25 path even when live
-			// requests enable reranking. Estimation must never spend tokens.
-			retrieveBody = memoryManager.PreviewAutoRetrieve(query, autoRetrieveK)
-		}
 	}
 	dynamic := []llm.SystemSection(nil)
 	if currentStateSnapshot != nil {
@@ -1039,6 +1028,38 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 			dynamic[i].Volatile = true
 		}
 	}
+	// Runtime callbacks may run arbitrary host code, including memory edits.
+	// Capture memory and its sanitized history after those callbacks under the
+	// same repository guard used by request assembly. This is preflight's memory
+	// linearization point: a later external mutation belongs to the next snapshot.
+	l.mu.Lock()
+	if l.historyRevision == historyRevision && l.routingRevision == routingRevision &&
+		l.contextUsageEpoch.Load() == contextEpoch && l.Model == runtimeModel && identifyContextProvider(l.Provider) == providerID {
+		l.withMemoryGuardLocked(func() {
+			l.validateMemorySnapshotLocked()
+			memBody, retrieveBody = l.turnMemoryContext, l.turnMemoryRecall
+			if l.turnMemoryRecallAttached {
+				retrieveBody = ""
+			}
+			if !l.turnMemoryPrepared && l.Memory != nil {
+				_, memBody, _ = l.memorySnapshotLocked()
+				if l.AutoRetrieveK > 0 {
+					query := lastUserTextLocked(l.Messages)
+					generation, _, valid := l.memorySnapshotLocked()
+					if valid {
+						// Local BM25 is side-effect-free and never calls a reranker.
+						candidates := l.memoryCandidatesLocked(query, l.AutoRetrieveK)
+						retrieveBody = formatRecall(novelRecall(candidates, l.Messages, query, l.AutoRetrieveTargetTokens, l.AutoRetrieveMaxTokens), generation)
+					}
+				}
+			}
+			historyTokens = estimateActiveHistoryTokens(l.contextHistoryMessages(l.Messages))
+			messages = append([]llm.Message(nil), l.Messages...)
+			activeBase, hasActiveSnapshot = l.activeContextBaseLocked()
+			historyRevision, contextEpoch = l.historyRevision, l.contextUsageEpoch.Load()
+		})
+	}
+	l.mu.Unlock()
 
 	requestSections := []llm.SystemSection(nil)
 	if len(sections) > 0 || checkpointCapable {
@@ -1098,7 +1119,7 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 	checkpointDelta := 0
 	if checkpointCapable && len(requestSections) > 0 {
 		projected, stable := projectCheckpointSnapshot(messages, requestSections)
-		checkpointDelta = estimateActiveHistoryTokens(projected) - estimateActiveHistoryTokens(messages)
+		checkpointDelta = estimateActiveHistoryTokens(contextMeteringMessages(provider, projected)) - estimateActiveHistoryTokens(contextMeteringMessages(provider, messages))
 		requestSections = stable
 	}
 	systemTokens, toolTokens := estimateRequestPrefix(llm.Request{
@@ -1249,7 +1270,7 @@ func (l *Loop) rebindProviderRuntime(provider llm.Provider, model string, maxOut
 	}
 	l.routingRevision++
 	l.invalidateActiveContextLocked()
-	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))) + l.requestOverheadTokens.Load())
+	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.contextHistoryMessages(l.Messages))) + l.requestOverheadTokens.Load())
 }
 
 // ProviderRuntimeState returns an immutable provider/runtime binding snapshot.
@@ -1497,7 +1518,7 @@ func (l *Loop) ResetSession(messages []llm.Message) {
 	// Prime the fallback from the restored history while mu is held so a
 	// concurrent compaction/lifecycle write lock cannot make a real session
 	// appear to have an empty context window.
-	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))))
+	l.estTokens.Store(int64(estimateActiveHistoryTokens(l.contextHistoryMessages(l.Messages))))
 	l.todoWriteIter = 0
 	l.todoReminderIter = 0
 	l.todoReconciledThisTurn = false
@@ -2043,6 +2064,13 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		l.syncTaskPlanNotice(ctx)
 		req, contextAnchor := l.buildRequestWithContext(specs)
 		transport.RecordTiming(ctx, "request_build_end")
+		var admissionErr error
+		req, contextAnchor, admissionErr = l.admitBuiltRequest(ctx, out, specs, pressureTokens, req, contextAnchor)
+		if admissionErr != nil {
+			stopReason = "error"
+			emit(ctx, out, Event{Kind: EventError, Err: admissionErr})
+			return admissionErr
+		}
 		if err := l.checkpointRequestHistory(); err != nil {
 			stopReason = "error"
 			emit(ctx, out, Event{Kind: EventError, Err: err})
@@ -3193,12 +3221,12 @@ func (l *Loop) buildRequestWithContext(specs []llm.ToolSpec) (req llm.Request, a
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.withMemoryGuardLocked(func() {
-		req, anchor = l.buildRequestMemoryLocked(specs)
+		req, anchor = l.buildRequestMemoryLocked(specs, nil)
 	})
 	return
 }
 
-func (l *Loop) buildRequestMemoryLocked(specs []llm.ToolSpec) (llm.Request, contextRequestAnchor) {
+func (l *Loop) buildRequestMemoryLocked(specs []llm.ToolSpec, posture *contextRequestAnchor) (llm.Request, contextRequestAnchor) {
 	l.validateMemorySnapshotLocked()
 	system := l.System
 	var sections []llm.SystemSection
@@ -3354,19 +3382,24 @@ func (l *Loop) buildRequestMemoryLocked(specs []llm.ToolSpec) (llm.Request, cont
 	// differs from the previous run, guaranteeing a cache miss + fresh
 	// breakpoint write. Cleared after we read it so subsequent
 	// requests resume normal cache reuse.
-	if l.BypassNextCache {
-		nonce := fmt.Sprintf("\n\n<cache-refresh nonce=%d>", time.Now().UnixNano())
+	cacheRefreshNonce := ""
+	if posture != nil {
+		cacheRefreshNonce = posture.cacheRefreshNonce
+	} else if l.BypassNextCache {
+		cacheRefreshNonce = fmt.Sprintf("\n\n<cache-refresh nonce=%d>", time.Now().UnixNano())
+		l.BypassNextCache = false
+	}
+	if cacheRefreshNonce != "" {
 		if len(sections) > 0 {
 			// Tag the last section so the nonce sits AFTER any cached
 			// boundary marker; cached sections stay cached, the volatile
 			// tail invalidates as intended.
 			sections = append(sections, llm.SystemSection{
-				Name: "cache-refresh", Body: nonce, Cache: false, Volatile: true,
+				Name: "cache-refresh", Body: cacheRefreshNonce, Cache: false, Volatile: true,
 			})
 		} else {
-			system = system + nonce
+			system = system + cacheRefreshNonce
 		}
-		l.BypassNextCache = false
 	}
 	sections = l.checkpointDynamicContextLocked(sections)
 	requestSessionID := ""
@@ -3391,9 +3424,15 @@ func (l *Loop) buildRequestMemoryLocked(specs []llm.ToolSpec) (llm.Request, cont
 	// emit text — otherwise a tool_use here produces results that never get
 	// a follow-up summary (the turn ends right after), the exact "ran and
 	// stopped with no conclusion" failure mode.
-	if l.rescueNoTools {
+	rescueWithoutTools := l.rescueNoTools
+	if posture != nil {
+		rescueWithoutTools = posture.rescueWithoutTools
+	}
+	if rescueWithoutTools {
 		req.Tools = nil
-		l.rescueNoTools = false
+		if posture == nil {
+			l.rescueNoTools = false
+		}
 	}
 	// Fast mode is a pure request-time override. We don't mutate
 	// l.effort because the user's persistent /effort preference
@@ -3405,7 +3444,9 @@ func (l *Loop) buildRequestMemoryLocked(specs []llm.ToolSpec) (llm.Request, cont
 			req.MaxTokens = 4096
 		}
 	}
-	return req, l.contextRequestAnchorLocked(l.Provider, req)
+	anchor := l.contextRequestAnchorLocked(l.Provider, req)
+	anchor.cacheRefreshNonce, anchor.rescueWithoutTools = cacheRefreshNonce, rescueWithoutTools
+	return req, anchor
 }
 
 func (l *Loop) rescueNoToolsSnapshot() bool {

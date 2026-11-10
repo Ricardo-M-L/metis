@@ -678,6 +678,7 @@ html, body {
 
 .todo-plan-popover-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
@@ -769,6 +770,67 @@ html, body {
   color: var(--fg-faint);
   font-size: 12px;
   white-space: nowrap;
+}
+
+.todo-plan-execution-group {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-mid);
+  list-style: none;
+}
+
+.todo-plan-execution-details > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--fg-mid);
+  font-size: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.todo-plan-execution-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.todo-plan-execution-details > summary::before {
+  content: '›';
+  width: 10px;
+  color: var(--fg-faint);
+  font-size: 16px;
+  line-height: 1;
+  transform-origin: center;
+}
+
+.todo-plan-execution-details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.todo-plan-execution-details > summary:hover {
+  background: var(--accent-soft);
+}
+
+.todo-plan-execution-details > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.todo-plan-execution-count {
+  margin-left: auto;
+  color: var(--fg-faint);
+}
+
+.todo-plan-execution-list {
+  margin: 3px 0 0 12px;
+  padding: 0 0 0 8px;
+  border-left: 1px solid var(--border-mid);
+  list-style: none;
+}
+
+.todo-plan-execution-item {
+  font-size: 13px;
 }
 
 @keyframes todo-plan-spin {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"github.com/Ricardo-M-L/metis/internal/spill"
+	"github.com/Ricardo-M-L/metis/internal/tools"
 )
 
 // ToolBatchBudgetError stops before another model request. The full completed
@@ -75,7 +76,7 @@ func (l *Loop) projectToolBatch(blocks []llm.ContentBlock) ([]llm.ContentBlock, 
 			if pass == 1 {
 				stored.Preview = ""
 			}
-			b.ToolResult = stored.Stub() + mandatory
+			b.ToolResult = readProjectionRecoveryHint(original, min(single, total)) + stored.Stub() + mandatory
 			if len(b.ToolResultBlocks) > 0 {
 				b.ToolResultBlocks = append([]llm.ContentBlock(nil), original.ToolResultBlocks...)
 				// The dispatch projection's leading text is the same body as ToolResult.
@@ -98,6 +99,23 @@ func (l *Loop) projectToolBatch(blocks []llm.ContentBlock) ([]llm.ContentBlock, 
 	return out, nil
 }
 
+func readProjectionRecoveryHint(block llm.ContentBlock, budget int) string {
+	view, ok := block.Presentation["read_view"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	path, _ := view["path"].(string)
+	page, ok := block.Presentation["read_page"].(map[string]any)
+	if path == "" || !ok {
+		return ""
+	}
+	start := fmt.Sprint(page["start"])
+	// Leave room for the page label and recovery instructions under a lower
+	// configured budget. Recover source bytes, not another numbered spill copy.
+	limit := max(4, min(8192, budget/2))
+	return fmt.Sprintf("[Read result was reduced by the tool budget. Recover the ORIGINAL source using Read(path=%q, byte_offset=%s, byte_limit=%d); continue its returned byte offsets.]\n\n", path, start, limit)
+}
+
 // commitToolBatch is the single first-history boundary, including early stops.
 func (l *Loop) commitToolBatch(blocks []llm.ContentBlock) error {
 	return l.commitToolBatchWithContext(context.Background(), blocks)
@@ -114,6 +132,7 @@ func (l *Loop) commitToolBatchWithContext(ctx context.Context, blocks []llm.Cont
 	l.mu.Unlock()
 	attachmentErr := recordInvocationImageAttachments(ctx, projected)
 	checkpointErr := l.checkpointHistory()
+	l.observeCommittedResultProjection(ctx, blocks, projected, budgetErr == nil && attachmentErr == nil && checkpointErr == nil)
 	if attachmentErr != nil {
 		return errors.Join(fmt.Errorf("checkpoint image attachments: %w", attachmentErr), checkpointErr, budgetErr)
 	}
@@ -121,4 +140,47 @@ func (l *Loop) commitToolBatchWithContext(ctx context.Context, blocks []llm.Cont
 		return checkpointErr
 	}
 	return budgetErr
+}
+
+// A Read may have completed source IO before the batch budget replaced its
+// body with a recovery stub. Notify the exact tool occurrence only after the
+// committed model-facing body is known; output bytes alone must not grant
+// full-file overwrite authority.
+func (l *Loop) observeCommittedResultProjection(ctx context.Context, original, projected []llm.ContentBlock, committed bool) {
+	if l.Registry == nil {
+		return
+	}
+	l.mu.Lock()
+	var calls []llm.ContentBlock
+	for i := len(l.Messages) - 1; i >= 0; i-- {
+		if l.Messages[i].Role == llm.RoleAssistant {
+			calls = append([]llm.ContentBlock(nil), l.Messages[i].Content...)
+			break
+		}
+	}
+	l.mu.Unlock()
+	for i, result := range original {
+		if result.Type != "tool_result" || i >= len(projected) {
+			continue
+		}
+		for _, call := range calls {
+			if call.Type != "tool_use" || call.ToolUseID != result.ToolUseID {
+				continue
+			}
+			if result.TraceCallID != "" && call.TraceCallID != result.TraceCallID {
+				continue
+			}
+			tool, ok := l.Registry.Get(call.ToolName)
+			if !ok {
+				break
+			}
+			observer, ok := tool.(tools.ResultProjectionObserver)
+			if !ok {
+				break
+			}
+			visible := committed && !result.IsError && !projected[i].IsError && result.ToolResult == projected[i].ToolResult
+			observer.ObserveResultProjection(ctx, result.Presentation, visible)
+			break
+		}
+	}
 }

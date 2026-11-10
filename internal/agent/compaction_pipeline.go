@@ -120,9 +120,9 @@ func (l *Loop) CompactNow(ctx context.Context, opts CompactOptions) (result Comp
 	// budgets and its summarizer only see history the next request can replay.
 	projection := &Loop{Provider: l.Provider}
 	historyTokens := func(history []llm.Message) int {
-		return estimateActiveHistoryTokens(projection.projectDynamicCheckpoints(history))
+		return estimateActiveHistoryTokens(projection.contextHistoryMessages(history))
 	}
-	beforeVisible := projection.projectDynamicCheckpoints(l.Messages)
+	beforeVisible := projection.contextHistoryMessages(l.Messages)
 
 	result.BeforeMessages = len(l.Messages)
 	result.BeforeTokens = estimateActiveHistoryTokens(beforeVisible)

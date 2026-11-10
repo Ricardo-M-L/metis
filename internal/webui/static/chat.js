@@ -953,7 +953,9 @@ function finishThinking() {
 }
 
 let todoPlanItems = [];
+let todoExecutionItems = [];
 let todoPlanOpen = false;
+let todoExecutionOpen = false;
 // Scope status updates independently from permission/context snapshots. A
 // same-session task boundary must invalidate an already in-flight plan poll.
 let todoPlanSnapshotGeneration = 0;
@@ -1017,7 +1019,9 @@ function isPlanningTool(name) {
   return normalized === 'todowrite' || ['taskcreate', 'taskupdate', 'taskstop'].includes(normalized);
 }
 
-function normalizeTodoItems(value, base = todoPlanItems) {
+// Tool rows are event snapshots. Only callers applying a live mutation may
+// explicitly supply the selected plan as the base for a single-item upsert.
+function normalizeTodoItems(value, base = []) {
   let parsed = value;
   if (typeof value === 'string') {
     try { parsed = JSON.parse(value); }
@@ -1058,6 +1062,18 @@ function todoPlanMetrics(todos = todoPlanItems) {
   return { total, completed, active, pending, current };
 }
 
+function todoPlanItemHTML(item, execution = false) {
+  return `<li class="todo-plan-item${execution ? ' todo-plan-execution-item' : ''}" data-status="${escAttr(item.status)}">
+    <span class="todo-plan-glyph" aria-hidden="true"></span>
+    <span class="todo-plan-item-text">${escHtml(item.content)}</span>
+    ${item.owner ? `<span class="todo-plan-owner">${escHtml(item.owner)}</span>` : ''}
+  </li>`;
+}
+
+function rememberTodoExecutionOpen(details) {
+  if (details && details.isConnected) todoExecutionOpen = details.open;
+}
+
 function renderTodoPlan() {
   const dock = document.getElementById('todoPlanDock');
   const popover = document.getElementById('todoPlanPopover');
@@ -1068,36 +1084,53 @@ function renderTodoPlan() {
   if (!dock || !popover || !trigger || !step || !counts || !list) return;
 
   const metrics = todoPlanMetrics();
-  const finished = metrics.total > 0 && metrics.completed === metrics.total;
+  const execution = todoPlanMetrics(todoExecutionItems);
+  const hasItems = metrics.total + execution.total > 0;
+  const primaryFinished = metrics.total > 0 && metrics.completed === metrics.total;
+  const finished = hasItems && metrics.completed === metrics.total && execution.completed === execution.total;
   // Persisted plan status is not run liveness. A saved in_progress item may
   // outlive an error/stop, or belong to a different session being viewed.
-  const running = metrics.total > 0 && !finished && turnRunning &&
+  const running = hasItems && !finished && turnRunning &&
     (!currentSessionId || currentSessionId === runningSessionId);
   dock.classList.toggle('is-complete', finished);
   dock.classList.toggle('is-running', running);
-  if (metrics.total === 0) {
+  if (!hasItems) {
     dock.hidden = true;
     popover.hidden = true;
+    list.innerHTML = '';
+    list._todoPlanHTML = '';
+    counts.textContent = '';
     trigger.setAttribute('aria-expanded', 'false');
     return;
   }
 
   dock.hidden = false;
-  step.textContent = finished
+  step.textContent = metrics.total === 0 ? `执行任务 ${execution.completed} / ${execution.total}` : finished
     ? `已完成 ${metrics.completed} / ${metrics.total}`
-    : running ? `第 ${metrics.current} / ${metrics.total} 步`
+    : primaryFinished ? `主计划完成 ${metrics.completed} / ${metrics.total}`
+      : running ? `第 ${metrics.current} / ${metrics.total} 步`
       : `未完成 ${metrics.completed} / ${metrics.total}`;
   counts.textContent = [
     metrics.completed ? `${metrics.completed} 已完成` : '',
     metrics.active ? `${metrics.active} ${running ? '进行中' : '未完成'}` : '',
     metrics.pending ? `${metrics.pending} 待处理` : '',
+    execution.total ? `执行任务 ${execution.completed}/${execution.total}` : '',
   ].filter(Boolean).join(' · ');
-  list.innerHTML = todoPlanItems.map(item => `
-    <li class="todo-plan-item" data-status="${escAttr(item.status)}">
-      <span class="todo-plan-glyph" aria-hidden="true"></span>
-      <span class="todo-plan-item-text">${escHtml(item.content)}</span>
-      ${item.owner ? `<span class="todo-plan-owner">${escHtml(item.owner)}</span>` : ''}
-    </li>`).join('');
+  const listHTML = todoPlanItems.map(item => todoPlanItemHTML(item)).join('') + (execution.total ? `
+    <li class="todo-plan-execution-group">
+      <details class="todo-plan-execution-details"${todoExecutionOpen ? ' open' : ''} ontoggle="rememberTodoExecutionOpen(this)">
+        <summary><span>执行任务</span><span class="todo-plan-execution-count">${execution.completed} / ${execution.total} 已完成</span></summary>
+        <ul class="todo-plan-execution-list">${todoExecutionItems.map(item => todoPlanItemHTML(item, true)).join('')}</ul>
+      </details>
+    </li>` : '');
+  // Polling unchanged progress must not remount a focused disclosure or reset
+  // the user's scroll position in a long task list.
+  if (list._todoPlanHTML !== listHTML) {
+    const scrollTop = list.scrollTop;
+    list.innerHTML = listHTML;
+    list._todoPlanHTML = listHTML;
+    if (Number.isFinite(scrollTop)) list.scrollTop = scrollTop;
+  }
   popover.hidden = !todoPlanOpen;
   trigger.setAttribute('aria-expanded', todoPlanOpen ? 'true' : 'false');
   dock.classList.toggle('is-open', todoPlanOpen);
@@ -1105,10 +1138,16 @@ function renderTodoPlan() {
 
 function applyTodoSnapshot(name, input) {
   if (!isTodoWriteTool(name) || (typeof renderingActivityHistory !== 'undefined' && renderingActivityHistory)) return false;
-  const next = normalizeTodoItems(input);
+  const next = normalizeTodoItems(input, todoPlanItems);
   if (!next) return false;
   noteLiveTodoPlanUpdate();
   todoPlanItems = next;
+  let args = input;
+  if (typeof args === 'string') { try { args = JSON.parse(args); } catch (_) {} }
+  if (args && args.new_plan) {
+    todoExecutionItems = [];
+    todoExecutionOpen = false;
+  }
   renderTodoPlan();
   return true;
 }
@@ -1118,12 +1157,16 @@ function applyStatusPlanSnapshot(status, generation = todoPlanSnapshotGeneration
   const activeSessionId = String((status && status.activeSessionId) || '');
   const selectedSessionId = String(currentSessionId || (turnRunning ? runningSessionId : '') || '');
   if (!activeSessionId || activeSessionId !== selectedSessionId) return false;
-  const raw = Array.isArray(status.planItems) ? status.planItems : [];
-  const next = raw.map(item => ({
+  // New servers separate user-facing steps from supporting Task* work. Older
+  // servers keep their existing merged view because its origin is unknown.
+  const raw = Array.isArray(status.planSteps) ? status.planSteps : (Array.isArray(status.planItems) ? status.planItems : []);
+  const cleanItems = items => items.map(item => ({
     content: String((item && item.content) || '').trim(),
     status: String((item && item.status) || 'pending').toLowerCase(),
     owner: String((item && item.owner) || '').trim(),
   })).filter(item => item.content && ['pending', 'in_progress', 'completed'].includes(item.status));
+  const next = cleanItems(raw);
+  const execution = cleanItems(Array.isArray(status.executionItems) ? status.executionItems : []);
   const scope = todoPlanScope(selectedSessionId);
   const planTurn = Number(status.planTurn) || 0;
   const pending = scope && scope.pendingTurn;
@@ -1142,7 +1185,7 @@ function applyStatusPlanSnapshot(status, generation = todoPlanSnapshotGeneration
   if (scope && planTurn > 0 && planTurn < Math.max(scope.turn, scope.minimumTurn)) return false;
   const advanced = scope && scope.awaitingFresh && scope.awaitedTurn > 0 && planTurn > scope.awaitedTurn;
   const fresh = scope && (scope.livePlan || advanced);
-  const completed = next.length > 0 && next.every(item => item.status === 'completed');
+  const completed = next.length + execution.length > 0 && [...next, ...execution].every(item => item.status === 'completed');
   if (scope && scope.awaitingFresh && !fresh && completed) return false;
   if (scope && planTurn > 0) {
     // The first observation of an unknown scope is only a baseline. Empty or
@@ -1157,6 +1200,7 @@ function applyStatusPlanSnapshot(status, generation = todoPlanSnapshotGeneration
   }
   todoPlanSnapshotGeneration++;
   todoPlanItems = next;
+  todoExecutionItems = execution;
   renderTodoPlan();
   return true;
 }
@@ -1164,12 +1208,14 @@ function applyStatusPlanSnapshot(status, generation = todoPlanSnapshotGeneration
 function clearTodoPlan() {
   todoPlanSnapshotGeneration++;
   todoPlanItems = [];
+  todoExecutionItems = [];
   todoPlanOpen = false;
+  todoExecutionOpen = false;
   renderTodoPlan();
 }
 
 function toggleTodoPlan() {
-  if (!todoPlanItems.length) return;
+  if (!todoPlanItems.length && !todoExecutionItems.length) return;
   todoPlanOpen = !todoPlanOpen;
   renderTodoPlan();
 }
@@ -1244,7 +1290,11 @@ function restoreTodoPlanFromHistory(history) {
   if (unconfirmedSubmission && restored.length > 0 && restored.every(item => item.status === 'completed')) restored = [];
   todoPlanSnapshotGeneration++;
   todoPlanItems = restored;
+  // Task* arguments cannot reconstruct their final status; wait for the
+  // authoritative scoped status rather than borrowing another visible group.
+  todoExecutionItems = [];
   todoPlanOpen = false;
+  todoExecutionOpen = false;
   renderTodoPlan();
 }
 
@@ -2537,6 +2587,13 @@ function toolSummaryText(name, input) {
   if (isTodoWriteTool(name)) {
     const todos = normalizeTodoItems(input);
     if (todos) {
+      let event = input;
+      if (typeof event === 'string') { try { event = JSON.parse(event); } catch (_) {} }
+      if (event && !Array.isArray(event.todos) && todos.length === 1) {
+        const item = todos[0];
+        const status = { pending: '待处理', in_progress: '进行中', completed: '已完成' }[item.status];
+        return `${status} · ${item.content}`;
+      }
       const metrics = todoPlanMetrics(todos);
       const active = todos.filter(item => item.status === 'in_progress').map(item => item.content);
       const suffix = active.length ? ` · ${active[0]}${active.length > 1 ? ` +${active.length - 1}` : ''}` : '';

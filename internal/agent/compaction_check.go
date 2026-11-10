@@ -134,7 +134,7 @@ func (l *Loop) deferRepeatedAutoCompact(pressureTokens int) bool {
 		l.clearAutoCompactPressureLocked()
 		return false
 	}
-	currentHistoryTokens := estimateActiveHistoryTokens(l.projectDynamicCheckpoints(l.Messages))
+	currentHistoryTokens := estimateActiveHistoryTokens(l.contextHistoryMessages(l.Messages))
 	currentOverheadTokens := pressureTokens - currentHistoryTokens
 	// This residual also includes provider/local estimator differences. Keep it
 	// signed so a lower authoritative preflight is never raised to a local floor.

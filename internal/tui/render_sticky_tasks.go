@@ -81,7 +81,7 @@ func renderStickyTaskStrip(m *Model) string {
 	if m.showTaskPanel {
 		return ""
 	}
-	tasks := tasksFullList(m.sessionID)
+	tasks, execution := taskPresentation(m.sessionID)
 	if len(tasks) == 0 {
 		return ""
 	}
@@ -176,6 +176,18 @@ func renderStickyTaskStrip(m *Model) string {
 			completedStyle.Render(glyphTaskCompleted+" "),
 			styleMuted.Render(fmt.Sprintf("+%d more done (use /todos for full list)", completedTrailer)),
 		)
+	}
+	if len(execution) > 0 {
+		done := 0
+		for _, task := range execution {
+			if task.Status == "completed" {
+				done++
+			}
+		}
+		// Extra Task* records remain inspectable under their own heading in
+		// Ctrl+T instead of looking like more top-level TodoWrite steps.
+		s.WriteString(styleMuted.Render(fmt.Sprintf("        ↳ 执行任务 %d/%d 完成 · Ctrl+T 查看", done, len(execution))))
+		s.WriteString("\n")
 	}
 
 	styled := s.String()

@@ -169,6 +169,27 @@ func tasksFullList(sessionID string) []TaskItem {
 	return out
 }
 
+// taskPresentation keeps additional execution records out of the primary plan
+// while preserving their own status in the full task panel. It reads the same
+// snapshot projection as Desktop so writes from workers are immediately visible.
+func taskPresentation(sessionID string) (steps, execution []TaskItem) {
+	if sessionID == "" {
+		return nil, nil
+	}
+	view, err := tasks.PlanningPresentationSnapshot(sessionID)
+	if err != nil {
+		return nil, nil
+	}
+	convert := func(items []tasks.Item) []TaskItem {
+		out := make([]TaskItem, 0, len(items))
+		for _, item := range items {
+			out = append(out, TaskItem{ID: item.ID, Status: item.Status, Content: item.Content, Owner: item.Owner})
+		}
+		return out
+	}
+	return convert(view.Steps), convert(view.ExecutionItems)
+}
+
 // currentInProgressTodoContent returns the Content of the first
 // in_progress todo for this session, or "" when no in-progress todo
 // exists. Mirrors claude-code Spinner.tsx:169 — `currentTodo.activeForm

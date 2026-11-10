@@ -66,7 +66,11 @@ func TestDispatch_SpillsOversizedToolResult(t *testing.T) {
 	}
 	// ".spill.txt" suffix keeps spill disjoint from Microcompact's
 	// bare "<id>.txt" namespace (2026-06-11 review).
-	path := filepath.Join(dir, "tu_big.spill.txt")
+	paths, globErr := filepath.Glob(filepath.Join(dir, "tu_big-*.spill.txt"))
+	if globErr != nil || len(paths) != 1 {
+		t.Fatalf("expected one content-addressed spill file: paths=%v err=%v", paths, globErr)
+	}
+	path := paths[0]
 	got, rerr := os.ReadFile(path)
 	if rerr != nil {
 		t.Fatalf("spill file not written: %v", rerr)

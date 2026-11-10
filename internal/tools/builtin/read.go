@@ -1,15 +1,13 @@
 package builtin
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
+	"strconv"
 
 	"github.com/Ricardo-M-L/metis/internal/permission"
 	"github.com/Ricardo-M-L/metis/internal/security"
@@ -48,6 +46,14 @@ Always use Read for file contents — NOT Bash with cat/head/tail/less/more. Rea
 When to slice with offset/limit instead of the default:
   - You already know the rough line range (e.g. from a Grep hit at line 482).
   - The file is over a few thousand lines and you only need a specific section.
+
+Long lines and large results are returned as bounded source-byte pages. Follow
+the provided byte_offset on the SAME source path; byte_limit controls page size
+(4..8192 bytes). Byte offsets are zero based and aligned to complete UTF-8
+runes. Do not mix byte pagination with line offset/limit. A partial page never
+authorizes a whole-file Write by itself. Whole-file Write becomes available only
+after confirmed, unredacted pages cover every byte of the same file version;
+an exact targeted Edit remains available after a partial view.
 
 When NOT to use Read:
   - Finding files by name pattern → use Glob (e.g. ` + "`**/*.go`" + `).
@@ -105,6 +111,14 @@ func (Read) InputSchema() map[string]any {
 			"limit": map[string]any{
 				"type":        "integer",
 				"description": "Maximum lines to return. Default 2000. Increase for big files only when you genuinely need the extra range; remember context is precious.",
+			},
+			"byte_offset": map[string]any{
+				"type": "integer", "minimum": 0,
+				"description": "Zero-based source-byte offset for bounded recovery of long lines/results. Use the next byte_offset returned by Read on the SAME source path; do not combine with line offset/limit.",
+			},
+			"byte_limit": map[string]any{
+				"type": "integer", "minimum": 4, "maximum": readPageBytes,
+				"description": "Maximum source bytes per page (4..8192; default 8192). Pages preserve complete UTF-8 runes. Whole-file Write requires confirmed, unredacted pages covering the complete same file version.",
 			},
 		},
 	}
@@ -224,6 +238,16 @@ func (r Read) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	}
 	offset := intArg(in, "offset", 1)
 	limit := intArg(in, "limit", 2000)
+	_, hasByteOffset := in["byte_offset"]
+	_, hasByteLimit := in["byte_limit"]
+	byteMode := hasByteOffset || hasByteLimit
+	byteOffset, byteLimit := intArg(in, "byte_offset", 0), intArg(in, "byte_limit", readPageBytes)
+	if offset < 1 || limit < 1 || byteOffset < 0 || byteLimit < 4 || byteLimit > readPageBytes {
+		return &tools.Result{Output: "Read: line offset/limit must be positive; byte_offset must be nonnegative and byte_limit must be 4..8192.", IsError: true}, nil
+	}
+	if byteMode && (in["offset"] != nil || in["limit"] != nil) {
+		return &tools.Result{Output: "Read: choose either line offset/limit or source byte_offset/byte_limit, not both.", IsError: true}, nil
+	}
 	binding, hasInvocationID, foundBinding := r.authorizer.consume(ctx)
 	if hasInvocationID && !foundBinding {
 		if _, prepErr := prepareExistingPath(path, false); prepErr != nil {
@@ -292,59 +316,18 @@ func (r Read) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// are applied to the rendered page before the ordinary final redactor.
 	fileRedactor := security.NewFileCredentialRedactor(data)
 
-	var b strings.Builder
-	sc := bufio.NewScanner(bytes.NewReader(data))
-	sc.Buffer(make([]byte, 1<<20), 1<<22)
-	lineno := 0
-	emitted := 0
-	truncated := false
-	sourceLineStart := 0
-	for sc.Scan() {
-		lineno++
-		line := sc.Text()
-		currentLineStart := sourceLineStart
-		sourceLineStart += len(sc.Bytes())
-		if sourceLineStart < len(data) && data[sourceLineStart] == '\r' {
-			sourceLineStart++
-		}
-		if sourceLineStart < len(data) && data[sourceLineStart] == '\n' {
-			sourceLineStart++
-		}
-		// Honor cancellation so a huge-file scan (up to the 256 MiB cap) or
-		// a slow/blocking read can't pin this goroutine after the parent
-		// turn is cancelled or times out. Cheap: a non-blocking select every
-		// ~512 lines.
-		if lineno%512 == 0 {
-			select {
-			case <-ctx.Done():
-				return &tools.Result{Output: "Read cancelled: " + ctx.Err().Error(), IsError: true}, nil
-			default:
-			}
-		}
-		if lineno < offset {
-			continue
-		}
-		if emitted >= limit {
-			// Scanner reached one more source line, so this is genuine
-			// truncation. Merely emitting exactly limit lines at EOF is a full
-			// view and must not permanently block a later whole-file Write.
-			truncated = true
-			break
-		}
-		fmt.Fprintf(&b, "%6d\t%s\n", lineno, fileRedactor.RedactLineAt(currentLineStart, line))
-		emitted++
+	output, pageStart, pageEnd, bytePageRedacted, err := renderReadPage(ctx, path, data, offset, limit, byteOffset, byteLimit, byteMode, fileRedactor)
+	if err != nil {
+		return &tools.Result{Output: "Read cancelled: " + err.Error(), IsError: true}, nil
 	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	output := b.String()
 	finalOutput := security.RedactSubprocessText(output)
-	viewRedacted := fileRedactor.HasRedactions() || finalOutput != output
+	viewRedacted := fileRedactor.HasRedactions() || bytePageRedacted || finalOutput != output
+	fullView := pageStart == 0 && pageEnd == len(data) && (byteMode || offset == 1) && !viewRedacted
 
 	// FILE_UNCHANGED_STUB is safe only when a prior full view and the current
 	// rendered view both contain every source byte. A redacted view must remain
 	// partial so it cannot grant whole-file Write authority.
-	if r.state != nil && offset == 1 && limit == 2000 && !viewRedacted {
+	if r.state != nil && !byteMode && offset == 1 && limit == 2000 && fullView {
 		if prior, ok := r.state.Get(statePath); ok && !prior.IsPartialView {
 			if prior.MTime.Equal(st.ModTime()) {
 				return &tools.Result{Output: fileUnchangedStub}, nil
@@ -367,19 +350,15 @@ func (r Read) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// and validates this full-file hash before touching the file. The hash we
 	// record is over the FULL file — what the LLM saw is partial, but the
 	// staleness check needs whole-file ground truth.
+	presentation := map[string]any{"read_page": map[string]any{"start": pageStart, "end": pageEnd, "total": len(data)}}
 	if r.state != nil {
-		partial := offset != 1 || truncated || viewRedacted
-		if partial {
-			r.state.RecordPartial(statePath, st.ModTime(), data, offset, limit)
-		} else {
-			r.state.Record(statePath, st.ModTime(), data)
-		}
+		revision := r.state.recordReadPageFixed(statePath, st.ModTime(), data, pageStart, pageEnd, !viewRedacted, tools.ResultProjectionPending(ctx))
+		presentation["read_view"] = map[string]any{"path": statePath, "hash": hashBytes(data), "revision": strconv.FormatUint(revision, 10), "full": fullView}
 	}
-
-	if emitted == 0 {
-		return &tools.Result{Output: "(file is empty or offset past end)"}, nil
+	if output == "" {
+		finalOutput = "(file is empty or offset past end)"
 	}
-	return &tools.Result{Output: finalOutput}, nil
+	return &tools.Result{Output: finalOutput, Presentation: presentation}, nil
 }
 
 func openPinnedReadFile(path string, maxBytes int64, afterOpen func()) (*os.File, os.FileInfo, string, error) {

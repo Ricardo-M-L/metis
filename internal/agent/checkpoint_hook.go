@@ -350,7 +350,7 @@ type RewindPoint struct {
 	CodeUnavailableReason string
 }
 
-// RewindSummaryPlan is an immutable snapshot of the conversation suffix that
+// RewindSummaryPlan holds an immutable snapshot of the conversation suffix that
 // an asynchronous summarizer should process. Its internals stay private so a
 // caller can carry the plan through a tea.Cmd without accidentally changing
 // the compare-and-swap precondition used at commit time.
@@ -360,6 +360,10 @@ type RewindSummaryPlan struct {
 	turn         int
 	prompt       string
 	compactor    *Compactor
+	// Bind fitted provenance to the exact generated result. Separate provider
+	// attempts may share an immutable plan; protect their result publication.
+	summaryMu sync.Mutex
+	summaries map[string]map[string]string
 }
 
 var (
@@ -640,7 +644,11 @@ func (l *Loop) PrepareSummarizeFromTurn(turn int) (*RewindSummaryPlan, error) {
 	// prepared operation and cannot be mixed with a different history read.
 	l.mu.Lock()
 	compactor := l.Compactor
-	history := transcript.Snapshot(l.Messages)
+	var history []llm.Message
+	l.withMemoryGuardLocked(func() {
+		l.validateMemorySnapshotLocked()
+		history = transcript.DeepSnapshot(l.Messages)
+	})
 	l.mu.Unlock()
 	if compactor == nil {
 		return nil, ErrSummarizerUnavailable
@@ -652,13 +660,38 @@ func (l *Loop) PrepareSummarizeFromTurn(turn int) (*RewindSummaryPlan, error) {
 	return &RewindSummaryPlan{history: history, messageIndex: messageIndex, turn: turn, prompt: prompt, compactor: compactor}, nil
 }
 
-// GenerateRewindSummary is provider-only work and is safe to run in a
-// Bubble Tea command. It does not mutate Loop state.
+// GenerateRewindSummary revalidates its captured memory sources, then performs
+// provider work. It is safe to run in a Bubble Tea command; repository and Loop
+// locks are released before invoking the provider.
 func (l *Loop) GenerateRewindSummary(ctx context.Context, plan *RewindSummaryPlan) (string, error) {
-	if l == nil || plan == nil || plan.compactor == nil {
+	if l == nil || plan == nil || plan.compactor == nil || plan.compactor.Provider == nil {
 		return "", ErrSummarizerUnavailable
 	}
-	return plan.compactor.SummarizeSegment(ctx, plan.history[plan.messageIndex:], "")
+	// Preparation and provider dispatch are separated by a UI/command boundary.
+	// Recheck under the repository guard before cloning provider input, so a
+	// withdrawal completed in between cannot reach even the summary provider.
+	l.mu.Lock()
+	var current bool
+	l.withMemoryGuardLocked(func() {
+		l.validateMemorySnapshotLocked()
+		current = reflect.DeepEqual(l.Messages, plan.history)
+	})
+	l.mu.Unlock()
+	if !current {
+		return "", ErrConversationChanged
+	}
+	var hints map[string]string
+	summary, err := plan.compactor.summarizeWithSources(ctx, plan.history[plan.messageIndex:], "", "", nil, &hints)
+	if err != nil {
+		return "", err
+	}
+	plan.summaryMu.Lock()
+	if plan.summaries == nil {
+		plan.summaries = make(map[string]map[string]string)
+	}
+	plan.summaries[summary] = hints
+	plan.summaryMu.Unlock()
+	return summary, nil
 }
 
 // CommitRewindSummary applies a previously generated summary only when the
@@ -668,11 +701,17 @@ func (l *Loop) CommitRewindSummary(plan *RewindSummaryPlan, summary string) (Rew
 }
 
 // CommitRewindSummaryWithPersist writes the replacement snapshot before
-// swapping Loop history. A persistence failure therefore leaves both the live
-// conversation and the resumable session unchanged.
+// swapping Loop history. A persistence failure never installs the candidate;
+// independently revoked sources remain sanitized in the live conversation.
 func (l *Loop) CommitRewindSummaryWithPersist(plan *RewindSummaryPlan, summary string, persist func([]llm.Message) error) (RewindResult, error) {
 	if l == nil || plan == nil {
 		return RewindResult{}, ErrInvalidRewindPoint
+	}
+	plan.summaryMu.Lock()
+	hints, generated := plan.summaries[summary]
+	plan.summaryMu.Unlock()
+	if !generated {
+		return RewindResult{}, fmt.Errorf("rewind: summary was not generated for this conversation snapshot")
 	}
 	replacement := append([]llm.Message(nil), plan.history[:plan.messageIndex]...)
 	// A summary boundary is assistant-authored. When the retained prefix is
@@ -692,25 +731,35 @@ func (l *Loop) CommitRewindSummaryWithPersist(plan *RewindSummaryPlan, summary s
 	replacement = append(replacement, llm.Message{
 		Role: llm.RoleAssistant,
 		Content: []llm.ContentBlock{{
-			Type: "text",
-			Text: "[Conversation from here summarized: " + summary + "]",
+			Type:         "text",
+			Text:         "[Conversation from here summarized: " + summary + "]",
+			Synthetic:    true,
+			ProviderHint: hints,
 		}},
 	})
 
 	l.mu.Lock()
-	if !reflect.DeepEqual(l.Messages, plan.history) {
-		l.mu.Unlock()
-		return RewindResult{}, ErrConversationChanged
-	}
-	if persist != nil {
-		if err := persist(replacement); err != nil {
-			l.mu.Unlock()
-			return RewindResult{}, err
+	var commitErr error
+	l.withMemoryGuardLocked(func() {
+		// A source may have been withdrawn while the provider was generating.
+		// Reject before persistence, rather than reinstalling its stale narrative.
+		l.validateMemorySnapshotLocked()
+		if !reflect.DeepEqual(l.Messages, plan.history) {
+			commitErr = ErrConversationChanged
+			return
 		}
-	}
-	l.restoreMessagesLocked(replacement)
-	l.storeContextEstimateFromHistory(estimateTokens(l.Messages))
+		if persist != nil {
+			if commitErr = persist(replacement); commitErr != nil {
+				return
+			}
+		}
+		l.restoreMessagesLocked(replacement)
+		l.storeContextEstimateFromHistory(estimateTokens(l.Messages))
+	})
 	l.mu.Unlock()
+	if commitErr != nil {
+		return RewindResult{}, commitErr
+	}
 	l.discardCheckpointMappingsFrom(plan.turn)
 
 	return RewindResult{

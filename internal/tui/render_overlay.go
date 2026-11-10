@@ -94,7 +94,7 @@ func renderScrollbar(view string, l *list.List) string {
 // Earlier metis used ▢/◐/▣ which were close but not pixel-identical
 // with claude-code's icons in side-by-side terminals.
 func renderTaskPanel(m *Model) string {
-	tasks := tasksFullList(m.sessionID)
+	tasks, execution := taskPresentation(m.sessionID)
 	var s strings.Builder
 	s.WriteString(styleMuted.Render("  ┌─ tasks ") + styleMuted.Render(strings.Repeat("─", 36)))
 	s.WriteString("\n")
@@ -106,36 +106,43 @@ func renderTaskPanel(m *Model) string {
 		return s.String()
 	}
 	strike := lipgloss.NewStyle().Foreground(textSecondary).Strikethrough(true)
-	for _, t := range tasks {
-		var icon string
-		var iconStyle lipgloss.Style
-		var titleStyle lipgloss.Style
-		switch t.Status {
-		case "pending":
-			icon = glyphTaskPending
-			iconStyle = lipgloss.NewStyle().Foreground(textSecondary)
-			titleStyle = styleText
-		case "in_progress":
-			icon = glyphTaskInProgress
-			iconStyle = lipgloss.NewStyle().Foreground(accentOrange)
-			titleStyle = lipgloss.NewStyle().Foreground(textPrimary).Bold(true)
-		case "completed":
-			icon = glyphTaskCompleted
-			iconStyle = lipgloss.NewStyle().Foreground(accentGreen)
-			titleStyle = strike
-		default:
-			icon = "?"
-			iconStyle = styleMuted
-			titleStyle = styleText
+	writeRows := func(items []TaskItem) {
+		for _, t := range items {
+			var icon string
+			var iconStyle lipgloss.Style
+			var titleStyle lipgloss.Style
+			switch t.Status {
+			case "pending":
+				icon = glyphTaskPending
+				iconStyle = lipgloss.NewStyle().Foreground(textSecondary)
+				titleStyle = styleText
+			case "in_progress":
+				icon = glyphTaskInProgress
+				iconStyle = lipgloss.NewStyle().Foreground(accentOrange)
+				titleStyle = lipgloss.NewStyle().Foreground(textPrimary).Bold(true)
+			case "completed":
+				icon = glyphTaskCompleted
+				iconStyle = lipgloss.NewStyle().Foreground(accentGreen)
+				titleStyle = strike
+			default:
+				icon = "?"
+				iconStyle = styleMuted
+				titleStyle = styleText
+			}
+			s.WriteString(styleMuted.Render("  │ "))
+			s.WriteString(iconStyle.Render(icon + " "))
+			content := truncateCells(taskItemLabel(t), 40)
+			s.WriteString(titleStyle.Render(content))
+			s.WriteString("\n")
 		}
-		s.WriteString(styleMuted.Render("  │ "))
-		s.WriteString(iconStyle.Render(icon + " "))
-		content := taskItemLabel(t)
-		if len(content) > 40 {
-			content = content[:39] + "…"
-		}
-		s.WriteString(titleStyle.Render(content))
-		s.WriteString("\n")
+	}
+	if len(execution) > 0 {
+		s.WriteString(styleMuted.Render("  │ 主计划") + "\n")
+	}
+	writeRows(tasks)
+	if len(execution) > 0 {
+		s.WriteString(styleMuted.Render("  │ ↳ 执行任务") + "\n")
+		writeRows(execution)
 	}
 	s.WriteString(styleMuted.Render("  └" + strings.Repeat("─", 44)))
 	s.WriteString("\n")

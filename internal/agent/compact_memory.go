@@ -161,14 +161,25 @@ func summaryBlockSourceSpans(role string, block llm.ContentBlock, redact bool) [
 		}
 		for _, section := range sections {
 			if section.Name == "memory_index" {
+				// The same policy line can appear in several Core blocks. Its
+				// serialized offsets, rather than the first matching bytes in the
+				// checkpoint, determine which copy survives input fitting.
+				base := strings.Index(text, maybeRedact(block.Text, redact))
+				bodyStart := strings.Index(block.Text, "\n\n[memory_index]\n"+section.Body)
+				if bodyStart >= 0 {
+					bodyStart += len("\n\n[memory_index]\n")
+				} else {
+					bodyStart = strings.Index(block.Text, section.Body)
+				}
+				offset := 0
 				for _, line := range strings.Split(section.Body, "\n") {
-					if strings.TrimSpace(line) != "" {
+					if strings.TrimSpace(line) != "" && base >= 0 && bodyStart >= 0 {
 						needle := maybeRedact(line, redact)
-						if pos := strings.Index(text, needle); pos >= 0 {
-							raw, _ := json.Marshal(summaryMemoryDependencies{ContextLines: []string{memoryLineHash(line)}})
-							add(pos, pos+len(needle), llm.ContentBlock{ProviderHint: map[string]string{summaryMemoryHint: string(raw)}})
-						}
+						pos := base + len(maybeRedact(block.Text[:bodyStart+offset], redact))
+						raw, _ := json.Marshal(summaryMemoryDependencies{ContextLines: []string{memoryLineHash(line)}})
+						add(pos, pos+len(needle), llm.ContentBlock{ProviderHint: map[string]string{summaryMemoryHint: string(raw)}})
 					}
+					offset += len(line) + 1
 				}
 			}
 		}

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -62,9 +63,10 @@ func readStatePathKey(path string) string {
 // here only guards multi-session reuse of the same store; intra-batch
 // the dispatch tier ordering already prevents read-then-edit races.
 type ReadFileState struct {
-	mu      sync.Mutex
-	entries map[string]*list.Element
-	order   *list.List // front = most recently recorded
+	mu           sync.Mutex
+	entries      map[string]*list.Element
+	order        *list.List // front = most recently recorded
+	nextRevision uint64
 }
 
 // ReadStateMaxEntries caps the number of files tracked at once.
@@ -75,6 +77,10 @@ const ReadStateMaxEntries = 100
 
 // ReadEntry is the snapshot a Read tool captures.
 type ReadEntry struct {
+	// Revision binds a model-visible result to this exact read, including
+	// repeated reads of unchanged bytes. Old batch receipts cannot revoke or
+	// grant the authority of a later read.
+	Revision uint64
 	// MTime is the file's modification time at read.
 	MTime time.Time
 	// Hash is sha256(content) — used as a fallback when an OS-level
@@ -100,9 +106,28 @@ type ReadEntry struct {
 // the back-pointer in the list can be evicted without an extra map
 // scan.
 type readNode struct {
-	path  string
-	entry ReadEntry
+	path         string
+	entry        ReadEntry
+	coverage     []readSourceRange
+	emptyVisible bool
+	page         *readPageReceipt
+	legacyFull   bool
 }
+
+type readSourceRange struct{ start, end int }
+
+// A receipt is valid only for the latest pinned read revision. Keep the prior
+// confirmed coverage so a negative receipt can revoke this page's contribution
+// without discarding bytes that were already visible from earlier pages.
+type readPageReceipt struct {
+	revision       uint64
+	start, end     int
+	eligible       bool
+	priorCoverage  []readSourceRange
+	priorEmptySeen bool
+}
+
+const readCoverageMaxRanges = 1024
 
 // NewReadFileState returns a fresh, session-scoped store.
 func NewReadFileState() *ReadFileState {
@@ -123,8 +148,8 @@ func (s *ReadFileState) Record(path string, mtime time.Time, content []byte) {
 	s.recordFixed(readStatePathKey(path), mtime, content)
 }
 
-func (s *ReadFileState) recordFixed(key string, mtime time.Time, content []byte) {
-	s.recordEntry(filepath.Clean(key), ReadEntry{
+func (s *ReadFileState) recordFixed(key string, mtime time.Time, content []byte) uint64 {
+	return s.recordEntry(filepath.Clean(key), ReadEntry{
 		MTime:         mtime,
 		Hash:          hashBytes(content),
 		ReadAt:        time.Now(),
@@ -146,8 +171,8 @@ func (s *ReadFileState) RecordPartial(path string, mtime time.Time, content []by
 	s.recordPartialFixed(readStatePathKey(path), mtime, content, offset, limit)
 }
 
-func (s *ReadFileState) recordPartialFixed(key string, mtime time.Time, content []byte, offset, limit int) {
-	s.recordEntry(filepath.Clean(key), ReadEntry{
+func (s *ReadFileState) recordPartialFixed(key string, mtime time.Time, content []byte, offset, limit int) uint64 {
+	return s.recordEntry(filepath.Clean(key), ReadEntry{
 		MTime:         mtime,
 		Hash:          hashBytes(content),
 		ReadAt:        time.Now(),
@@ -158,19 +183,78 @@ func (s *ReadFileState) recordPartialFixed(key string, mtime time.Time, content 
 	})
 }
 
-func (s *ReadFileState) recordEntry(path string, entry ReadEntry) {
+func (s *ReadFileState) recordReadPageFixed(key string, mtime time.Time, content []byte, start, end int, eligible, pending bool) uint64 {
 	if s == nil {
-		return
+		return 0
+	}
+	entry := ReadEntry{MTime: mtime, Hash: hashBytes(content), ReadAt: time.Now(), Size: int64(len(content)), Offset: 1, IsPartialView: true}
+	key = filepath.Clean(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextRevision++
+	entry.Revision = s.nextRevision
+	var node *readNode
+	if el, ok := s.entries[key]; ok {
+		node = el.Value.(*readNode)
+		if node.entry.Hash != entry.Hash || node.entry.Size != entry.Size {
+			node.coverage = nil
+			node.emptyVisible = false
+		}
+		s.order.MoveToFront(el)
+	} else {
+		node = &readNode{path: key}
+		s.entries[key] = s.order.PushFront(node)
+	}
+	node.entry = entry
+	node.legacyFull = false
+	node.page = &readPageReceipt{
+		revision: entry.Revision, start: start, end: end,
+		eligible:      eligible && start >= 0 && start <= end && end <= len(content),
+		priorCoverage: append([]readSourceRange(nil), node.coverage...), priorEmptySeen: node.emptyVisible,
+	}
+	if !pending {
+		confirmReadPageLocked(node, true)
+	} else {
+		// Even with earlier confirmed coverage, a new dispatched Read stays
+		// pending until its own result projection supplies a receipt.
+		node.entry.IsPartialView = true
+	}
+	s.evictLocked()
+	return entry.Revision
+}
+
+func (s *ReadFileState) recordEntry(path string, entry ReadEntry) uint64 {
+	if s == nil {
+		return 0
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.nextRevision++
+	entry.Revision = s.nextRevision
 	if el, ok := s.entries[path]; ok {
-		el.Value.(*readNode).entry = entry
+		el.Value = newLegacyReadNode(path, entry)
 		s.order.MoveToFront(el)
-		return
+		return entry.Revision
 	}
-	el := s.order.PushFront(&readNode{path: path, entry: entry})
+	el := s.order.PushFront(newLegacyReadNode(path, entry))
 	s.entries[path] = el
+	s.evictLocked()
+	return entry.Revision
+}
+
+func newLegacyReadNode(path string, entry ReadEntry) *readNode {
+	node := &readNode{path: path, entry: entry, legacyFull: !entry.IsPartialView}
+	if node.legacyFull {
+		if entry.Size == 0 {
+			node.emptyVisible = true
+		} else {
+			node.coverage = []readSourceRange{{0, int(entry.Size)}}
+		}
+	}
+	return node
+}
+
+func (s *ReadFileState) evictLocked() {
 	for s.order.Len() > ReadStateMaxEntries {
 		oldest := s.order.Back()
 		if oldest == nil {
@@ -179,6 +263,77 @@ func (s *ReadFileState) recordEntry(path string, entry ReadEntry) {
 		s.order.Remove(oldest)
 		delete(s.entries, oldest.Value.(*readNode).path)
 	}
+}
+
+func (s *ReadFileState) confirmVisible(key, hash string, revision uint64, visible bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if el, ok := s.entries[filepath.Clean(key)]; ok {
+		node := el.Value.(*readNode)
+		entry := &node.entry
+		if entry.Hash == hash && entry.Revision == revision {
+			if node.page != nil {
+				confirmReadPageLocked(node, visible)
+			} else if node.legacyFull {
+				// Compatibility for full snapshots recorded by trusted callers.
+				// Generic RecordPartial has no source-range evidence to confirm.
+				entry.IsPartialView = !visible
+				if !visible {
+					node.coverage, node.emptyVisible = nil, false
+				} else if entry.Size == 0 {
+					node.emptyVisible = true
+				} else {
+					node.coverage = []readSourceRange{{0, int(entry.Size)}}
+				}
+			}
+		}
+	}
+}
+
+func confirmReadPageLocked(node *readNode, visible bool) {
+	page := node.page
+	if page == nil || page.revision != node.entry.Revision {
+		return
+	}
+	node.coverage = append([]readSourceRange(nil), page.priorCoverage...)
+	node.emptyVisible = page.priorEmptySeen
+	if visible && page.eligible {
+		if node.entry.Size == 0 {
+			node.emptyVisible = true
+		} else if page.start < page.end {
+			node.coverage = mergeReadCoverage(node.coverage, readSourceRange{page.start, page.end})
+		}
+	}
+	node.entry.IsPartialView = !readCoverageComplete(node)
+}
+
+func readCoverageComplete(node *readNode) bool {
+	if node.entry.Size == 0 {
+		return node.emptyVisible
+	}
+	return len(node.coverage) == 1 && node.coverage[0].start == 0 && int64(node.coverage[0].end) == node.entry.Size
+}
+
+func mergeReadCoverage(ranges []readSourceRange, next readSourceRange) []readSourceRange {
+	ranges = append(ranges, next)
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].start < ranges[j].start })
+	merged := ranges[:0]
+	for _, current := range ranges {
+		if len(merged) == 0 || merged[len(merged)-1].end < current.start {
+			merged = append(merged, current)
+		} else if current.end > merged[len(merged)-1].end {
+			merged[len(merged)-1].end = current.end
+		}
+	}
+	// Sequential paging coalesces to one range. Bound adversarially sparse
+	// one-byte reads without ever manufacturing complete coverage.
+	if len(merged) > readCoverageMaxRanges {
+		return nil
+	}
+	return merged
 }
 
 // Get returns the recorded entry for path, if any. Does NOT bump LRU
