@@ -2929,6 +2929,7 @@ type contextStatusSnapshot struct {
 	maxWindow                                              int
 	maxInputTokens                                         int
 	maxOutputTokens                                        int
+	defaultOutputBudgetTokens                              int
 	source                                                 string
 	compactThreshold                                       float64
 	compactAtTokens                                        int
@@ -4019,7 +4020,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 					"name": snap.Name, "agentId": snap.AgentID, "sessionId": activeSessionID,
 					"status": snap.Status.String(), "background": snap.Background,
 					"executionPhase": snap.ExecutionPhase, "holdsExecutionSlot": snap.HoldsExecutionSlot,
-					"startedAt": snap.Started,
+					"continuationAttempts": snap.ContinuationAttempts,
+					"startedAt":            snap.Started,
 				})
 			}
 		}
@@ -4063,7 +4065,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			defaultWindow: workerContext.DefaultWindow, maxWindow: workerContext.MaxWindow,
 			profileDefaultWindow: workerContext.ProfileDefaultWindow, profileMaxWindow: workerContext.ProfileMaxWindow,
 			maxInputTokens: workerContext.MaxInputTokens, maxOutputTokens: workerContext.MaxOutputTokens, source: workerContext.Source,
-			windowKind: workerContext.WindowKind, modelWindow: workerContext.ModelWindow, modelMaxInputTokens: workerContext.ModelMaxInputTokens, modelMaxOutputTokens: workerContext.ModelMaxOutputTokens, modelSource: workerContext.ModelSource,
+			defaultOutputBudgetTokens: workerContext.DefaultOutputBudgetTokens,
+			windowKind:                workerContext.WindowKind, modelWindow: workerContext.ModelWindow, modelMaxInputTokens: workerContext.ModelMaxInputTokens, modelMaxOutputTokens: workerContext.ModelMaxOutputTokens, modelSource: workerContext.ModelSource,
 			requestedWindow: workerContext.RequestedWindow, limitSource: workerContext.LimitSource, budgetSource: workerContext.BudgetSource, providerID: workerContext.ProviderID, model: workerContext.Model, routeKey: workerContext.RouteKey,
 			compactThreshold: workerContext.CompactThreshold, compactAtTokens: workerContext.CompactAtTokens,
 			compactionStage: workerContext.CompactionStage,
@@ -4082,7 +4085,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				defaultWindow: caps.DefaultWindow, maxWindow: caps.MaxWindow,
 				profileDefaultWindow: caps.ProfileDefaultWindow, profileMaxWindow: caps.ProfileMaxWindow,
 				maxInputTokens: caps.MaxInputTokens, maxOutputTokens: caps.MaxOutputTokens, source: caps.Source,
-				windowKind: caps.WindowKind, modelWindow: caps.ModelWindow, modelMaxInputTokens: caps.ModelMaxInputTokens, modelMaxOutputTokens: caps.ModelMaxOutputTokens, modelSource: caps.ModelSource,
+				defaultOutputBudgetTokens: usage.DefaultOutputBudgetTokens,
+				windowKind:                caps.WindowKind, modelWindow: caps.ModelWindow, modelMaxInputTokens: caps.ModelMaxInputTokens, modelMaxOutputTokens: caps.ModelMaxOutputTokens, modelSource: caps.ModelSource,
 				requestedWindow: caps.RequestedWindow, limitSource: caps.LimitSource, budgetSource: caps.BudgetSource, providerID: caps.ProviderID, model: caps.Model, routeKey: caps.RouteKey,
 				compactThreshold: threshold, compactAtTokens: trigger, compactionStage: usage.CompactionStage}
 		})
@@ -4119,7 +4123,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		subAgents, namedAgents, backgroundTasks = status.SubAgents, status.NamedAgents, status.BackgroundTasks
 		agentDetails = make([]map[string]any, 0, len(status.Agents))
 		for _, item := range status.Agents {
-			agentDetails = append(agentDetails, map[string]any{"name": item.Name, "agentId": item.AgentID, "sessionId": activeSessionID, "status": item.Status, "background": item.Background, "executionPhase": item.ExecutionPhase, "holdsExecutionSlot": item.HoldsExecutionSlot, "startedAt": item.StartedAt})
+			agentDetails = append(agentDetails, map[string]any{"name": item.Name, "agentId": item.AgentID, "sessionId": activeSessionID, "status": item.Status, "background": item.Background, "executionPhase": item.ExecutionPhase, "holdsExecutionSlot": item.HoldsExecutionSlot, "continuationAttempts": item.ContinuationAttempts, "startedAt": item.StartedAt})
 		}
 		jobDetails = make([]map[string]any, 0, len(status.Jobs))
 		for _, item := range status.Jobs {
@@ -4140,7 +4144,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"contextDefaultWindow": contextStatus.defaultWindow, "contextMaxWindow": contextStatus.maxWindow,
 		"contextProfileDefaultWindow": contextStatus.profileDefaultWindow, "contextProfileMaxWindow": contextStatus.profileMaxWindow,
 		"contextMaxInputTokens": contextStatus.maxInputTokens, "contextMaxOutputTokens": contextStatus.maxOutputTokens, "contextSource": contextStatus.source,
-		"contextWindowKind": contextStatus.windowKind, "contextModelWindow": contextStatus.modelWindow, "contextModelMaxInputTokens": contextStatus.modelMaxInputTokens, "contextModelMaxOutputTokens": contextStatus.modelMaxOutputTokens, "contextModelSource": contextStatus.modelSource,
+		"contextDefaultOutputBudgetTokens": contextStatus.defaultOutputBudgetTokens,
+		"contextWindowKind":                contextStatus.windowKind, "contextModelWindow": contextStatus.modelWindow, "contextModelMaxInputTokens": contextStatus.modelMaxInputTokens, "contextModelMaxOutputTokens": contextStatus.modelMaxOutputTokens, "contextModelSource": contextStatus.modelSource,
 		"contextRequestedWindow": contextStatus.requestedWindow, "contextLimitSource": contextStatus.limitSource, "contextBudgetSource": contextStatus.budgetSource, "contextProviderId": contextStatus.providerID, "contextModel": contextStatus.model, "contextRouteKey": contextStatus.routeKey,
 		"compactAtTokens":        contextStatus.compactAtTokens,
 		"contextCompactionStage": contextStatus.compactionStage,
@@ -4225,6 +4230,7 @@ type subAgentDetailView struct {
 	AgentID                  string            `json:"agentId"`
 	Status                   string            `json:"status"`
 	ExecutionPhase           string            `json:"executionPhase,omitempty"`
+	ContinuationAttempts     int               `json:"continuationAttempts,omitempty"`
 	HoldsExecutionSlot       bool              `json:"holdsExecutionSlot"`
 	Background               bool              `json:"background"`
 	StartedAt                time.Time         `json:"startedAt"`
@@ -4389,22 +4395,23 @@ func subAgentDetailFromRoster(sessionID string, teammate *agent.Teammate) subAge
 		exitError = snap.ExitErr.Error()
 	}
 	return subAgentDetailView{
-		SessionID:          sessionID,
-		Name:               snap.Name,
-		AgentID:            snap.AgentID,
-		Status:             snap.Status.String(),
-		ExecutionPhase:     snap.ExecutionPhase,
-		HoldsExecutionSlot: snap.HoldsExecutionSlot,
-		Background:         snap.Background,
-		StartedAt:          snap.Started,
-		EndedAt:            snap.EndTime,
-		ElapsedMS:          elapsed.Milliseconds(),
-		Output:             output,
-		OutputTruncated:    outputTruncated,
-		Result:             result,
-		ResultTruncated:    resultTruncated,
-		StopHint:           snap.StopHint,
-		ExitError:          exitError,
+		SessionID:            sessionID,
+		Name:                 snap.Name,
+		AgentID:              snap.AgentID,
+		Status:               snap.Status.String(),
+		ExecutionPhase:       snap.ExecutionPhase,
+		ContinuationAttempts: snap.ContinuationAttempts,
+		HoldsExecutionSlot:   snap.HoldsExecutionSlot,
+		Background:           snap.Background,
+		StartedAt:            snap.Started,
+		EndedAt:              snap.EndTime,
+		ElapsedMS:            elapsed.Milliseconds(),
+		Output:               output,
+		OutputTruncated:      outputTruncated,
+		Result:               result,
+		ResultTruncated:      resultTruncated,
+		StopHint:             snap.StopHint,
+		ExitError:            exitError,
 	}
 }
 
@@ -4480,7 +4487,7 @@ func (s *Server) handleSubAgentEvents(w http.ResponseWriter, r *http.Request, se
 				flusher.Flush()
 				return
 			}
-			if next.Status != current.Status || next.ExecutionPhase != current.ExecutionPhase || next.HoldsExecutionSlot != current.HoldsExecutionSlot || next.ConversationRevision != current.ConversationRevision {
+			if next.Status != current.Status || next.ExecutionPhase != current.ExecutionPhase || next.ContinuationAttempts != current.ContinuationAttempts || next.HoldsExecutionSlot != current.HoldsExecutionSlot || next.ConversationRevision != current.ConversationRevision {
 				if !writeSubAgentSSE(w, "snapshot", map[string]any{"agent": next}) {
 					return
 				}
@@ -4532,6 +4539,7 @@ func subAgentDeltaPayload(view subAgentDetailView, delta string) map[string]any 
 		"conversationRevision":     view.ConversationRevision,
 		"usage":                    view.Usage,
 		"executionPhase":           view.ExecutionPhase,
+		"continuationAttempts":     view.ContinuationAttempts,
 		"holdsExecutionSlot":       view.HoldsExecutionSlot,
 		"sessionId":                view.SessionID,
 		"agentId":                  view.AgentID,

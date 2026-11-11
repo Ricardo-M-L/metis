@@ -105,13 +105,14 @@ type subagentHistoryCheckpoint struct {
 // the parent turn. A background child can finish after its parent tool_result
 // has already been saved, so that result cannot be the source of final status.
 type SubAgentTerminal struct {
-	Status     string    `json:"status"`
-	Background bool      `json:"background"`
-	EndedAt    time.Time `json:"endedAt"`
-	Output     string    `json:"output,omitempty"`
-	Result     string    `json:"result,omitempty"`
-	StopHint   string    `json:"stopHint,omitempty"`
-	ExitError  string    `json:"exitError,omitempty"`
+	Status               string    `json:"status"`
+	Background           bool      `json:"background"`
+	EndedAt              time.Time `json:"endedAt"`
+	Output               string    `json:"output,omitempty"`
+	Result               string    `json:"result,omitempty"`
+	StopHint             string    `json:"stopHint,omitempty"`
+	ExitError            string    `json:"exitError,omitempty"`
+	ContinuationAttempts int       `json:"continuationAttempts,omitempty"`
 }
 
 // subagentEntry mirrors the JSONL line shape used for the main

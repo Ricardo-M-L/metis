@@ -208,6 +208,13 @@ type providerModelSettingsProvider struct {
 	defaultOutput int
 }
 
+func (p providerModelSettingsProvider) DefaultOutputBudget() int {
+	if llm.ProviderDefaultOutputBudget(p.Provider) <= 0 {
+		return 0
+	}
+	return p.defaultOutput
+}
+
 func (p providerModelSettingsProvider) DynamicContextCheckpoints() bool {
 	capability, ok := p.Provider.(interface{ DynamicContextCheckpoints() bool })
 	return ok && capability.DynamicContextCheckpoints()

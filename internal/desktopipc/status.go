@@ -77,28 +77,32 @@ type ContextPressure struct {
 	MaxWindow            int               `json:"maxWindow,omitempty"`
 	MaxInputTokens       int               `json:"maxInputTokens,omitempty"`
 	MaxOutputTokens      int               `json:"maxOutputTokens,omitempty"`
-	Source               string            `json:"source,omitempty"`
-	CompactThreshold     float64           `json:"compactThreshold"`
-	CompactAtTokens      int               `json:"compactAtTokens"`
+	// DefaultOutputBudgetTokens is the worker's provider default reservation,
+	// not the model capability or a request-specific child cap. Zero is unknown.
+	DefaultOutputBudgetTokens int     `json:"defaultOutputBudgetTokens,omitempty"`
+	Source                    string  `json:"source,omitempty"`
+	CompactThreshold          float64 `json:"compactThreshold"`
+	CompactAtTokens           int     `json:"compactAtTokens"`
 }
 
 type Subagent struct {
-	Name               string    `json:"name"`
-	AgentID            string    `json:"agentId"`
-	Anonymous          bool      `json:"anonymous"`
-	Status             string    `json:"status"`
-	ExecutionPhase     string    `json:"executionPhase"`
-	HoldsExecutionSlot bool      `json:"holdsExecutionSlot"`
-	Background         bool      `json:"background"`
-	StartedAt          time.Time `json:"startedAt"`
-	EndedAt            time.Time `json:"endedAt"`
-	ElapsedMS          int64     `json:"elapsedMs"`
-	Output             string    `json:"output"`
-	OutputTruncated    bool      `json:"outputTruncated"`
-	Result             string    `json:"result"`
-	ResultTruncated    bool      `json:"resultTruncated"`
-	StopHint           string    `json:"stopHint"`
-	ExitError          string    `json:"exitError"`
+	Name                 string    `json:"name"`
+	AgentID              string    `json:"agentId"`
+	Anonymous            bool      `json:"anonymous"`
+	Status               string    `json:"status"`
+	ExecutionPhase       string    `json:"executionPhase"`
+	ContinuationAttempts int       `json:"continuationAttempts,omitempty"`
+	HoldsExecutionSlot   bool      `json:"holdsExecutionSlot"`
+	Background           bool      `json:"background"`
+	StartedAt            time.Time `json:"startedAt"`
+	EndedAt              time.Time `json:"endedAt"`
+	ElapsedMS            int64     `json:"elapsedMs"`
+	Output               string    `json:"output"`
+	OutputTruncated      bool      `json:"outputTruncated"`
+	Result               string    `json:"result"`
+	ResultTruncated      bool      `json:"resultTruncated"`
+	StopHint             string    `json:"stopHint"`
+	ExitError            string    `json:"exitError"`
 }
 
 type Job struct {

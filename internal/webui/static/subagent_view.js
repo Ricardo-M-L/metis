@@ -405,7 +405,8 @@ function subAgentConversationModels(state, agent) {
     ? subAgentText('Waiting for an execution slot. This agent has not started yet.', '正在等待执行名额，子代理尚未开始执行。')
     : agent.status === 'running' ? subAgentText('The agent is working. Its task and tool activity will appear here.', '子代理正在执行，任务与工具活动会在这里更新。')
       : subAgentText('This agent has no recorded messages.', '这个子代理没有保存会话消息。') });
-  const error = state.error || subAgentDetailState.error || agent.exitError;
+  const error = state.error || subAgentDetailState.error ||
+    (typeof subagentOutcomeNotice === 'function' ? subagentOutcomeNotice(agent) : '');
   if (error) models.push({ index: 'error', role: 'system', blocks: [], notice: error, error: true });
   if (state.completeness?.state === 'unavailable' && state.messages.size === 0) models.unshift({ index: 'unavailable', role: 'system', blocks: [],
     notice: subAgentText('Only the retained output is available for this older agent.', '这个子代理的完整会话记录不可用，目前展示已保留的输出。') });

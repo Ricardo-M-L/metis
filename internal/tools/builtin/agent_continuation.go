@@ -72,7 +72,8 @@ func (a Agent) subAgentExecution(loop *agent.Loop, cwd, system, profile string, 
 	return agent.SubAgentExecutionConfig{
 		Version: 1, Provider: a.executionProviderName(), Model: a.model,
 		Effort: string(loop.EffortValue()), Fast: loop.FastEnabled(), WorkDir: cwd,
-		System: system, Profile: profile, Tools: names,
+		MaxOutputTokens: loop.RequestMaxTokens,
+		System:          system, Profile: profile, Tools: names,
 		PermissionMode: string(gate.Mode()), PermissionRulesHash: agentPermissionRulesHash(a.gate),
 	}
 }
@@ -140,6 +141,12 @@ func (a *Agent) restoreSubAgentExecution(snapshot *agent.SubAgentSnapshot, input
 	} else if config.Provider != a.executionProviderName() {
 		return fmt.Errorf("saved child provider %q is unavailable; refusing to substitute %q", config.Provider, a.executionProviderName())
 	}
+	if _, specified := input["max_output_tokens"]; specified {
+		cap, err := agentRequestedOutputCap(input, provider)
+		if err != nil || cap != config.MaxOutputTokens {
+			return fmt.Errorf("cannot change max_output_tokens when continuing an existing child; start a new Agent task")
+		}
+	}
 	a.provider, a.model, a.promptProviderName = provider, config.Model, config.Provider
 	a.promptWorkDir = config.WorkDir
 	a.effort = func() llm.Effort { return llm.Effort(config.Effort) }
@@ -168,6 +175,9 @@ func continuationInput(input map[string]any, snapshot *agent.SubAgentSnapshot) m
 	if snapshot.Execution != nil {
 		copy["cwd"] = snapshot.Execution.WorkDir
 		copy["subagent_type"] = snapshot.Execution.Profile
+		if snapshot.Execution.MaxOutputTokens > 0 {
+			copy["max_output_tokens"] = snapshot.Execution.MaxOutputTokens
+		}
 	} else if snapshot.Header.WorkDir != "" {
 		copy["cwd"] = snapshot.Header.WorkDir
 	}
@@ -203,6 +213,9 @@ func (a Agent) continueLiveSubAgent(ctx context.Context, input map[string]any, t
 			return &tools.Result{Output: "active child continuation accepts a prompt only; do not replace its execution settings", IsError: true}, nil
 		}
 	}
+	if _, specified := input["max_output_tokens"]; specified {
+		return &tools.Result{Output: "active child continuation accepts a prompt only; do not replace max_output_tokens", IsError: true}, nil
+	}
 	receipt, err := teammate.SubmitContinuation(a.parentSessionID, prompt)
 	if err != nil {
 		guidance := "acceptance was not confirmed; inspect the child's history and status before repeating this prompt"
@@ -221,6 +234,7 @@ func (a Agent) continueLiveSubAgent(ctx context.Context, input map[string]any, t
 // palette. Copying the parent's Agent tool would retain the root session ID
 // and its broader registry, even after the outer child palette was narrowed.
 func rebindNestedChildAgent(registry *tools.Registry, parentID string, gate *permission.Gate, provider llm.Provider, providerName, model, system, cwd string, effort func() llm.Effort, fast func() bool) {
+	rebindSubAgentQueryTools(registry, parentID)
 	tool, ok := registry.Get("Agent")
 	if !ok {
 		return

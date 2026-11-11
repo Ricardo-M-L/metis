@@ -198,6 +198,9 @@ type Teammate struct {
 	// this sub-agent via SubAgentOutput / SubAgentStop. Returned as
 	// part of the run_in_background handshake tool_result.
 	AgentID string
+	// ParentSessionID is fixed before registration. Even a queued child that
+	// has not written its transcript yet must remain scoped to its direct parent.
+	ParentSessionID string
 
 	// Anonymous flags auto-generated names so UI can hide them from
 	// the roster view (`/agents list`) by default — claude-code
@@ -239,12 +242,14 @@ type Teammate struct {
 	// Status / Output / Result / EndTime / ExitErr — set by the
 	// sub-loop's runner goroutine; read via Snapshot() under the mutex
 	// so SubAgentOutput / SubAgentList never race the streaming writer.
-	Status   TeammateStatus
-	Output   strings.Builder
-	Result   string // final text on Completed, last partial on Killed/Failed
-	EndTime  time.Time
-	ExitErr  error
-	StopHint string // user-facing reason ("timeout 600s", "user kill", "max_iter exhausted")
+	Status                     TeammateStatus
+	Output                     strings.Builder
+	Result                     string // final text on Completed, last partial on Killed/Failed
+	EndTime                    time.Time
+	ExitErr                    error
+	StopHint                   string // user-facing reason ("timeout 600s", "user kill", "max_iter exhausted")
+	outputContinuationAttempts int
+	outputRecovering           bool
 }
 
 // IsNamed reports whether this teammate was explicitly named at
@@ -344,26 +349,44 @@ func (t *Teammate) Finish(status TeammateStatus, result string, exitErr error, h
 	t.Result = result
 	t.ExitErr = exitErr
 	t.StopHint = hint
+	t.outputRecovering = false
 	t.EndTime = time.Now()
+}
+
+func (t *Teammate) setOutputRecovery(recovering bool, attempts int) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.Status.IsActive() {
+		return
+	}
+	t.outputRecovering = recovering
+	if attempts >= 0 {
+		t.outputContinuationAttempts = attempts
+	}
 }
 
 // TeammateSnapshot is the read-only view returned by Teammate.Snapshot()
 // + Roster.List(). Detaches caller from the mutex so the reader can't
 // accidentally race the runner.
 type TeammateSnapshot struct {
-	Name               string
-	AgentID            string
-	Anonymous          bool
-	Background         bool
-	Started            time.Time
-	Status             TeammateStatus
-	ExecutionPhase     string
-	HoldsExecutionSlot bool
-	Output             string
-	Result             string
-	EndTime            time.Time
-	ExitErr            error
-	StopHint           string
+	Name                 string
+	AgentID              string
+	ParentSessionID      string
+	Anonymous            bool
+	Background           bool
+	Started              time.Time
+	Status               TeammateStatus
+	ExecutionPhase       string
+	HoldsExecutionSlot   bool
+	Output               string
+	Result               string
+	EndTime              time.Time
+	ExitErr              error
+	StopHint             string
+	ContinuationAttempts int
 }
 
 // IsNamed mirrors Teammate.IsNamed on the snapshot view so /agents
@@ -375,25 +398,31 @@ func (s TeammateSnapshot) IsNamed() bool { return !s.Anonymous }
 func (t *Teammate) Snapshot() TeammateSnapshot {
 	t.mu.RLock()
 	snapshot := TeammateSnapshot{
-		Name:       t.Name,
-		AgentID:    t.AgentID,
-		Anonymous:  t.Anonymous,
-		Background: t.Background,
-		Started:    t.Started,
-		Status:     t.Status,
-		Output:     t.Output.String(),
-		Result:     t.Result,
-		EndTime:    t.EndTime,
-		ExitErr:    t.ExitErr,
-		StopHint:   t.StopHint,
+		Name:                 t.Name,
+		AgentID:              t.AgentID,
+		ParentSessionID:      t.ParentSessionID,
+		Anonymous:            t.Anonymous,
+		Background:           t.Background,
+		Started:              t.Started,
+		Status:               t.Status,
+		Output:               t.Output.String(),
+		Result:               t.Result,
+		EndTime:              t.EndTime,
+		ExitErr:              t.ExitErr,
+		StopHint:             t.StopHint,
+		ContinuationAttempts: t.outputContinuationAttempts,
 	}
 	lease := t.executionLease
+	recovering := t.outputRecovering
 	t.mu.RUnlock()
 	switch snapshot.Status {
 	case StatusQueued:
 		snapshot.ExecutionPhase = "queued"
 	case StatusRunning:
 		snapshot.ExecutionPhase, snapshot.HoldsExecutionSlot = lease.executionSnapshot()
+		if recovering {
+			snapshot.ExecutionPhase = "continuing"
+		}
 	default:
 		snapshot.ExecutionPhase = "finished"
 		// Finish may precede final runner cleanup by a few instructions.

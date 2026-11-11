@@ -59,6 +59,7 @@ func (t *Teammate) SubmitContinuation(parentID, text string) (SubAgentContinuati
 	t.mu.RLock()
 	continuation := t.continuation
 	stopping := t.doneClosed || t.cancelRequested || !t.Status.IsActive()
+	recovering := t.outputRecovering
 	agentID := t.AgentID
 	t.mu.RUnlock()
 	if continuation == nil || stopping {
@@ -77,7 +78,7 @@ func (t *Teammate) SubmitContinuation(parentID, text string) (SubAgentContinuati
 		return SubAgentContinuationReceipt{}, fmt.Errorf("persist parent follow-up: %w", err)
 	}
 	status := "queued"
-	if continuation.loop.SteerInject(input.UserText()) && continuation.running {
+	if !recovering && continuation.loop.SteerInject(input.UserText()) && continuation.running {
 		status = "steered"
 	}
 	return SubAgentContinuationReceipt{AgentID: agentID, InputID: input.ID, Status: status, Durable: true}, nil
@@ -88,13 +89,13 @@ func (t *Teammate) SubmitContinuation(parentID, text string) (SubAgentContinuati
 // race is either consumed here or remains durable for later cold recovery.
 func RunSubAgentWithContinuations(ctx context.Context, out chan<- Event, loop *Loop, teammate *Teammate, transcript *SubAgentTranscript) error {
 	if teammate == nil {
-		return loop.Run(ctx, out)
+		return runSubAgentOutputRecovery(ctx, out, loop, nil, transcript)
 	}
 	teammate.mu.RLock()
 	continuation := teammate.continuation
 	teammate.mu.RUnlock()
 	if continuation == nil {
-		return loop.Run(ctx, out)
+		return runSubAgentOutputRecovery(ctx, out, loop, teammate, transcript)
 	}
 	continuation.mu.Lock()
 	if continuation.closed || continuation.running || continuation.loop != loop || continuation.transcript != transcript {
@@ -111,7 +112,7 @@ func RunSubAgentWithContinuations(ctx context.Context, out chan<- Event, loop *L
 	}()
 
 	for {
-		runErr := loop.Run(ctx, out)
+		runErr := runSubAgentOutputRecovery(ctx, out, loop, teammate, transcript)
 		continuation.mu.Lock()
 		if runErr != nil || ctx.Err() != nil {
 			continuation.closed = true

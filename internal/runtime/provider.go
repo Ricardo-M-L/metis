@@ -172,6 +172,11 @@ type visionOverrideProvider struct {
 
 func (p visionOverrideProvider) SupportsVision() bool { return p.supportsVision }
 
+// This is a value capability: zero preserves an unknown/server-managed budget.
+func (p visionOverrideProvider) DefaultOutputBudget() int {
+	return llm.ProviderDefaultOutputBudget(p.Provider)
+}
+
 // This is a value capability: false preserves the underlying adapter's opt-out.
 func (p visionOverrideProvider) DynamicContextCheckpoints() bool {
 	capability, ok := p.Provider.(interface{ DynamicContextCheckpoints() bool })
@@ -670,6 +675,10 @@ func buildCustomProvider(cfg *config.Config, id string, raw config.ProviderRaw, 
 		responses.CatalogProvider = opts.CatalogProvider
 	}
 	if err := bindProviderContext(provider, id, transportName, strings.TrimSpace(raw.CatalogProvider) != ""); err != nil {
+		return nil, err
+	}
+	res.MaxOutputTokens, err = applyCustomAutomaticOutputBudget(provider, raw, transportName, modelSettings, res.MaxOutputTokens)
+	if err != nil {
 		return nil, err
 	}
 	if raw.SupportsVision != nil {

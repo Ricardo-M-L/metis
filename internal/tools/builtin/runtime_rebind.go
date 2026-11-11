@@ -17,6 +17,7 @@ func RebindProviderTools(reg *tools.Registry, provider llm.Provider, model, syst
 	if reg == nil {
 		return
 	}
+	rebindSubAgentQueryTools(reg, parentSessionID)
 	if tool, ok := reg.Get("Agent"); ok {
 		switch current := tool.(type) {
 		case Agent:
@@ -51,6 +52,55 @@ func RebindProviderTools(reg *tools.Registry, provider llm.Provider, model, syst
 			updated.model = model
 			reg.Replace(&updated)
 		}
+	}
+}
+
+// Saved-history readers carry the same direct-parent identity as Agent. A
+// model/session switch and nested delegation must update both together.
+func rebindSubAgentQueryTools(reg *tools.Registry, parentSessionID string) {
+	if reg == nil {
+		return
+	}
+	for _, name := range []string{"SubAgentList", "SubAgentOutput"} {
+		if current, ok := reg.Get(name); ok {
+			reg.Replace(rebindSubAgentQueryTool(current, parentSessionID))
+		}
+	}
+}
+
+func rebindSubAgentQueryTool(current tools.Tool, parentSessionID string) tools.Tool {
+	switch tool := current.(type) {
+	case agentPermissionBoundTool:
+		tool.inner = rebindSubAgentQueryTool(tool.inner, parentSessionID)
+		return tool
+	case *agentPermissionBoundTool:
+		updated := *tool
+		updated.inner = rebindSubAgentQueryTool(updated.inner, parentSessionID)
+		return &updated
+	case SubAgentList:
+		if tool.history != nil {
+			tool = tool.WithSessionPersistence(tool.history.sessionDir, parentSessionID)
+		}
+		return tool
+	case *SubAgentList:
+		updated := *tool
+		if updated.history != nil {
+			updated = updated.WithSessionPersistence(updated.history.sessionDir, parentSessionID)
+		}
+		return &updated
+	case SubAgentOutput:
+		if tool.history != nil {
+			tool = tool.WithSessionPersistence(tool.history.sessionDir, parentSessionID)
+		}
+		return tool
+	case *SubAgentOutput:
+		updated := *tool
+		if updated.history != nil {
+			updated = updated.WithSessionPersistence(updated.history.sessionDir, parentSessionID)
+		}
+		return &updated
+	default:
+		return current
 	}
 }
 

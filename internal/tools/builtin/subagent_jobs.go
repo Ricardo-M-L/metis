@@ -19,7 +19,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -38,22 +37,31 @@ import (
 // having to remember an agent_id verbatim.
 type SubAgentList struct {
 	tools.BaseTool
-	gate   *permission.Gate
-	roster *agent.Roster
+	gate    *permission.Gate
+	roster  *agent.Roster
+	history *subAgentQueryScope
 }
 
 func NewSubAgentList(gate *permission.Gate, r *agent.Roster) SubAgentList {
 	return SubAgentList{gate: gate, roster: r}
 }
 
+func (s SubAgentList) WithSessionPersistence(sessionDir, parentSessionID string) SubAgentList {
+	s.history = &subAgentQueryScope{sessionDir: sessionDir, parentID: parentSessionID}
+	return s
+}
+
 func (SubAgentList) Name() string { return "SubAgentList" }
 func (SubAgentList) Description() string {
-	return "List active and recently-finished sub-agents in the current session. Returns each one's agent_id, name, status (queued/running/completed/failed/killed), started_at, and (for completed) the final result snippet. Desktop queued agents are waiting for execution capacity and can be cancelled with SubAgentStop. Pairs with Agent({run_in_background: true}) — use this to discover what's still in flight."
+	return "List active and saved sub-agents belonging to the current direct parent session. Returns agent_id, name, status (queued/running/completed/failed/killed), load_state and terminal stop reason, plus a result snippet. Saved producers not loaded here without a terminal receipt have status=unknown; an empty live roster does not mean history was deleted. Use optional limit/offset for pages and agent_id for exact historical queries. Desktop queued agents await execution capacity and can be cancelled with SubAgentStop."
 }
 func (SubAgentList) InputSchema() map[string]any {
 	return map[string]any{
-		"type":       "object",
-		"properties": map[string]any{},
+		"type": "object",
+		"properties": map[string]any{
+			"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum rows, default 50."},
+			"offset": map[string]any{"type": "integer", "minimum": 0, "maximum": subAgentHistoryMaxScan, "description": "Page offset in the known parent-scoped history."},
+		},
 	}
 }
 
@@ -67,7 +75,10 @@ func (s SubAgentList) CanUse(_ context.Context, _ map[string]any) (tools.Permiss
 	return mapDecision(d), src
 }
 
-func (s SubAgentList) Execute(_ context.Context, _ map[string]any) (*tools.Result, error) {
+func (s SubAgentList) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	if s.history != nil {
+		return s.executeHistorical(ctx, in)
+	}
 	if s.roster == nil {
 		return &tools.Result{Output: "(no sub-agents — Roster wiring missing. This typically happens in headless `metis run` mode or when the loop was constructed without a Roster. Use `metis chat` for interactive sub-agent dispatch.)"}, nil
 	}
@@ -112,17 +123,23 @@ func (s SubAgentList) Execute(_ context.Context, _ map[string]any) (*tools.Resul
 // run; the read is a snapshot, doesn't block the sub-agent.
 type SubAgentOutput struct {
 	tools.BaseTool
-	gate   *permission.Gate
-	roster *agent.Roster
+	gate    *permission.Gate
+	roster  *agent.Roster
+	history *subAgentQueryScope
 }
 
 func NewSubAgentOutput(gate *permission.Gate, r *agent.Roster) SubAgentOutput {
 	return SubAgentOutput{gate: gate, roster: r}
 }
 
+func (s SubAgentOutput) WithSessionPersistence(sessionDir, parentSessionID string) SubAgentOutput {
+	s.history = &subAgentQueryScope{sessionDir: sessionDir, parentID: parentSessionID}
+	return s
+}
+
 func (SubAgentOutput) Name() string { return "SubAgentOutput" }
 func (SubAgentOutput) Description() string {
-	return "Read the assistant text accumulated so far by a specific sub-agent. Pass `agent_id` (preferred) or `name`. Returns the running output + current status. Safe to call mid-run."
+	return "Read a sub-agent's output and actual lifecycle/stop reason, including saved history after restart or live-roster eviction. Pass `agent_id` (preferred) or an unambiguous `name` within the current direct parent session. Does not resume or execute the child. A not_loaded record still exists; missing/corrupt history is reported explicitly. Safe to call mid-run."
 }
 func (SubAgentOutput) InputSchema() map[string]any {
 	return map[string]any{
@@ -149,7 +166,10 @@ func (s SubAgentOutput) CanUse(_ context.Context, _ map[string]any) (tools.Permi
 	return mapDecision(d), src
 }
 
-func (s SubAgentOutput) Execute(_ context.Context, in map[string]any) (*tools.Result, error) {
+func (s SubAgentOutput) Execute(ctx context.Context, in map[string]any) (*tools.Result, error) {
+	if s.history != nil {
+		return s.executeHistorical(ctx, in)
+	}
 	if s.roster == nil {
 		return &tools.Result{Output: "(no sub-agents — Roster wiring missing. This typically happens in headless `metis run` mode or when the loop was constructed without a Roster. Use `metis chat` for interactive sub-agent dispatch.)", IsError: true}, nil
 	}
@@ -258,7 +278,7 @@ func lookupTeammate(r *agent.Roster, in map[string]any) (*agent.Teammate, error)
 	if id != "" {
 		t, ok := r.LookupByAgentID(id)
 		if !ok {
-			return nil, fmt.Errorf("no sub-agent with agent_id=%s (it may have finished and been GC'd; try SubAgentList)", id)
+			return nil, fmt.Errorf("no sub-agent with agent_id=%s in this process; use parent-scoped saved-history queries when persistence is configured", id)
 		}
 		return t, nil
 	}
@@ -266,7 +286,7 @@ func lookupTeammate(r *agent.Roster, in map[string]any) (*agent.Teammate, error)
 	if !ok {
 		t, _, ok = r.LookupRecentlyFinished(name)
 		if !ok {
-			return nil, fmt.Errorf("no sub-agent with name=%s (it may have finished and been GC'd; try SubAgentList)", name)
+			return nil, fmt.Errorf("no sub-agent with name=%s in this process; use its stable agent_id for parent-scoped saved-history queries", name)
 		}
 	}
 	return t, nil
@@ -278,15 +298,19 @@ func lookupTeammate(r *agent.Roster, in map[string]any) (*agent.Teammate, error)
 //
 // Roster nil disables the tools (they'd just return "no sub-agents")
 // — same graceful-degrade pattern as AttachJobsRegistry.
-func AttachSubAgentTools(reg *tools.Registry, gate *permission.Gate, r *agent.Roster) {
-	if reg == nil || r == nil {
+func AttachSubAgentTools(reg *tools.Registry, gate *permission.Gate, r *agent.Roster, scopes ...SubAgentQueryScope) {
+	if reg == nil || (r == nil && len(scopes) == 0) {
 		return
 	}
-	reg.Register(NewSubAgentList(gate, r))
-	reg.Register(NewSubAgentOutput(gate, r))
-	reg.Register(NewSubAgentStop(gate, r))
+	list, output := NewSubAgentList(gate, r), NewSubAgentOutput(gate, r)
+	if len(scopes) > 0 {
+		scope := scopes[len(scopes)-1]
+		list = list.WithSessionPersistence(scope.SessionDir, scope.ParentSessionID)
+		output = output.WithSessionPersistence(scope.SessionDir, scope.ParentSessionID)
+	}
+	reg.Register(list)
+	reg.Register(output)
+	if r != nil {
+		reg.Register(NewSubAgentStop(gate, r))
+	}
 }
-
-// ensure sort is referenced — used below for stable ordering when we
-// add filters/limits later.
-var _ = sort.Strings

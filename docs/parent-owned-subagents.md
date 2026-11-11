@@ -32,3 +32,37 @@ The transcript is appended under a producer lease. A child has one writer, so
 concurrent continuation cannot start two producers or replace its recorded
 history. A successful live-delivery receipt acknowledges durable input; task
 completion is reported separately by the child lifecycle and output.
+
+## Output budgets and interrupted answers
+
+`Agent.max_output_tokens` optionally lowers the child's per-response output
+budget. It does not increase the inherited provider budget, change the parent's
+client, or replace the model's output capability. An explicit provider or model
+budget remains authoritative when an answer is continued.
+
+A child that reaches an output-length limit with a plain-text answer may append
+at most three text-only continuations in the same transcript. They retain the
+child's original deadline, cancellation, usage accounting and iteration limits.
+Continuation does not rerun completed tools. Truncated tool calls, protocol
+errors, filtering and other failures do not enter this automatic path; a
+continuation cannot execute tools or recover tools from text. No progress or an
+exhausted recovery allowance leaves an incomplete result rather than inventing
+successful completion.
+
+The parent receives the stop reason, a diagnostic and any partial answer as
+separate information. The stored terminal state preserves the reason and
+continuation count. Desktop distinguishes a failure to start from an answer
+that started but could not finish, and exposes the saved partial result.
+
+## Inspecting saved children
+
+`SubAgentList` and `SubAgentOutput` can read saved child records after the live
+roster has been cleared or the parent process has restarted. Reading a saved
+record does not resume or execute it. Both live and saved lookup remain scoped
+to the direct parent conversation; an agent ID from another parent cannot be
+used to read its output. Repeated names require an explicit agent ID.
+
+Queries are bounded and paginated. A truncated scan or unreadable history is
+reported explicitly, and an unloaded record without a terminal state is not
+proof that the child completed. CLI summaries count child rows separately from
+pagination and diagnostic metadata.

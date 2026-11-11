@@ -94,7 +94,8 @@ func (s *desktopWorkerStatusSampler) snapshot(final bool) desktopipc.Status {
 			DefaultWindow: caps.DefaultWindow, MaxWindow: caps.MaxWindow,
 			ProfileDefaultWindow: caps.ProfileDefaultWindow, ProfileMaxWindow: caps.ProfileMaxWindow,
 			MaxInputTokens: caps.MaxInputTokens, MaxOutputTokens: caps.MaxOutputTokens, Source: caps.Source,
-			WindowKind: caps.WindowKind, ModelWindow: caps.ModelWindow, ModelMaxInputTokens: caps.ModelMaxInputTokens, ModelMaxOutputTokens: caps.ModelMaxOutputTokens, ModelSource: caps.ModelSource,
+			DefaultOutputBudgetTokens: usage.DefaultOutputBudgetTokens,
+			WindowKind:                caps.WindowKind, ModelWindow: caps.ModelWindow, ModelMaxInputTokens: caps.ModelMaxInputTokens, ModelMaxOutputTokens: caps.ModelMaxOutputTokens, ModelSource: caps.ModelSource,
 			RequestedWindow: caps.RequestedWindow, LimitSource: caps.LimitSource, BudgetSource: caps.BudgetSource,
 			ProviderID: caps.ProviderID, Model: caps.Model, RouteKey: caps.RouteKey,
 			CompactThreshold: threshold, CompactAtTokens: trigger, CompactionStage: usage.CompactionStage,
@@ -156,7 +157,8 @@ func (s *desktopWorkerStatusSampler) snapshot(final bool) desktopipc.Status {
 		status.Agents = append(status.Agents, desktopipc.Subagent{
 			Name: snap.Name, AgentID: snap.AgentID, Anonymous: snap.Anonymous, Status: snap.Status.String(), Background: snap.Background,
 			ExecutionPhase: snap.ExecutionPhase, HoldsExecutionSlot: snap.HoldsExecutionSlot,
-			StartedAt: snap.Started, EndedAt: snap.EndTime, ElapsedMS: elapsed.Milliseconds(), Output: output, OutputTruncated: outputTruncated,
+			ContinuationAttempts: snap.ContinuationAttempts,
+			StartedAt:            snap.Started, EndedAt: snap.EndTime, ElapsedMS: elapsed.Milliseconds(), Output: output, OutputTruncated: outputTruncated,
 			Result: result, ResultTruncated: resultTruncated, StopHint: snap.StopHint, ExitError: exitError,
 		})
 	}

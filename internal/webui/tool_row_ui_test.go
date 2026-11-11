@@ -25,6 +25,8 @@ func TestToolRowBrowserInteractions(t *testing.T) {
 		"websearch_empty_error_fallback",
 		"websearch_history_replay",
 		"subagent_semantic_rows",
+		"subagent_failure_classification",
+		"subagent_failure_history_and_recovery",
 		"subagent_stage_lifecycle",
 		"subagent_background_lifecycle_across_turns",
 		"subagent_reused_provider_id_trace_binding",
@@ -577,6 +579,68 @@ if (scenario === 'keyboard_disclosure') {
   assert.match(visibleToolText(external), /Send external message.*External channel/);
   assert.match(visibleToolText(list), /View sub-agents.*Current agents/);
   assert.match(teammate.querySelector('.tc-summary').textContent, /Message failed/);
+ } else if (scenario === 'subagent_failure_classification') {
+  const add = (id, reason, extra = {}, output = 'retained partial answer') => {
+    context.handleToolStart({tool:'Agent', id, session:'A', input:JSON.stringify({description:'战略路线', name:'战略路线', prompt:'hidden instructions'})});
+    flushFrames();
+    const row = area.querySelectorAll('.call-row').at(-1);
+    const child = {sessionId:'A', parentToolUseId:id, agentId:'child-'+id, name:'战略路线', status:'failed', ...extra};
+    if (reason) child.stopReason = reason;
+    context.handleToolResult({tool:'Agent', id, isError:true, output,
+      presentation:{'metis.agent_started':true, subagent:child}});
+    return row;
+  };
+  const limit=add('limit','max_tokens',{partialOutput:true,continuationAttempts:3,canResume:true});
+  assert.match(limit.querySelector('.tc-summary').textContent,/战略路线.*输出达到上限/);
+  assert.doesNotMatch(limit.querySelector('.tc-summary').textContent,/启动失败/);
+  assert.equal(limit.querySelector('.tc-open-agent').hidden,false,'an already-started failed child retains its detail link');
+  limit.querySelector('.tc-open-agent').dispatch('click');
+  assert.equal(context.openedAgents.at(-1).id,'child-limit');
+  assert.match(add('timeout','timeout 1m0s').querySelector('.tc-summary').textContent,/战略路线.*超时/);
+  assert.match(add('cancel','cancelled',{status:'killed'}).querySelector('.tc-summary').textContent,/战略路线.*取消/);
+  assert.match(add('permission','permission_denied').querySelector('.tc-summary').textContent,/战略路线.*权限/);
+  assert.match(add('protocol','provider_protocol_error').querySelector('.tc-summary').textContent,/战略路线.*协议/);
+  assert.match(add('api','api_error',{diagnostic:'HTTP 401 {"api_key":"DO_NOT_SHOW"} <img src=x onerror=evil()>'}).querySelector('.tc-summary').textContent,/战略路线.*供应商/);
+  assert.doesNotMatch(area.querySelectorAll('.call-row').at(-1).querySelector('.tc-summary').textContent,/DO_NOT_SHOW|img|HTTP 401/);
+  const legacy=add('legacy','',{},'## A task-authored max_tokens phrase is not a runtime diagnostic');
+  assert.match(legacy.querySelector('.tc-summary').textContent,/战略路线.*执行未完成/);
+  assert.doesNotMatch(legacy.querySelector('.tc-summary').textContent,/输出达到上限/,'partial answer prose cannot invent a stop reason');
+  context.handleToolStart({tool:'Agent',id:'unknown',session:'A',input:JSON.stringify({name:'Unknown task'})});flushFrames();
+  context.handleToolResult({tool:'Agent',id:'unknown',isError:true,output:'arbitrary task text'});
+  assert.match(area.querySelectorAll('.call-row').at(-1).querySelector('.tc-summary').textContent,/执行失败/);
+  context.handleToolStart({tool:'Agent',id:'not-started',session:'A',input:JSON.stringify({name:'Not started'})});flushFrames();
+  context.handleToolResult({tool:'Agent',id:'not-started',isError:true,output:'setup failed',presentation:{'metis.agent_started':false}});
+  assert.match(area.querySelectorAll('.call-row').at(-1).querySelector('.tc-summary').textContent,/启动失败/);
+  context.handleToolStart({tool:'Agent',id:'not-authorized',session:'A',input:JSON.stringify({name:'Blocked task'})});flushFrames();
+  context.handleToolResult({tool:'Agent',id:'not-authorized',isError:true,output:'denied',presentation:{'metis.agent_started':false,subagent:{status:'failed',stopReason:'permission_denied'}}});
+  assert.match(area.querySelectorAll('.call-row').at(-1).querySelector('.tc-summary').textContent,/权限被拒绝/);
+  context.lang='en';context.refreshActivityGroupLanguage();
+  assert.match(limit.querySelector('.tc-summary').textContent,/战略路线.*output limit/i);
+  assert.doesNotMatch(limit.querySelector('.tc-summary').textContent,/Start failed/);
+} else if (scenario === 'subagent_failure_history_and_recovery') {
+  const id='historic-limit',child={sessionId:'A',parentToolUseId:id,agentId:'historic-child',name:'战略路线',status:'failed',stopReason:'max_tokens',partialOutput:true,canResume:true};
+  context.renderHistoryMessages([
+    {role:'user',content:[{type:'text',text:'Design a mobile OS'}]},
+    {role:'assistant',content:[{type:'tool_use',tool_use_id:id,name:'Agent',input:{description:'战略路线',prompt:'private'}}]},
+    {role:'user',content:[{type:'tool_result',tool_use_id:id,content:'PARTIAL_DESIGN',is_error:true,presentation:{'metis.agent_started':true,subagent:child}}]},
+  ]);flushFrames();
+  const old=area.querySelector('.call-row');
+  assert.match(old.querySelector('.tc-summary').textContent,/战略路线.*输出达到上限/);
+  assert.equal(old.querySelector('.tc-open-agent').hidden,false);
+  context.finishUserTurn('completed');context.beginUserTurn();
+  context.handleToolStart({tool:'Agent',id:'recovered',session:'A',input:JSON.stringify({description:'续写任务'})});flushFrames();
+  const row=area.querySelectorAll('.call-row').at(-1);
+  context.handleSubagentLifecycle({sessionId:'A',parentToolUseId:'recovered',agentId:'recovered-child',name:'续写任务',status:'running',executionPhase:'continuing',continuationAttempts:1},'running');
+  assert.match(row.querySelector('.tc-subagent-state').textContent,/续写中/);
+  row.querySelector('.tc-summary').classList.add('err');row.querySelector('.tc-summary').textContent='旧失败提示';
+  row.querySelector('.tc-io-text[data-out]').setAttribute('data-error','true');
+  context.handleToolResult({tool:'Agent',id:'recovered',output:'COMPLETE_DESIGN',presentation:{'metis.agent_started':true,subagent:{sessionId:'A',parentToolUseId:'recovered',agentId:'recovered-child',name:'续写任务',status:'completed',stopReason:'end_turn',continuationAttempts:1,partialOutput:false}}});
+  assert.equal(row.querySelector('.tc-summary').classList.contains('err'),false,'successful recovery clears stale failure styling');
+  assert.match(row.querySelector('.tc-summary').textContent,/续写任务/);
+  assert.doesNotMatch(row.querySelector('.tc-summary').textContent,/旧失败|启动失败|输出达到上限/);
+  assert.equal(row.querySelector('.tc-io-text[data-out]').getAttribute('data-error'),null);
+  assert.match(row.querySelector('.tc-subagent-state').textContent,/已完成/);
+  assert.match(old.querySelector('.tc-summary').textContent,/输出达到上限/,'a later recovery cannot rewrite an earlier failed event');
 } else if (scenario === 'subagent_stage_lifecycle') {
   const input = JSON.stringify({description:'Review code', prompt:'private task body'});
   context.handleToolStart({tool:'Agent', id:'parent-1', session:'A', input});

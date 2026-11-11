@@ -46,7 +46,7 @@ func runSubagentConversationUI(t *testing.T, scenario string) {
 }
 
 func TestSubagentConversationReader(t *testing.T) {
-	for _, scenario := range []string{"messages_tools_safe", "tool_pairing_boundaries", "owner_generation", "paused_updates", "pagination_anchor", "directory_usage", "catalog_pagination_refresh", "reopen_paused_canonical", "reopen_chrome_latest", "late_fetch_keeps_delta", "pagination_cursor_advances", "live_preview_boundaries", "keyboard_presentation", "parent_owned_capability"} {
+	for _, scenario := range []string{"failure_classification_chrome", "messages_tools_safe", "tool_pairing_boundaries", "owner_generation", "paused_updates", "pagination_anchor", "directory_usage", "catalog_pagination_refresh", "reopen_paused_canonical", "reopen_chrome_latest", "late_fetch_keeps_delta", "pagination_cursor_advances", "live_preview_boundaries", "keyboard_presentation", "parent_owned_capability"} {
 		t.Run(scenario, func(t *testing.T) { runSubagentConversationUI(t, scenario) })
 	}
 }
@@ -204,6 +204,23 @@ async function run(){
     c.currentSessionId='B';c.renderStatusSnapshot({viewRoster:{sessionId:'A',agents:[agent],subAgents:1,jobs:[]}});
     assert.equal(overlay.hidden,true);assert.equal(active.closed,true,'switching the parent session closes the child lane');
     active.emit('delta',{agentId:'child',sessionId:'A',delta:'LATE_FOREIGN_TEXT'});assert.doesNotMatch(body.textContent,/LATE_FOREIGN_TEXT/);
+  }else if(scenario==='failure_classification_chrome'){
+    await show([message('user','TASK'),message('assistant','PARTIAL_DESIGN')]);
+    snapshot({status:'failed',stopHint:'max_tokens',exitError:'sub-agent incomplete: max_tokens'});await settle();
+    assert.match(el('subAgentDetailDescription').textContent,/output limit/i);
+    assert.match(body.textContent,/PARTIAL_DESIGN/,'partial output remains readable');
+    assert.match(body.textContent,/output limit/i,'detail explains the recorded failure');
+    assert.doesNotMatch(body.textContent,/Start failed/);
+    snapshot({status:'failed',stopHint:'api_error',exitError:'HTTP 401 {"api_key":"DO_NOT_SHOW"} <img src=x onerror=evil()>'});await settle();
+    assert.match(body.textContent,/provider/i);
+    assert.doesNotMatch(body.textContent,/DO_NOT_SHOW|onerror|HTTP 401/,'raw provider payload is not a user-facing diagnostic');
+    assert.equal(body.querySelectorAll('img').length,0);
+    snapshot({status:'running',stopHint:'',exitError:'',executionPhase:'continuing',continuationAttempts:1});await settle();
+    assert.match(el('subAgentDetailDescription').textContent,/continuing/i);
+    assert.doesNotMatch(body.textContent,/output limit reached|provider request failed/i,'old terminal error is removed while continuing');
+    snapshot({status:'completed',stopHint:'end_turn',exitError:'',executionPhase:'',continuationAttempts:1});await settle();
+    assert.match(el('subAgentDetailDescription').textContent,/Completed/);
+    assert.doesNotMatch(body.textContent,/output limit reached|provider request failed/i);
   }else if(scenario==='messages_tools_safe'){
     const long='LONG_BEGIN\n'+('complete output '+ '<img src=x onerror=evil()>\n').repeat(6000)+'LONG_END';
     const data=[message('user','FIRST_TASK'),

@@ -488,6 +488,10 @@ func (a Agent) InputSchema() map[string]any {
 				"type":        "integer",
 				"description": "tool-call budget for the sub-agent (default 100). Bumped from 10 → 100 on 2026-05-21 after image #36 repro: impl-* sub-agents kept hitting the 10-turn cap mid-implementation. claude-code's equivalent (forkSubagent.maxTurns) is 200; metis goes 100 as a middle ground that covers typical large file rewrites without unbounded runaway.",
 			},
+			"max_output_tokens": map[string]any{
+				"type": "integer", "minimum": 1,
+				"description": "Optional downward per-response output cap for this child only. Must not exceed the selected provider's effective output budget. Omit to inherit. Unsupported for server-managed subscription protocols. Saved on the child and unchanged by resume_from; automatic text-only continuations keep the same cap.",
+			},
 			"timeout_seconds": map[string]any{
 				"type":        "integer",
 				"description": "wall-clock budget for the sub-agent. Defaults to config.Agents.DefaultTimeoutSeconds (10 minutes). 0 disables timeout.",
@@ -667,6 +671,10 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 		resumedSnapshot = snapshot
 		in = continuationInput(in, snapshot)
 	}
+	outputCap, capErr := agentRequestedOutputCap(in, a.provider)
+	if capErr != nil {
+		return &tools.Result{Output: capErr.Error(), IsError: true}, nil
+	}
 
 	// G.2 — resolve per-invocation isolation/cwd BEFORE registering
 	// the teammate so we can refuse the spawn without polluting the
@@ -761,9 +769,10 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 			effectiveName = resumedSnapshot.Header.TeammateName
 		}
 		teammate = &agent.Teammate{
-			Name:       effectiveName, // empty → Roster auto-assigns _anon-<hex>
-			AgentID:    agentID,
-			Background: runInBackground,
+			Name:            effectiveName, // empty → Roster auto-assigns _anon-<hex>
+			AgentID:         agentID,
+			ParentSessionID: a.parentSessionID,
+			Background:      runInBackground,
 		}
 		// Desktop publishes a queued identity immediately; its runner acquires
 		// execution capacity after setup. CLI retains fail-fast admission.
@@ -978,6 +987,7 @@ func (a Agent) Execute(ctx context.Context, in map[string]any) (*tools.Result, e
 
 	sub := agent.NewLoop(a.provider, subRegistry, subGate, agent.NewHookRegistry(), subSystem, maxIter)
 	sub.Model = a.model
+	sub.RequestMaxTokens = outputCap
 	if a.effort != nil {
 		sub.SetEffort(a.effort())
 	}
@@ -1363,11 +1373,22 @@ func decorateAgentSubAgentResult(result *tools.Result, sessionID, parentToolUseI
 	if result.Presentation == nil {
 		result.Presentation = make(map[string]any)
 	}
+	// This decorator is reached only after a child identity has been accepted
+	// by the foreground runner, background queue, or an existing live child.
+	result.Presentation[agent.AgentStartedPresentationKey] = true
 	snap := teammate.Snapshot()
+	stopReason, diagnostic, canResume := subAgentFailureDetails(snap)
+	partial := result.IsError && !snap.Status.IsActive() && strings.TrimSpace(snap.Output) != ""
 	result.Presentation["subagent"] = map[string]any{
 		"sessionId": sessionID, "parentToolUseId": parentToolUseID,
 		"agentId": snap.AgentID, "name": snap.Name,
 		"background": snap.Background, "status": snap.Status.String(),
+		"stopReason": stopReason, "diagnostic": diagnostic,
+		"continuationAttempts": snap.ContinuationAttempts,
+		"partialOutput":        partial, "canResume": canResume,
+	}
+	if result.IsError && !snap.Status.IsActive() {
+		result.Output = subAgentFailureOutput(snap, stopReason, diagnostic, canResume)
 	}
 	return result
 }
@@ -1782,6 +1803,9 @@ drainLoop:
 		if teammate != nil {
 			status := agent.StatusFailed
 			hint := stopReason
+			if hint == "" {
+				hint, _, _ = subAgentFailureDetails(agent.TeammateSnapshot{Status: status, ExitErr: finalErr})
+			}
 			if errors.Is(finalErr, context.DeadlineExceeded) && timeout > 0 {
 				hint = fmt.Sprintf("timeout %s", timeout)
 			} else if errors.Is(finalErr, context.Canceled) {
@@ -1969,6 +1993,9 @@ func (a Agent) executeBackground(
 		case errors.Is(finalErr, context.Canceled):
 			teammate.Finish(agent.StatusKilled, final, finalErr, "cancelled")
 		default:
+			if stopReason == "" {
+				stopReason, _, _ = subAgentFailureDetails(agent.TeammateSnapshot{Status: agent.StatusFailed, ExitErr: finalErr})
+			}
 			teammate.Finish(agent.StatusFailed, final, finalErr, stopReason)
 		}
 		publishTerminal()
@@ -2135,6 +2162,7 @@ func recordSubAgentTerminal(transcript *agent.SubAgentTranscript, parentOut chan
 		Status: snap.Status.String(), Background: snap.Background,
 		EndedAt: snap.EndTime, Output: snap.Output, Result: snap.Result,
 		StopHint: snap.StopHint, ExitError: exitError,
+		ContinuationAttempts: snap.ContinuationAttempts,
 	})
 	publishSubAgentLifecycle(parentOut, agent.Event{
 		Kind:               agent.EventSubAgentEnd,
@@ -2174,7 +2202,7 @@ func notifyParent(ch chan<- agent.SubAgentNotification, t *agent.Teammate, dur t
 		Status:   snap.Status,
 		Summary:  snap.Result,
 		Duration: dur,
-		Err:      snap.ExitErr,
+		Err:      safeSubAgentNotificationError(snap),
 	}:
 	default:
 	}

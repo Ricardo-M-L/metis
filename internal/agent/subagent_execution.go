@@ -19,6 +19,7 @@ type SubAgentExecutionConfig struct {
 	Model               string   `json:"model"`
 	Effort              string   `json:"effort,omitempty"`
 	Fast                bool     `json:"fast,omitempty"`
+	MaxOutputTokens     int      `json:"maxOutputTokens,omitempty"`
 	WorkDir             string   `json:"workDir"`
 	System              string   `json:"system"`
 	Profile             string   `json:"profile,omitempty"`
@@ -36,6 +37,9 @@ type SubAgentExecutionConfig struct {
 func (c SubAgentExecutionConfig) Validate() error {
 	if c.Version != 1 {
 		return fmt.Errorf("unsupported subagent execution version %d", c.Version)
+	}
+	if c.MaxOutputTokens < 0 {
+		return fmt.Errorf("subagent execution output cap must not be negative")
 	}
 	if strings.TrimSpace(c.Model) == "" || c.Model != strings.TrimSpace(c.Model) {
 		return fmt.Errorf("subagent execution requires a model")

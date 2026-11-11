@@ -795,7 +795,7 @@ function refreshActivityGroupLanguage() {
       const semantic = semanticToolSummary(row.dataset.tool, row.getAttribute('data-args') || '');
       const summary = row.querySelector('.tc-summary');
       const detail = toolDetails[row.dataset.rowKey];
-      if (summary && row.dataset.state === 'error') summary.textContent = semanticToolErrorSummary(row.dataset.tool, detail?.output || '', detail?.input || row.getAttribute('data-args') || '');
+      if (summary && row.dataset.state === 'error') summary.textContent = semanticToolErrorSummary(row.dataset.tool, detail?.output || '', detail?.input || row.getAttribute('data-args') || '', detail?.presentation, row);
       else if (semantic !== null && summary) summary.textContent = semantic;
       const inspect = row.querySelector('.tc-inspect');
       if (inspect) inspect.textContent = uiText('Inspect', '查看详情');
@@ -2429,6 +2429,7 @@ function subagentRowExecutionPhaseLabel(phase) {
     waiting_background: uiText('Waiting for background task', '等待后台任务'),
     waiting_children: uiText('Waiting for child agents', '等待子代理'),
     waiting_slot: uiText('Waiting for execution slot', '等待执行槽'),
+    continuing: uiText('Continuing output', '续写中'),
   };
   return labels[phase] || '';
 }
@@ -2437,7 +2438,7 @@ function subagentRowVisibleStatus(row) {
   if (!row) return '';
   const status = row.dataset.subagentStatus;
   const lifecycle = subagentRowStatusLabel(status);
-  if (!lifecycle || !['queued', 'running'].includes(status)) return lifecycle;
+  if (!lifecycle || !['queued', 'running'].includes(status)) return subagentOutcomeLabel(subagentRowOutcome(row)) || lifecycle;
   const phase = subagentRowExecutionPhaseLabel(row.dataset.subagentExecutionPhase);
   return phase && phase !== lifecycle ? lifecycle + ' · ' + phase : lifecycle;
 }
@@ -2536,7 +2537,81 @@ function semanticToolSummary(name, input) {
   if (key === 'messageteammate') return field('to') || uiText('Recipient not specified', '未指定接收者');
   return uiText('External channel', '外部频道');
 }
-function semanticToolErrorSummary(name, output = '', input = '') {
+// Only runtime fields classify a child outcome. Partial assistant prose is not
+// an error message, and retained provider payloads are never copied to labels.
+function subagentOutcomeKind(info = {}) {
+  const status = String(info.status || '').toLowerCase();
+  if (status === 'completed') return 'completed';
+  if (['queued', 'running'].includes(status)) {
+    return info.executionPhase === 'continuing' ? 'continuing' : '';
+  }
+  let reason = String(info.stopReason || info.stopHint || '').trim().toLowerCase().replace(/-/g, '_');
+  const diagnostic = String(info.diagnostic || info.exitError || '').trim();
+  if (!reason || ['error', 'failed', 'unknown'].includes(reason)) {
+    // Older terminal records predate structured stopReason, but their exact
+    // host-authored diagnostic prefix is still useful without showing its body.
+    const incomplete = diagnostic.match(/^sub-agent incomplete: (max_tokens|length|max_output_tokens|provider_protocol_error|max_iterations)$/i);
+    if (incomplete) reason = incomplete[1].toLowerCase();
+    else if (/^context deadline exceeded$/i.test(diagnostic)) reason = 'timeout';
+    else if (/^context cancel(?:ed|led)$/i.test(diagnostic)) reason = 'cancelled';
+    else if (/^(?:(?:llm|provider|stream|complete|request):\s*)*(?:openai|anthropic|gemini|azure|bedrock|vertex)\s+(?:HTTP\s+)?\d{3}\b/i.test(diagnostic)) reason = 'api_error';
+  }
+  if (['max_tokens', 'length', 'max_output_tokens'].includes(reason)) return 'output_limit';
+  if (/^(?:timeout|deadline_exceeded|context_deadline_exceeded|turn_wall_clock)(?:$|[ :])/.test(reason)) return 'timeout';
+  if (['cancelled', 'canceled', 'ctx_cancelled', 'context_canceled', 'context_cancelled'].includes(reason)) return 'cancelled';
+  if (['permission_denied', 'approval_denied', 'denied', 'permission_rejected'].includes(reason)) return 'permission';
+  if (['provider_protocol_error', 'provider_incomplete', 'protocol_error', 'invalid_tool_call', 'malformed_tool_call'].includes(reason)) return 'protocol';
+  if (['api_error', 'provider_error', 'invalid_request', 'authentication_error', 'rate_limit', 'rate_limit_error', 'server_error'].includes(reason)) return 'provider';
+  if (status === 'killed' || ['stopped', 'interrupted'].includes(reason)) return 'stopped';
+  if (status === 'failed' || status === 'error') return !reason && !diagnostic ? 'incomplete' : 'failed';
+  return '';
+}
+
+function subagentOutcomeLabel(info = {}) {
+  const labels = {
+    output_limit: uiText('Output limit reached; incomplete', '输出达到上限，未完成'),
+    timeout: uiText('Execution timed out', '执行超时'),
+    cancelled: uiText('Cancelled', '已取消'),
+    stopped: uiText('Stopped', '已停止'),
+    permission: uiText('Permission denied', '权限被拒绝'),
+    protocol: uiText('Provider protocol error', '供应商协议错误'),
+    provider: uiText('Provider request failed', '供应商请求失败'),
+    incomplete: uiText('Execution incomplete', '执行未完成'),
+    failed: uiText('Execution failed', '执行失败'),
+    continuing: uiText('Continuing output', '续写中'),
+  };
+  return labels[subagentOutcomeKind(info)] || '';
+}
+
+function subagentOutcomeNotice(info = {}) {
+  const kind = subagentOutcomeKind(info);
+  if (!kind || ['completed', 'continuing'].includes(kind)) return '';
+  const label = subagentOutcomeLabel(info);
+  const retained = info.partialOutput || info.output || info.result
+    ? uiText(' The existing partial output is retained below.', ' 已保留现有的部分输出。') : '';
+  const cause = kind === 'output_limit'
+    ? uiText('The agent reached its per-response output limit before finishing.', '子代理达到单次输出上限，任务尚未完成。')
+    : label + uiText('. Inspect the recorded activity for context.', '。可查看已保存的执行记录。');
+  return cause + retained;
+}
+
+function subagentRowOutcome(row) {
+  return { ...(row && row._subagentOutcome || {}), status: row?.dataset.subagentStatus || row?._subagentOutcome?.status || '' };
+}
+
+function updateSubagentRowOutcome(row, info) {
+  if (!row || !info || typeof info !== 'object') return;
+  const prior = row.dataset.subagentStatus;
+  if (['completed', 'failed', 'killed'].includes(prior) && ['queued', 'running'].includes(info.status)) return;
+  const next = { ...(row._subagentOutcome || {}) };
+  ['stopReason', 'stopHint', 'diagnostic', 'exitError', 'executionPhase', 'partialOutput', 'continuationAttempts', 'canResume'].forEach(key => {
+    if (Object.prototype.hasOwnProperty.call(info, key)) next[key] = info[key];
+  });
+  if (info.status) next.status = info.status;
+  row._subagentOutcome = next;
+}
+
+function semanticToolErrorSummary(name, output = '', input = '', presentation = null, row = null) {
   const key = String(name || '').toLowerCase().replace(/[^a-z]/g, '');
   const line = firstLine(output);
   // Interpret only known runtime diagnostics. The full result stays in the
@@ -2575,7 +2650,20 @@ function semanticToolErrorSummary(name, output = '', input = '') {
       return path ? message + ' · ' + path : message + uiText('; inspect details', '，查看详情');
     }
   }
-  if (key === 'agent') return uiText('Start failed; inspect details', '启动失败，查看详情');
+  if (key === 'agent') {
+    const started = presentation && presentation['metis.agent_started'];
+    const info = row?._subagentOutcome ? subagentRowOutcome(row) : presentation?.subagent || {};
+    const knownChild = started === true || !!row?.dataset.subagentId;
+    const facts = { ...info, status: info.status || 'failed' };
+    const kind = subagentOutcomeKind(facts);
+    const classified = !['', 'failed', 'incomplete', 'completed'].includes(kind) ? subagentOutcomeLabel(facts) : '';
+    const label = classified || (started === false && !knownChild
+      ? uiText('Start failed', '启动失败')
+      : !knownChild ? uiText('Execution failed', '执行失败')
+        : subagentOutcomeLabel(facts) || uiText('Execution incomplete', '执行未完成'));
+    const task = semanticToolSummary(name, input);
+    return [task, label + uiText('; inspect details', '，查看详情')].filter(Boolean).join(' · ');
+  }
   if (key === 'messageteammate') return uiText('Message failed; inspect details', '消息发送失败，查看详情');
   if (key === 'sendmessage') return uiText('External delivery failed; inspect details', '外部发送失败，查看详情');
   if (semanticToolSummary(name, '') === null && line) return line;
@@ -2909,6 +2997,7 @@ function attachSubagentIdentity(row, info, status) {
   row.dataset.subagentSessionId = owner;
   row.dataset.subagentName = boundedToolLabel(info.name || '');
   row.dataset.subagentBackground = String(!!info.background);
+  updateSubagentRowOutcome(row, { ...info, status });
   updateSubagentRowStatus(row, status);
   if (Object.prototype.hasOwnProperty.call(info, 'executionPhase')) updateSubagentRowExecutionPhase(row, info.executionPhase);
   const open = row.querySelector('.tc-open-agent');
@@ -2953,6 +3042,7 @@ function reconcileSubagentToolRows(roster) {
         row.dataset.subagentSessionId !== owner || ['completed', 'failed', 'killed'].includes(row.dataset.subagentStatus)) return;
     const agent = agents.get(String(row.dataset.subagentId || ''));
     if (agent) {
+      updateSubagentRowOutcome(row, agent);
       updateSubagentRowStatus(row, agent.status);
       updateSubagentRowExecutionPhase(row, agent.executionPhase);
     }
@@ -3243,16 +3333,21 @@ function handleToolResult(d) {
     }
     const t = chip.querySelector('.tc-time');
     if (t) t.textContent = d.elapsedMs ? fmtMs(d.elapsedMs) : '';
+    if (toolDetails[rowKey]) toolDetails[rowKey].presentation = d.presentation || null;
     const summary = chip.querySelector('.tc-summary');
     if (!ok && summary) {
       summary.classList.add('err');
-      if (!isWebSearchTool(name)) summary.textContent = semanticToolErrorSummary(name, d.output, chip.getAttribute('data-args') || '');
+      if (!isWebSearchTool(name)) summary.textContent = semanticToolErrorSummary(name, d.output, chip.getAttribute('data-args') || '', d.presentation, chip);
+    } else if (ok && summary) {
+      summary.classList.remove('err');
+      if (semanticToolSummary(name, chip.getAttribute('data-args') || '') !== null) summary.textContent = semanticToolSummary(name, chip.getAttribute('data-args') || '');
     }
     updateToolRowAccessibleLabel(chip);
     const out = chip.querySelector('.tc-io-text[data-out]');
     if (out) {
       out.textContent = d.output || '(no output)';
       if (!ok) out.setAttribute('data-error', 'true');
+      else out.removeAttribute('data-error');
     }
     if (isWebSearchTool(name)) renderWebSearchInline(chip, d.output || '', ok ? 'ok' : 'error');
     // DSH SearchBlock parity: a successful Grep renders as a structured
@@ -4958,6 +5053,7 @@ function refreshHistoricalSubagentStatuses(sessionId, generation) {
               row.dataset.subagentSessionId !== sessionId ||
               row.dataset.subagentId !== agentId || row.dataset.subagentStatus !== requestedStatuses.get(row) ||
               !['queued', 'running'].includes(row.dataset.subagentStatus)) return;
+          updateSubagentRowOutcome(row, detail);
           updateSubagentRowStatus(row, detail.status);
         });
       } catch (_) { /* Keep the persisted started state when detail is unavailable. */ }
@@ -5232,7 +5328,7 @@ function virtualHistoryApplyUnit(unit, nodes) {
   applyHistoryMessageMetadata({ turnMetrics: metric ? [metric] : [], events: state.errors.get(unit.turn) || [] }, state.sessionData || {}, unit.turn);
   virtualHistoryNodes(nodes, '.call-row[data-subagent-id]').forEach(row => {
     const child = state.agents.get(String(row.dataset.subagentId || ''));
-    if (child) { updateSubagentRowStatus(row, child.status); updateSubagentRowExecutionPhase(row, child.executionPhase); }
+    if (child) { updateSubagentRowOutcome(row, child); updateSubagentRowStatus(row, child.status); updateSubagentRowExecutionPhase(row, child.executionPhase); }
   });
   if (!unit.live && unit === state.units.at(-1) && viewedHistoryTurnIsRunning()) {
     activityCurrentTurnId = 'history-' + unit.turn;

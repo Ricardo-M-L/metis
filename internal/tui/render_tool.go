@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"image/color"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -1147,21 +1148,8 @@ func summarizeNormalizedToolResult(te ToolEvent) string {
 		if out == "" {
 			return fmt.Sprintf("%s · no output yet", dur)
 		}
-		status := ""
-		// Parse "status=X" from the FIRST whitespace-separated KV line.
-		// Two shapes:
-		//   - multi-line output: head = up to first "\n"
-		//   - single-line output (just spawned, no body yet): head = whole out
-		head := out
-		if nl := strings.Index(out, "\n"); nl > 0 {
-			head = out[:nl]
-		}
-		for _, kv := range strings.Fields(head) {
-			if strings.HasPrefix(kv, "status=") {
-				status = strings.TrimPrefix(kv, "status=")
-				break
-			}
-		}
+		metadata := subAgentOutputMetadata(out)
+		status, reason := metadata["status"], metadata["stop_reason"]
 		body := ""
 		if idx := strings.Index(out, "---output---"); idx >= 0 {
 			body = out[idx+len("---output---"):]
@@ -1172,7 +1160,12 @@ func summarizeNormalizedToolResult(te ToolEvent) string {
 			word = "line"
 		}
 		switch status {
+		case "queued":
+			return fmt.Sprintf("%s · queued", dur)
 		case "running":
+			if metadata["execution_phase"] == "continuing" {
+				return fmt.Sprintf("%s · continuing output", dur)
+			}
 			if n > 0 {
 				return fmt.Sprintf("%s · still running · %d %s", dur, n, word)
 			}
@@ -1180,9 +1173,23 @@ func summarizeNormalizedToolResult(te ToolEvent) string {
 		case "completed":
 			return fmt.Sprintf("%s · completed · %d %s", dur, n, word)
 		case "killed":
+			if reason == "cancelled" || reason == "ctx_cancelled" {
+				return fmt.Sprintf("%s · cancelled", dur)
+			}
 			return fmt.Sprintf("%s · killed", dur)
 		case "failed":
+			switch reason {
+			case "max_tokens", "length", "max_output_tokens":
+				return fmt.Sprintf("%s · output limit · incomplete", dur)
+			case "timeout", "deadline_exceeded":
+				return fmt.Sprintf("%s · timed out", dur)
+			}
+			if strings.HasPrefix(reason, "timeout ") {
+				return fmt.Sprintf("%s · timed out", dur)
+			}
 			return fmt.Sprintf("%s · failed", dur)
+		case "unknown":
+			return fmt.Sprintf("%s · state unavailable", dur)
 		}
 		return fmt.Sprintf("%s · %d %s", dur, n, word)
 	case "SubAgentList":
@@ -1193,15 +1200,34 @@ func summarizeNormalizedToolResult(te ToolEvent) string {
 			return fmt.Sprintf("%s · failed", dur)
 		}
 		out := strings.TrimSpace(te.Output)
-		if out == "" || strings.HasPrefix(out, "(no sub-agents") {
+		incomplete := subAgentListFlag(out, "history_incomplete=true")
+		more := subAgentListFlag(out, "more_saved_records=true")
+		if out == "" || (strings.HasPrefix(out, "(no sub-agents") && !incomplete && !more) {
 			return fmt.Sprintf("%s · no sub-agents", dur)
 		}
-		n := lineCount(out)
+		n := 0
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "agent_id=") {
+				n++
+			}
+		}
+		// Old plain-text readers did not carry a query footer. Retain their
+		// count fallback without counting new pagination/diagnostic metadata.
+		if n == 0 && !strings.Contains(out, "query_page ") && !incomplete && !more {
+			n = lineCount(out)
+		}
 		word := "agents"
 		if n == 1 {
 			word = "agent"
 		}
-		return fmt.Sprintf("%s · %d %s", dur, n, word)
+		summary := fmt.Sprintf("%s · %d %s", dur, n, word)
+		if more {
+			summary += " · more available"
+		}
+		if incomplete {
+			summary += " · history incomplete"
+		}
+		return summary
 	case "SubAgentStop":
 		if te.IsError {
 			return fmt.Sprintf("%s · failed", dur)
@@ -1599,6 +1625,78 @@ func stripSubAgentOutputEnvelope(out string) string {
 		kept = append(kept, ln)
 	}
 	return strings.TrimSpace(strings.Join(kept, "\n"))
+}
+
+// subAgentOutputMetadata reads only the reader-authored first line. Names and
+// diagnostics use Go-quoted values; whitespace splitting would let a name such
+// as "review status=completed" impersonate the actual lifecycle field.
+func subAgentOutputMetadata(out string) map[string]string {
+	head, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
+	if !strings.HasPrefix(head, "agent_id=") {
+		return nil
+	}
+	fields := make(map[string]string)
+	for rest := head; rest != ""; {
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			break
+		}
+		eq := strings.IndexByte(rest, '=')
+		if eq <= 0 || strings.ContainsAny(rest[:eq], " \t\r\n") {
+			break
+		}
+		key := rest[:eq]
+		rest = rest[eq+1:]
+		value := ""
+		if strings.HasPrefix(rest, `"`) {
+			end, escaped := -1, false
+			for i := 1; i < len(rest); i++ {
+				if escaped {
+					escaped = false
+					continue
+				}
+				if rest[i] == '\\' {
+					escaped = true
+				} else if rest[i] == '"' {
+					end = i + 1
+					break
+				}
+			}
+			if end < 0 {
+				break
+			}
+			var err error
+			value, err = strconv.Unquote(rest[:end])
+			if err != nil {
+				break
+			}
+			rest = rest[end:]
+			if rest != "" && rest[0] != ' ' && rest[0] != '\t' {
+				break
+			}
+		} else if end := strings.IndexAny(rest, " \t\r\n"); end >= 0 {
+			value, rest = rest[:end], rest[end:]
+		} else {
+			value, rest = rest, ""
+		}
+		if _, duplicate := fields[key]; duplicate {
+			return nil
+		}
+		fields[key] = value
+	}
+	return fields
+}
+
+// Flags are recognized only on dedicated query lines, never inside an
+// assistant result snippet or a quoted child name.
+func subAgentListFlag(out, prefix string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == prefix || strings.HasPrefix(line, prefix+" ") || strings.HasPrefix(line, prefix+";") {
+			return true
+		}
+	}
+	return false
 }
 
 // formatToolPreviewLine applies per-tool prefix-dimming so the

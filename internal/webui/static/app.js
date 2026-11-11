@@ -820,13 +820,14 @@ function subAgentExecutionPhaseLabel(phase) {
     waiting_background: subAgentText('Waiting for background task', '等待后台任务'),
     waiting_children: subAgentText('Waiting for child agents', '等待子代理'),
     waiting_slot: subAgentText('Waiting for execution slot', '等待执行槽'),
+    continuing: subAgentText('Continuing output', '续写中'),
   };
   return labels[phase] || '';
 }
 
 function subAgentLifecycleAndPhaseLabel(agent) {
   const status = String(agent && agent.status || '');
-  const lifecycle = subAgentStatusLabel(status);
+  const lifecycle = (typeof subagentOutcomeLabel === 'function' ? subagentOutcomeLabel(agent) : '') || subAgentStatusLabel(status);
   if (status !== 'queued' && status !== 'running') return lifecycle;
   const phase = subAgentExecutionPhaseLabel(agent.executionPhase);
   return phase && phase !== lifecycle ? lifecycle + ' · ' + phase : lifecycle;
@@ -1109,7 +1110,8 @@ function subAgentWasCancelled(agent) {
 }
 
 function subAgentDetailStatusLabel(agent) {
-  return subAgentWasCancelled(agent) ? subAgentText('Cancelled', '已取消') : subAgentStatusLabel(agent.status);
+  const outcome = typeof subagentOutcomeLabel === 'function' ? subagentOutcomeLabel(agent) : '';
+  return outcome || (subAgentWasCancelled(agent) ? subAgentText('Cancelled', '已取消') : subAgentStatusLabel(agent.status));
 }
 
 function subAgentDetailExecutionPhase(agent) {

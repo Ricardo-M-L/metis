@@ -96,6 +96,7 @@ func (s *Server) persistedSubAgentView(sessionID, agentID string) (subAgentDetai
 		view.Output, view.OutputTruncated = trimSubAgentDetailOutput(terminal.Output)
 		view.Result, view.ResultTruncated = trimSubAgentDetailOutput(terminal.Result)
 		view.StopHint, view.ExitError = terminal.StopHint, terminal.ExitError
+		view.ContinuationAttempts = terminal.ContinuationAttempts
 		if elapsed := terminal.EndedAt.Sub(conversation.Header.CreatedAt); elapsed > 0 {
 			view.ElapsedMS = elapsed.Milliseconds()
 		}

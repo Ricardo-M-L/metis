@@ -46,7 +46,10 @@ type ContextUsage struct {
 	Capabilities     llm.ContextCapabilities
 	CompactThreshold float64
 	CompactAtTokens  int
-	epoch            uint64
+	// Provider default only; individual requests and children may use a lower
+	// override. Keep it in this same-lock snapshot, including display freezes.
+	DefaultOutputBudgetTokens int
+	epoch                     uint64
 }
 
 type contextPrefixEstimate struct {
@@ -120,7 +123,8 @@ func (l *Loop) contextUsageSnapshotLocked() ContextUsage {
 		caps.Model = l.Model
 	}
 	snapshot := ContextUsage{Used: used, Capabilities: caps,
-		CompactThreshold: threshold, CompactAtTokens: trigger, epoch: l.contextUsageEpoch.Load()}
+		DefaultOutputBudgetTokens: llm.ProviderDefaultOutputBudget(l.Provider),
+		CompactThreshold:          threshold, CompactAtTokens: trigger, epoch: l.contextUsageEpoch.Load()}
 	prefix := l.contextPrefix
 	if prefix.valid && prefix.historyRevision == l.historyRevision &&
 		prefix.routingRevision == l.routingRevision && prefix.model == l.Model &&
@@ -236,6 +240,10 @@ func (l *Loop) contextRequestAnchorLocked(provider llm.Provider, req llm.Request
 	if base, ok := l.activeContextBaseLocked(); ok {
 		pressure = max(base+overhead, 0)
 	}
+	maxOutput := l.contextCapabilities.MaxOutputTokens
+	if req.MaxTokens > 0 && (maxOutput <= 0 || req.MaxTokens < maxOutput) {
+		maxOutput = req.MaxTokens
+	}
 	return contextRequestAnchor{
 		valid:        true,
 		provider:     provider,
@@ -253,7 +261,7 @@ func (l *Loop) contextRequestAnchorLocked(provider llm.Provider, req llm.Request
 		maxContext:           maxContext,
 		windowKind:           l.contextCapabilities.WindowKind,
 		maxInput:             l.contextCapabilities.MaxInputTokens,
-		maxOutput:            l.contextCapabilities.MaxOutputTokens,
+		maxOutput:            maxOutput,
 	}
 }
 

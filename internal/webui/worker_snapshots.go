@@ -139,7 +139,8 @@ func (s *Server) workerViewRoster(sessionID string) map[string]any {
 			"sessionId": sessionID, "name": item.Name, "agentId": item.AgentID,
 			"status": item.Status, "background": item.Background,
 			"executionPhase": item.ExecutionPhase, "holdsExecutionSlot": item.HoldsExecutionSlot,
-			"startedAt": item.StartedAt,
+			"continuationAttempts": item.ContinuationAttempts,
+			"startedAt":            item.StartedAt,
 		})
 	}
 	jobs := make([]map[string]any, 0, len(status.Jobs))
@@ -193,7 +194,8 @@ func subAgentDetailFromWorker(sessionID string, a desktopipc.Subagent) subAgentD
 	return subAgentDetailView{
 		SessionID: sessionID, Name: a.Name, AgentID: a.AgentID, Status: a.Status,
 		ExecutionPhase: a.ExecutionPhase, HoldsExecutionSlot: a.HoldsExecutionSlot, Background: a.Background,
-		StartedAt: a.StartedAt, EndedAt: a.EndedAt, ElapsedMS: a.ElapsedMS,
+		ContinuationAttempts: a.ContinuationAttempts,
+		StartedAt:            a.StartedAt, EndedAt: a.EndedAt, ElapsedMS: a.ElapsedMS,
 		Output: a.Output, OutputTruncated: a.OutputTruncated, Result: a.Result,
 		ResultTruncated: a.ResultTruncated, StopHint: a.StopHint, ExitError: a.ExitError,
 	}

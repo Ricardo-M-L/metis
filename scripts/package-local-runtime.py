@@ -342,6 +342,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True, help="new or existing empty staging directory")
     parser.add_argument("--report-directory", type=Path, action="append", default=[],
                         help="curated supporting reports; repeat to copy JSON/Markdown from several directories")
+    parser.add_argument("--computer-use-artifact-dir", type=Path,
+                        help="offline helper archives matching the compiled computer-use catalog")
     parser.add_argument("--wails", default=shutil.which("wails") or "/Users/yujun2/go/bin/wails", help="Wails CLI")
     parser.add_argument("--go", default=shutil.which("go") or "/Users/yujun2/.local/go-1.26.4/bin/go", help="Go compiler")
     parser.add_argument("--npm", default=shutil.which("npm") or "npm", help="npm executable")
@@ -422,6 +424,14 @@ def build_package(args: argparse.Namespace, commands: Commands) -> dict[str, obj
             source_app = build_repo / "metis-desktop/build/bin/METIS.app"
             if not source_app.is_dir():
                 raise PackageError("native build did not produce METIS.app")
+            # Local updates must retain the same pinned helper resources as
+            # official Desktop packages. Validate them before sealing the app.
+            helper_args = [sys.executable, str(build_repo / "scripts/bundle-computer-use.py"),
+                           "--app", str(source_app.resolve(strict=True))]
+            helper_artifacts = getattr(args, "computer_use_artifact_dir", None)
+            if helper_artifacts is not None:
+                helper_args += ["--artifact-dir", str(helper_artifacts.expanduser().resolve(strict=True))]
+            commands.run("bundle pinned computer-use archives", helper_args, build_repo, environment)
             commands.run("bundle fresh CLI inside native application", [sys.executable,
                          str(build_repo / "scripts/prepare-desktop-cli.py"), "--repo", str(build_repo),
                          "--platform", "darwin/arm64", "--app", str(source_app), "--cli", str(cli),

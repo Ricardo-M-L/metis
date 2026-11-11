@@ -97,6 +97,9 @@ type Loop struct {
 	ResponseFormat *llm.ResponseFormat
 	MaxIters       int
 	GraceCalls     int
+	// RequestMaxTokens is a child-owned downward per-response cap. It never
+	// mutates the provider shared with the parent. Configure before Run.
+	RequestMaxTokens int
 	// ContinueOnIterationLimit makes MaxIters a segment length within the same
 	// Run instead of a terminal cap. Runtime enables this for ordinary main
 	// CLI/Desktop turns; raw NewLoop, child loops and explicit caps retain the
@@ -1774,15 +1777,17 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		discardedStaleSteers = len(l.steerBuf)
 		l.steerBuf = nil
 	}
-	l.haltRequested = false
-	l.haltReason = ""
-	l.todoReconciledThisTurn = false
-	// Verification obligations and verdicts belong to one user turn. Keeping
-	// them across Run calls lets a PASS from an earlier task satisfy a later
-	// unrelated high-risk task, or makes old mutations inflate the new risk
-	// score. Reset at the actual turn boundary while preserving it across every
-	// model/tool iteration inside this Run.
-	l.contract.reset()
+	if !subAgentTextContinuation(ctx) {
+		l.haltRequested = false
+		l.haltReason = ""
+		l.todoReconciledThisTurn = false
+		// Verification obligations and verdicts belong to one user turn. Keeping
+		// them across Run calls lets a PASS from an earlier task satisfy a later
+		// unrelated high-risk task, or makes old mutations inflate the new risk
+		// score. Reset at the actual turn boundary while preserving it across every
+		// model/tool iteration inside this Run.
+		l.contract.reset()
+	}
 	l.steerClosed = false
 	l.mu.Unlock()
 	if discardedStaleSteers > 0 {
@@ -1793,6 +1798,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	}
 	defer func() {
 		if discarded := l.stopAcceptingSteer(); len(discarded) > 0 {
+			if subAgentTextContinuation(ctx) {
+				return
+			} // still owned by the durable parent-input queue
 			// The Run commonly exits because ctx was cancelled; detach only the
 			// cancellation signal so the loss notice itself is not dropped.
 			notice := Event{
@@ -1862,8 +1870,16 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		return err
 	}
 	specs := l.toolSpecsWithContext(ctx)
+	if subAgentTextContinuation(ctx) {
+		specs = nil
+	}
 	l.contract.verifyUnavailable = !l.verifierDispatchAvailable()
 	verificationAttempts := 0
+	outputTurn := subAgentOutputTurn(ctx)
+	if outputTurn != nil {
+		verificationAttempts = outputTurn.verificationAttempts
+		defer func() { outputTurn.verificationAttempts = verificationAttempts }()
+	}
 	graceUsed := 0
 	emptyStopRescued := false // see empty_stop_rescue.go — at most one rescue per turn
 	textToolCallRescued := false
@@ -1876,8 +1892,14 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	stuckDet := &stuckDetector{}                // see stuck_detector.go — Phase C-mini
 	awaitedBackgroundJobs := make(map[string]struct{})
 	finiteJobs := &finiteJobTracker{pool: l.Jobs}
+	if outputTurn != nil {
+		awaitedBackgroundJobs, finiteJobs = outputTurn.awaitedJobs, outputTurn.finiteJobs
+	}
 	ctx = context.WithValue(ctx, finiteJobTrackerContextKey{}, finiteJobs)
 	defer func() {
+		if outputTurn != nil {
+			return
+		} // the child recovery owner cleans up once after every segment
 		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancelCleanup()
 		if cleanupErr := finiteJobs.cleanup(cleanupCtx); cleanupErr != nil {
@@ -1907,6 +1929,12 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	var turnDeadline time.Time
 	if turnBudget > 0 {
 		turnDeadline = time.Now().Add(turnBudget)
+		if outputTurn != nil {
+			if outputTurn.deadline.IsZero() {
+				outputTurn.deadline = turnDeadline
+			}
+			turnDeadline = outputTurn.deadline
+		}
 	}
 
 	for {
@@ -1925,6 +1953,15 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		if err := ctx.Err(); err != nil {
 			stopReason = "error"
 			return err
+		}
+		// A truncation continuation is exactly one tool-less generation. Normal
+		// completion gates remain authoritative, but may not start another
+		// request or restore tools inside this recovery segment.
+		if subAgentTextContinuation(ctx) && runIter > 0 {
+			stopReason = "acceptance_incomplete"
+			l.Hooks.EmitLoopEnd(ctx, tc, stopReason)
+			emit(ctx, out, Event{Kind: EventLoopDone, StopReason: stopReason})
+			return nil
 		}
 		// Per-turn wall-clock cap (see deadline computation above).
 		// Checked at the top of each iter so an in-flight Bash /
@@ -2049,6 +2086,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			return err
 		}
 		specs = l.toolSpecsWithContext(ctx)
+		if subAgentTextContinuation(ctx) {
+			specs = nil
+		}
 		pressureTokens := l.EstimateRequestContextTokens(specs)
 		l.maybeCompactWithPressure(ctx, out, pressureTokens)
 		// Automatic compaction may recover from a summarizer failure, but a
@@ -2059,7 +2099,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
 		}
-		requestWithoutTools := l.rescueNoToolsSnapshot()
+		requestWithoutTools := subAgentTextContinuation(ctx) || l.rescueNoToolsSnapshot()
 		transport.RecordTiming(ctx, "request_build_start")
 		l.syncTaskPlanNotice(ctx)
 		req, contextAnchor := l.buildRequestWithContext(specs)
@@ -2184,6 +2224,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		}
 		assistant, stop, usage, err := l.consumeStreamWithRecoveryUsage(recoveryCtx, provider, req, stream, out, recoverySession, accountUsage)
 		if err != nil {
+			assistant, _ = normalizeSubAgentOutputAssistant(ctx, assistant)
 			if len(assistant) > 0 {
 				for i := range assistant {
 					if assistant[i].ProviderHint == nil {
@@ -2229,8 +2270,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 		// the next user turn cannot resume an unaccepted server-side call.
 		if IsIncompleteStopReason(stop) && containsToolUseBlock(assistant) {
 			emit(ctx, out, Event{
-				Kind: EventInfo,
-				Info: fmt.Sprintf("(provider stopped with %s while emitting tool calls — refusing the calls)", stop),
+				Kind:   EventInfo,
+				Source: "incomplete_tool_call",
+				Info:   fmt.Sprintf("(provider stopped with %s while emitting tool calls — refusing the calls)", stop),
 			})
 			withoutTools := assistant[:0]
 			for _, block := range assistant {
@@ -2239,6 +2281,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				}
 			}
 			assistant = withoutTools
+		}
+		if IsIncompleteStopReason(stop) && l.RecoverTextToolCalls {
+			if _, protocol := recoverableTextToolCallName(assistant, l.Registry); protocol {
+				emit(ctx, out, Event{Kind: EventInfo, Source: "incomplete_tool_call", Info: "(incomplete response contains an unaccepted text tool call — automatic continuation refused)"})
+			}
 		}
 
 		// Do not persist a truly empty, zero-block assistant message. Besides
@@ -2256,12 +2303,17 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 				assistant[i].TraceCallID = NewTraceInvocationID()
 			}
 		}
+		assistant, normalizedOutput := normalizeSubAgentOutputAssistant(ctx, assistant)
 		retainAssistant := len(assistant) > 0
 		if retainAssistant {
 			assistant = canonicalImageReferenceBlocks(assistant)
 			l.mu.Lock()
 			l.Messages = append(l.Messages, llm.Message{Role: llm.RoleAssistant, Content: assistant})
-			l.storeActiveContextSnapshotLocked(usage, contextAnchor)
+			snapshotUsage := usage
+			if normalizedOutput {
+				snapshotUsage = nil
+			}
+			l.storeActiveContextSnapshotLocked(snapshotUsage, contextAnchor)
 			l.mu.Unlock()
 		}
 
@@ -2340,7 +2392,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			// A user may submit while final text is still streaming. Consume
 			// that steer before any end-of-turn gates so it remains part of
 			// the current query chain rather than waiting for another prompt.
-			if steer := l.drainSteer(); steer != "" {
+			if steer := l.drainSteerAtCompletion(ctx, false); steer != "" {
 				l.mu.Lock()
 				l.Messages = append(l.Messages, llm.Message{
 					Role: llm.RoleUser,
@@ -2525,7 +2577,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			// Close acceptance atomically with the last pending check. If a
 			// submit won the race, process it now; otherwise subsequent TUI
 			// input falls back to the explicit next-turn queue.
-			if steer := l.drainSteerOrClose(); steer != "" {
+			if steer := l.drainSteerAtCompletion(ctx, true); steer != "" {
 				l.mu.Lock()
 				l.Messages = append(l.Messages, llm.Message{
 					Role: llm.RoleUser,
@@ -3443,6 +3495,9 @@ func (l *Loop) buildRequestMemoryLocked(specs []llm.ToolSpec, posture *contextRe
 		if req.MaxTokens > 4096 {
 			req.MaxTokens = 4096
 		}
+	}
+	if l.RequestMaxTokens > 0 && (req.MaxTokens <= 0 || req.MaxTokens > l.RequestMaxTokens) {
+		req.MaxTokens = l.RequestMaxTokens
 	}
 	anchor := l.contextRequestAnchorLocked(l.Provider, req)
 	anchor.cacheRefreshNonce, anchor.rescueWithoutTools = cacheRefreshNonce, rescueWithoutTools

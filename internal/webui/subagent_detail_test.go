@@ -170,6 +170,42 @@ func TestSubAgentDetailReopensFromTranscriptAfterRestart(t *testing.T) {
 	}
 }
 
+func TestSubAgentFailureRecoveryDetailSurvivesRestart(t *testing.T) {
+	_, store := testServer(t)
+	const agentID = "agt-output-limit"
+	transcript, err := agent.NewSubAgentTranscript(store.Dir, agentID,
+		agent.NewSubAgentHeader(agentID, "deepseek-flash", "parent-a", "战略路线", t.TempDir(), "default"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transcript.AppendTerminal(agent.SubAgentTerminal{
+		Status: "failed", EndedAt: time.Now(), Output: "PARTIAL_DESIGN", Result: "PARTIAL_DESIGN",
+		StopHint: "max_tokens", ExitError: "sub-agent incomplete: max_tokens", ContinuationAttempts: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := transcript.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewServer("127.0.0.1:0", nil, store)
+	rr := httptest.NewRecorder()
+	restarted.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/subagents/"+agentID+"?sessionId=parent-a", nil))
+	var body struct {
+		Agent map[string]any `json:"agent"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if rr.Code != http.StatusOK || body.Agent["continuationAttempts"] != float64(3) || body.Agent["stopHint"] != "max_tokens" || body.Agent["name"] != "战略路线" || body.Agent["output"] != "PARTIAL_DESIGN" {
+		t.Fatalf("cold failure metadata missing: %#v", body.Agent)
+	}
+	rr = httptest.NewRecorder()
+	restarted.handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/subagents/"+agentID+"?sessionId=parent-b", nil))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("failure metadata leaked across parents: %d", rr.Code)
+	}
+}
+
 func TestSubAgentDetailStreamEmitsSnapshotDeltaAndTerminal(t *testing.T) {
 	_, store := testServer(t)
 	roster := agent.NewRoster(2)

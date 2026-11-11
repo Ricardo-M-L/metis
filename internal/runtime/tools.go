@@ -229,8 +229,12 @@ func BuildToolRegistry(opts ToolRegistryOptions) *tools.Registry {
 	// SubAgentOutput / SubAgentStop. Mirrors AttachJobsRegistry for
 	// bash. Roster nil → graceful no-op (tools register but report
 	// "no sub-agents" instead of panicking).
-	if opts.Roster != nil {
+	if opts.Cfg != nil && opts.Cfg.Session.Dir != "" {
+		builtin.AttachSubAgentTools(reg, opts.Gate, opts.Roster, builtin.SubAgentQueryScope{SessionDir: opts.Cfg.Session.Dir, ParentSessionID: CurrentSessionID()})
+	} else if opts.Roster != nil {
 		builtin.AttachSubAgentTools(reg, opts.Gate, opts.Roster)
+	}
+	if opts.Roster != nil {
 		// MessageTeammate (G.3) — peer-to-peer messaging tool.
 		// Lives next to the SubAgent* family because it shares the
 		// same Roster dependency.
