@@ -32,10 +32,18 @@ are kept in a separate section at the end.
 |---|---|---|
 | `METIS_AUTO_MEMORY` | interactive/Desktop: on; headless: off | Set to `0`, `false`, or `off` to disable the interactive/Desktop default. Set to `1`, `true`, or `on` to enable every path. `--auto-memory` remains the headless opt-in. |
 | `METIS_AUTO_MEMORY_DEBUG` | off | Set to `1` to log the enabled memdir plus extractor decisions and failures. Has practical value only with auto-memory enabled. |
-| `METIS_AUTO_RETRIEVE` | off | Positive integer top-K for archival memory retrieval on every turn. Values above `50` are clamped to `50`; non-positive or non-numeric values leave retrieval off. |
-| `METIS_AUTO_RETRIEVE_RERANK` | off | Set to `1` or `true` to rerank the retrieved candidates with the active model. Adds one model call per retrieval. |
+| `METIS_AUTO_RETRIEVE` | off (on-demand recall) | Set a positive integer `N` to opt into legacy automatic top-K retrieval from archival and topic memory on each turn. Values above `50` are clamped to `50`; `0`, `off`, `false`, `disabled`, negative or non-numeric values keep automatic retrieval off. |
+| `METIS_AUTO_RETRIEVE_RERANK` | off | Set to `1` or `true` to rerank legacy automatic-retrieval candidates with the active model. Adds one model call per retrieval; has no effect while `METIS_AUTO_RETRIEVE` is off. |
 | `METIS_DREAM_INTERVAL_HOURS` | `12` | Minimum hours between dream passes. Fractional values are accepted; `0` or a negative value disables dreaming. |
 | `METIS_DREAM_MIN_SESSIONS` | `3` | Minimum distinct sessions touched since the previous dream. Values below `1` are clamped to `1`. |
+
+By default, the active model uses `Memory` search/read only when relevant
+history is missing from the supplied Core preferences, compact topic index and
+conversation. Sufficient context and unrelated short questions need no recall;
+there is no separate classification-model call. Tool allowlists and permission
+rules still apply. See [memory lifecycle and accounting](../../docs/context-management.md#memory-recall-and-background-enrichment)
+for the durable enrichment queue and the remaining local persistence and
+revocation checks.
 
 ## TUI, locale, and notifications
 

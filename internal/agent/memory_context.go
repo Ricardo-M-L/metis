@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"os"
 	"regexp"
 	"strconv"
@@ -68,31 +69,32 @@ func normalizeRecallText(text string) string { return strings.Join(strings.Field
 // set: compaction/deletion automatically makes missing bodies eligible again.
 func novelRecall(passages []memory.Passage, messages []llm.Message, query string, target, hard int) []memory.Passage {
 	var active []string
+	var collect func(llm.ContentBlock)
+	collect = func(block llm.ContentBlock) {
+		if block.Type == "text" {
+			active = append(active, normalizeRecallText(html.UnescapeString(block.Text)))
+		}
+		if block.Type == "tool_result" {
+			active = append(active, normalizeRecallText(html.UnescapeString(block.ToolResult)))
+		}
+		for _, child := range block.ToolResultBlocks {
+			collect(child)
+		}
+	}
 	for _, message := range messages {
 		for _, block := range message.Content {
-			if block.Type == "text" {
-				active = append(active, normalizeRecallText(block.Text))
-			}
+			collect(block)
 		}
 	}
 	var picked []memory.Passage
+	seen := map[string]bool{}
 	for _, p := range passages {
 		body := normalizeRecallText(p.Content)
-		if body == "" || !memory.RecallRelevant(query, p.Content) {
+		if body == "" || seen[body] || !memory.RecallRelevant(query, p.Content) {
 			continue
 		}
-		covered := false
-		for _, text := range active {
-			if strings.Contains(text, body) {
-				covered = true
-				break
-			}
-		}
-		if covered {
-			continue
-		}
+		seen[body] = true
 		picked = append(picked, p)
-		active = append(active, body)
 	}
 	target, hard = recallBudgetLimits(target, hard)
 	var admitted []memory.Passage
@@ -107,7 +109,23 @@ func novelRecall(passages []memory.Passage, messages []llm.Message, query string
 			break
 		}
 	}
-	return admitted
+	// Budget the stable candidate set before removing covered bodies. Repeated
+	// questions must not refill the allowance with lower-ranked candidates.
+	var novel []memory.Passage
+	for _, passage := range admitted {
+		body := normalizeRecallText(passage.Content)
+		covered := false
+		for _, text := range active {
+			if strings.Contains(text, body) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			novel = append(novel, passage)
+		}
+	}
+	return novel
 }
 
 type recallReference struct{ ID, Hash string }
@@ -122,7 +140,9 @@ var recallRefs = regexp.MustCompile(` refs="([A-Za-z0-9_-]+)"`)
 func formatRecall(passages []memory.Passage, generation string) string {
 	var sections []string
 	for _, p := range passages {
-		body := memory.FormatRetrieveSection([]memory.Passage{p})
+		quoted := p
+		quoted.Content = html.EscapeString(p.Content)
+		body := memory.FormatRetrieveSection([]memory.Passage{quoted})
 		data, _ := json.Marshal([]recallReference{{p.ID, recallPassageHash(p)}})
 		body = strings.Replace(body, "<auto-retrieve>", `<auto-retrieve refs="`+base64.RawURLEncoding.EncodeToString(data)+`">`, 1)
 		sections = append(sections, body)

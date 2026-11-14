@@ -269,12 +269,12 @@ func BuildAgentLoop(cfg *config.Config, opts AgentLoopOptions) *agent.Loop {
 		}
 	}
 
-	// Per-turn local BM25 retrieval defaults to top-5. This reads the cached
-	// unified archival+topic corpus and adds only the relevant volatile tail;
-	// it does not perturb the stable system-prompt prefix or make an LLM call.
-	// METIS_AUTO_RETRIEVE=0/off/false disables it; positive values are clamped
-	// to 1..50 for backwards compatibility with existing tuning.
-	loop.AutoRetrieveK = 5
+	// Detailed recall is on demand by default: the active model uses Memory
+	// search/read when the stable Core/topic index and conversation leave a
+	// relevant gap. No extra retrieval or classifier call runs on every turn.
+	// METIS_AUTO_RETRIEVE=N retains the legacy local BM25 path as an explicit
+	// opt-in; positive values are clamped to 1..50. The off aliases remain valid.
+	loop.AutoRetrieveK = 0
 	if raw := strings.TrimSpace(os.Getenv("METIS_AUTO_RETRIEVE")); raw != "" {
 		switch strings.ToLower(raw) {
 		case "0", "off", "false", "disabled":

@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -1508,6 +1509,9 @@ func (s *lifecycleTextStream) Recv() (llm.StreamEvent, error) {
 func TestModelSessionSwitchWaitsForDistillationBeforeDaily(t *testing.T) {
 	m, store := newSessionSwitchModel(t, permission.ModeAsk)
 	repository := attachLifecycleMemory(t, m.loop)
+	// Unknown repository implementations retain the original join contract;
+	// their writer cannot be reconstructed safely in an independent process.
+	m.loop.Memory = &legacyLifecycleDistillationRepository{Repository: repository}
 	provider := &lifecycleDistillProvider{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	m.loop.RebindProviderRuntime(provider, "test-model", 1024, m.loop.System, m.loop.SystemSections)
 	m.loop.DistillEvery = 1
@@ -1576,6 +1580,32 @@ func TestModelSessionSwitchWaitsForDistillationBeforeDaily(t *testing.T) {
 	assertDailySource(t, repository, "source", "cli-resume")
 }
 
+type legacyLifecycleDistillationRepository struct{ memory.Repository }
+
+func lifecycleDistillationJobs(t *testing.T, root string) []agent.DistillationQueueJob {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(root, "distillation-queue"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jobs []agent.DistillationQueueJob
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(root, "distillation-queue", entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var job agent.DistillationQueueJob
+		if err := json.Unmarshal(data, &job); err != nil {
+			t.Fatal(err)
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs
+}
+
 func runLifecycleOneTurn(t *testing.T, m *Model, provider llm.Provider, prompt string) {
 	t.Helper()
 	m.loop.RebindProviderRuntime(provider, "test-model", 1024, m.loop.System, m.loop.SystemSections)
@@ -1597,7 +1627,13 @@ func TestModelOneTurnSessionSwitchFlushesResidualDistillation(t *testing.T) {
 	m, store := newSessionSwitchModel(t, permission.ModeAsk)
 	repository := attachLifecycleMemory(t, m.loop)
 	release := make(chan struct{})
-	close(release)
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
 	provider := &lifecycleDistillProvider{entered: make(chan struct{}, 1), release: release}
 	runLifecycleOneTurn(
 		t,
@@ -1610,31 +1646,94 @@ func TestModelOneTurnSessionSwitchFlushesResidualDistillation(t *testing.T) {
 	}
 	select {
 	case <-provider.entered:
-		t.Fatal("one-turn session distilled before a durability boundary")
+		t.Fatal("foreground turn entered the optional provider")
 	default:
 	}
+	jobs := lifecycleDistillationJobs(t, repository.Root())
+	if len(jobs) != 1 || jobs[0].Status != "pending" || jobs[0].SessionID != "source" ||
+		!strings.HasPrefix(jobs[0].SourceMessageID, "source/message/") || jobs[0].SourceRequestID == "" ||
+		!strings.Contains(jobs[0].UserMessage, "Citrine Lark") {
+		t.Fatalf("completed turn was not durably queued with source identity: %+v", jobs)
+	}
+	sourceJob := jobs[0]
 
 	target := &session.Header{ID: "target-after-residual", Model: "test-model", System: "base-system", Mode: "ask"}
 	if err := store.WriteHeaderFull(*target); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.activateSession(target.ID, target, nil, true); err != nil {
-		t.Fatalf("activateSession: %v", err)
+	switched := make(chan error, 1)
+	go func() { switched <- m.activateSession(target.ID, target, nil, true) }()
+	select {
+	case err := <-switched:
+		if err != nil {
+			t.Fatalf("activateSession: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("durable session switch waited for the optional provider")
 	}
 	select {
 	case <-provider.entered:
+		t.Fatal("session switch synchronously entered the optional provider")
 	default:
-		t.Fatal("session switch did not flush the one-turn residual distillation")
 	}
-	hits, err := repository.Archival().Search(memory.SearchOptions{Query: "Citrine Lark"})
+	if m.sessionID != target.ID {
+		t.Fatalf("active session=%q, want %q", m.sessionID, target.ID)
+	}
+	assertDailySource(t, repository, "source", "cli-resume")
+	jobs = lifecycleDistillationJobs(t, repository.Root())
+	if len(jobs) != 1 || jobs[0].ID != sourceJob.ID || jobs[0].Status != "pending" || jobs[0].SourceMessageID != sourceJob.SourceMessageID {
+		t.Fatalf("session switch lost the durable hand-off: %+v", jobs)
+	}
+	// A later independent consumer must write to the original root/source even
+	// after the active TUI session points at a different repository.
+	targetRepository, err := memory.NewMemoryManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.loop.Memory = targetRepository
+	workerDone := make(chan error, 1)
+	go func() {
+		workerDone <- agent.RunDurableDistillationQueue(context.Background(), repository.Root(), func(_ context.Context, job agent.DistillationQueueJob) (memory.Repository, llm.Provider, error) {
+			if job.ID != sourceJob.ID || job.SessionID != "source" || job.RepositoryRoot != sourceJob.RepositoryRoot {
+				return nil, nil, errors.New("worker rebound the source job")
+			}
+			fresh, err := memory.NewMemoryManager(job.RepositoryRoot)
+			return fresh, provider, err
+		})
+	}()
+	select {
+	case <-provider.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("durable worker did not consume the source job")
+	}
+	close(release)
+	select {
+	case err := <-workerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("durable worker did not complete")
+	}
+	freshSource, err := memory.NewMemoryManager(repository.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits, err := freshSource.Archival().Search(memory.SearchOptions{Query: "Citrine Lark"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(hits) != 1 || hits[0].SourceSessionID != "source" ||
-		!strings.HasPrefix(hits[0].SourceMessageID, "source/message/") {
+		hits[0].SourceMessageID != sourceJob.SourceMessageID {
 		t.Fatalf("boundary-distilled memory/provenance = %+v", hits)
 	}
-	assertDailySource(t, repository, "source", "cli-resume")
+	if hits, err := targetRepository.Archival().Search(memory.SearchOptions{Query: "Citrine Lark"}); err != nil || len(hits) != 0 {
+		t.Fatalf("source fact leaked into active target repository: %+v, %v", hits, err)
+	}
+	jobs = lifecycleDistillationJobs(t, repository.Root())
+	if len(jobs) != 1 || jobs[0].Status != "completed" || jobs[0].UserMessage != "" || jobs[0].AssistantMessage != "" {
+		t.Fatalf("durable completion did not retain a scrubbed watermark: %+v", jobs)
+	}
 }
 
 func TestModelSessionSwitchDistillEveryZeroIsNoOp(t *testing.T) {

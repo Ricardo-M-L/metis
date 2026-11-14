@@ -665,7 +665,7 @@ func (c *Compactor) Microcompact(messages []llm.Message) []llm.Message {
 		mutated := false
 		for bi := range newContent {
 			b := &newContent[bi]
-			if b.Type != "tool_result" {
+			if b.Type != "tool_result" || isMemoryToolObservation(*b) {
 				continue
 			}
 			if len(b.ToolResult) < c.MicrocompactMinChars {
@@ -749,7 +749,7 @@ func (c *Compactor) Snip(messages []llm.Message) []llm.Message {
 		mutated := false
 		for bi := range newContent {
 			b := &newContent[bi]
-			if b.Type != "tool_result" {
+			if b.Type != "tool_result" || isMemoryToolObservation(*b) {
 				continue
 			}
 			if len(b.ToolResult) <= c.SnipMaxToolResultChars {
@@ -815,7 +815,7 @@ func (c *Compactor) EnforcePostCompactBudget(messages []llm.Message) []llm.Messa
 		mutatedRow := false
 		for bi := range newContent {
 			b := &newContent[bi]
-			if b.Type != "tool_result" {
+			if b.Type != "tool_result" || isMemoryToolObservation(*b) {
 				continue
 			}
 			if len(b.ToolResult) <= PostCompactMaxToolResultChars {
@@ -864,7 +864,7 @@ func (c *Compactor) SnipAll(messages []llm.Message) []llm.Message {
 		mutated := false
 		for bi := range newContent {
 			b := &newContent[bi]
-			if b.Type != "tool_result" {
+			if b.Type != "tool_result" || isMemoryToolObservation(*b) {
 				continue
 			}
 			if len(b.ToolResult) <= c.SnipMaxToolResultChars {

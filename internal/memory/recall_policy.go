@@ -58,7 +58,7 @@ func (mm *MemoryManager) recallSnapshotLocked() (string, string, []Passage, erro
 			}
 		}
 	}
-	topics, err := loadTopicDocuments(mm.root)
+	topics, err := mm.loadTopicDocumentsCached()
 	if err != nil {
 		return "", "", nil, err
 	}
@@ -67,11 +67,11 @@ func (mm *MemoryManager) recallSnapshotLocked() (string, string, []Passage, erro
 			passages = append(passages, topic.passage)
 		}
 	}
-	sort.Slice(passages, func(i, j int) bool { return passages[i].ID < passages[j].ID })
-	index, err := mm.compactTopicIndex()
-	if err != nil {
+	if err := mm.decorateUsage(passages); err != nil {
 		return "", "", nil, err
 	}
+	sort.Slice(passages, func(i, j int) bool { return passages[i].ID < passages[j].ID })
+	index := mm.compactTopicIndexFromDocuments(topics)
 	core := ""
 	if mm.core != nil {
 		core = mm.core.Render()
@@ -93,7 +93,13 @@ func (mm *MemoryManager) recallSnapshotLocked() (string, string, []Passage, erro
 		fmt.Fprintf(h, "%s|%o\n", path, info.Mode())
 	}
 	for _, p := range passages {
-		data, _ := json.Marshal([]string{p.ID, p.Content, p.Scope, p.SourceSessionID})
+		// Retrieval uses tags and type as well as content. Attribution and scope
+		// also govern visibility/revocation, so semantic edits to any of them
+		// must invalidate a frozen recall selection. Usage remains independent.
+		data, _ := json.Marshal(struct {
+			ID, Content, Type, Scope, Source, SourceSessionID, SourceMessageID string
+			Tags                                                               []string
+		}{p.ID, p.Content, p.Type, p.Scope, p.Source, p.SourceSessionID, p.SourceMessageID, p.Tags})
 		h.Write(data)
 	}
 	h.Write([]byte(body))

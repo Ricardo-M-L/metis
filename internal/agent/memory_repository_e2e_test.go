@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"os"
 	"path/filepath"
@@ -290,7 +291,7 @@ func TestMemoryRepositoryE2E_RestartRecallUsageAndProvenance(t *testing.T) {
 		t.Fatalf("provider request has no user message with recall tail: %+v", request.Messages)
 	}
 	lastBlock := userMessage.Content[len(userMessage.Content)-1]
-	if !lastBlock.Synthetic || !strings.Contains(lastBlock.Text, "<auto-retrieve") || !strings.Contains(lastBlock.Text, memoryE2ETarget) {
+	if !lastBlock.Synthetic || !strings.Contains(lastBlock.Text, "<auto-retrieve") || !strings.Contains(html.UnescapeString(lastBlock.Text), memoryE2ETarget) {
 		t.Fatalf("recall is not the synthetic user tail: %+v", lastBlock)
 	}
 
@@ -357,7 +358,7 @@ func TestMemoryRepositoryE2E_RestartRecallUsageAndProvenance(t *testing.T) {
 	}
 }
 
-func TestMemoryRepositoryE2E_OneTurnBoundaryFlushesResidualForFreshSession(t *testing.T) {
+func TestMemoryRepositoryE2E_DurableQueueWorkerPersistsForFreshSession(t *testing.T) {
 	root := t.TempDir()
 	provider := &memoryRepositoryE2EProvider{}
 
@@ -385,19 +386,29 @@ func TestMemoryRepositoryE2E_OneTurnBoundaryFlushesResidualForFreshSession(t *te
 		t.Fatalf("residual fact exists before boundary flush: passages=%+v err=%v", got, err)
 	}
 
-	launches := make(chan int, 16)
+	launches := make(chan error, 16)
 	for range 16 {
-		go func() { launches <- loopA.FlushPendingDistillation(sessionAID) }()
+		go func() {
+			handled, err := loopA.PersistPendingDistillation(sessionAID)
+			if !handled && err == nil {
+				err = errors.New("durable boundary was not handled")
+			}
+			launches <- err
+		}()
 	}
-	launched := 0
 	for range 16 {
-		launched += <-launches
+		if err := <-launches; err != nil {
+			t.Fatal(err)
+		}
 	}
-	if launched != 1 {
-		t.Fatalf("concurrent FlushPendingDistillation launched=%d, want exactly 1", launched)
+	if got := provider.distillRequestCount(); got != 0 {
+		t.Fatalf("durable handoff waited for provider: calls=%d", got)
 	}
-	if err := loopA.WaitForDistillation(context.Background(), sessionAID); err != nil {
-		t.Fatalf("join residual distillation: %v", err)
+	if err := RunDurableDistillationQueue(context.Background(), root, func(_ context.Context, job DistillationQueueJob) (memory.Repository, llm.Provider, error) {
+		fresh, err := memory.NewMemoryManager(job.RepositoryRoot)
+		return fresh, provider, err
+	}); err != nil {
+		t.Fatalf("recover durable worker: %v", err)
 	}
 	if got := loopA.FlushPendingDistillation(sessionAID); got != 0 {
 		t.Fatalf("second residual flush launched duplicate jobs=%d", got)
@@ -434,12 +445,12 @@ func TestMemoryRepositoryE2E_OneTurnBoundaryFlushesResidualForFreshSession(t *te
 		t.Fatalf("run fresh session B: %v", err)
 	}
 	request := provider.lastStreamRequest(t)
-	if !strings.Contains(requestText(request), memoryE2ETarget) {
+	if !strings.Contains(html.UnescapeString(requestText(request)), memoryE2ETarget) {
 		t.Fatalf("fresh session B did not receive boundary recall: %+v", request.Messages)
 	}
 }
 
-func TestMemoryRepositoryE2E_BoundaryFlushesAllFourResidualTurns(t *testing.T) {
+func TestMemoryRepositoryE2E_LegacyRepositoryBoundaryFlushesAllFourResidualTurns(t *testing.T) {
 	root := t.TempDir()
 	provider := &memoryRepositoryE2EProvider{}
 	manager, err := memory.NewMemoryManager(root)
@@ -447,7 +458,7 @@ func TestMemoryRepositoryE2E_BoundaryFlushesAllFourResidualTurns(t *testing.T) {
 		t.Fatalf("create memory manager: %v", err)
 	}
 	loop := NewLoop(provider, newRegistryWith(t), nil, nil, "BASE MEMORY E2E SYSTEM", 3)
-	loop.Memory = manager
+	loop.Memory = &legacyDistillationRepository{Repository: manager}
 	const sessionID = "memory-four-residual-turns"
 	loop.CurrentStateSnapshot = func() RuntimeStateSnapshot {
 		return RuntimeStateSnapshot{SessionID: sessionID}
@@ -488,7 +499,7 @@ func TestMemoryRepositoryE2E_BoundaryFlushesAllFourResidualTurns(t *testing.T) {
 	}
 }
 
-func TestMemoryRepositoryE2E_DefaultCadenceDrainsWholeFiveTurnWindow(t *testing.T) {
+func TestMemoryRepositoryE2E_LegacyRepositoryDefaultCadenceDrainsWholeFiveTurnWindow(t *testing.T) {
 	root := t.TempDir()
 	provider := &memoryRepositoryE2EProvider{}
 	manager, err := memory.NewMemoryManager(root)
@@ -496,7 +507,7 @@ func TestMemoryRepositoryE2E_DefaultCadenceDrainsWholeFiveTurnWindow(t *testing.
 		t.Fatalf("create memory manager: %v", err)
 	}
 	loop := NewLoop(provider, newRegistryWith(t), nil, nil, "BASE MEMORY E2E SYSTEM", 3)
-	loop.Memory = manager
+	loop.Memory = &legacyDistillationRepository{Repository: manager}
 	const sessionID = "memory-five-turn-cadence"
 	loop.CurrentStateSnapshot = func() RuntimeStateSnapshot {
 		return RuntimeStateSnapshot{SessionID: sessionID}
@@ -518,7 +529,7 @@ func TestMemoryRepositoryE2E_DefaultCadenceDrainsWholeFiveTurnWindow(t *testing.
 	}
 }
 
-func TestMemoryRepositoryE2E_FailedBoundaryDistillationIsReportedAndRetryable(t *testing.T) {
+func TestMemoryRepositoryE2E_LegacyRepositoryFailedBoundaryDistillationIsReportedAndRetryable(t *testing.T) {
 	root := t.TempDir()
 	provider := &memoryRepositoryE2EProvider{}
 	manager, err := memory.NewMemoryManager(root)
@@ -526,7 +537,7 @@ func TestMemoryRepositoryE2E_FailedBoundaryDistillationIsReportedAndRetryable(t 
 		t.Fatalf("create memory manager: %v", err)
 	}
 	loop := NewLoop(provider, newRegistryWith(t), nil, nil, "BASE MEMORY E2E SYSTEM", 3)
-	loop.Memory = manager
+	loop.Memory = &legacyDistillationRepository{Repository: manager}
 	const sessionID = "memory-boundary-retry"
 	loop.CurrentStateSnapshot = func() RuntimeStateSnapshot {
 		return RuntimeStateSnapshot{SessionID: sessionID}

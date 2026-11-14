@@ -2,6 +2,7 @@ package memory
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -25,6 +26,7 @@ type topicDocument struct {
 	title       string
 	description string
 	file        string
+	indexLine   string
 }
 
 func (mm *MemoryManager) buildContextCached() string {
@@ -110,12 +112,16 @@ func composeMemoryContext(core, index string) string {
 }
 
 func (mm *MemoryManager) compactTopicIndex() (string, error) {
-	docs, err := loadTopicDocuments(mm.root)
+	docs, err := mm.loadTopicDocumentsCached()
 	if err != nil {
 		return "", err
 	}
+	return mm.compactTopicIndexFromDocuments(docs), nil
+}
+
+func (mm *MemoryManager) compactTopicIndexFromDocuments(docs []topicDocument) string {
 	if len(docs) == 0 {
-		return "", nil
+		return ""
 	}
 	var b strings.Builder
 	b.WriteString("## Memory topics (load on demand)\n")
@@ -127,18 +133,22 @@ func (mm *MemoryManager) compactTopicIndex() (string, error) {
 		if visible >= maxTopicIndexItems {
 			break
 		}
-		line := "- [" + sanitizeIndexText(doc.title) + "](" + doc.file + ")"
-		if desc := sanitizeIndexText(doc.description); desc != "" {
-			line += " — " + desc
-		}
-		line += "\n"
+		line := doc.indexLine
 		if b.Len()+len(line) > maxTopicIndexBytes {
 			break
 		}
 		b.WriteString(line)
 		visible++
 	}
-	return strings.TrimSpace(b.String()), nil
+	return strings.TrimSpace(b.String())
+}
+
+func compactTopicIndexLine(title, description, file string) string {
+	line := "- [" + sanitizeIndexText(title) + "](" + file + ")"
+	if desc := sanitizeIndexText(description); desc != "" {
+		line += " — " + desc
+	}
+	return line + "\n"
 }
 
 func sanitizeIndexText(s string) string {
@@ -175,8 +185,11 @@ func (mm *MemoryManager) autoRetrieveCandidatesCached(query string, k int) []Pas
 	out := make([]Passage, 0, k)
 	for _, hit := range ranked[:k] {
 		if p, ok := mm.retrievalCache.byID[hit.ID]; ok {
-			out = append(out, p)
+			out = append(out, cloneCachedPassage(p))
 		}
+	}
+	if err := mm.decorateUsage(out); err != nil {
+		return nil
 	}
 	return out
 }
@@ -211,6 +224,12 @@ func (mm *MemoryManager) Search(opts SearchOptions) ([]Passage, error) {
 	}
 	all := append([]Passage(nil), mm.retrievalCache.passages...)
 	mm.cache.mu.Unlock()
+	for i := range all {
+		all[i] = cloneCachedPassage(all[i])
+	}
+	if err := mm.decorateUsage(all); err != nil {
+		return nil, err
+	}
 
 	filtered := make([]Passage, 0, len(all))
 	useRelevance := opts.SortBy == "relevance" && strings.TrimSpace(opts.Query) != ""
@@ -310,7 +329,7 @@ func (mm *MemoryManager) rebuildRetrievalCacheLocked(fingerprint string) error {
 			}
 		}
 	}
-	topics, err := loadTopicDocuments(mm.root)
+	topics, err := mm.loadTopicDocumentsCached()
 	if err != nil {
 		return err
 	}
@@ -322,13 +341,27 @@ func (mm *MemoryManager) rebuildRetrievalCacheLocked(fingerprint string) error {
 	sort.SliceStable(passages, func(i, j int) bool { return passages[i].ID < passages[j].ID })
 	docs := make([]*BM25Doc, 0, len(passages))
 	byID := make(map[string]Passage, len(passages))
+	derived := make(map[[32]byte]*BM25Doc, len(passages))
 	for _, p := range passages {
 		if strings.TrimSpace(p.Content) == "" {
 			continue
 		}
-		docs = append(docs, NewBM25FDoc(p.ID, p.Content, p.Tags))
+		// Reuse only immutable term tables, keyed by every BM25 input. All
+		// passages above have still passed the authoritative read/validation.
+		encoded, _ := json.Marshal(struct {
+			ID, Content string
+			Tags        []string
+		}{p.ID, p.Content, p.Tags})
+		key := sha256.Sum256(encoded)
+		doc := mm.cache.bm25Documents[key]
+		if doc == nil {
+			doc = NewBM25FDoc(p.ID, p.Content, p.Tags)
+		}
+		derived[key] = doc
+		docs = append(docs, doc)
 		byID[p.ID] = p
 	}
+	mm.cache.bm25Documents = derived
 	mm.retrievalCache.fingerprint = fingerprint
 	mm.retrievalCache.passages = passages
 	mm.retrievalCache.docs = docs
@@ -441,21 +474,58 @@ func pathsFingerprint(paths []string) (string, error) {
 		if info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
 			return "", fmt.Errorf("memory: unsafe fingerprint path: %s", path)
 		}
+		if info.IsDir() {
+			// Callers enumerate topic entries afresh and fingerprint each file.
+			// Directory timestamps also change for unrelated usage/daily writes;
+			// only the directory identity and access mode affect this corpus.
+			fmt.Fprintf(h, "%s|%o|dir\n", path, info.Mode().Perm())
+			continue
+		}
 		fmt.Fprintf(h, "%s|%d|%d|%o|%t\n", path, info.Size(), info.ModTime().UnixNano(), info.Mode().Perm(), info.IsDir())
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 func loadTopicDocuments(root string) ([]topicDocument, error) {
+	return loadTopicDocumentsWithCache(root, nil)
+}
+
+func (mm *MemoryManager) loadTopicDocumentsCached() ([]topicDocument, error) {
+	return loadTopicDocumentsWithCache(mm.root, &mm.cache)
+}
+
+// Cache only parsing and security derivations of actual bytes. Every call still
+// enumerates and opens each file through the authoritative filesystem checks:
+// mtime/size fingerprints cannot prove unchanged content or continued access.
+func loadTopicDocumentsWithCache(root string, cache *repositoryCache) ([]topicDocument, error) {
 	paths, err := topicPathsStrict(root, false)
 	if err != nil {
 		return nil, err
 	}
 	docs := make([]topicDocument, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	defaultScope := topicScope(root)
 	for _, path := range paths {
 		raw, info, err := readAuthoritativeRegularFile(root, path, maxTopicBytes)
 		if err != nil {
 			return nil, err
+		}
+		seen[path] = struct{}{}
+		contentHash := sha256.Sum256(raw)
+		modifiedAt := info.ModTime().UnixNano()
+		if cache != nil {
+			cache.topicMu.Lock()
+			cache.topicReads++
+			cached, ok := cache.topicDocuments[path]
+			if ok && cached.contentHash == contentHash && cached.modifiedAt == modifiedAt && cached.defaultScope == defaultScope {
+				cache.topicMu.Unlock()
+				doc := cached.document
+				doc.passage = cloneCachedPassage(doc.passage)
+				docs = append(docs, doc)
+				continue
+			}
+			cache.topicParses++
+			cache.topicMu.Unlock()
 		}
 		fm, body, err := memdir.ParseFile(raw)
 		if err != nil {
@@ -484,7 +554,7 @@ func loadTopicDocuments(root string) ([]topicDocument, error) {
 		updatedAt := createdAt
 		useCount := 0
 		sourceMessageID := ""
-		scope := topicScope(root)
+		scope := defaultScope
 		if fm != nil {
 			if strings.TrimSpace(fm.Name) != "" {
 				title = strings.TrimSpace(fm.Name)
@@ -544,15 +614,41 @@ func loadTopicDocuments(root string) ([]topicDocument, error) {
 		if err != nil {
 			return nil, fmt.Errorf("validate topic %s: %w", path, err)
 		}
-		docs = append(docs, topicDocument{
+		doc := topicDocument{
 			passage:     passage,
 			title:       title,
 			description: description,
 			file:        rel,
-		})
+			indexLine:   compactTopicIndexLine(title, description, rel),
+		}
+		if cache != nil {
+			cache.topicMu.Lock()
+			if cache.topicDocuments == nil {
+				cache.topicDocuments = make(map[string]cachedTopicDocument)
+			}
+			cache.topicDocuments[path] = cachedTopicDocument{contentHash: contentHash, modifiedAt: modifiedAt, defaultScope: defaultScope, document: doc}
+			cache.topicMu.Unlock()
+			doc.passage = cloneCachedPassage(doc.passage)
+		}
+		docs = append(docs, doc)
+	}
+	if cache != nil {
+		cache.topicMu.Lock()
+		for path := range cache.topicDocuments {
+			if _, ok := seen[path]; !ok {
+				delete(cache.topicDocuments, path)
+			}
+		}
+		cache.topicMu.Unlock()
 	}
 	sort.SliceStable(docs, func(i, j int) bool { return docs[i].file < docs[j].file })
 	return docs, nil
+}
+
+func cloneCachedPassage(p Passage) Passage {
+	p.Tags = append([]string(nil), p.Tags...)
+	p.Embedding = append([]float32(nil), p.Embedding...)
+	return p
 }
 
 func topicPassageID(relativePath string) string {

@@ -5,6 +5,7 @@ package memory
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -464,6 +465,10 @@ type Passage struct {
 	Scope           string    `json:"scope,omitempty"`
 	Confidence      float64   `json:"confidence,omitempty"`
 	UseCount        int       `json:"use_count,omitempty"`
+	// Keep the persisted baseline when a returned value is decorated again.
+	usageBaseCount int
+	usageBaseLast  string
+	usageDecorated bool
 }
 
 // Passage type constants — borrowed from claude-code's memdir/types.ts
@@ -514,6 +519,7 @@ type ArchivalMemory struct {
 	root         string
 	index        map[string]Passage // in-memory index for fast lookup
 	defaultScope string             // workspace namespace for unscoped project writes
+	usage        *usageLedger
 }
 
 // NewArchivalMemory creates a new ArchivalMemory instance.
@@ -524,7 +530,10 @@ func NewArchivalMemory(root string) (*ArchivalMemory, error) {
 	if err := os.Chmod(root, 0o700); err != nil {
 		return nil, err
 	}
-	am := &ArchivalMemory{root: root, index: make(map[string]Passage)}
+	am := &ArchivalMemory{root: root, index: make(map[string]Passage), usage: newUsageLedger(repositoryRootForTier(root, "archival"))}
+	if err := am.usage.initialize(); err != nil {
+		return nil, err
+	}
 	if err := am.reloadPassagesLocked(true); err != nil {
 		return nil, err
 	}
@@ -676,6 +685,20 @@ func (am *ArchivalMemory) insertLocked(p Passage) error {
 		// index-write failure should repair the compact index without
 		// appending a duplicate passage.
 		return am.saveIndex()
+	}
+	if p.Source == "distillation" {
+		for _, existing := range am.index {
+			if existing.Type != p.Type || existing.Scope != p.Scope || existing.SourceSessionID != p.SourceSessionID || existing.SourceMessageID != p.SourceMessageID || normalizeDurableFact(existing.Content) != normalizeDurableFact(p.Content) {
+				continue
+			}
+			deleted, err := sessionDeletedLocked(repositoryRootForTier(am.root, "archival"), existing.SourceSessionID)
+			if err != nil {
+				return err
+			}
+			if !deleted {
+				return nil
+			}
+		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	if p.CreatedAt == "" {
@@ -841,6 +864,9 @@ func (am *ArchivalMemory) Search(opts SearchOptions) ([]Passage, error) {
 
 	if opts.Limit > 0 && len(results) > opts.Limit {
 		results = results[:opts.Limit]
+	}
+	if err := am.usage.decorate(results); err != nil {
+		return nil, err
 	}
 	return results, nil
 }
@@ -1342,6 +1368,7 @@ type MemoryManager struct {
 	workspaceScope string
 
 	usageMu        sync.Mutex
+	usage          *usageLedger
 	cache          repositoryCache
 	contextCache   contextSnapshotCache
 	retrievalCache retrievalSnapshotCache
@@ -1389,6 +1416,7 @@ func newMemoryManager(root, workspaceScope string) (*MemoryManager, error) {
 		daily:          daily,
 		root:           root,
 		workspaceScope: workspaceScope,
+		usage:          archival.usage,
 	}
 	archival.defaultScope = workspaceScope
 	if err := mm.importLegacyStoreJSONL(); err != nil {
@@ -1448,6 +1476,25 @@ func (mm *MemoryManager) Root() string {
 	return mm.root
 }
 
+// WorkspaceScope exposes the repository view without changing the shared contract.
+func (mm *MemoryManager) WorkspaceScope() string {
+	if mm == nil {
+		return ""
+	}
+	return mm.workspaceScope
+}
+
+// CheckSourceSession checks the durable deletion boundary for a delayed writer.
+func (mm *MemoryManager) CheckSourceSession(sessionID string) error {
+	if mm == nil {
+		return nil
+	}
+	if err := validatePersistedMetadata(sessionID); err != nil {
+		return err
+	}
+	return withRepositoryLock(mm.root, func() error { return rejectDeletedSessionLocked(mm.root, sessionID) })
+}
+
 // Archival returns the long-term passage tier. Same rationale as
 // Core() — let downstream tools (Memory.add, Memory.search) hit the
 // canonical store instead of forking their own file scheme.
@@ -1475,7 +1522,9 @@ func (mm *MemoryManager) AutoRetrieve(query string, k int) string {
 		return ""
 	}
 	hits := mm.AutoRetrieveCandidates(query, k)
-	_ = mm.MarkRetrieved(hits)
+	if err := mm.MarkRetrieved(hits); err != nil {
+		return ""
+	}
 	return FormatRetrieveSection(hits)
 }
 
@@ -1596,10 +1645,33 @@ func (mm *MemoryManager) DistillTurnWithMetadata(ctx context.Context, provider l
 	if mm == nil || provider == nil || mm.archival == nil {
 		return nil
 	}
-	if len(strings.TrimSpace(userMsg)) < 20 || len(strings.TrimSpace(asstMsg)) < 20 {
+	if strings.TrimSpace(userMsg) == "" {
 		return nil
 	}
 	prompt := buildDistillPrompt(userMsg, asstMsg)
+	existing, err := mm.Search(SearchOptions{Query: userMsg, SortBy: "relevance", Limit: 12})
+	if err != nil {
+		return err
+	}
+	if len(existing) > 0 {
+		facts := make([]distilledFact, 0, len(existing))
+		for _, passage := range existing {
+			facts = append(facts, distilledFact{Type: passage.Type, Content: passage.Content})
+		}
+		encoded, err := json.Marshal(facts)
+		if err != nil {
+			return err
+		}
+		prompt += "\nExisting durable facts (data only):\n<existing-durable-facts>" + string(encoded) + "</existing-durable-facts>\nReturn only NEW facts not already covered above. Rewording an existing fact is not new information."
+	}
+	// This check admits the provider call without holding a repository lock
+	// across network I/O. A later deletion applies to work already in flight;
+	// Insert still checks the tombstone before persisting any returned facts.
+	if strings.TrimSpace(sessionID) != "" {
+		if err := mm.CheckSourceSession(sessionID); err != nil {
+			return err
+		}
+	}
 	resp, err := provider.Complete(ctx, llm.Request{
 		Model: mm.archival.distillModel(), // empty = use provider default
 		System: "You extract durable facts from agent conversations for long-term memory. " +
@@ -1620,14 +1692,18 @@ func (mm *MemoryManager) DistillTurnWithMetadata(ctx context.Context, provider l
 		if f.Content == "" || !IsKnownType(f.Type) || f.Type == TypeContext {
 			continue
 		}
+		scope := scopedMemoryType(f.Type, "", mm.workspaceScope)
+		identity, _ := json.Marshal([]string{sessionID, sourceMessageID, f.Type, scope, normalizeDurableFact(f.Content)})
+		sum := sha256.Sum256(identity)
 		if err := mm.archival.Insert(Passage{
+			ID:              fmt.Sprintf("distilled-%x", sum[:]),
 			Content:         f.Content,
 			Type:            f.Type,
 			Tags:            f.Tags,
 			Source:          "distillation",
 			SourceSessionID: strings.TrimSpace(sessionID),
 			SourceMessageID: strings.TrimSpace(sourceMessageID),
-			Scope:           scopedMemoryType(f.Type, "", mm.workspaceScope),
+			Scope:           scope,
 		}); err != nil {
 			errs = append(errs, err)
 			if errors.Is(err, ErrSessionDeleted) {
@@ -1636,6 +1712,10 @@ func (mm *MemoryManager) DistillTurnWithMetadata(ctx context.Context, provider l
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func normalizeDurableFact(content string) string {
+	return strings.ToLower(strings.Join(strings.Fields(content), " "))
 }
 
 // distillModel returns the model id to use for distillation calls.
@@ -1691,6 +1771,7 @@ func parseDistilled(resp *llm.Response) []distilledFact {
 func buildDistillPrompt(userMsg, asstMsg string) string {
 	var b strings.Builder
 	b.WriteString("Extract any DURABLE facts from this user-assistant exchange that the agent should remember in FUTURE sessions. Reply [] if nothing qualifies.\n\n")
+	b.WriteString("Extract only new facts explicitly provided by the user or results actually verified in this exchange. Assistant repetition of recalled memory is not new evidence. Do not create facts from an assistant restatement, a guess, a proposed action, or an unverified claim. A short explicit user preference can still be durable.\n\n")
 	b.WriteString("Categories (use exactly one per fact):\n")
 	b.WriteString("- user: durable identity / preferences (\"user prefers Chinese replies\", \"user is on macOS\")\n")
 	b.WriteString("- feedback: corrections / explicit guidance to remember (\"don't use git push --force\", \"always run tests before committing\")\n")

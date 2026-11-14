@@ -35,6 +35,8 @@ func TestRenderBasePrompt_WithProviderHint(t *testing.T) {
 // TestAssembleSystemPromptSections_FullMode produces sections in
 // expected order with cache flags.
 func TestAssembleSystemPromptSections_FullMode(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	t.Chdir(t.TempDir())
 	secs := AssembleSystemPromptSections("BASE_TEST", AssembleOptions{Mode: PromptFull})
 	// Always: base + env. project_context / addendum depend on cwd
 	// state, so we just ensure the first two are correctly named/cached.

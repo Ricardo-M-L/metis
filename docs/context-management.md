@@ -28,6 +28,20 @@ Normal hot-session optimization must not repeatedly shorten old tool results or 
 
 There is no universal cache expiry time. In the absence of reliable endpoint-specific retention information, elapsed wall-clock time alone must not rewrite history. Provider-specific cache editing is not assumed available.
 
+## Memory recall and background enrichment
+
+Default requests retain Core preferences and a compact topic index. The active model uses `Memory` search/read when relevant project history, decisions or preferences are missing from the conversation. It skips retrieval when the visible context is sufficient or the question is unrelated. No separate classification-model call is required. Tool allowlists and permissions remain authoritative; an unavailable `Memory` tool does not silently enable automatic recall.
+
+`METIS_AUTO_RETRIEVE=N` explicitly enables the legacy automatic archival-and-topic BM25 path, with `N` capped at 50. Unset, `0`, `off`, `false` and `disabled` keep that path off. `METIS_AUTO_RETRIEVE_RERANK` only adds a model call when legacy automatic recall is enabled.
+
+With the standard memory manager or Desktop workspace binding, successful turns persist their recall record and qualifying distillation jobs locally before returning. Existing distillation cadence and successful session boundaries release the staged jobs; merely recording a turn does not let an already-running worker consume it early. A separate background worker processes eligible work using the frozen source workspace, provider and model, with current trust checks. A successful headless exit acknowledges that durable hand-off without waiting for the enrichment model call; queued work can remain pending and retry on a later startup. Startup recovery explicitly releases work retained by a prior process. Custom repositories without this capability retain their bounded distillation join. Auto Memory and Dream have separate lifecycle rules.
+
+Deleting a source session prevents queued jobs that have not passed source-session validation from dispatching. An already accepted or in-flight external request cannot be recalled, but its later response cannot write new memory attributed to the deleted source. This follows the request-snapshot acceptance boundary above and does not promise erasure of content already known to the remote provider.
+
+Retrieval usage is stored in an independent append-only ledger when retained recall is handed to a provider request. Replaying the same request receipt is idempotent; access counts and timestamps do not change semantic memory generations. Content, deletion and provenance still pass the recall guard before request acceptance. On-demand recall and background enrichment do not promise zero local reads or writes per input: freshness checks, revocation validation, durable turn records and usage persistence still apply.
+
+Oversized `Memory` observations keep only complete, budgeted source passages or Core lines, with a prompt to narrow the memory query. Their authoritative copies remain in the memory repository; they are never exported into generic spill files that an ordinary `Read` could use to bypass later source revocation. Usage and summary provenance follow retained sources only.
+
 ## Configuration and diagnostics
 
 These budgets are local estimates, not exact provider tokenizer limits. Metadata, retained warnings and recovery pointers participate in the relevant budget.
@@ -44,7 +58,7 @@ These budgets are local estimates, not exact provider tokenizer limits. Metadata
 | WebSearch `fresh` | false | Bypass brief successful-result reuse |
 | OpenAI-compatible provider `extra.tail_system_messages` | false | Explicit endpoint opt-in to privileged dynamic checkpoints for Chat Completions |
 
-Embedders may set the corresponding Loop recall and tool-budget fields. Existing `METIS_AUTO_RETRIEVE` still controls Top-K/enabling; it is not itself a token budget. Oversized whole memory passages are skipped rather than arbitrarily truncated. Third-party memory repositories without the optional snapshot capability retain legacy behavior and cannot promise external revocation detection.
+Embedders may set the corresponding Loop recall and tool-budget fields. `METIS_AUTO_RETRIEVE` controls the optional legacy automatic-recall Top-K; it is not itself a token budget. Oversized whole memory passages are skipped rather than arbitrarily truncated. Third-party memory repositories without the optional snapshot capability retain legacy behavior and cannot promise external revocation detection.
 
 WebSearch queries configured API sources and the keyless backend concurrently by default. `sources` can select a narrower set. Duplicate URLs are merged with source attribution; a session-scoped 15-second reuse window applies only to successful, nonempty searches with no source failures, and configuration changes invalidate reuse. Complete downloaded/search content is retained before previewing. Explicit source errors remain visible. No extra paid extractor or secondary model is required.
 

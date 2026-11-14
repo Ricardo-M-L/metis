@@ -85,10 +85,23 @@ type retrievalSnapshotCache struct {
 	builds      uint64
 }
 
-// repositoryCache owns only immutable prompt/corpus snapshots. Disk stores
+type cachedTopicDocument struct {
+	contentHash  [32]byte
+	modifiedAt   int64
+	defaultScope string
+	document     topicDocument
+}
+
+// repositoryCache owns only immutable prompt/corpus snapshots and derivations
+// of bytes already read through the authoritative filesystem checks. Disk stores
 // retain their own locks; this lock never nests underneath a store write.
 type repositoryCache struct {
-	mu sync.Mutex
+	mu             sync.Mutex
+	topicMu        sync.Mutex
+	topicDocuments map[string]cachedTopicDocument
+	topicReads     uint64
+	topicParses    uint64
+	bm25Documents  map[[32]byte]*BM25Doc
 }
 
 // Invalidate drops immutable prompt/corpus snapshots after an external writer

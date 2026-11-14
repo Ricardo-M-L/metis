@@ -154,6 +154,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return cmdChat(ctx, args[1:])
 	case "run":
 		return cmdRun(ctx, args[1:])
+	case "__memory-distill-worker":
+		return cmdMemoryDistillWorker(ctx, args[1:])
 	case "config":
 		return cmdConfig(args[1:])
 	case "dirs":
@@ -2249,6 +2251,10 @@ func setupRuntime(ctx context.Context, flags *cliFlags) (*runtime, error) {
 	tui.SetVoiceMaxRecord(cfg.UI.VoiceMaxRecord())
 	tui.SetStatusLineRefresh(cfg.UI.StatusLineRefresh())
 
+	loop.DurableDistillationLauncher = startMemoryDistillationWorker
+	if err := resumeMemoryDistillationWorker(loop.DurableDistillationRoot()); err != nil {
+		fmt.Fprintf(os.Stderr, "metis: pending memory work retained: %v\n", err)
+	}
 	sandboxOwned = false
 	return rt, nil
 }

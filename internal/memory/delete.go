@@ -24,7 +24,7 @@ func (mm *MemoryManager) DeleteSession(sessionID string) error {
 	}
 	mm.usageMu.Lock()
 	defer mm.usageMu.Unlock()
-	return withRepositoryLock(mm.root, func() error {
+	repositoryErr := withRepositoryLock(mm.root, func() error {
 		// Persist the deletion boundary before touching any tier. Even if one
 		// corrupt file makes cleanup incomplete, a late writer cannot resurrect
 		// data for this source session.
@@ -45,6 +45,11 @@ func (mm *MemoryManager) DeleteSession(sessionID string) error {
 		mm.Invalidate()
 		return errors.Join(errs...)
 	})
+	// The repository lock is released before taking the independent queue lock.
+	// Workers never hold a queue lock during repository writes or provider I/O.
+	// Revoke even if tier cleanup failed: a durable tombstone and scrubbed
+	// hand-off must not depend on starting a worker or resolving credentials.
+	return errors.Join(repositoryErr, revokeSessionDistillationQueue(mm.root, sessionID))
 }
 
 func (rm *RecallMemory) DeleteSession(sessionID string) error {

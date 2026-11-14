@@ -30,12 +30,9 @@ type headlessDistillationJoinTimeout struct{ error }
 
 func (e *headlessDistillationJoinTimeout) Unwrap() error { return e.error }
 
-// persistHeadlessMemoryBoundary turns residual successful exchanges into
-// registered distillation jobs and joins only the owning session before the
-// caller may tear down provider/repository dependencies. The wait deliberately
-// receives a fresh bounded context: callers invoke this only after their work
-// context completed successfully, and a late parent cancellation must not race
-// a clean durability hand-off.
+// persistHeadlessMemoryBoundary releases this session's staged durable jobs
+// without waiting for provider calls. Repositories without that capability
+// retain their bounded join with a fresh context for the completed task.
 func persistHeadlessMemoryBoundary(
 	loop distillationBoundary,
 	sessionID, source string,
@@ -43,6 +40,13 @@ func persistHeadlessMemoryBoundary(
 ) error {
 	if loop == nil || strings.TrimSpace(sessionID) == "" {
 		return nil
+	}
+	if durable, ok := loop.(interface {
+		PersistPendingDistillation(string) (bool, error)
+	}); ok {
+		if handled, err := durable.PersistPendingDistillation(sessionID); handled {
+			return err
+		}
 	}
 	if grace <= 0 {
 		grace = runtimeDistillationShutdownGrace
@@ -79,7 +83,21 @@ func (r *runtime) persistHeadlessMemoryBoundary(source string, grace time.Durati
 	if r == nil || r.loop == nil || strings.TrimSpace(r.sessionID) == "" {
 		return nil
 	}
-	return completeHeadlessMemoryBoundary(r.loop, r.sessionID, source, grace, os.Stderr)
+	if err := completeHeadlessMemoryBoundary(r.loop, r.sessionID, source, grace, os.Stderr); err != nil {
+		return err
+	}
+	if root := r.loop.DurableDistillationRoot(); root != "" {
+		if err := startMemoryDistillationWorker(root); err != nil {
+			// Enqueue is already durable. A launch failure must be visible while
+			// preserving the completed foreground task and its retryable job.
+			return json.NewEncoder(os.Stderr).Encode(map[string]string{
+				"kind": "memory_enrichment_warning", "source": headlessMemorySource(source),
+				"task_status": "completed", "memory_status": "pending", "reason": "worker_start_failed",
+				"message": "Task completed; memory enrichment is durably queued and will retry on a later startup.",
+			})
+		}
+	}
+	return nil
 }
 
 // completeHeadlessMemoryBoundary preserves successful task status when only

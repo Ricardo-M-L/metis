@@ -57,6 +57,10 @@ func (l *Loop) projectToolBatch(blocks []llm.ContentBlock) ([]llm.ContentBlock, 
 			if original.ToolResult == "" {
 				continue
 			}
+			if isMemoryToolObservation(original) {
+				out[i] = projectMemoryToolObservation(original, min(single, total), pass == 1)
+				continue
+			}
 			if l.SpillDir == "" {
 				return blocks, &ToolBatchBudgetError{"spill storage unavailable; full batch retained"}
 			}

@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
-	"github.com/Ricardo-M-L/metis/internal/memdir"
 )
 
 func TestMemoryManagerImplementsRepository(t *testing.T) {
@@ -215,11 +214,22 @@ func TestRepositoryTopicRetrievalPersistsUsageMetadata(t *testing.T) {
 	if got := mm.PreviewAutoRetrieve("Nebula Quartz workstation", 1); got == "" {
 		t.Fatal("topic preview unexpectedly empty")
 	}
-	assertTopicUsage(t, path, 0, false)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTopicUsage(t, mm, 0, false)
 	if got := mm.AutoRetrieve("Nebula Quartz workstation", 1); got == "" {
 		t.Fatal("topic retrieval unexpectedly empty")
 	}
-	assertTopicUsage(t, path, 1, true)
+	assertTopicUsage(t, mm, 1, true)
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("retrieval usage rewrote topic frontmatter")
+	}
 }
 
 func assertArchiveUsage(t *testing.T, mm *MemoryManager, id string, wantCount int, wantTimestamp bool) {
@@ -240,19 +250,22 @@ func assertArchiveUsage(t *testing.T, mm *MemoryManager, id string, wantCount in
 	t.Fatalf("archive passage %s not found", id)
 }
 
-func assertTopicUsage(t *testing.T, path string, wantCount int, wantTimestamp bool) {
+func assertTopicUsage(t *testing.T, mm *MemoryManager, wantCount int, wantTimestamp bool) {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	hits, err := mm.Search(SearchOptions{SortBy: "recent"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	fm, _, err := memdir.ParseFile(raw)
-	if err != nil {
-		t.Fatal(err)
+	for _, passage := range hits {
+		if !isTopicPassage(passage) {
+			continue
+		}
+		if passage.UseCount != wantCount || (passage.LastUsedAt != "") != wantTimestamp {
+			t.Fatalf("topic usage = count:%d last:%q, want count:%d timestamp:%t", passage.UseCount, passage.LastUsedAt, wantCount, wantTimestamp)
+		}
+		return
 	}
-	if fm.UseCount != wantCount || (fm.LastUsedAt != "") != wantTimestamp {
-		t.Fatalf("topic usage = count:%d last:%q, want count:%d timestamp:%t", fm.UseCount, fm.LastUsedAt, wantCount, wantTimestamp)
-	}
+	t.Fatal("topic passage not found")
 }
 
 func TestRepositoryRejectsUnsafeCoreAndSanitizesArchive(t *testing.T) {

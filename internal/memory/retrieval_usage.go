@@ -1,57 +1,119 @@
 package memory
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
+	"sort"
 	"strings"
 	"time"
-
-	"github.com/Ricardo-M-L/metis/internal/memdir"
 )
 
-// MarkRetrieved persists reuse metadata for only the passages that were
-// actually attached to a model request. AutoRetrieveCandidates deliberately
-// stays side-effect-free so rerank candidates and prompt-size previews are not
-// mistaken for genuine memory use.
+// MarkRetrieved records only passages actually attached to a model request.
+// Candidate expansion and previews remain side-effect free.
 func (mm *MemoryManager) MarkRetrieved(passages []Passage) error {
+	return mm.MarkRetrievedEvent(generateID(), passages)
+}
+
+// MarkRetrievedEvent is an optional capability for request-scoped idempotency.
+// Retrying the same event and selection never increments a counter twice.
+func (mm *MemoryManager) MarkRetrievedEvent(eventID string, passages []Passage) error {
 	if mm == nil || len(passages) == 0 {
 		return nil
 	}
+	if strings.TrimSpace(eventID) == "" {
+		return errors.New("memory: empty usage event id")
+	}
+	if err := validatePersistedMetadata(eventID); err != nil {
+		return err
+	}
 	mm.usageMu.Lock()
 	defer mm.usageMu.Unlock()
-	return withRepositoryLock(mm.root, func() error {
-		return mm.markRetrievedLocked(passages)
-	})
+	return withRepositoryLock(mm.root, func() error { return mm.markRetrievedEventLocked(eventID, passages) })
 }
 
 func (mm *MemoryManager) markRetrievedLocked(passages []Passage) error {
+	return mm.markRetrievedEventLocked(generateID(), passages)
+}
 
-	archiveIDs := map[string]struct{}{}
-	topicIDs := map[string]struct{}{}
-	for _, passage := range passages {
-		id := strings.TrimSpace(passage.ID)
-		if id == "" {
+// Caller holds the repository lock. The authoritative sources establish
+// existence; ledger entries can never recreate a removed passage.
+func (mm *MemoryManager) markRetrievedEventLocked(eventID string, passages []Passage) error {
+	wanted := make(map[string][]Passage, len(passages))
+	needArchive, needTopics := false, false
+	for _, p := range passages {
+		if strings.TrimSpace(p.ID) == "" {
 			continue
 		}
-		if isTopicPassage(passage) {
-			topicIDs[id] = struct{}{}
+		wanted[p.ID] = append(wanted[p.ID], p)
+		if isTopicPassage(p) {
+			needTopics = true
 		} else {
-			archiveIDs[id] = struct{}{}
+			needArchive = true
+			if strings.HasPrefix(p.ID, "topic-") {
+				needTopics = true
+			}
 		}
 	}
-	now := time.Now().UTC()
-	var errs []error
-	if len(archiveIDs) > 0 && mm.archival != nil {
-		errs = append(errs, mm.archival.markRetrieved(archiveIDs, now))
+	var current []Passage
+	if needArchive && mm.archival != nil {
+		mm.archival.mu.Lock()
+		archived, err := mm.archival.readPassagesLocked(false)
+		mm.archival.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		current = append(current, archived...)
 	}
-	if len(topicIDs) > 0 {
-		errs = append(errs, markTopicPassagesRetrieved(mm.root, topicIDs, now))
+	if needTopics {
+		topics, err := mm.loadTopicDocumentsCached()
+		if err != nil {
+			return err
+		}
+		for _, doc := range topics {
+			current = append(current, doc.passage)
+		}
 	}
-	mm.Invalidate()
-	return errors.Join(errs...)
+	entries := make([]usageEntry, 0, len(wanted))
+	seen := make(map[string]bool, len(wanted))
+	for _, p := range current {
+		receipts, requested := wanted[p.ID]
+		if !requested {
+			continue
+		}
+		for _, receipt := range receipts {
+			if receipt.CreatedAt != "" && receipt.CreatedAt != p.CreatedAt || receipt.SourceSessionID != "" && receipt.SourceSessionID != p.SourceSessionID || receipt.Scope != "" && receipt.Scope != p.Scope {
+				return fmt.Errorf("memory: retrieved passage %s identity changed", p.ID)
+			}
+		}
+		if !mm.passageVisible(p) {
+			return fmt.Errorf("memory: retrieved passage %s is outside this workspace", p.ID)
+		}
+		deleted, err := sessionDeletedLocked(mm.root, p.SourceSessionID)
+		if err != nil {
+			return err
+		}
+		if deleted {
+			continue
+		}
+		key := passageUsageKey(p)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		entries = append(entries, usageEntry{Key: key})
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	return mm.usage.appendLocked(usageEvent{Version: 1, ID: eventID, At: time.Now().UTC().Format(time.RFC3339Nano), Entries: entries})
+}
+
+func (mm *MemoryManager) decorateUsage(passages []Passage) error {
+	if mm == nil {
+		return nil
+	}
+	return mm.usage.decorate(passages)
 }
 
 func isTopicPassage(passage Passage) bool {
@@ -63,98 +125,4 @@ func isTopicPassage(passage Passage) bool {
 		}
 	}
 	return false
-}
-
-func (am *ArchivalMemory) markRetrieved(ids map[string]struct{}, now time.Time) error {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-	path := filepath.Join(am.root, "passages.jsonl")
-	raw, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	stamp := now.Format(time.RFC3339Nano)
-	changed := false
-	var output strings.Builder
-	refreshedIndex := make(map[string]Passage)
-	for _, line := range strings.Split(string(raw), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		passage, parseErr := parsePassageLine(trimmed)
-		if parseErr != nil {
-			output.WriteString(line)
-			output.WriteByte('\n')
-			continue
-		}
-		if _, ok := ids[passage.ID]; ok {
-			passage.LastUsedAt = stamp
-			passage.UseCount++
-			encoded, marshalErr := json.Marshal(passage)
-			if marshalErr != nil {
-				return marshalErr
-			}
-			line = string(encoded)
-			changed = true
-		}
-		refreshedIndex[passage.ID] = passage
-		output.WriteString(line)
-		output.WriteByte('\n')
-	}
-	if !changed {
-		am.index = refreshedIndex
-		return nil
-	}
-	if err := atomicWriteFile(path, output.String(), 0o600); err != nil {
-		return err
-	}
-	am.index = refreshedIndex
-	return am.saveIndex()
-}
-
-func markTopicPassagesRetrieved(root string, ids map[string]struct{}, now time.Time) error {
-	remaining := make(map[string]struct{}, len(ids))
-	for id := range ids {
-		remaining[id] = struct{}{}
-	}
-	var errs []error
-	for _, path := range topicPaths(root, false) {
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			continue
-		}
-		id := topicPassageID(rel)
-		if _, ok := remaining[id]; !ok {
-			continue
-		}
-		delete(remaining, id)
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		frontmatter, body, err := memdir.ParseFile(raw)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if err := frontmatter.Validate(); err != nil {
-			errs = append(errs, fmt.Errorf("mark retrieved %s: %w", rel, err))
-			continue
-		}
-		frontmatter.MarkAccessed(now)
-		rendered, err := memdir.RenderFile(frontmatter, string(body))
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if err := atomicWriteFile(path, string(rendered), 0o600); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
 }

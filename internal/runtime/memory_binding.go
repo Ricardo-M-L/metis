@@ -135,6 +135,16 @@ func (b *WorkspaceMemoryBinding) repository() memory.Repository {
 	return repository
 }
 
+// DurableMemoryManager returns a frozen concrete workspace view for a durable
+// background hand-off. Custom repositories retain their own lifecycle: a root
+// path alone cannot establish that reconstructing a MemoryManager is safe.
+// Callers must retain this pointer, rather than resolving the mutable binding
+// again after a workspace switch. No repository method runs under b.mu.
+func (b *WorkspaceMemoryBinding) DurableMemoryManager() *memory.MemoryManager {
+	manager, _ := b.repository().(*memory.MemoryManager)
+	return manager
+}
+
 // RecallSnapshot forwards authority, not merely the rendered context. Holding
 // the binding read lock also prevents workspace activation during consumption.
 func (b *WorkspaceMemoryBinding) RecallSnapshot() (generation, body string, err error) {
@@ -267,6 +277,22 @@ func (b *WorkspaceMemoryBinding) MarkRetrieved(passages []memory.Passage) error 
 		return repository.MarkRetrieved(passages)
 	}
 	return errMemoryRepositoryUnavailable
+}
+
+// MarkRetrievedEvent preserves the request receipt identity across Desktop's
+// stable binding. Snapshot the current workspace before forwarding, and do not
+// hold b.mu during repository work or call back through the mutable binding.
+func (b *WorkspaceMemoryBinding) MarkRetrievedEvent(eventID string, passages []memory.Passage) error {
+	repository := b.repository()
+	if !usableMemoryRepository(repository) {
+		return errMemoryRepositoryUnavailable
+	}
+	if recorder, ok := repository.(interface {
+		MarkRetrievedEvent(string, []memory.Passage) error
+	}); ok {
+		return recorder.MarkRetrievedEvent(eventID, passages)
+	}
+	return repository.MarkRetrieved(passages)
 }
 
 func (b *WorkspaceMemoryBinding) CommitTopic(ctx context.Context, mutation memory.TopicMutation) error {

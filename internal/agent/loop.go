@@ -132,6 +132,9 @@ type Loop struct {
 	// 0 = disabled (default). Typical opt-in is METIS_AUTO_RETRIEVE=5
 	// via runtime.BuildAgentLoop's env override.
 	AutoRetrieveK int
+	// A durable receipt is immutable. Avoid re-reading its corpus identity on
+	// every tool iteration; the ledger remains authoritative after restart.
+	memoryUsageCommitted sync.Map
 
 	// Per-turn newly admitted recall estimates, not a session-wide quota.
 	// Zero uses 800 target / 1500 hard maximum. Complete fences are preserved.
@@ -374,6 +377,10 @@ type Loop struct {
 	// to 0 to disable (e.g. tests, cron-fire isolated mode where
 	// per-turn distillation noise dominates the actual work).
 	DistillEvery int
+	// DurableDistillationLauncher only starts a separately owned queue worker;
+	// it must return without joining provider work. Host runtimes configure it
+	// after provider/repository routing is established.
+	DurableDistillationLauncher func(root string) error
 
 	// distillJobs owns the background auto-distillation lifecycle. A session
 	// delete or process shutdown can cancel and join these jobs before removing
@@ -561,6 +568,11 @@ type distillSnapshot struct {
 	provider        llm.Provider
 	sessionID       string
 	sourceMessageID string
+	sourceRequestID string
+	workspacePath   string
+	providerName    string
+	modelID         string
+	waitForCadence  bool
 	userMsg         string
 	assistantMsg    string
 	turn            int
@@ -781,7 +793,13 @@ func (l *Loop) prepareTurnMemory(ctx context.Context) {
 	revision := l.historyRevision
 	l.mu.RUnlock()
 
-	generation, memBody, snapshotOK := recallSnapshot(manager)
+	// On-demand turns need only the guarded authoritative read below. Legacy
+	// automatic selection also freezes a generation before its preview/rerank.
+	automatic := manager != nil && k > 0 && query != ""
+	generation, memBody, snapshotOK := "", "", true
+	if automatic {
+		generation, memBody, snapshotOK = recallSnapshot(manager)
+	}
 	retrieveBody := ""
 	var picked []memory.Passage
 	if manager != nil && snapshotOK {
@@ -807,10 +825,10 @@ func (l *Loop) prepareTurnMemory(ctx context.Context) {
 	}
 	l.withMemoryGuardLocked(func() {
 		currentGeneration, currentBody, currentOK := l.memorySnapshotLocked()
-		if !currentOK || currentGeneration != generation || ctx.Err() != nil {
+		if !currentOK || (automatic && currentGeneration != generation) || ctx.Err() != nil {
 			picked = nil
-			memBody = currentBody
 		}
+		memBody = currentBody
 		l.validateMemorySnapshotLocked()
 		picked = novelRecall(picked, l.Messages, query, l.AutoRetrieveTargetTokens, l.AutoRetrieveMaxTokens)
 		retrieveBody = formatRecall(picked, generation)
@@ -825,19 +843,14 @@ func (l *Loop) prepareTurnMemory(ctx context.Context) {
 			picked = nil
 			return
 		}
-		l.Messages[idx].Content = append(l.Messages[idx].Content, llm.ContentBlock{
-			Type: "text", Text: retrieveBody, Synthetic: true,
-		})
+		block := llm.ContentBlock{Type: "text", Text: retrieveBody, Synthetic: true}
+		attachMemoryUsageReceipt(&block, picked)
+		l.Messages[idx].Content = append(l.Messages[idx].Content, block)
 		l.turnMemoryRecallAttached = true
 	})
 	l.mu.Unlock()
 
-	// Retrieval candidates and token estimates are previews, not memory use.
-	// Persist usage only after the exact Top-K has survived the session/history
-	// revision check and was attached to the request-bound user message.
-	if manager != nil && len(picked) > 0 {
-		_ = manager.MarkRetrieved(picked)
-	}
+	// Usage receipts are committed only when the admitted request is dispatched.
 }
 
 func messageContainsAutoRetrieve(message llm.Message) bool {
@@ -1831,7 +1844,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 	// Freeze stable memory + Top-K recall before any request is assembled.
 	// This deliberately runs outside l.mu; a slow disk or optional reranker
 	// must not freeze Desktop status, stop, or session-navigation paths.
+	transport.RecordTiming(ctx, "memory_prepare_start")
 	l.prepareTurnMemory(ctx)
+	transport.RecordTiming(ctx, "memory_prepare_end")
 	l.syncTaskPlanNotice(ctx)
 
 	tc := HookContext{SessionID: tasks.SessionIDFromContext(ctx), Model: l.Model, Turn: l.turnIdx}
@@ -2127,6 +2142,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
 		}
+		if err := l.commitRequestMemoryUsage(ctx, req); err != nil {
+			stopReason = "error"
+			emit(ctx, out, Event{Kind: EventError, Err: err})
+			return err
+		}
 		// Snapshot before dispatch: providers encode their own model, not
 		// necessarily req.Model. An in-place change during a stream cannot be
 		// safely attributed, but must not affect request or billing behavior.
@@ -2157,6 +2177,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					transport.RecordTiming(ctx, "request_build_end")
 					if checkpointErr := l.checkpointRequestHistory(); checkpointErr != nil {
 						return checkpointErr
+					}
+					if usageErr := l.commitRequestMemoryUsage(ctx, req); usageErr != nil {
+						return usageErr
 					}
 					provider = contextAnchor.provider
 					if provider == nil {
@@ -3291,7 +3314,7 @@ func (l *Loop) buildRequestMemoryLocked(specs []llm.ToolSpec, posture *contextRe
 		_, memBody, _ = l.memorySnapshotLocked()
 	}
 	// Per-turn auto retrieval: BM25 the latest user message against archival
-	// and topic memory. Runtime defaults to Top-5; AutoRetrieveK == 0 disables
+	// and topic memory. Runtime defaults to on-demand; AutoRetrieveK > 0 enables
 	// it. This branch is only a side-effect-free compatibility fallback for
 	// direct buildRequest callers because normal Run calls prepareTurnMemory.
 	//
@@ -3586,6 +3609,11 @@ func (l *Loop) maybeDistillSnapshot(snapshot *distillSnapshot) {
 	if cadence <= 0 || snapshot.turn == 0 || snapshot.turn%cadence != 0 {
 		return
 	}
+	if _, durable := durableDistillationManager(snapshot.repository); durable {
+		// recordCompletedTurn already fsynced this exchange. A process-owned
+		// worker consumes it without borrowing the foreground provider lifecycle.
+		return
+	}
 	if snapshot.sourceMessageID != "" {
 		l.queuePendingDistillation(*snapshot)
 		// Cadence is a checkpoint for every successful exchange since the prior
@@ -3645,9 +3673,24 @@ func (l *Loop) FlushPendingDistillation(sessionID string) int {
 	}
 	l.mu.RLock()
 	disabled := l.DistillEvery <= 0
+	manager, durable := durableDistillationManager(l.Memory)
 	l.mu.RUnlock()
 	if disabled {
 		return 0
+	}
+	if durable {
+		released, err := ReleaseDurableDistillationQueue(manager.Root(), sessionID)
+		if err != nil {
+			l.distillMu.Lock()
+			if l.distillFailures == nil {
+				l.distillFailures = make(map[string]error)
+			}
+			l.distillFailures[strings.TrimSpace(sessionID)+"\x00durable-release"] = err
+			l.distillMu.Unlock()
+			return 0
+		}
+		l.startReleasedDistillationWorker(manager.Root())
+		return released
 	}
 	sessionID = strings.TrimSpace(sessionID)
 	l.distillMu.Lock()
@@ -3937,18 +3980,38 @@ func (l *Loop) recordCompletedTurn(ctx context.Context) (*distillSnapshot, error
 	}
 	l.mu.RLock()
 	snapshot := &distillSnapshot{
-		repository: l.Memory,
-		provider:   l.Provider,
-		turn:       transcript.CountTurns(l.Messages),
+		repository:     l.Memory,
+		provider:       l.Provider,
+		turn:           transcript.CountTurns(l.Messages),
+		providerName:   strings.TrimSpace(l.contextCapabilities.ProviderID),
+		modelID:        strings.TrimSpace(l.Model),
+		waitForCadence: true,
 	}
 	snapshot.userMsg, snapshot.assistantMsg = lastExchangeLocked(l.Messages)
 	sessionGeneration := l.autoCompactSessionGeneration
 	l.mu.RUnlock()
+	if snapshot.providerName == "" {
+		// A new raw Loop may not have run a request boundary yet. This is a
+		// memory-only metadata read from the frozen provider, never discovery.
+		snapshot.providerName = strings.TrimSpace(providerContextCapabilities(snapshot.provider).ProviderID)
+	}
+	if manager, durable := durableDistillationManager(snapshot.repository); durable {
+		// Standard workspace bindings can switch repositories independently.
+		// Capture their concrete view before recording or enqueueing anything.
+		snapshot.repository = manager
+	}
 	if snapshot.repository == nil || strings.TrimSpace(snapshot.userMsg) == "" || strings.TrimSpace(snapshot.assistantMsg) == "" {
 		return nil, nil
 	}
 	if l.CurrentStateSnapshot != nil {
-		snapshot.sessionID = strings.TrimSpace(l.CurrentStateSnapshot().SessionID)
+		state := l.CurrentStateSnapshot()
+		snapshot.sessionID = strings.TrimSpace(state.SessionID)
+		snapshot.workspacePath = strings.TrimSpace(state.WorkingDirectory)
+		if snapshot.providerName == "" {
+			// The provider's route metadata is authoritative. A host callback
+			// may expose only an adapter name, or retain a boot-time profile.
+			snapshot.providerName = strings.TrimSpace(state.Provider)
+		}
 	}
 	l.mu.RLock()
 	stillCurrentSession := l.autoCompactSessionGeneration == sessionGeneration
@@ -3962,6 +4025,10 @@ func (l *Loop) recordCompletedTurn(ctx context.Context) (*distillSnapshot, error
 		// state, not a durable identity and can move backwards at those boundaries.
 		snapshot.sourceMessageID = snapshot.sessionID + "/message/" + uuid.NewString()
 	}
+	snapshot.sourceRequestID = TraceInvocationIDFromContext(ctx)
+	if snapshot.sourceRequestID == "" {
+		snapshot.sourceRequestID = snapshot.sourceMessageID
+	}
 	if err := snapshot.repository.RecordTurn(
 		ctx,
 		snapshot.sessionID,
@@ -3972,9 +4039,21 @@ func (l *Loop) recordCompletedTurn(ctx context.Context) (*distillSnapshot, error
 		return nil, err
 	}
 	l.mu.RLock()
-	distillationEnabled := l.DistillEvery > 0
+	cadence := l.DistillEvery
 	l.mu.RUnlock()
-	if distillationEnabled {
+	if cadence > 0 {
+		if durable, err := enqueueDurableDistillation(*snapshot); durable {
+			if err != nil {
+				return nil, fmt.Errorf("persist memory distillation job: %w", err)
+			}
+			if snapshot.turn > 0 && snapshot.turn%cadence == 0 {
+				if _, err := ReleaseDurableDistillationQueue(snapshot.repository.Root(), snapshot.sessionID); err != nil {
+					return nil, fmt.Errorf("release memory distillation cadence: %w", err)
+				}
+				l.startReleasedDistillationWorker(snapshot.repository.Root())
+			}
+			return snapshot, nil
+		}
 		l.queuePendingDistillation(*snapshot)
 	}
 	return snapshot, nil

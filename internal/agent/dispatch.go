@@ -1314,7 +1314,7 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 			}
 		}
 	}
-	return llm.ContentBlock{
+	resultBlock := llm.ContentBlock{
 		Type: "tool_result", ToolUseID: blk.ToolUseID,
 		ToolResult:          resultBody,
 		TrustedResultSuffix: resultBody[trustedBodyStart:],
@@ -1322,6 +1322,8 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 		Display:             res.Display,
 		Presentation:        clonePresentation(res.Presentation),
 	}
+	attachMemoryToolProvenance(&resultBlock, blk.ToolName, res, memoryResultBody(resultBlock) == res.Output)
+	return resultBlock
 }
 
 // detachInterruptBlockContext removes ordinary turn cancellation while

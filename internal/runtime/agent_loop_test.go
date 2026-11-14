@@ -309,25 +309,35 @@ func TestBuildMemoryManagerImportsLegacyJSONLDespiteCanonicalNameConflict(t *tes
 	}
 }
 
-func TestBuildAgentLoopAutoRetrieveDefaultsOnAndAllowsOptOut(t *testing.T) {
-	cfg := defaultLoopCfg(t)
-	loop := BuildAgentLoop(cfg, AgentLoopOptions{
-		Provider: &stubProvider{maxCtx: 100_000},
-		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAcceptEdits),
-	})
-	if loop.AutoRetrieveK != 5 {
-		t.Fatalf("default AutoRetrieveK=%d, want 5", loop.AutoRetrieveK)
-	}
-
-	t.Setenv("METIS_AUTO_RETRIEVE", "off")
-	loop = BuildAgentLoop(cfg, AgentLoopOptions{
-		Provider: &stubProvider{maxCtx: 100_000},
-		Registry: tools.NewRegistry(),
-		Gate:     permission.New(permission.ModeAcceptEdits),
-	})
-	if loop.AutoRetrieveK != 0 {
-		t.Fatalf("explicit off AutoRetrieveK=%d, want 0", loop.AutoRetrieveK)
+func TestBuildAgentLoopAutoRetrieveDefaultsToOnDemandAndAllowsLegacyOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		want int
+	}{
+		{name: "default", want: 0},
+		{name: "off", env: "off", want: 0},
+		{name: "false", env: "false", want: 0},
+		{name: "disabled", env: "disabled", want: 0},
+		{name: "zero", env: "0", want: 0},
+		{name: "legacy", env: "5", want: 5},
+		{name: "trimmed", env: " 3 ", want: 3},
+		{name: "clamped", env: "100", want: 50},
+		{name: "invalid", env: "invalid", want: 0},
+		{name: "negative", env: "-1", want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultLoopCfg(t)
+			t.Setenv("METIS_AUTO_RETRIEVE", tc.env)
+			loop := BuildAgentLoop(cfg, AgentLoopOptions{
+				Provider: &stubProvider{maxCtx: 100_000},
+				Registry: tools.NewRegistry(),
+				Gate:     permission.New(permission.ModeAcceptEdits),
+			})
+			if loop.AutoRetrieveK != tc.want {
+				t.Fatalf("METIS_AUTO_RETRIEVE=%q: AutoRetrieveK=%d, want %d", tc.env, loop.AutoRetrieveK, tc.want)
+			}
+		})
 	}
 }
 

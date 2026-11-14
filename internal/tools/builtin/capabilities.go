@@ -93,9 +93,11 @@ func (ProjectCoordinator) IsReadOnly(in map[string]any) bool {
 	return action == "list" || action == "status"
 }
 
-// Memory writes user-facing memory entries. Mutating but recoverable
-// (the file content stays on disk, no rm).
-func (Memory) IsReadOnly(map[string]any) bool { return false }
+// Memory inspections are read-only; writes still require the normal gate.
+func (Memory) IsReadOnly(in map[string]any) bool {
+	action, _ := in["action"].(string)
+	return action == "read" || action == "search" || action == "stats"
+}
 
 // NotebookEdit modifies a Jupyter notebook cell. Same as Edit —
 // mutating + destructive (overwrites cell content).

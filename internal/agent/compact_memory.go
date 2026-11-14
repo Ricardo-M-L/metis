@@ -91,6 +91,84 @@ func projectSummarySpans(before, after string, spans []summarySourceSpan) []summ
 
 var summaryRecallBody = regexp.MustCompile(`(?m)^\[[0-9]+\] `)
 
+// Memory observations carry an aggregate dependency set for whole-result
+// withdrawal. A summary, however, depends only on source-bearing bytes that
+// survived serialization and fitting. Labels, reference envelopes and recovery
+// instructions must not donate dependencies from omitted passages or Core lines.
+func summaryMemoryToolSourceSpans(role string, block llm.ContentBlock, redact bool) []summarySourceSpan {
+	var aggregate summaryMemoryDependencies
+	if json.Unmarshal([]byte(block.ProviderHint[summaryMemoryHint]), &aggregate) != nil {
+		return nil
+	}
+	body := block.ToolResult
+	var spans []summarySourceSpan
+	add := func(start, end int, deps summaryMemoryDependencies) {
+		if start >= end {
+			return
+		}
+		raw, _ := json.Marshal(deps)
+		spans = append(spans, summarySourceSpan{start, end, llm.ContentBlock{ProviderHint: map[string]string{summaryMemoryHint: string(raw)}}})
+	}
+	allowedRefs := make(map[recallReference]bool, len(aggregate.References))
+	for _, ref := range aggregate.References {
+		allowedRefs[ref] = true
+	}
+	for _, loc := range recallFence.FindAllStringIndex(body, -1) {
+		fence := body[loc[0]:loc[1]]
+		match := recallRefs.FindStringSubmatch(fence)
+		var refs []recallReference
+		if len(match) != 2 {
+			continue
+		}
+		raw, err := base64.RawURLEncoding.DecodeString(match[1])
+		if err != nil || json.Unmarshal(raw, &refs) != nil || len(refs) != 1 || !allowedRefs[refs[0]] {
+			continue
+		}
+		label := summaryRecallBody.FindStringIndex(fence)
+		if label == nil {
+			continue
+		}
+		start, end := label[1], strings.LastIndex(fence, "</auto-retrieve>")
+		// The builtin's [date · type] prefix describes the source; it is
+		// not itself source content. A clipped label cannot retain a fact.
+		if strings.HasPrefix(fence[start:], "[") {
+			if close := strings.Index(fence[start:], "] "); close >= 0 {
+				start += close + len("] ")
+			}
+		}
+		for end > start && (fence[end-1] == '\n' || fence[end-1] == '\r') {
+			end--
+		}
+		add(loc[0]+start, loc[0]+end, summaryMemoryDependencies{References: refs})
+	}
+	allowedLines := make(map[string]bool, len(aggregate.ContextLines))
+	for _, hash := range aggregate.ContextLines {
+		allowedLines[hash] = true
+	}
+	offset := 0
+	for _, line := range strings.Split(body, "\n") {
+		hash := memoryLineHash(line)
+		if line != "" && allowedLines[hash] {
+			add(offset, offset+len(line), summaryMemoryDependencies{ContextLines: []string{hash}})
+		}
+		offset += len(line) + 1
+	}
+	window := compactRuneWindow(body, summaryToolResultHeadRunes, summaryToolResultTailRunes, "tool result")
+	spans = projectSummarySpans(body, window, spans)
+	// Serialize an empty own body to locate its header exactly, even when a
+	// display/presentation field happens to contain identical body text.
+	own := block
+	own.ToolResult, own.ToolResultBlocks = "", nil
+	var header strings.Builder
+	writeSummaryContentBlock(&header, role, own, redact)
+	base := header.Len() - 1 // the serializer's final newline follows the body
+	for i := range spans {
+		spans[i].start = base + len(maybeRedact(window[:spans[i].start], redact))
+		spans[i].end = base + len(maybeRedact(window[:spans[i].end], redact))
+	}
+	return spans
+}
+
 func summaryBlockSourceSpans(role string, block llm.ContentBlock, redact bool) []summarySourceSpan {
 	var rendered strings.Builder
 	writeSummaryContentBlock(&rendered, role, block, redact)
@@ -102,7 +180,13 @@ func summaryBlockSourceSpans(role string, block llm.ContentBlock, redact bool) [
 		}
 	}
 	if raw, ok := block.ProviderHint[summaryMemoryHint]; ok {
-		add(0, len(text), llm.ContentBlock{ProviderHint: map[string]string{summaryMemoryHint: raw}})
+		if block.Type == "tool_result" && block.Synthetic && block.ProviderHint[memoryToolObservationHint] == "1" {
+			out = append(out, summaryMemoryToolSourceSpans(role, block, redact)...)
+		} else {
+			// Derived summaries and legacy opaque sources retain their full
+			// existing dependency set when any of their narrative is used.
+			add(0, len(text), llm.ContentBlock{ProviderHint: map[string]string{summaryMemoryHint: raw}})
+		}
 	}
 	if block.Synthetic {
 		for _, loc := range recallFence.FindAllStringIndex(block.Text, -1) {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -140,6 +141,85 @@ func TestSuccessfulHeadlessOneTurnFlushesResidualDistillation(t *testing.T) {
 	}
 	if len(distilled) != 1 || distilled[0] != sessionID {
 		t.Fatalf("distilled sessions = %v, want exactly [%s]", distilled, sessionID)
+	}
+}
+
+func readHeadlessDistillationJob(t *testing.T, root string) agent.DistillationQueueJob {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(root, "distillation-queue", "*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("durable jobs = %d, want 1", len(paths))
+	}
+	data, err := os.ReadFile(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var job agent.DistillationQueueJob
+	if err := json.Unmarshal(data, &job); err != nil {
+		t.Fatal(err)
+	}
+	return job
+}
+
+func TestSuccessfulHeadlessOneTurnReleasesStagedQueueWithoutProviderWait(t *testing.T) {
+	t.Setenv("METIS_HOME", t.TempDir())
+	const sessionID = "headless-staged-boundary"
+	root, workspace := t.TempDir(), t.TempDir()
+	manager, err := memory.NewMemoryManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &headlessOutcomeProvider{completeFunc: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	loop := agent.NewLoop(provider, tools.NewRegistry(), nil, nil, "system", 3)
+	loop.Memory = manager
+	loop.DistillEvery = 5
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = loop.CancelAndWaitForDistillation(ctx, sessionID)
+	})
+	loop.CurrentStateSnapshot = func() agent.RuntimeStateSnapshot {
+		return agent.RuntimeStateSnapshot{SessionID: sessionID, WorkingDirectory: workspace}
+	}
+	loop.AppendUser("Remember that the durable release codename is White Finch.")
+	if _, err := collectHeadlessEvents(func(events chan<- agent.Event) error {
+		return loop.Run(context.Background(), events)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	job := readHeadlessDistillationJob(t, root)
+	if job.Status != "pending" || job.Ready {
+		t.Fatalf("single turn released before cadence: status=%q ready=%v", job.Status, job.Ready)
+	}
+	if ready, err := agent.DurableDistillationQueueHasPending(root); err != nil || ready {
+		t.Fatalf("staged job became consumable: ready=%v error=%v", ready, err)
+	}
+	rt := &runtime{loop: loop, sessionID: sessionID}
+	done := make(chan error, 1)
+	go func() { done <- rt.persistHeadlessMemoryBoundary("metis run", 2*time.Second) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("durable headless boundary waited for provider completion")
+	}
+	job = readHeadlessDistillationJob(t, root)
+	if job.Status != "pending" || !job.Ready {
+		t.Fatalf("success boundary did not release durable job: status=%q ready=%v", job.Status, job.Ready)
+	}
+	if ready, err := agent.DurableDistillationQueueHasPending(root); err != nil || !ready {
+		t.Fatalf("released job is not consumable: ready=%v error=%v", ready, err)
+	}
+	if calls := provider.completeCalls.Load(); calls != 0 {
+		t.Fatalf("foreground boundary made %d provider calls", calls)
 	}
 }
 
@@ -492,11 +572,44 @@ func newHeadlessOutcomeRuntime(t *testing.T, provider llm.Provider) *runtime {
 		t.Fatal(err)
 	}
 	loop := agent.NewLoop(provider, tools.NewRegistry(), nil, nil, "system", 3)
-	loop.Memory = manager
+	// These fixtures exercise legacy provider/join error classification.
+	// Custom repository wrappers retain that lifecycle intentionally.
+	loop.Memory = &legacyHeadlessMemoryRepository{Repository: manager}
 	loop.DistillEvery = 5
 	const sessionID = "headless-outcome"
 	loop.CurrentStateSnapshot = func() agent.RuntimeStateSnapshot { return agent.RuntimeStateSnapshot{SessionID: sessionID} }
 	return &runtime{loop: loop, sessionID: sessionID, cfg: &config.Config{Session: config.Session{Dir: t.TempDir()}}}
+}
+
+type legacyHeadlessMemoryRepository struct{ memory.Repository }
+
+type durableHeadlessBoundary struct {
+	recordingHeadlessBoundary
+	persisted []string
+	err       error
+}
+
+func (b *durableHeadlessBoundary) PersistPendingDistillation(session string) (bool, error) {
+	b.persisted = append(b.persisted, session)
+	return true, b.err
+}
+
+func TestPersistHeadlessMemoryBoundaryAcknowledgesDurableQueueWithoutProviderWait(t *testing.T) {
+	boundary := &durableHeadlessBoundary{}
+	if err := persistHeadlessMemoryBoundary(boundary, "durable-session", "metis run", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if len(boundary.persisted) != 1 || boundary.persisted[0] != "durable-session" {
+		t.Fatalf("durable handoff=%v", boundary.persisted)
+	}
+	if calls := boundary.snapshot(); len(calls) != 0 {
+		t.Fatalf("durable path invoked legacy join: %v", calls)
+	}
+	storageErr := errors.New("queue fsync failed")
+	boundary.err = storageErr
+	if err := completeHeadlessMemoryBoundary(boundary, "durable-session", "metis run", time.Second, io.Discard); !errors.Is(err, storageErr) {
+		t.Fatalf("queue persistence error lost: %v", err)
+	}
 }
 
 func TestHeadlessSuccessRoutesKeepCompletedTaskWhenMemoryProviderFails(t *testing.T) {
