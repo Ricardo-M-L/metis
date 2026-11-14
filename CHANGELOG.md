@@ -7,6 +7,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.120] - 2026-11-14
+
+Full CLI and Desktop release. The macOS Desktop ZIP and DMG are Developer ID
+signed, Apple-notarized, stapled and Gatekeeper-verified for this version.
+
+### Fixed
+
+- Resume a child agent answer that ended because of the output length limit, up
+  to three bounded continuations, without replaying its tools or dropping
+  verification obligations, deadlines, usage accounting or parent input.
+- Derive bounded default output budgets for recognized DeepSeek reasoning models.
+- Surface safe child-agent failure reasons and parent-scoped saved child history
+  in the CLI and Desktop instead of losing a truncated or failed child run.
+- Keep pinned Computer Use resources in fresh local runtime packages.
+- Allow bounded headroom for Windows CLI test fixtures so normal process and Git
+  startup overhead cannot truncate the package suite.
+
 ## [0.4.119] - 2026-11-10
 
 Full CLI and Desktop release. macOS packages continue the owner-authorized
