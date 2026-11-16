@@ -66,3 +66,14 @@ func TestCacheProjectionSchemaAndHistoryChanges(t *testing.T) {
 		t.Fatal("history addition not classified")
 	}
 }
+
+func TestCacheSummaryDoesNotInventCacheAccounting(t *testing.T) {
+	r := NewCacheStatsRing(2)
+	r.RecordRequest(llm.Request{Model: "fixture"}, CacheStat{Input: 100})
+	summary := r.CacheSummary()
+	for _, want := range []string{"actual_cache_read_ratio = unknown", "reported_hit_rate = unknown", "cache_miss = unknown"} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("cache report lacks %q: %s", want, summary)
+		}
+	}
+}

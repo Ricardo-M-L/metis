@@ -4,6 +4,7 @@ import (
 	"reflect"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
 // DeepSnapshot detaches mutable message blocks and JSON-like metadata for an
@@ -28,6 +29,13 @@ func snapshotBlocks(blocks []llm.ContentBlock) []llm.ContentBlock {
 	out := make([]llm.ContentBlock, len(blocks))
 	for i, block := range blocks {
 		out[i] = block
+		if block.ContextUpdate != nil {
+			u := *block.ContextUpdate
+			u.State = append([]provider.ContextSection(nil), u.State...)
+			u.Changed = append([]provider.ContextSection(nil), u.Changed...)
+			u.Removed = append([]string(nil), u.Removed...)
+			out[i].ContextUpdate = &u
+		}
 		out[i].ToolResultBlocks = snapshotBlocks(block.ToolResultBlocks)
 		if block.ToolInput != nil {
 			out[i].ToolInput = cloneMetadata(reflect.ValueOf(block.ToolInput)).Interface().(map[string]any)

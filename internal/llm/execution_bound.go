@@ -89,6 +89,13 @@ func (p *executionBoundProvider) DynamicContextCheckpoints() bool {
 	return ok && capability.DynamicContextCheckpoints()
 }
 
+func (p *executionBoundProvider) ContextUpdateScope() string {
+	if capability, ok := p.Provider.(pubprov.ContextUpdateProvider); ok {
+		return capability.ContextUpdateScope()
+	}
+	return ""
+}
+
 // Recovery consumers test this marker's value rather than its presence.
 func (p *executionBoundProvider) ManagesRecoverySession() bool {
 	managed, ok := p.Provider.(interface{ ManagesRecoverySession() bool })

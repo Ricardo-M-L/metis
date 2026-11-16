@@ -7,6 +7,43 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Default compatible tool discovery to a 10% schema budget instead of always
+  stripping Deferred schemas. Small catalogs remain directly callable; explicit
+  ENABLE_TOOL_SEARCH settings retain their precedence.
+- Expose live prompt-cache observations through MetisInfo's cache section,
+  distinguishing request-fingerprint changes from cache-hit evidence and keeping
+  missing cache accounting explicitly unknown.
+
+### Fixed
+
+- Honor explicit terminal clear requests even when the final View already
+  flushed unchanged, preventing missed idle/error redraws without disabling
+  ordinary differential rendering.
+- Keep slash-command drafts when Escape dismisses suggestions, and reopen the
+  list only after the draft changes rather than on cursor-only navigation.
+- Separate permission-choice focus from draft editing. Typing spaces cannot
+  approve actions; Tab switches focus, Enter confirms only focused choices,
+  and editor-focused paste remains a draft. Escape still denies the action.
+- Checkpoint interactive TUI, REPL and WebUI history before model requests;
+  storage failures stop new model work while preserving completed output and
+  cancellation evidence when a later tail write fails.
+- Handle nullable named-slice schema values without panicking during request
+  snapshot capture, and avoid double-counting durable context in preflight
+  compaction pressure.
+- Persist ordered runtime context on capable local Responses routes so later
+  responses and resumed sessions retain the previously sent input prefix.
+  Reestablish a full baseline after compaction and keep conservative system
+  projection on unsupported or provider-managed routes.
+- Preserve the actual parent request's system sections, child-available tool
+  definitions, reasoning effort, and cache affinity on a warm Fork's first request. Keep
+  cold agents and background-memory safety projections independent.
+- Close a Fork's inherited pending tool calls before history restoration so
+  orphan repair cannot insert a duplicate interrupted result.
+- Detach warm request snapshots and invalidate their first-request pin on
+  history or provider changes without rotating affinity within a session.
+
 ## [0.4.121] - 2026-11-16
 
 Full CLI and Desktop release, including the changes prepared for the unpublished

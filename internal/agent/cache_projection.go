@@ -140,7 +140,13 @@ func (r *CacheStatsRing) RecordRequest(req llm.Request, stat CacheStat) {
 // CacheSummary is safe for a read-only introspection tool: no prompt bodies,
 // schema bodies, session IDs, or credentials are exposed.
 func writeCacheSummary(b *strings.Builder, s CacheStat, turns int, rate float64) {
-	fmt.Fprintf(b, "turns = %d\nactual_input_uncached = %d\nactual_cache_read = %d\nactual_cache_create = %d\nactual_output = %d\nactual_cache_read_ratio = %.4f\n", turns, s.Input, s.CacheRead, s.CacheCreate, s.Output, rate)
+	fmt.Fprintf(b, "available = true\nturns = %d\nactual_input_uncached = %d\nactual_cache_read = %d\nactual_cache_create = %d\nactual_output = %d\n", turns, s.Input, s.CacheRead, s.CacheCreate, s.Output)
+	if s.CacheRead == 0 && s.CacheCreate == 0 {
+		b.WriteString("actual_cache_read_ratio = unknown\nreported_hit_rate = unknown\n")
+	} else {
+		fmt.Fprintf(b, "actual_cache_read_ratio = %.4f\nreported_hit_rate = %.2f%%\n", rate, s.HitRate()*100)
+	}
+	fmt.Fprintf(b, "request_fingerprint = %s\ncache_miss = unknown\n", s.Fingerprint)
 	p := s.Projection
 	fmt.Fprintf(b, "projection_source = %s\nestimated_stable_system_tokens = %d\nestimated_dynamic_system_tokens = %d\nestimated_tool_schema_tokens = %d\nestimated_history_tokens = %d\nestimated_shared_prefix_tokens = %d\nfirst_changed_category = %s\n", p.Source, p.StableSystemTokens, p.DynamicSystemTokens, p.ToolSchemaTokens, p.HistoryTokens, p.SharedPrefixTokens, p.FirstChange)
 	b.WriteString("interpretation = local logical request only; fingerprint changes do not imply a full cache miss\n")
@@ -154,7 +160,7 @@ func (r *CacheStatsRing) CacheSummary() string {
 	defer r.mu.RUnlock()
 	entries := r.buf
 	if len(entries) == 0 {
-		return "[cache]\nturns = 0\n"
+		return "[cache]\navailable = false\nturns = 0\n"
 	}
 	s := entries[len(entries)-1]
 	var b strings.Builder
@@ -170,5 +176,7 @@ func (r *CacheStatsRing) CacheSummary() string {
 		rate = float64(read) / float64(total)
 	}
 	writeCacheSummary(&b, s, len(entries), rate)
+	changed := len(entries) > 1 && s.Fingerprint != "" && entries[len(entries)-2].Fingerprint != "" && s.Fingerprint != entries[len(entries)-2].Fingerprint
+	fmt.Fprintf(&b, "fingerprint_changed = %t\n", changed)
 	return b.String()
 }

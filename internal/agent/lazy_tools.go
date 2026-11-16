@@ -7,12 +7,11 @@
 // trading one extra round-trip for a much smaller per-iteration prompt.
 //
 // Mode is controlled by the `ENABLE_TOOL_SEARCH` environment variable.
-// Default matches claude-code's `tst` (always-defer) rather than
-// openclaude's `tst-auto` — running unrestricted MCP servers on a
-// modern 192k+ window otherwise burns 4-20k tokens per turn before the
-// model even sees the user's message:
+// These adapters use client-side discovery, not native deferred-tool wire
+// semantics. Budget-based selection keeps small catalogs stable and directly
+// callable while still deferring large catalogs. Explicit settings win:
 //
-//	(unset)    → always lazy (deferred MCP tools always stripped)
+//	(unset)    → auto, defer at 10% of the context window
 //	"auto"     → auto, fires when deferred tokens > 10% of context window
 //	"auto:N"   → auto, N% (1..99)
 //	"auto:0"   → always lazy (equivalent to "true")
@@ -419,13 +418,13 @@ const (
 )
 
 // parseEnableToolSearch resolves the ENABLE_TOOL_SEARCH env value into
-// a (mode, percentage) pair. Empty falls back to LazyModeAlways
-// (claude-code parity — see file header). Unrecognized values fall
-// back to Auto/10 so a typo doesn't silently break MCP loads.
+// a (mode, percentage) pair. Empty and unrecognized values select Auto/10.
+// A small compatible catalog should not pay an extra discovery round or
+// change the tools prefix merely because native defer_loading is unavailable.
 //
 //	value         mode      percentage    notes
-//	(empty)       Always    0             default (claude-code "tst")
-//	"auto"        Auto      10            opt-in budget-based trigger
+//	(empty)       Auto      10            default budget-based trigger
+//	"auto"        Auto      10            explicit budget-based trigger
 //	"auto:N"      Auto      N             1 ≤ N ≤ 99
 //	"auto:0"      Always    0             same as "true"
 //	"auto:100"    Standard  0             same as "false"
@@ -439,7 +438,7 @@ const (
 func parseEnableToolSearch(value string) (LazyMode, int) {
 	v := strings.ToLower(strings.TrimSpace(value))
 	if v == "" {
-		return LazyModeAlways, 0
+		return LazyModeAuto, LazyTokenPercentageDefault
 	}
 	if v == "auto" {
 		return LazyModeAuto, LazyTokenPercentageDefault

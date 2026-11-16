@@ -6,8 +6,10 @@ import (
 	"github.com/Ricardo-M-L/metis/internal/llm"
 	"strings"
 
+	"encoding/base64"
 	"github.com/Ricardo-M-L/metis/internal/agent/transcript"
 	"github.com/Ricardo-M-L/metis/internal/memory"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
 type memorySnapshotGuard interface {
@@ -153,4 +155,80 @@ func (l *Loop) checkpointRequestHistory() error {
 		return fmt.Errorf("persist validated request history: %w", err)
 	}
 	return nil
+}
+
+// Ordered context metadata is part of durable history, not a hidden cache.
+// Revocation must erase both the rendered wire delta and its full resume state.
+func sanitizeContextUpdateMemory(block llm.ContentBlock, current string, visible map[string]string, valid bool) (llm.ContentBlock, bool) {
+	if block.ContextUpdate == nil {
+		return block, false
+	}
+	update := *block.ContextUpdate
+	allowed := func(section provider.ContextSection) bool {
+		if section.Name == "memory_index" {
+			if !valid {
+				return false
+			}
+			for _, line := range strings.Split(section.Body, "\n") {
+				if strings.TrimSpace(line) != "" && !strings.Contains(current, line) {
+					return false
+				}
+			}
+		}
+		if section.Name == "auto-retrieve" {
+			if !valid {
+				return false
+			}
+			for _, fence := range recallFence.FindAllString(section.Body, -1) {
+				match := recallRefs.FindStringSubmatch(fence)
+				if len(match) != 2 {
+					return false
+				}
+				data, err := base64.RawURLEncoding.DecodeString(match[1])
+				var refs []recallReference
+				if err != nil || json.Unmarshal(data, &refs) != nil || len(refs) == 0 {
+					return false
+				}
+				for _, ref := range refs {
+					if visible[ref.ID] != ref.Hash {
+						return false
+					}
+				}
+			}
+		}
+		return true
+	}
+	removed := map[string]bool{}
+	filter := func(sections []provider.ContextSection) []provider.ContextSection {
+		var kept []provider.ContextSection
+		for _, section := range sections {
+			if allowed(section) {
+				kept = append(kept, section)
+			} else {
+				removed[section.Name] = true
+			}
+		}
+		return kept
+	}
+	update.State, update.Changed = filter(update.State), filter(update.Changed)
+	if len(removed) == 0 {
+		return block, false
+	}
+	update.Removed = append([]string(nil), update.Removed...)
+	for _, name := range []string{"memory_index", "auto-retrieve"} {
+		if removed[name] {
+			found := false
+			for _, old := range update.Removed {
+				if old == name {
+					found = true
+				}
+			}
+			if !found {
+				update.Removed = append(update.Removed, name)
+			}
+		}
+	}
+	block.ContextUpdate = &update
+	block.Text = renderContextUpdate(&update)
+	return block, true
 }

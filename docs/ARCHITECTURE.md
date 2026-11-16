@@ -423,3 +423,21 @@ Windows amd64.
 The Desktop build matrix runs for stable tag pushes and is required before that
 release is published. A manual release-workflow dispatch remains a CLI-only
 rebuild path; it does not synthesize Desktop assets for an existing tag.
+
+### Durable runtime context and warm Fork requests
+
+Local Responses providers explicitly advertise support for ordered developer
+context. The loop projects changes without mutating history during estimates,
+then saves context updates through its history checkpoint before sending the
+request. Compaction establishes a new baseline; unknown or provider-managed
+routes retain their normal system projection.
+
+Warm Fork takes a detached header from the completed parent request and closes
+inherited tool calls before restoring history. The initial child request keeps
+that header and cache affinity while filtering tools through its child registry;
+subsequent requests use live discovery and runtime state. History/provider changes invalidate the initial header pin.
+
+Cache diagnostics preserve the existing logical projection estimates and actual
+provider token buckets. Tool dispatch binds a detached summary to the invoking
+loop so a shared registry cannot attribute another session's statistics to a
+MetisInfo call. Missing cache accounting stays unknown.

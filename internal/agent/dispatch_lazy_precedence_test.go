@@ -120,8 +120,8 @@ func TestDispatchToolSpecs_EnvTrueIgnoresUnknownWindow(t *testing.T) {
 	}
 }
 
-// TestDispatchToolSpecs_AutoFiresOnSmallWindow — auto-10% (opt-in via
-// explicit "auto" — empty default is now "always" since 2026-05-11).
+// TestDispatchToolSpecs_AutoFiresOnSmallWindow — the auto-10% budget also
+// applies when selected explicitly rather than through the default.
 // Fat MCP schema on 16k window (>10% of budget) trips the strip.
 func TestDispatchToolSpecs_AutoFiresOnSmallWindow(t *testing.T) {
 	t.Setenv("ENABLE_TOOL_SEARCH", "auto")

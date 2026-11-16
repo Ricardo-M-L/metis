@@ -98,6 +98,9 @@ type ContentBlock struct {
 	// replay: otherwise a resumed checkpoint becomes an apparent user request
 	// and may be selected as the active task by a later compaction.
 	Synthetic bool `json:"synthetic,omitempty"`
+	// ContextUpdate is host-produced replay metadata for a context_update block.
+	// Provider adapters encode its Text only when they support ordered updates.
+	ContextUpdate *ContextUpdate `json:"context_update,omitempty"`
 
 	// Image-specific (Type="image"):
 	MediaType string `json:"media_type,omitempty"` // e.g., "image/png"
@@ -166,6 +169,9 @@ type Request struct {
 	// be synthesized per request. Providers that do not define such a wire
 	// contract ignore it.
 	SessionID string
+	// ContextUpdateScope selects a supported ordered-context projection.
+	// Empty preserves the legacy request-only context behavior.
+	ContextUpdateScope string
 	// SystemSections is the typed-section form of System. When non-nil,
 	// providers that support per-section caching (Anthropic) prefer
 	// this over System and emit cache_control independently per

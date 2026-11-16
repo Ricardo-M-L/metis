@@ -4,6 +4,7 @@ import (
 	"reflect"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
 // activeContextSnapshot is the provider-authoritative size of the active
@@ -167,14 +168,19 @@ type contextProviderIdentity struct {
 }
 
 type contextRequestAnchor struct {
-	valid           bool
-	provider        llm.Provider
-	providerID      contextProviderIdentity
-	requestModel    string
-	messageCount    int
-	historyRevision uint64
-	routingRevision uint64
-	requestOverhead int
+	memoryGeneration, memoryBody string
+	memoryValid                  bool
+	memoryPresent                bool
+	valid                        bool
+	provider                     llm.Provider
+	providerID                   contextProviderIdentity
+	requestModel                 string
+	messageCount                 int
+	sourceMessageCount           int
+	contextUpdate                *llm.Message
+	historyRevision              uint64
+	routingRevision              uint64
+	requestOverhead              int
 	// Captured from the actual projected request, independently of the live
 	// history position used to attribute the response.
 	requestUsageFloor    int
@@ -244,8 +250,9 @@ func (l *Loop) contextRequestAnchorLocked(provider llm.Provider, req llm.Request
 	if req.MaxTokens > 0 && (maxOutput <= 0 || req.MaxTokens < maxOutput) {
 		maxOutput = req.MaxTokens
 	}
+	memoryGeneration, memoryBody, memoryValid := l.memorySnapshotLocked()
 	return contextRequestAnchor{
-		valid:        true,
+		memoryGeneration: memoryGeneration, memoryBody: memoryBody, memoryValid: memoryValid, memoryPresent: l.Memory != nil, valid: true,
 		provider:     provider,
 		providerID:   identifyContextProvider(provider),
 		requestModel: req.Model,
@@ -277,6 +284,9 @@ func estimateRequestOverhead(req llm.Request) int {
 func estimateRequestPrefix(req llm.Request) (systemTokens, toolTokens int) {
 	if len(req.SystemSections) > 0 {
 		for _, section := range req.SystemSections {
+			if req.ContextUpdateScope != "" && provider.IsMutableContextSection(section) {
+				continue
+			}
 			systemTokens += 4 + estimateStringTokens(section.Body)
 		}
 	} else {
@@ -289,6 +299,7 @@ func estimateRequestPrefix(req llm.Request) (systemTokens, toolTokens int) {
 }
 
 func (l *Loop) invalidateActiveContextLocked() {
+	l.lastRequest, l.warmRequest = nil, nil
 	l.invalidateProviderContextLocked()
 	l.contextPrefix = contextPrefixEstimate{}
 }

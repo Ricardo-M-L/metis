@@ -99,7 +99,7 @@ func (m MetisInfo) WithCacheStats(stats interface{ CacheSummary() string }) Meti
 
 func (MetisInfo) Name() string { return "MetisInfo" }
 func (MetisInfo) Description() string {
-	return "Introspection: dump effective config, active model + context window, catalog freshness, providers, MCP servers, skills, hooks, permission mode, registered tools, and live background jobs as INI sections. Call when debugging \"why isn't tool X / skill Y / MCP Z working?\", \"what's my effective context limit on this model?\", or \"is my context window coming from catalog or a hardcoded fallback?\"."
+	return "Introspection: dump prompt-cache observations, effective config, active model + context window, catalog freshness, providers, MCP servers, skills, hooks, permission mode, registered tools, and live background jobs as INI sections. Call when debugging \"why isn't tool X / skill Y / MCP Z working?\", \"what's my effective context limit on this model?\", or \"is my context window coming from catalog or a hardcoded fallback?\"."
 }
 
 func (MetisInfo) InputSchema() map[string]any {
@@ -129,8 +129,17 @@ func (m MetisInfo) Execute(ctx context.Context, in map[string]any) (*tools.Resul
 	var b strings.Builder
 	want := func(name string) bool { return section == "" || section == name }
 
-	if want("cache") && m.cacheStats != nil {
-		b.WriteString(m.cacheStats.CacheSummary())
+	if want("cache") {
+		if summary, ok := tools.CacheSummaryFromContext(ctx); ok {
+			if summary == "" {
+				summary = "[cache]\navailable = false\n"
+			}
+			b.WriteString(summary)
+		} else if m.cacheStats != nil {
+			b.WriteString(m.cacheStats.CacheSummary())
+		} else {
+			b.WriteString("[cache]\navailable = false\n")
+		}
 	}
 	if want("config") {
 		m.writeConfigStaleness(&b)

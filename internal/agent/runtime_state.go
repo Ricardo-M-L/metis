@@ -51,10 +51,19 @@ func writeRuntimeStateField(body *strings.Builder, name, value string) {
 // changes. Caller must hold l.mu for writing because the cached baseline and
 // revision are session state.
 func (l *Loop) currentRuntimeStateSectionLocked() (llmSection runtimeStateSection, ok bool) {
-	if l.CurrentStateSnapshot == nil {
+	if l.CurrentStateSnapshot == nil && l.inheritedRuntimeState == nil {
 		return runtimeStateSection{}, false
 	}
-	next := l.CurrentStateSnapshot()
+	var next RuntimeStateSnapshot
+	if l.CurrentStateSnapshot != nil {
+		next = l.CurrentStateSnapshot()
+	} else {
+		next = *l.inheritedRuntimeState
+		next.Model, next.Provider = "", ""
+		if l.Gate != nil {
+			next.PermissionMode = string(l.Gate.Mode())
+		}
+	}
 	next.PlanMode = l.planMode
 	if next.Model == "" {
 		next.Model = l.Model

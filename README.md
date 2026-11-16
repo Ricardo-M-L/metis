@@ -41,6 +41,9 @@ quirks. `Metis` aims for:
   history) with frozen-snapshot semantics borrowed from Hermes and
   context-fencing borrowed from Claude Code.
 
+See [prompt caching](docs/prompt-caching.md) for warm-fork prefix guarantees,
+provider compatibility boundaries, and a local CLI/TUI request-capture smoke test.
+
 ## Install
 
 ### macOS / Linux
@@ -317,6 +320,13 @@ A later source wins when two skills have the same name.
 | `!cmd` | bash mode — runs `cmd` in shell without invoking the LLM |
 | Enter mid-turn | queue input; runs as the next turn after the current one finishes |
 
+When an approval prompt is visible, typing moves focus to the draft editor;
+spaces never approve an action. `Tab` switches between editing and the approval
+choices, `Enter` confirms only focused choices, and `Esc` denies the action.
+Editor-focused paste and confirmation leave the draft intact. In the slash menu,
+`Esc` closes suggestions without clearing the draft; cursor movement alone does
+not reopen the dismissed list.
+
 `fullAccess` is the final, red-marked step in the `Shift+Tab` cycle. It can also
 be selected with `/permissions`, `/fullAccess`, Desktop settings, or the
 dangerous CLI flag. Explicit policy denials, hooks, argument validation, OS
@@ -478,12 +488,13 @@ max_iterations = 100
 
 [tools]
 # ToolSearch lazy MCP schema is controlled by the ENABLE_TOOL_SEARCH
-# env var. Defaults match claude-code's `tst` (always-defer); set
-# explicit "auto" to opt into openclaude's `tst-auto` budget mode.
+# env var. The default uses a 10% schema budget: small catalogs stay
+# fully specified and cache-stable, while large catalogs use discovery.
+# This is client-side compatibility discovery, not native defer_loading.
 #
-#   (unset)     → always strip mcp__* schemas (default since 2026-05-11)
-#   true        → same as unset
-#   auto        → fires when MCP schemas exceed 10% of context window
+#   (unset)     → auto at 10% of the context window
+#   true        → always strip unresolved Deferred schemas
+#   auto        → fires when Deferred schemas reach 10% of context window
 #   auto:N      → auto, fires at N% (1..99)
 #   auto:0      → always lazy (alias for "true")
 #   auto:100    → never lazy (alias for "false")

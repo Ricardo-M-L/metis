@@ -61,6 +61,14 @@ type Loop struct {
 	// durations after the fact. nil = not recorded.
 	TimingSink func(tool string, elapsed time.Duration, isError bool)
 
+	// A completed request header may be reused by a warm child; history and
+	// routing replacements invalidate these detached request pins.
+	warmRequestAnchor     *contextRequestAnchor
+	lastRequest           *requestSnapshot
+	warmRequest           *llm.Request
+	cacheAffinityID       string
+	inheritedRuntimeState *RuntimeStateSnapshot
+
 	System            string
 	principalIdentity string // immutable host identity, independent of prompt rebinding
 	// RecoverTextToolCalls enables one safe compatibility retry when a model
@@ -1015,17 +1023,40 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 	rescueWithoutTools := l.rescueNoTools
 	historyRevision, routingRevision := l.historyRevision, l.routingRevision
 	contextEpoch := l.contextUsageEpoch.Load()
+	warm := l.warmRequest
+	if warm != nil {
+		copied := cloneRequest(*warm)
+		warm = &copied
+	}
+	inherited := l.inheritedRuntimeState
+	if inherited != nil {
+		copied := *inherited
+		inherited = &copied
+	}
 	provider := l.Provider
 	providerID := identifyContextProvider(provider)
 	l.mu.RUnlock()
 
+	orderedContext := contextUpdateScope(provider) != ""
+	if orderedContext {
+		checkpointCapable = false
+	}
 	memBody, retrieveBody := turnMemoryContext, turnMemoryRecall
 	if turnMemoryRecallAttached {
 		retrieveBody = ""
 	}
 	dynamic := []llm.SystemSection(nil)
-	if currentStateSnapshot != nil {
-		state := currentStateSnapshot()
+	if currentStateSnapshot != nil || inherited != nil {
+		var state RuntimeStateSnapshot
+		if currentStateSnapshot != nil {
+			state = currentStateSnapshot()
+		} else {
+			state = *inherited
+			state.Model, state.Provider = "", ""
+			if l.Gate != nil {
+				state.PermissionMode = string(l.Gate.Mode())
+			}
+		}
 		state.PlanMode = planMode
 		if state.Model == "" {
 			state.Model = runtimeModel
@@ -1053,6 +1084,11 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 		l.contextUsageEpoch.Load() == contextEpoch && l.Model == runtimeModel && identifyContextProvider(l.Provider) == providerID {
 		l.withMemoryGuardLocked(func() {
 			l.validateMemorySnapshotLocked()
+			// Revocation may discard a previously copied warm header. Preflight
+			// must use the same surviving pin as actual guarded assembly.
+			if l.warmRequest == nil {
+				warm = nil
+			}
 			memBody, retrieveBody = l.turnMemoryContext, l.turnMemoryRecall
 			if l.turnMemoryRecallAttached {
 				retrieveBody = ""
@@ -1138,9 +1174,21 @@ func (l *Loop) EstimateRequestContextTokens(specs []llm.ToolSpec) int {
 		checkpointDelta = estimateActiveHistoryTokens(contextMeteringMessages(provider, projected)) - estimateActiveHistoryTokens(contextMeteringMessages(provider, messages))
 		requestSections = stable
 	}
-	systemTokens, toolTokens := estimateRequestPrefix(llm.Request{
-		System: system, SystemSections: requestSections, Tools: requestTools,
-	})
+	projectedRequest := llm.Request{System: system, SystemSections: requestSections, Tools: requestTools, Messages: l.projectContextHistory(provider, messages)}
+	if warm != nil {
+		projectedRequest.System, projectedRequest.SystemSections, projectedRequest.Tools = warm.System, warm.SystemSections, warm.Tools
+		if rescueWithoutTools {
+			projectedRequest.Tools = nil
+		}
+	}
+	if orderedContext {
+		var update *llm.Message
+		projectedRequest, update = projectContext(projectedRequest, provider)
+		if update != nil {
+			checkpointDelta += estimateActiveHistoryTokens([]llm.Message{*update})
+		}
+	}
+	systemTokens, toolTokens := estimateRequestPrefix(projectedRequest)
 	overhead := systemTokens + toolTokens + checkpointDelta
 
 	total := historyTokens + overhead
@@ -1187,6 +1235,9 @@ func (l *Loop) haltTurn(reason string) {
 // the same goroutine as the loop but write to shared state.
 func (l *Loop) SetPlanMode(on bool) {
 	l.mu.Lock()
+	if l.planMode != on {
+		l.lastRequest, l.warmRequest = nil, nil
+	}
 	l.planMode = on
 	l.mu.Unlock()
 }
@@ -1526,6 +1577,8 @@ func (l *Loop) ResetSession(messages []llm.Message) {
 	ownsCompact := l.compactMu.TryLock()
 	l.mu.Lock()
 	l.restoreMessagesLocked(messages)
+	l.cacheAffinityID = ""
+	l.inheritedRuntimeState = nil
 	// A failed replacement belongs to the old physical session ledger only.
 	l.memoryRevocationBefore = nil
 	l.memoryGuardSnapshot = nil
@@ -2126,6 +2179,11 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			emit(ctx, out, Event{Kind: EventError, Err: admissionErr})
 			return admissionErr
 		}
+		if err := l.commitContextUpdate(contextAnchor); err != nil {
+			stopReason = "error"
+			emit(ctx, out, Event{Kind: EventError, Err: err})
+			return err
+		}
 		if err := l.checkpointRequestHistory(); err != nil {
 			stopReason = "error"
 			emit(ctx, out, Event{Kind: EventError, Err: err})
@@ -2175,6 +2233,9 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 					transport.RecordTiming(ctx, "request_build_start")
 					req, contextAnchor = l.buildRequestForRetryWithContext(specs, requestWithoutTools)
 					transport.RecordTiming(ctx, "request_build_end")
+					if checkpointErr := l.commitContextUpdate(contextAnchor); checkpointErr != nil {
+						return checkpointErr
+					}
 					if checkpointErr := l.checkpointRequestHistory(); checkpointErr != nil {
 						return checkpointErr
 					}
@@ -2264,6 +2325,7 @@ func (l *Loop) Run(ctx context.Context, out chan<- Event) (runErr error) {
 			emit(ctx, out, Event{Kind: EventError, Err: err})
 			return err
 		}
+		l.rememberRequest(req, contextAnchor)
 		// A rescue request advertised no tools. If a provider nevertheless
 		// returns a tool_use block, never dispatch it: doing so would violate the
 		// request boundary and make the supposedly final rescue perform a new
@@ -3477,8 +3539,8 @@ func (l *Loop) buildRequestMemoryLocked(specs []llm.ToolSpec, posture *contextRe
 		}
 	}
 	sections = l.checkpointDynamicContextLocked(sections)
-	requestSessionID := ""
-	if l.CurrentStateSnapshot != nil {
+	requestSessionID := l.cacheAffinityID
+	if requestSessionID == "" && l.CurrentStateSnapshot != nil {
 		requestSessionID = strings.TrimSpace(l.runtimeStateSnapshot.SessionID)
 	}
 	req := llm.Request{
@@ -3522,7 +3584,28 @@ func (l *Loop) buildRequestMemoryLocked(specs []llm.ToolSpec, posture *contextRe
 	if l.RequestMaxTokens > 0 && (req.MaxTokens <= 0 || req.MaxTokens > l.RequestMaxTokens) {
 		req.MaxTokens = l.RequestMaxTokens
 	}
+	req = l.applyWarmRequestLocked(req)
+	// One-shot safety posture always overrides a reusable request header.
+	if rescueWithoutTools {
+		req.Tools = nil
+	}
+	var update *llm.Message
+	req, update = l.projectContextLocked(req)
 	anchor := l.contextRequestAnchorLocked(l.Provider, req)
+	anchor.contextUpdate = update
+	anchor.sourceMessageCount = len(l.Messages)
+	if update != nil {
+		anchor.messageCount++
+		delta := estimateActiveHistoryTokens([]llm.Message{*update})
+		l.contextPrefix.pendingCheckpointTokens = delta
+		// Provider usage anchors refer only to committed live history. The
+		// proposed append is already included in the raw-history fallback,
+		// but must be added explicitly to a provider-authoritative base.
+		if _, active := l.activeContextBaseLocked(); active {
+			anchor.requestContextTokens += delta
+		}
+		l.requestOverheadTokens.Store(int64(anchor.requestOverhead + delta))
+	}
 	anchor.cacheRefreshNonce, anchor.rescueWithoutTools = cacheRefreshNonce, rescueWithoutTools
 	return req, anchor
 }

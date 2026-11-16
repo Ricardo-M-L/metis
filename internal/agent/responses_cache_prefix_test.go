@@ -84,7 +84,12 @@ func TestResponsesWireMutableContextPreservesHistoryPrefix(t *testing.T) {
 			}
 			send := func() wireRequest {
 				t.Helper()
-				req := l.buildRequest([]llm.ToolSpec{{Name: "Fixture", Description: "fixture tool", InputSchema: map[string]any{"type": "object"}}})
+				// Match Run's producer boundary: the immutable update must be
+				// durable before its first HTTP request establishes a replay prefix.
+				req, anchor := l.buildRequestWithContext([]llm.ToolSpec{{Name: "Fixture", Description: "fixture tool", InputSchema: map[string]any{"type": "object"}}})
+				if err := l.commitContextUpdate(anchor); err != nil {
+					t.Fatal(err)
+				}
 				stream, err := p.Stream(context.Background(), req)
 				if err != nil {
 					t.Fatal(err)
@@ -129,8 +134,48 @@ func TestResponsesWireMutableContextPreservesHistoryPrefix(t *testing.T) {
 			if codex && before.CacheKey != state.SessionID {
 				t.Fatal("Codex session cache key changed")
 			}
-			if tail := string(afterState.Input[len(afterState.Input)-1]); !strings.Contains(tail, "memory-after") || !strings.Contains(tail, "plan-after") || !strings.Contains(tail, "permission_mode: plan") || strings.Contains(tail, "plan-before") {
-				t.Fatal("fresh developer context omitted updates or retained stale state")
+			if tail := string(afterState.Input[len(afterState.Input)-1]); !strings.Contains(tail, "plan-after") || !strings.Contains(tail, "permission_mode: plan") || strings.Contains(tail, "plan-before") {
+				t.Fatal("fresh developer delta omitted runtime updates or retained stale state")
+			}
+			// A delta replaces only changed named sections. Reconstruct the
+			// effective state from the actual wire, so an unchanged memory body
+			// must remain available without being redundantly repeated at the tail.
+			effective := map[string]string{}
+			for _, item := range afterState.Input {
+				var message struct {
+					Role    string `json:"role"`
+					Content []struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				}
+				if err := json.Unmarshal(item, &message); err != nil {
+					t.Fatal(err)
+				}
+				if message.Role != "developer" {
+					continue
+				}
+				for _, part := range message.Content {
+					_, payload, found := strings.Cut(part.Text, "\n")
+					if !found {
+						t.Fatal("ordered context delta has no payload")
+					}
+					var delta struct {
+						Changed []struct{ Name, Body string }
+						Removed []string
+					}
+					if err := json.Unmarshal([]byte(payload), &delta); err != nil {
+						t.Fatal(err)
+					}
+					for _, section := range delta.Changed {
+						effective[section.Name] = section.Body
+					}
+					for _, name := range delta.Removed {
+						delete(effective, name)
+					}
+				}
+			}
+			if !strings.Contains(effective["memory_index"], "memory-after") || !strings.Contains(effective["runtime_state"], "plan-after") || strings.Contains(effective["runtime_state"], "plan-before") || effective["env"] != "<env>fixture</env>" {
+				t.Fatal("ordered wire deltas lost or incorrectly replaced an effective context section")
 			}
 			l.AppendUser("next submitted turn")
 			nextTurn := send()

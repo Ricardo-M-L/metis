@@ -171,10 +171,8 @@ func TestParseEnableToolSearch(t *testing.T) {
 		wantMode LazyMode
 		wantPct  int
 	}{
-		// default → always (claude-code "tst" parity). Empty env var
-		// triggers the always-defer path; explicit "auto" opts into
-		// the budget-based behavior.
-		{"", LazyModeAlways, 0},
+		// Default compatibility projection is budget-based, like explicit auto.
+		{"", LazyModeAuto, 10},
 		{"auto", LazyModeAuto, 10},
 		{"AUTO", LazyModeAuto, 10}, // case-insensitive
 		{" auto ", LazyModeAuto, 10},

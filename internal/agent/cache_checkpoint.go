@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
 const dynamicCheckpointHint = "metis.dynamic_context"
@@ -13,6 +14,9 @@ const dynamicCheckpointHint = "metis.dynamic_context"
 // transport opt-in. History is the source of truth, including after resume or
 // compaction; no out-of-band 'last snapshot' can suppress reconstruction.
 func (l *Loop) checkpointDynamicContextLocked(sections []llm.SystemSection) []llm.SystemSection {
+	if contextUpdateScope(l.Provider) != "" {
+		return sections
+	}
 	capability, ok := l.Provider.(interface{ DynamicContextCheckpoints() bool })
 	if !ok || !capability.DynamicContextCheckpoints() || len(sections) == 0 {
 		return sections
@@ -83,8 +87,11 @@ scanPrevious:
 // messages or blocks, so estimators may also call it directly on live history.
 // Actual requests still need a deep snapshot so retained blocks cannot alias history.
 func (l *Loop) projectDynamicCheckpoints(messages []llm.Message) []llm.Message {
-	if capability, ok := l.Provider.(interface{ DynamicContextCheckpoints() bool }); ok && capability.DynamicContextCheckpoints() {
+	if contextUpdateScope(l.Provider) != "" {
 		return messages
+	}
+	if capability, ok := l.Provider.(interface{ DynamicContextCheckpoints() bool }); ok && capability.DynamicContextCheckpoints() {
+		return l.projectContextHistory(l.Provider, messages)
 	}
 	// A local checkpoint newer than a continuation token means local replay
 	// happened since that managed chain. Do not resume an obsolete server-side
@@ -92,7 +99,7 @@ func (l *Loop) projectDynamicCheckpoints(messages []llm.Message) []llm.Message {
 	lastCheckpoint := -1
 	for i, message := range messages {
 		for _, block := range message.Content {
-			if message.Role == llm.RoleSystem && block.ProviderHint[dynamicCheckpointHint] == "checkpoint" {
+			if message.Role == llm.RoleSystem && (block.ProviderHint[dynamicCheckpointHint] == "checkpoint" || provider.IsContextUpdateMessage(message)) {
 				lastCheckpoint = i
 			}
 		}
@@ -102,7 +109,7 @@ func (l *Loop) projectDynamicCheckpoints(messages []llm.Message) []llm.Message {
 		if message.Role == llm.RoleSystem || i < lastCheckpoint {
 			blocks := make([]llm.ContentBlock, 0, len(message.Content))
 			for _, block := range message.Content {
-				if block.ProviderHint[dynamicCheckpointHint] != "checkpoint" && !(i < lastCheckpoint && block.Type == "provider_state") {
+				if block.Type != "context_update" && block.ProviderHint[dynamicCheckpointHint] != "checkpoint" && !(i < lastCheckpoint && block.Type == "provider_state") {
 					blocks = append(blocks, block)
 				}
 			}

@@ -179,6 +179,11 @@ func (l *Loop) validateMemorySnapshotLocked() {
 			var derivedRemoved bool
 			block, derivedRemoved = sanitizeDerivedMemory(block, body, visible, ok && authoritative)
 			removed = removed || derivedRemoved
+			if authoritative && l.Messages[i].Role == llm.RoleSystem && block.Type == "context_update" {
+				var changed bool
+				block, changed = sanitizeContextUpdateMemory(block, body, visible, ok)
+				removed = removed || changed
+			}
 			if authoritative && l.Messages[i].Role == llm.RoleSystem && block.ProviderHint[dynamicCheckpointHint] == "checkpoint" {
 				updated := sanitizeCheckpointMemory(block, body, ok)
 				if updated.Text != block.Text {

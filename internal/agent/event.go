@@ -417,6 +417,7 @@ type ParentSnapshot struct {
 	Messages []llm.Message
 	System   string
 	Model    string
+	request  *requestSnapshot
 }
 
 // WithParentSnapshot tags ctx with a defensive copy of the parent

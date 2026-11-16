@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/Ricardo-M-L/metis/internal/llm"
+	"github.com/Ricardo-M-L/metis/pkg/provider"
 )
 
 // CompactOptions describes why the single compaction pipeline is running.
@@ -552,9 +553,13 @@ func cloneMessages(messages []llm.Message) []llm.Message {
 }
 
 func stripProviderState(messages []llm.Message) []llm.Message {
-	out := cloneMessages(messages)
-	for i := range out {
-		out[i].Content = stripProviderStateBlocks(out[i].Content)
+	out := make([]llm.Message, 0, len(messages))
+	for _, message := range messages {
+		if provider.IsContextUpdateMessage(message) {
+			continue
+		}
+		message.Content = stripProviderStateBlocks(message.Content)
+		out = append(out, message)
 	}
 	return out
 }

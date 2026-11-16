@@ -14,10 +14,20 @@ func TestDynamicCheckpointResumeReconstructionAndManagedMode(t *testing.T) {
 	p.StateMode = openai.ResponsesStateLocal
 	state := RuntimeStateSnapshot{SessionID: "fixture", WorkingDirectory: "/one", PermissionMode: "default"}
 	l := &Loop{Provider: p, System: "base", SystemSections: []llm.SystemSection{{Name: "base", Body: "base", Cache: true}}, CurrentStateSnapshot: func() RuntimeStateSnapshot { return state }, Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{{Type: "text", Text: "hello"}}}}}
-	first := l.buildRequest(nil)
+	// Request construction is a pure projection for ordered context. Model
+	// the producer's actual pre-send boundary before treating a prefix as sent.
+	buildCommitted := func() llm.Request {
+		t.Helper()
+		req, anchor := l.buildRequestWithContext(nil)
+		if err := l.commitContextUpdate(anchor); err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}
+	first := buildCommitted()
 	history := l.History()
 	state.WorkingDirectory = "/two"
-	second := l.buildRequest(nil)
+	second := buildCommitted()
 	if !reflect.DeepEqual(second.Messages[:len(first.Messages)], first.Messages) {
 		t.Fatal("changed state mutated previously sent prefix")
 	}

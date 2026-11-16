@@ -215,7 +215,7 @@ func NewCodexResponses(model string, maxTokens int, timeout time.Duration, tempe
 	// Codex requires store=false, but supports encrypted reasoning replay and
 	// image inputs on the Responses wire protocol.
 	r.StateMode = ResponsesStateLocal
-	r.Capabilities = ResponsesCapabilities{EncryptedReasoning: true, PromptCaching: true, Images: true}
+	r.Capabilities = ResponsesCapabilities{EncryptedReasoning: true, PromptCaching: true, Images: true, DeveloperContext: true}
 	return r
 }
 
@@ -390,6 +390,7 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 	}
 	stateMode := r.effectiveStateMode()
 	var volatile []responsesContentPart
+	durableContext := req.ContextUpdateScope != "" && req.ContextUpdateScope == r.ContextUpdateScope() && !volatileInInstructions
 	out := &responsesRequest{
 		Model:           r.Model,
 		Instructions:    req.System,
@@ -441,7 +442,9 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 			// provider-managed (including recovery) placement unchanged: its
 			// stored input chain must not accumulate old runtime snapshots.
 			if sec.Volatile || (!volatileInInstructions && (sec.Name == "memory_index" || sec.Name == "runtime_state")) {
-				volatile = append(volatile, responsesContentPart{Type: "input_text", Text: sec.Body})
+				if !durableContext {
+					volatile = append(volatile, responsesContentPart{Type: "input_text", Text: sec.Body})
+				}
 				continue
 			}
 			if sb.Len() > 0 {
@@ -507,6 +510,13 @@ func (r *Responses) buildResponsesRequestWithVolatilePlacement(req provider.Requ
 		lastCheckpoint = -1
 	}
 	for messageIndex, m := range messages {
+		if provider.IsContextUpdateMessage(m) {
+			block := m.Content[0]
+			if durableContext && block.ContextUpdate != nil && block.ContextUpdate.Scope == req.ContextUpdateScope {
+				out.Input = append(out.Input, responsesInputItem{Type: "message", Role: "developer", Content: []responsesContentPart{{Type: "input_text", Text: block.Text}}})
+			}
+			continue
+		}
 		switch m.Role {
 		case provider.RoleSystem:
 			// Durable dynamic checkpoints retain developer authority and replay

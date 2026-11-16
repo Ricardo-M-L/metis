@@ -52,6 +52,17 @@ type ResponsesCapabilities struct {
 	Images             bool
 	StructuredOutputs  bool
 	HostedTools        bool
+	DeveloperContext   bool
+}
+
+// ContextUpdateScope opts into ordered developer context only on an explicitly
+// capable local-replay route. Provider-managed chains retain replacement state
+// in instructions rather than accumulating runtime snapshots server-side.
+func (r *Responses) ContextUpdateScope() string {
+	if r.Capabilities.DeveloperContext && r.effectiveStateMode() == ResponsesStateLocal {
+		return "responses-local-v1"
+	}
+	return ""
 }
 
 // ConfigureCapabilityProfile replaces URL inference with an explicit profile.
@@ -69,6 +80,7 @@ func (r *Responses) ConfigureCapabilityProfile(profile string) error {
 			Images:             true,
 			StructuredOutputs:  true,
 			HostedTools:        true,
+			DeveloperContext:   true,
 		}
 	case "compatible":
 		r.Capabilities = ResponsesCapabilities{}
@@ -94,6 +106,7 @@ func detectResponsesCapabilities(baseURL string) ResponsesCapabilities {
 			Images:             true,
 			StructuredOutputs:  true,
 			HostedTools:        true,
+			DeveloperContext:   true,
 		}
 	case host == "api.x.ai", host == "mtls.api.x.ai":
 		return ResponsesCapabilities{StatefulResponses: true, Images: true, StructuredOutputs: true}

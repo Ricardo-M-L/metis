@@ -91,7 +91,7 @@ revocation checks.
 | Variable | Default | Description |
 |---|---|---|
 | `METIS_LAZY_MCP` | `auto` | MCP startup policy. Unset / `auto` uses a valid cache and starts a server on cache miss; `always` (also `true`, `1`, `yes`) requires lazy startup; `never` (also `false`, `0`, `no`, `off`) starts eagerly. Unknown values fall back to `auto`. |
-| `ENABLE_TOOL_SEARCH` | always defer MCP schemas | Controls deferred MCP tool-schema discovery. Unset / `true` always defers, `false` sends full schemas, `auto` uses a 10% context threshold, and `auto:N` uses an `N` percent threshold (`1`-`99`). |
+| `ENABLE_TOOL_SEARCH` | auto at 10% of context | Controls deferred tool-schema discovery. Unset / `auto` uses a 10% context threshold; `true` always defers, `false` sends full schemas, and `auto:N` uses an `N` percent threshold (`1`-`99`). An unknown context window keeps full schemas in auto mode. |
 | `MCP_CONNECT_TIMEOUT` | `30s` | MCP startup, handshake, and initial-list timeout. Accepts Go duration syntax such as `45s` or `2m`. |
 | `MCP_REQUEST_TIMEOUT` | `60s` | Timeout for non-tool MCP RPCs. Accepts Go duration syntax. |
 | `MCP_TOOL_TIMEOUT` | `100000s` | Timeout for MCP `tools/call` (about 27.8 hours). Accepts Go duration syntax. |

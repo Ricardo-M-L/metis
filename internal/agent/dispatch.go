@@ -57,6 +57,9 @@ func (l *Loop) ToolSpecsSnapshot() []llm.ToolSpec {
 }
 
 func (l *Loop) toolSpecs() []llm.ToolSpec {
+	if specs, ok := l.warmToolSpecs(); ok {
+		return specs
+	}
 	all := l.Registry.ModelEntriesForCache()
 	out := make([]llm.ToolSpec, 0, len(all))
 	deferred := make(map[string]bool)
@@ -1039,14 +1042,8 @@ func (l *Loop) runExecute(ctx context.Context, t tools.Tool, blk llm.ContentBloc
 	// And the parent's conversation snapshot so the Fork tool can
 	// spawn a child loop that inherits parent history+system. Pure
 	// read pattern — Fork copies what it needs and never mutates back.
-	l.mu.RLock()
-	snap := ParentSnapshot{
-		Messages: l.Messages,
-		System:   l.System,
-		Model:    l.Model,
-	}
-	l.mu.RUnlock()
-	toolCtx = WithParentSnapshot(toolCtx, snap)
+	toolCtx = WithParentSnapshot(toolCtx, l.parentSnapshot(t.Name()))
+	toolCtx = tools.WithCacheSummary(toolCtx, l.CacheStats.CacheSummary())
 	// Shared USD budget: sub-agent builders (Agent / Fork) pull this so
 	// child spend draws down the parent's pool. nil when no cap is set.
 	toolCtx = WithBudget(toolCtx, l.Budget)

@@ -188,13 +188,9 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// Default bumped 20 → 100 on 2026-05-21 (parity with Agent.max_iter).
 	// See agent.go for the full rationale.
 	maxIter := intArg(in, "max_iter", 100)
-	// G.13 (2026-05-12) — Fork is the warm-context spawn path.
-	// Prepend the fork preamble so the child knows it can see the
-	// parent's full history above and shouldn't re-explore.
-	subSystem := agent.BuildSubPrompt(agent.SubPromptInputs{
-		Mode: agent.SubPromptFork,
-		Base: snap.System,
-	})
+	// Keep the parent prefix intact; the appended child directive carries
+	// the fork role without rewriting the shared system instructions.
+	subSystem := snap.System
 	// Root permission controls capture the root Gate and must not be invoked
 	// through a child PlanController. Like cold Agent children, Fork can return
 	// a proposed plan as text while the root owns approval and mode transitions.
@@ -207,14 +203,9 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	sub.Budget = agent.BudgetFromContext(ctx)
 	// Shared spill dir — child offloads oversized tool results too.
 	sub.SpillDir = agent.SpillDirFromContext(ctx)
-	// Forks also get short-form tool descriptions — they inherit the
-	// parent's snap.System (already heavy with conversation context)
-	// and don't need the parent's full tool prompts repeated. Phase
-	// C.1 / 2026-05-14.
-	sub.ShortToolDescriptions = true
-	// Restore copies the slice defensively; any further mutation in
-	// the parent doesn't affect the child's view.
-	sub.Restore(snap.Messages)
+	// The first warm request retains the actual parent tool descriptions.
+	// Its registry still enforces every child permission boundary.
+	history := append([]llm.Message(nil), snap.Messages...)
 	// 2026-05-15 fix — placeholder tool_results before the directive.
 	// See package doc-comment for why this is needed (OpenAI strict
 	// pairing of tool_calls↔tool_results). The parent snapshot ALWAYS
@@ -223,8 +214,9 @@ func (f Fork) Execute(ctx context.Context, in map[string]any) (*tools.Result, er
 	// tool_results so the child's first API call sees a well-formed
 	// conversation; only then append the directive.
 	if placeholders := buildPlaceholderToolResults(snap.Messages); len(placeholders) > 0 {
-		sub.AppendUserBlocks(placeholders)
+		history = append(history, llm.Message{Role: llm.RoleUser, Content: placeholders})
 	}
+	sub.RestoreFork(*snap, history)
 	// Append the directive as a fresh user message — claude-code
 	// wraps it in <fork-boilerplate> reminding the child it's a
 	// worker. We ship a minimal one-liner equivalent so the model
