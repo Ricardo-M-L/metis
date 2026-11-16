@@ -7,6 +7,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.121] - 2026-11-16
+
+Full CLI and Desktop release, including the changes prepared for the unpublished
+v0.4.120 draft. Official macOS packages are Developer ID signed, Apple notarized,
+stapled and Gatekeeper verified. First-time Computer Use installation requires
+internet access to download the pinned, hash-verified helper.
+
+### Added
+
+- Recall detailed memories on demand through Memory tools while keeping core
+  preferences and a compact topic index available in context.
+- Persist background memory learning in a durable queue with restart recovery,
+  cadence controls and source-deletion guards.
+
+### Fixed
+
+- Preserve memory provenance through compaction and summarized tool results, and
+  record memory usage independently without counting duplicate receipts.
+- Recover child answers truncated by output limits with bounded continuations,
+  while preserving tool history, verification obligations and failure details.
+- Retain pinned Computer Use resources in fresh local runtime packages and allow
+  bounded startup headroom for Windows CLI test fixtures.
+
 ## [0.4.120] - 2026-11-14
 
 Full CLI and Desktop release. The macOS Desktop ZIP and DMG are Developer ID
