@@ -7,6 +7,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.122] - 2026-11-16
+
+Full CLI and Desktop release. Official macOS packages are Developer ID signed,
+Apple notarized, stapled and Gatekeeper verified. First-time Computer Use
+installation requires internet access for the pinned, hash-verified helper.
+
 ### Changed
 
 - Default compatible tool discovery to a 10% schema budget instead of always
