@@ -1,7 +1,7 @@
 # Metis Bubble Tea patch
 
 This directory is Bubble Tea `v2.0.8`
-(`h1:SxTJMhCAI3lbPmy4SgX5LWZ24AdINr4I6UEqzZvYJuY=`) plus three Metis patches,
+(`h1:SxTJMhCAI3lbPmy4SgX5LWZ24AdINr4I6UEqzZvYJuY=`) plus four Metis patches,
 and its `go.mod` points at the adjacent patched Ultraviolet module:
 
 - `cursed_renderer.go` disables Ultraviolet fullscreen scroll optimization.
@@ -19,6 +19,11 @@ and its `go.mod` points at the adjacent patched Ultraviolet module:
   land completely in the terminal's native scrollback instead of being clipped
   inside the old alternate buffer.
 
+- `cursed_renderer.go` tracks an explicit pending redraw independently of View
+  equality. A late `ClearScreen` must repaint even if the final idle View already
+  flushed; it must not be lost to the unchanged-View fast path. The flag clears
+  only after successful output, without resetting cursor/mouse/alt-screen state.
+
 When upgrading Bubble Tea, first replace this directory with the exact target
-module source, then reapply all three changes and run both this module's tests and
+module source, then reapply all four changes and run both this module's tests and
 Metis's TUI renderer regression tests.

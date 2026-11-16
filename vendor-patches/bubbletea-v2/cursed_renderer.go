@@ -32,6 +32,7 @@ type cursedRenderer struct {
 	mapnl         bool
 	syncdUpdates  bool // whether to use synchronized output mode for updates
 	starting      bool // indicates whether the renderer is starting after being stopped
+	redrawPending bool // an explicit clear must repaint even an unchanged view
 }
 
 var _ renderer = &cursedRenderer{}
@@ -283,11 +284,16 @@ func (s *cursedRenderer) flush(closing bool) error {
 		_, _ = s.scr.WriteString(ansi.SetTabEvery8Columns)
 	}
 
-	if !s.starting && !closing && s.lastView != nil && viewEquals(s.lastView, &view) && frameArea == s.cellbuf.Bounds() {
+	if !s.redrawPending && !s.starting && !closing && s.lastView != nil && viewEquals(s.lastView, &view) && frameArea == s.cellbuf.Bounds() {
 		// No changes, nothing to do.
 		return nil
 	}
 
+	if s.redrawPending {
+		// Re-arm on retry too: a failed output write may have consumed the
+		// terminal renderer's clear flag without reaching the real terminal.
+		s.scr.Erase()
+	}
 	// We're no longer starting.
 	s.starting = false
 
@@ -570,6 +576,7 @@ func (s *cursedRenderer) flush(closing bool) error {
 	}
 
 	s.lastView = &view
+	s.redrawPending = false
 
 	return nil
 }
@@ -638,6 +645,7 @@ func (s *cursedRenderer) resize(w, h int) {
 // clearScreen implements renderer.
 func (s *cursedRenderer) clearScreen() {
 	s.mu.Lock()
+	s.redrawPending = true
 	// Move the cursor to the top left corner of the screen and trigger a full
 	// screen redraw.
 	s.scr.MoveTo(0, 0)
