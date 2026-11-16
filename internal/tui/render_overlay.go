@@ -383,12 +383,11 @@ func renderAtMention(m *Model) string {
 //	▌   3. No
 //	▌   4. Cancel turn
 //	▌
-//	▌ ↑↓ select · enter confirm · esc deny · typing still goes to the input box
+//	▌ Approval focused · ↑↓ select · Enter confirm · Tab to input · Esc deny
 //	▌ auto-deny in 42s
 //
-// The footer explicitly tells the user the textarea is NOT dead —
-// keybind_permission.go routes letter keys to the input editor, only
-// arrows/enter/esc are intercepted for the prompt.
+// The footer names the focused surface. Typing selects the editor; Tab
+// switches back to the approval choices, where Enter explicitly confirms.
 func renderPermission(m *Model) string {
 	var s strings.Builder
 	headerStyle := lipgloss.NewStyle().Foreground(accentOrange).Bold(true)
@@ -430,7 +429,7 @@ func renderPermission(m *Model) string {
 		s.WriteString(bar)
 		s.WriteString(" ")
 		num := fmt.Sprintf("%d. ", i+1)
-		if i == m.permCursor {
+		if i == m.permCursor && !m.permInputFocused {
 			s.WriteString(styleAccent.Bold(true).Render("❯ "))
 			s.WriteString(styleAccent.Bold(true).Render(num + choice.Label))
 		} else {
@@ -443,7 +442,11 @@ func renderPermission(m *Model) string {
 	s.WriteString("\n")
 	s.WriteString(bar)
 	s.WriteString(" ")
-	s.WriteString(styleMuted.Render("↑↓ select · enter confirm · esc deny · typing still goes to the input box"))
+	if m.permInputFocused {
+		s.WriteString(styleAccent.Render("Editing prompt · Tab to approval · Esc deny"))
+	} else {
+		s.WriteString(styleMuted.Render("Approval focused · ↑↓ select · Enter confirm · Tab to input · Esc deny"))
+	}
 	s.WriteString("\n")
 	// Auto-deny countdown — gives the user a clear visual that the
 	// prompt won't wait forever, and provides closure when the operator

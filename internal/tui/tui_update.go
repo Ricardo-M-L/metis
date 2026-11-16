@@ -384,12 +384,11 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		// dropped (image #20 user report 2026-05-07: "输入框用
 		// command+v 粘贴不进去").
 		//
-		// Skip during permission prompt / copy mode / overlays — the
-		// keyboard is owned by something other than the textarea then,
-		// and pasting into a permission dialog is meaningless.
+		// Paste belongs to the editor only. Approval choices and other
+		// overlays keep it blocked; Tab or typing selects the draft editor.
 		// (turnActive is NOT a guard: users routinely queue the next
 		// prompt while the agent is mid-stream.)
-		if m.permActive || m.copyMode || m.activeScreen != nil || m.effortPicker != nil {
+		if (m.permActive && !m.permInputFocused) || m.copyMode || m.activeScreen != nil || m.effortPicker != nil {
 			pasteDebug("blocked: perm=%v copy=%v screen=%v effort=%v len=%d",
 				m.permActive, m.copyMode, m.activeScreen != nil, m.effortPicker != nil, len(msg.Content))
 			return m, nil

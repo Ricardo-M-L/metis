@@ -348,6 +348,8 @@ type Model struct {
 	palFilter   string
 	palCursor   int
 	palMatched  []CommandCatalogEntry
+	// Dismissing completion preserves this draft until its text changes.
+	palDismissedInput string
 
 	// Ctrl+R history search overlay state. Distinct from the slash
 	// palette (`showPalette`) so a user can hit `/` mid-history-search
@@ -394,12 +396,14 @@ type Model struct {
 	atCursor  int      // selected row in atMatched (0-based)
 	atMatched []string // current fuzzy-matched file paths
 
-	permActive   bool
-	permQuestion string
-	permTool     string // tool name being asked about (Bash/Edit/etc)
-	permArgs     string // truncated arg preview (command / path / etc)
-	permChoices  []permChoice
-	permCursor   int
+	permActive bool
+	// Typing selects the draft editor; Tab returns to approval choices.
+	permInputFocused bool
+	permQuestion     string
+	permTool         string // tool name being asked about (Bash/Edit/etc)
+	permArgs         string // truncated arg preview (command / path / etc)
+	permChoices      []permChoice
+	permCursor       int
 	// permReply is the reply channel handed to us via the agent loop's
 	// EventPermissionRequest. We send exactly one decision through it
 	// to unblock the tool dispatcher.

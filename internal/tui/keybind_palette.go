@@ -24,6 +24,7 @@ func (m *Model) paletteVisible() bool {
 // alive, which can be painted again by the same Enter key update after a
 // destructive command resets the input.
 func (m *Model) dismissPalette() {
+	m.palDismissedInput = ""
 	m.showPalette = false
 	m.palFilter = ""
 	m.palCursor = 0
@@ -37,8 +38,9 @@ func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	keyName := msg.String()
 	switch keyName {
 	case "esc":
+		draft := m.input.Value()
 		m.dismissPalette()
-		m.input.Reset()
+		m.palDismissedInput = draft
 	case "up":
 		// claude-code parity: ↑ at the top wraps to the bottom (and Tab
 		// already wraps below). Long /help-style lists are dramatically

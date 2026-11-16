@@ -241,7 +241,7 @@ func (m *Model) View() tea.View {
 		// origin from the same layout calculation that positions the native
 		// cursor, so selection never relies on a guessed chrome height.
 		m.inputBodyStartY = inputStartRow + 2
-		if m.activeScreen != nil || m.effortPicker != nil || m.copyMode || m.permActive || m.askUserActive || m.showHistory {
+		if m.activeScreen != nil || m.effortPicker != nil || m.copyMode || (m.permActive && !m.permInputFocused) || m.askUserActive || m.showHistory {
 			return v
 		}
 		cur := m.input.Cursor()

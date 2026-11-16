@@ -261,6 +261,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		}
 	case agent.EventPermissionRequest:
 		m.permActive = true
+		m.permInputFocused = false
 		m.permStartedAt = time.Now()
 		m.permTool = ev.ToolName
 		m.permArgs = toolArgsPreview(ev.ToolName, ev.PermissionInput)

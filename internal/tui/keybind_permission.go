@@ -2,7 +2,7 @@ package tui
 
 // keybind_permission.go — permission-prompt key handling and the
 // shift+tab mode-cycle (which also gates this screen). Permission
-// prompts block all other input until the user picks Yes/Always/No/Cancel.
+// choices and the draft editor have separate, visible keyboard focus.
 
 import (
 	"time"
@@ -49,25 +49,29 @@ func SetPermissionTimeout(d time.Duration) {
 	}
 }
 
-// handlePermKey processes a key while the permission prompt is up.
-//
-// Returns handled=true ONLY when the key is part of the prompt's
-// vocabulary (arrow navigation, enter/space confirm, esc deny). Every
-// other key returns handled=false so the caller can forward it to the
-// input editor — that's the user-feedback fix for image #18, where a
-// permission prompt was locking the textarea entirely until the user
-// answered. Now the user can keep composing the next prompt while a
-// permission popup waits for a decision; only the keys that would
-// ambiguously target both the prompt and the editor are intercepted.
-//
-// claude-code, crush, and opencode all block the editor entirely when
-// their permission prompts are visible — metis diverges here because
-// the user explicitly asked for "type while waiting" behavior. The
-// risk (accidental enter-as-confirm-vs-submit) is mitigated by NOT
-// listing letter shortcuts (y/n/a/c) as intercepted: the user can
-// freely type "your code" without granting permission.
+// handlePermKey separates approval from composing a draft. Typing switches
+// to the editor; Tab explicitly returns to the choices. Space never approves,
+// and Enter approves only while the choices own focus. Escape always denies.
 func (m *Model) handlePermKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
-	switch msg.String() {
+	key := msg.String()
+	switch key {
+	case "esc":
+		m.executePermission("n")
+		return m, nil, true
+	case "tab":
+		m.permInputFocused = !m.permInputFocused
+		return m, nil, true
+	case "space", "backspace", "delete", "home", "end", "ctrl+a", "ctrl+e", "ctrl+u", "ctrl+w",
+		"ctrl+v", "ctrl+g", "alt+enter", "ctrl+j":
+		m.permInputFocused = true
+	}
+	if press, ok := msg.(tea.KeyPressMsg); ok && press.Text != "" {
+		m.permInputFocused = true
+	}
+	if m.permInputFocused {
+		return m, nil, false
+	}
+	switch key {
 	case "left", "up":
 		if m.permCursor > 0 {
 			m.permCursor--
@@ -78,13 +82,10 @@ func (m *Model) handlePermKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
 			m.permCursor++
 		}
 		return m, nil, true
-	case "enter", "space":
-		choice := m.permChoices[m.permCursor]
-		m.executePermission(choice.Key)
-		return m, nil, true
-	case "esc":
-		m.permActive = false
-		m.executePermission("n")
+	case "enter":
+		if m.permCursor >= 0 && m.permCursor < len(m.permChoices) {
+			m.executePermission(m.permChoices[m.permCursor].Key)
+		}
 		return m, nil, true
 	}
 	return m, nil, false
@@ -115,6 +116,7 @@ func (m *Model) executePermission(key string) {
 		m.permReply = nil
 	}
 	m.permActive = false
+	m.permInputFocused = false
 	m.permQuestion = ""
 	m.permTool = ""
 	m.permArgs = ""

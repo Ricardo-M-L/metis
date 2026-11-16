@@ -95,3 +95,15 @@ scrolls into view. Only that block shows dim shortcuts, sharing its auxiliary
 row when space permits; selection does not add a separate heading.
 Restored calls follow the same rule. Selection never writes transcript messages
 or modifies the executed input, permission preview, or stored tool event.
+
+
+## Draft and approval focus
+
+Escape dismisses slash completion while keeping the draft. Navigation alone
+keeps that menu dismissed; editing the text resumes completion.
+
+A pending permission request starts with the approval choices focused. Typing or
+an editor shortcut moves focus to the draft; Tab switches between the draft and
+approval choices. Space edits the draft and never approves a tool. Enter only
+approves while the choices are focused; Escape denies from either surface. The
+permission footer and input cursor show which surface owns the keyboard.
