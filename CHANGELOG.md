@@ -7,6 +7,32 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.123] - 2026-11-23
+
+Full CLI and Desktop release. Official macOS packages are Developer ID signed,
+Apple notarized, stapled and Gatekeeper verified. First-time Computer Use
+installation requires internet access for the pinned, hash-verified helper.
+
+### Added
+
+- Inspect persisted session token usage, throughput, first-token timing and
+  available startup-stage metrics with `metis sessions metrics <id> [--json]`.
+  Missing startup observations remain unknown rather than being reported as zero.
+
+### Changed
+
+- Coalesce streaming scroll updates, reuse stable transcript rows and retain
+  the reading position while new output arrives.
+- Send a queued Desktop or WebUI message to the currently running turn while
+  preserving its acknowledgement and preventing duplicate queue entries.
+
+### Fixed
+
+- Restore an accepted prompt suggestion after its draft is cleared, without
+  requesting a new suggestion from the model.
+- Wait for the sandbox probe's final output before closing its process, keeping
+  credential-isolation and ordinary plugin-file visibility checks deterministic.
+
 ## [0.4.122] - 2026-11-16
 
 Full CLI and Desktop release. Official macOS packages are Developer ID signed,
