@@ -436,6 +436,7 @@ for name in auth.json mcp-oauth.json; do
 done
 test "$(cat asset.txt)" = plugin-ok && printf 'asset-after=visible\n' >&2
 test "$(cat auth.json)" = plugin-local && printf 'plugin-auth=visible\n' >&2
+printf 'inspection-complete\n' >&2
 `
 	if err := os.WriteFile(serverPath, []byte(serverScript), 0o700); err != nil {
 		t.Fatal(err)
@@ -482,7 +483,9 @@ test "$(cat auth.json)" = plugin-local && printf 'plugin-auth=visible\n' >&2
 		_ = transport.Close()
 		t.Fatalf("release stdio MCP probe: %v", err)
 	}
-	waitForStderrContains(t, transport, "asset-after=visible")
+	// Close kills the process tree. Wait until every probe has run, rather
+	// than killing the final auth.json check after the earlier asset marker.
+	waitForStderrContains(t, transport, "inspection-complete")
 	if err := transport.Close(); err != nil {
 		t.Fatalf("close sandboxed stdio MCP: %v", err)
 	}
