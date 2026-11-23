@@ -265,7 +265,8 @@ type Model struct {
 	// dim/italic styling; flushed into a "thinking" Message when the
 	// next text or tool block starts (so the trace persists in the
 	// transcript instead of vanishing at turn end).
-	thinkingText string
+	thinkingText      string
+	thinkingMessageID string
 	// imagePaste indexes pasted clipboard images by display tag so
 	// the input can show `[Image #1]` (claude-code style) while the
 	// submit pipeline still resolves to the cached file path.
@@ -296,9 +297,11 @@ type Model struct {
 	// frame for the full transcript — see metis-tranquil-lemon.md
 	// "C方案" rationale: 1200-item realistic-session benchmarks went
 	// from 5.6 MB allocs/frame (viewport) to ~150 KB (list).
-	chatList      *list.List
-	turnActive    bool
-	streamingText string
+	chatList            *list.List
+	turnActive          bool
+	streamingText       string
+	streamingMessageID  string
+	readingLiveRevision *readingLiveRevision
 	// Only a successful live task may resume on background completion. Errors,
 	// interruption, and session switches revoke this until a new user turn.
 	backgroundResumeAllowed bool
@@ -671,10 +674,10 @@ type Model struct {
 
 	// renderCache memoizes per-message / per-tool-event render output
 	// so the View() loop pays glamour cost once per item instead of
-	// every spinner tick. WindowSizeMsg invalidates the whole cache;
-	// streaming/thinking text is rendered outside the timeline path
-	// and never enters the cache. See render_cache.go.
-	renderCache *renderCache
+	// every spinner tick. WindowSizeMsg invalidates the whole cache.
+	// Live assistant layout has a separate bounded cache below.
+	renderCache          *renderCache
+	streamingRenderCache streamingRenderCache
 
 	// msgSeq is the monotonic counter behind nextID(). Plain int64
 	// (not atomic.Int64 type) on purpose: existing tests copy *Model
@@ -1027,7 +1030,7 @@ func RunTUI(ctx context.Context, loop *agent.Loop, cronSvc *agent.CronService, s
 	// case is the user loses ≤100 ms of pre-typed input. Live typing
 	// after bubbletea starts is unaffected. Re-enable when v2 either
 	// raw-modes custom readers or exposes a separate early-input API.
-	opts := []tea.ProgramOption{tea.WithContext(ctx)}
+	opts := []tea.ProgramOption{tea.WithContext(ctx), tea.WithMouseWheelCoalescing()}
 	_ = earlyInputReader
 	// v2: WithAltScreen / WithMouseCellMotion options are gone — those
 	// terminal modes are now declared per-frame in View() via

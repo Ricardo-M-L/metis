@@ -13,6 +13,15 @@ type Item interface {
 	Render(width int) string
 }
 
+// RowLayoutItem supplies an immutable rendered row layout. Implementations may
+// cache it with their existing rendering identity: every visual dependency and
+// width must invalidate that cache. Rows contain no newline characters or
+// trailing empty rows. The list normalizes an empty layout to one visual row,
+// matching an empty Item.Render result, and never mutates the returned slice.
+type RowLayoutItem interface {
+	RenderRows(width int) []string
+}
+
 // RawRenderable represents an item that can provide a raw rendering
 // without additional styling.
 type RawRenderable interface {

@@ -227,8 +227,7 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 				m.activeScreen.Resize(ws.Width, ws.Height)
 				return m, nil
 			}
-			var cmd tea.Cmd
-			m.activeScreen, cmd = m.activeScreen.Update(msg)
+			cmd := m.updateActiveScreen(msg)
 			if m.activeScreen.Done() {
 				// Phase C widgets that "report a result" on dismissal
 				// are caught here. Type-assert + apply before clearing
@@ -348,30 +347,21 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		return m.handleKey(msg)
 
 	case tea.FocusMsg:
-		// Terminal regained focus (user switched back to this tab /
-		// window). Snap the chat list to the bottom + re-arm
-		// stickyBottom so subsequent streaming output stays glued to
-		// the latest message — matches claude-code's "switch back, see
-		// the newest" behaviour (user screenshot 37, 2026-05-17:
-		// claude code 回到当前会话最底层展示, metis 却不会).
-		//
-		// Guards:
-		//   - copy mode: alt-screen is off, native scrollback is in
-		//     use; forcing ScrollToBottom would fight the user.
-		//   - permission prompt / activeScreen / overlays: chat list
-		//     is not the focus target so a re-snap is just noise.
-		if !m.copyMode && !m.permActive && m.activeScreen == nil &&
+		// Catch up on focus only when the user was following the live tail.
+		// Scrolling up is an explicit reading state, including while a turn
+		// runs; tab/window focus must not override it. Modals and copy mode
+		// retain their own scroll target.
+		if m.stickyBottom && !m.copyMode && !m.permActive && m.activeScreen == nil &&
 			!m.showHistory && !m.showTaskPanel {
 			m.chatList.ScrollToBottom()
-			m.stickyBottom = true
 		}
 		return m, nil
 
 	case tea.BlurMsg:
 		// Lost focus — no state change needed. We don't want to drop
 		// stickyBottom here: the user might pop back in seconds and
-		// expect to see the latest content (the focus-in branch above
-		// re-snaps regardless). Keeping this case explicit so a future
+		// expect to see the latest content if they were following it.
+		// Keeping this case explicit so a future
 		// reader doesn't think Blur was forgotten.
 		return m, nil
 
@@ -719,54 +709,9 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case tea.MouseWheelMsg:
-		// v2 split MouseMsg into Click/Release/Wheel/Motion subtypes.
-		// Wheel arrives as MouseWheelMsg with direction in .Button,
-		// renamed from MouseButtonWheelUp/Down to MouseWheelUp/Down.
-		//
-		// Optional wheel quantization (claude-code SCROLL_QUANTUM):
-		// when ScrollQuantum > 0, accumulate the wheel direction into
-		// m.wheelAccum and only call list.ScrollBy when |accum| >= Q.
-		// A trackpad emits dozens of wheel events per gesture, but
-		// only the cumulative scroll matters visually. Quantization
-		// reduces list-level churn for free; the user still feels
-		// "smooth" because the underlying terminal scroll is line-
-		// granular regardless.
-		var dir int
-		switch msg.Button {
-		case tea.MouseWheelUp:
-			dir = -m.chatList.MouseWheelDelta()
-			// Wheel-up = "I want to read history" — break sticky-bottom
-			// so streaming output won't yank the viewport back down on
-			// the next tick. claude-code parity (isSticky → false).
-			m.stickyBottom = false
-		case tea.MouseWheelDown:
-			dir = m.chatList.MouseWheelDelta()
-		default:
-			return m, nil
-		}
-		q := perfConfig().ScrollQuantum
-		if q <= 0 {
-			m.chatList.ScrollBy(dir)
-			// Re-stick if a wheel-down landed us at the floor.
-			if msg.Button == tea.MouseWheelDown && m.chatList.AtBottom() {
-				m.stickyBottom = true
-			}
-			return m, nil
-		}
-		// Reset accumulator on direction reversal so a flick-up after
-		// a scroll-down doesn't have to walk back through the buffered
-		// down-direction delta.
-		if (dir < 0) != (m.wheelAccum < 0) {
-			m.wheelAccum = 0
-		}
-		m.wheelAccum += dir
-		if m.wheelAccum <= -q || m.wheelAccum >= q {
-			m.chatList.ScrollBy(m.wheelAccum)
-			m.wheelAccum = 0
-			if msg.Button == tea.MouseWheelDown && m.chatList.AtBottom() {
-				m.stickyBottom = true
-			}
-		}
+		m.scrollTranscriptWheel(msg.Button, 1)
+	case tea.MouseWheelBatchMsg:
+		m.scrollTranscriptWheel(msg.Button, msg.Count)
 	case spinnerTick:
 		// Spinner glyph index is now time-gated (renderSpinnerStatus
 		// computes it from elapsed via spinnerStepMs), so we no longer
@@ -914,10 +859,7 @@ func (m *Model) finalizeTurn(err error) {
 	m.totalTokens.Snap()
 	// Flush thinking trace before flushing reply text so the order in
 	// the transcript matches the order events arrived in.
-	if m.thinkingText != "" {
-		m.messages = append(m.messages, Message{Role: "thinking", Content: strings.TrimSpace(m.thinkingText), Timestamp: time.Now()})
-		m.thinkingText = ""
-	}
+	m.flushThinkingText()
 	if m.streamingText != "" {
 		// Phase F Ctrl+B (2026-05-12) — when the flushed reply came
 		// in while backgrounded, prefix with a chip so the user can
@@ -928,8 +870,7 @@ func (m *Model) finalizeTurn(err error) {
 		if wasBackgrounded {
 			content = "[bg] " + content
 		}
-		m.messages = append(m.messages, Message{Role: "assistant", Content: content, Timestamp: time.Now()})
-		m.streamingText = ""
+		m.flushStreamingText(content)
 	}
 	// A completed model response is not yet a saved conversation. Surface a
 	// failed append before completion notifications, retain the live history

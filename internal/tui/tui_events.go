@@ -75,10 +75,7 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// thinking?, …] ordering. We persist the cipher text in
 		// Content so resume → toAnthropic round-trip can echo it back
 		// (the data plane is wired in commit 1; this is the UI side).
-		if m.thinkingText != "" {
-			m.messages = append(m.messages, Message{Role: "thinking", Content: strings.TrimSpace(m.thinkingText), Timestamp: time.Now()})
-			m.thinkingText = ""
-		}
+		m.flushThinkingText()
 		m.messages = append(m.messages, Message{
 			Role:      "redacted_thinking",
 			Content:   ev.TextDelta, // base64 cipher text, never user-visible
@@ -91,21 +88,12 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// First text after thinking — flush the thinking trace into a
 		// persisted Message so it stays in the transcript when the
 		// turn ends.
-		if m.thinkingText != "" {
-			m.messages = append(m.messages, Message{Role: "thinking", Content: strings.TrimSpace(m.thinkingText), Timestamp: time.Now()})
-			m.thinkingText = ""
-		}
+		m.flushThinkingText()
 		m.streamingText += ev.TextDelta
 		m.spinnerPhase = "responding" // arrow → ↓
 	case agent.EventToolStart:
-		if m.thinkingText != "" {
-			m.messages = append(m.messages, Message{Role: "thinking", Content: strings.TrimSpace(m.thinkingText), Timestamp: time.Now()})
-			m.thinkingText = ""
-		}
-		if m.streamingText != "" {
-			m.messages = append(m.messages, Message{Role: "assistant", Content: m.streamingText, Timestamp: time.Now()})
-			m.streamingText = ""
-		}
+		m.flushThinkingText()
+		m.flushStreamingText(m.streamingText)
 		// Reset firstStreamAt + flip spinner phase to "tool" (renders ↓
 		// for tool-input/use/responding/thinking per claude-code's
 		// SpinnerAnimationRow.tsx mode switch). When the tool finishes
@@ -304,14 +292,8 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// closes so the final reply appears in the transcript. Without
 		// this, a no-tool response leaves streamingText orphaned in
 		// Model state and the user sees nothing.
-		if m.thinkingText != "" {
-			m.messages = append(m.messages, Message{Role: "thinking", Content: strings.TrimSpace(m.thinkingText), Timestamp: time.Now()})
-			m.thinkingText = ""
-		}
-		if m.streamingText != "" {
-			m.messages = append(m.messages, Message{Role: "assistant", Content: m.streamingText, Timestamp: time.Now()})
-			m.streamingText = ""
-		}
+		m.flushThinkingText()
+		m.flushStreamingText(m.streamingText)
 		// keep toolEvents for display
 	case agent.EventError:
 		// Compaction may have been the thing that errored — clear the
@@ -329,14 +311,8 @@ func (m *Model) handleAgentEvent(ev agent.Event) {
 		// happening" case the user flagged — without these flushes,
 		// streamingText was orphaned in Model state and the transcript
 		// jumped straight from spinner to error row.
-		if m.thinkingText != "" {
-			m.messages = append(m.messages, Message{Role: "thinking", Content: strings.TrimSpace(m.thinkingText), Timestamp: time.Now()})
-			m.thinkingText = ""
-		}
-		if m.streamingText != "" {
-			m.messages = append(m.messages, Message{Role: "assistant", Content: m.streamingText, Timestamp: time.Now()})
-			m.streamingText = ""
-		}
+		m.flushThinkingText()
+		m.flushStreamingText(m.streamingText)
 		if m.turnCancelledByUser && isContextCancellation(ev.Err) {
 			return
 		}

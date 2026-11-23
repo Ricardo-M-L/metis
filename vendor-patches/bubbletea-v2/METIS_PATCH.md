@@ -1,7 +1,7 @@
 # Metis Bubble Tea patch
 
 This directory is Bubble Tea `v2.0.8`
-(`h1:SxTJMhCAI3lbPmy4SgX5LWZ24AdINr4I6UEqzZvYJuY=`) plus four Metis patches,
+(`h1:SxTJMhCAI3lbPmy4SgX5LWZ24AdINr4I6UEqzZvYJuY=`) plus five Metis patches,
 and its `go.mod` points at the adjacent patched Ultraviolet module:
 
 - `cursed_renderer.go` disables Ultraviolet fullscreen scroll optimization.
@@ -24,6 +24,14 @@ and its `go.mod` points at the adjacent patched Ultraviolet module:
   flushed; it must not be lost to the unchanged-View fast path. The flag clears
   only after successful output, without resetting cursor/mouse/alt-screen state.
 
+- `wheel_coalescing.go` adds explicitly opted-in, 16 ms vertical wheel batches
+  before model Update/View. The first event stays immediate; ordinary programs
+  are unchanged. All non-wheel messages are ordering barriers. Coordinates and
+  modifiers stay attached to their original target, reversed pending motion is
+  superseded, and extreme same-frame counts saturate at 256. Filters and models
+  opting in receive `MouseWheelBatchMsg` and must account for its Count without
+  rendering once per step. The broker never changes renderer clear/flush state.
+
 When upgrading Bubble Tea, first replace this directory with the exact target
-module source, then reapply all four changes and run both this module's tests and
+module source, then reapply all five changes and run both this module's tests and
 Metis's TUI renderer regression tests.

@@ -1,10 +1,7 @@
 package tui
 
-// focus_scroll_test.go — pins claude-code-parity "switch back to this
-// tab → see the latest message" behaviour added 2026-05-17 in response
-// to user screenshot 37 ("我发现每次我切换 claude code 都会回到 claude
-// code 当前会话最底层展示, 但是我的 metis 却不会"). xterm DECSET 1004
-// focus reporting → bubbletea v2 FocusMsg → ScrollToBottom + sticky-on.
+// Focus reporting preserves the user's reading/follow choice. Returning
+// to the tab catches up only when follow was already enabled.
 
 import (
 	"testing"
@@ -12,21 +9,48 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-// TestFocusMsg_ScrollsToBottom — when the terminal regains focus, the
-// Update handler must snap the chat list back to the latest content.
-// Verified by scrolling up first, sending FocusMsg, then asserting
-// AtBottom() is true.
-func TestFocusMsg_ScrollsToBottom(t *testing.T) {
+func TestFocusMsg_PreservesReadingPosition(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		name := "idle"
+		if running {
+			name = "running"
+		}
+		t.Run(name, func(t *testing.T) {
+			m := newE2EModel(t, 80, 30, 50)
+			m.turnActive = running
+			m.spinnerActive = running
+			_ = m.View()
+			m.chatList.ScrollToTop()
+			m.stickyBottom = false
+			before := m.chatList.Render()
+			if m.chatList.AtBottom() {
+				t.Fatal("fixture must have scrollable history")
+			}
+
+			m.Update(tea.BlurMsg{})
+			m.Update(tea.FocusMsg{})
+
+			if m.stickyBottom || m.chatList.AtBottom() {
+				t.Fatal("focus must preserve manual reading instead of resuming follow")
+			}
+			if after := m.chatList.Render(); after != before {
+				t.Fatal("focus changed the visible history")
+			}
+		})
+	}
+}
+
+func TestFocusMsg_CatchesUpWhenFollowing(t *testing.T) {
 	m := newE2EModel(t, 80, 30, 50) // 50 messages → forces a scrollable list
 	_ = m.View()                    // initialize the chat list layout
 
-	// Scroll up so we're NOT at the bottom — simulates the user
-	// having paged back to read history before tab-switching away.
+	// Simulate layout that has not caught up with new output while follow
+	// is still enabled. Manual scrolling would clear stickyBottom.
 	m.chatList.ScrollToTop()
 	if m.chatList.AtBottom() {
 		t.Fatal("precondition: chat list should NOT be at bottom after ScrollToTop")
 	}
-	m.stickyBottom = false
+	m.stickyBottom = true
 
 	updated, _ := m.Update(tea.FocusMsg{})
 	if got, ok := updated.(*Model); !ok || got != m {
@@ -37,7 +61,7 @@ func TestFocusMsg_ScrollsToBottom(t *testing.T) {
 		t.Errorf("FocusMsg should snap chat list to bottom; AtBottom() = false")
 	}
 	if !m.stickyBottom {
-		t.Errorf("FocusMsg should re-arm stickyBottom for follow-up streaming output; stickyBottom = false")
+		t.Errorf("FocusMsg should preserve follow for streaming output")
 	}
 }
 
@@ -49,7 +73,7 @@ func TestFocusMsg_SuppressedDuringCopyMode(t *testing.T) {
 	m := newE2EModel(t, 80, 30, 50)
 	_ = m.View()
 	m.chatList.ScrollToTop()
-	m.stickyBottom = false
+	m.stickyBottom = true
 	m.copyMode = true
 
 	m.Update(tea.FocusMsg{})
@@ -67,7 +91,7 @@ func TestFocusMsg_SuppressedDuringPermissionPrompt(t *testing.T) {
 	m := newE2EModel(t, 80, 30, 50)
 	_ = m.View()
 	m.chatList.ScrollToTop()
-	m.stickyBottom = false
+	m.stickyBottom = true
 	m.permActive = true
 
 	m.Update(tea.FocusMsg{})

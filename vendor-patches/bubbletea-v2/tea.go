@@ -458,6 +458,10 @@ type Program struct {
 	// cleanup on exit.
 	disableCatchPanics bool
 
+	// mouseWheelCoalescing is an explicit opt-in to frame-bounded vertical
+	// wheel batches before the model's Update and View are called.
+	mouseWheelCoalescing bool
+
 	// filter supplies an event filter that will be invoked before Bubble Tea
 	// processes a tea.Msg. The event filter can return any tea.Msg which will
 	// then get handled by Bubble Tea instead of the original event. If the
@@ -764,6 +768,19 @@ func (p *Program) handleCommands(cmds chan Cmd) chan struct{} {
 // eventLoop is the central message loop. It receives and handles the default
 // Bubble Tea messages, update the model and triggers redraws.
 func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
+	messages := (<-chan Msg)(p.msgs)
+	if p.mouseWheelCoalescing {
+		ctx, cancel := context.WithCancel(p.ctx)
+		coalesced := make(chan Msg)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer close(coalesced)
+			p.coalesceMouseWheels(ctx, p.msgs, coalesced, mouseWheelFrameInterval)
+		}()
+		defer func() { cancel(); <-done }()
+		messages = coalesced
+	}
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -772,7 +789,10 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 		case err := <-p.errs:
 			return model, err
 
-		case msg := <-p.msgs:
+		case msg, ok := <-messages:
+			if !ok {
+				return model, nil
+			}
 			msg = p.translateInputEvent(msg)
 
 			// Filter messages.
@@ -822,7 +842,7 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 
 			case MouseMsg:
 				switch msg.(type) {
-				case MouseClickMsg, MouseReleaseMsg, MouseWheelMsg, MouseMotionMsg:
+				case MouseClickMsg, MouseReleaseMsg, MouseWheelMsg, MouseWheelBatchMsg, MouseMotionMsg:
 					// Only send mouse messages to the renderer if they are an
 					// actual mouse event.
 					if cmd := p.renderer.onMouse(msg); cmd != nil {

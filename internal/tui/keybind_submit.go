@@ -233,6 +233,9 @@ func (m *Model) applyThinkingDisplay(mode string) {
 	if mode != "show" && mode != "hide" && mode != "auto" {
 		return
 	}
+	if m.readingLiveRevision != nil && m.readingLiveRevision.role == "thinking" {
+		m.readingLiveRevision = nil
+	}
 	m.thinkingDisplay = mode
 	if m.renderCache != nil {
 		m.renderCache.InvalidateAll()
@@ -1465,6 +1468,8 @@ func (m *Model) startAgentTurn(turnRunCtx context.Context) tea.Cmd {
 	// in-flight assistant text doesn't visually concatenate with the
 	// previous turn's tail (that one is intentional and unchanged).
 	m.streamingText = ""
+	m.streamingMessageID = ""
+	m.readingLiveRevision = nil
 	m.turnToolEventStart = len(m.toolEvents)
 	m.turnActive = true
 	m.spinnerActive = true

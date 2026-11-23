@@ -35,6 +35,7 @@ package tui
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,7 +62,19 @@ type messageKey struct {
 	contentK string // raw content if short, "h:len:xxh3hex" if long
 	width    int
 	expand   bool
+	plain    bool
 	theme    string
+}
+
+// Keep the layout beside the rendered message so scroll/height probes reuse
+// the same rows as painting. Rows are immutable after publication.
+type messageLayout struct {
+	text string
+	rows []string
+}
+
+func layoutMessage(text string) messageLayout {
+	return messageLayout{text: text, rows: strings.Split(normalizeChatItemBoundary(text), "\n")}
 }
 
 // toolKey identifies a cached renderToolEvent(te, expand) output.
@@ -87,7 +100,7 @@ type toolKey struct {
 // and the work it guards is a few-byte map lookup.
 type renderCache struct {
 	mu   sync.RWMutex
-	msg  map[messageKey]string
+	msg  map[messageKey]messageLayout
 	tool map[toolKey]string
 
 	hits          atomic.Int64
@@ -118,7 +131,7 @@ func newRenderCache(slowMs, statsEvery int) *renderCache {
 		statsEvery = defaultStatsLogEvery
 	}
 	return &renderCache{
-		msg:           make(map[messageKey]string),
+		msg:           make(map[messageKey]messageLayout),
 		tool:          make(map[toolKey]string),
 		slowRenderMs:  slowMs,
 		statsLogEvery: statsEvery,
@@ -153,10 +166,15 @@ func contentCacheKey(content string) string {
 // (the pre-cache behavior). No production code path produces a nil
 // renderCache — NewModel always populates it.
 func (c *renderCache) GetMessage(m Message, width int, expand bool) (string, bool) {
+	layout, ok := c.getMessageLayout(m, width, expand, false)
+	return layout.text, ok
+}
+
+func (c *renderCache) getMessageLayout(m Message, width int, expand, plain bool) (messageLayout, bool) {
 	if c == nil {
-		return "", false
+		return messageLayout{}, false
 	}
-	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width, expand: expand, theme: themes.Current().Name}
+	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width, expand: expand, plain: plain, theme: themes.Current().Name}
 	c.mu.RLock()
 	s, ok := c.msg[k]
 	c.mu.RUnlock()
@@ -173,12 +191,16 @@ func (c *renderCache) GetMessage(m Message, width int, expand bool) (string, boo
 // Put() means callers that already have the rendered string (e.g. tests)
 // don't pay for fake telemetry.
 func (c *renderCache) PutMessage(m Message, width int, expand bool, rendered string) {
+	c.putMessageLayout(m, width, expand, false, layoutMessage(rendered))
+}
+
+func (c *renderCache) putMessageLayout(m Message, width int, expand, plain bool, layout messageLayout) {
 	if c == nil {
 		return
 	}
-	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width, expand: expand, theme: themes.Current().Name}
+	k := messageKey{role: m.Role, contentK: contentCacheKey(m.Content), width: width, expand: expand, plain: plain, theme: themes.Current().Name}
 	c.mu.Lock()
-	c.msg[k] = rendered
+	c.msg[k] = layout
 	c.mu.Unlock()
 }
 
@@ -294,7 +316,7 @@ func (c *renderCache) InvalidateAll() {
 		return
 	}
 	c.mu.Lock()
-	c.msg = make(map[messageKey]string)
+	c.msg = make(map[messageKey]messageLayout)
 	c.tool = make(map[toolKey]string)
 	c.mu.Unlock()
 }

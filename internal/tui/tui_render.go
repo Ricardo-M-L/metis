@@ -161,6 +161,15 @@ func (m *Model) timeline() []timelineItem {
 // the bubbletea v2 model where the View describes its own terminal
 // requirements each frame.
 func (m *Model) View() tea.View {
+	if m.stickyBottom {
+		m.readingLiveRevision = nil
+	}
+	// Welcome, copy and full-window screens can return before building chat
+	// items. Release an ended live reply even on those paths (e.g. after
+	// switching to an empty session), while retaining an active stream.
+	if m.streamingText == "" {
+		m.streamingRenderCache = streamingRenderCache{}
+	}
 	// RecordView fires on every View() invocation regardless of which
 	// branch returns. defer ensures the early-return paths (copyMode,
 	// activeScreen, empty timeline) still tick the counter so the
@@ -208,9 +217,8 @@ func (m *Model) View() tea.View {
 		// Enable xterm focus reporting (DECSET 1004 — `\x1b[?1004h`)
 		// so bubbletea v2 dispatches FocusMsg / BlurMsg when the
 		// terminal tab gains/loses focus. tui_update.go handles
-		// FocusMsg by snapping the chat list back to the bottom,
-		// matching claude-code's "switch back to this tab → see the
-		// latest" behaviour (user screenshot 37, 2026-05-17).
+		// FocusMsg by catching up only when following the live tail;
+		// returning to the terminal preserves an explicit reading position.
 		v.ReportFocus = true
 		// Drive the terminal window/tab title via bubbletea v2's
 		// built-in support (tea.View.WindowTitle → ansi.SetWindowTitle
@@ -464,14 +472,10 @@ func (m *Model) View() tea.View {
 		// still clip something but at least the user sees recent chat.
 		maxVpHeight = 3
 	}
-	totalLines := m.chatList.TotalLineCount()
-	desiredVp := totalLines
-	if desiredVp > maxVpHeight {
-		desiredVp = maxVpHeight
-	}
-	if desiredVp < 1 {
-		desiredVp = 1
-	}
+	// Height above the physical viewport cannot change the composer position.
+	// Avoid laying out the rest of a long transcript just to measure it.
+	m.chatList.SetSize(w-2, m.chatList.Height())
+	desiredVp := max(1, m.chatList.VisibleHeight(maxVpHeight))
 	m.chatList.SetSize(w-2, desiredVp) // -2 for the scrollbar gutter
 	if m.stickyBottom && wasAtBottom {
 		m.chatList.ScrollToBottom()

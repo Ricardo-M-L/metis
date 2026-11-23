@@ -603,6 +603,9 @@ func (m *Model) activateSession(id string, hdr *session.Header, messages []llm.M
 	m.subAgents = nil
 	m.thinkingText = ""
 	m.streamingText = ""
+	m.thinkingMessageID = ""
+	m.streamingMessageID = ""
+	m.readingLiveRevision = nil
 	m.queuedPrompts = nil
 	m.totalTokens.Reset()
 	m.histAll = nil

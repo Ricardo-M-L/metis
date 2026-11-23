@@ -62,18 +62,12 @@ func TestView_LongTranscript_StableHitRate(t *testing.T) {
 		})
 	}
 
-	// First frame: every distinct (role, content, width) is a miss
-	// the first time it's queried. The chatList may query the same
-	// item multiple times per frame (TotalLineCount + Render +
-	// AtBottom paths), so 1st-frame hits >= 0 (not necessarily 0)
-	// because the second query of the same item within frame 1 hits.
-	// Consecutive Read results now form one explorationGroupItem which renders
-	// its compact count directly (no per-tool cache entries). What we assert:
-	// each of the 100 unique markdown messages misses exactly once.
+	// The first frame measures and lays out only enough items to fill the
+	// viewport. The rest of the history is rendered on demand when reached.
 	_ = m.View()
 	_, miss1, _ := m.renderCache.Stats()
-	if miss1 != int64(numMessages) {
-		t.Errorf("first frame miss=%d, want %d message entries (Read tools are one grouped item)", miss1, numMessages)
+	if miss1 == 0 || miss1 >= int64(numMessages) {
+		t.Errorf("first frame miss=%d, want a nonempty subset of %d messages", miss1, numMessages)
 	}
 
 	// Subsequent 99 frames: items are unchanged, so every Get hits.

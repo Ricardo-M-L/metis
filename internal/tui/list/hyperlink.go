@@ -36,7 +36,7 @@ func (l *List) URLAtPoint(itemIdx, lineY, col int) string {
 		return ""
 	}
 	item := l.getItem(itemIdx)
-	lines := strings.Split(item.content, "\n")
+	lines := item.rows
 	if lineY < 0 || lineY >= len(lines) {
 		return ""
 	}

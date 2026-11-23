@@ -288,7 +288,7 @@ func (l *List) SelectedText() string {
 			continue
 		}
 		item := l.getItem(idx)
-		lines := strings.Split(item.content, "\n")
+		lines := item.rows
 
 		var fromLine, toLine, fromCol, toCol int
 		switch {
@@ -588,7 +588,7 @@ func csiKillsSelectionBg(csi string) bool {
 // non-empty word selection.
 func (l *List) selectWord(itemIdx, lineY, colX int) bool {
 	item := l.getItem(itemIdx)
-	lines := strings.Split(item.content, "\n")
+	lines := item.rows
 	if lineY < 0 || lineY >= len(lines) {
 		return false
 	}
@@ -615,7 +615,7 @@ func (l *List) selectWord(itemIdx, lineY, colX int) bool {
 // line (typical iTerm2 / xterm behavior).
 func (l *List) selectLine(itemIdx, lineY int) bool {
 	item := l.getItem(itemIdx)
-	lines := strings.Split(item.content, "\n")
+	lines := item.rows
 	if lineY < 0 || lineY >= len(lines) {
 		return false
 	}
@@ -647,7 +647,7 @@ func (l *List) extendSpanSelection(itemIdx, lineY, colX int) {
 		return
 	}
 	item := l.getItem(itemIdx)
-	lines := strings.Split(item.content, "\n")
+	lines := item.rows
 	if lineY < 0 || lineY >= len(lines) {
 		return
 	}

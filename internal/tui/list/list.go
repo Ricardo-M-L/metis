@@ -19,6 +19,7 @@
 package list
 
 import (
+	"slices"
 	"strings"
 )
 
@@ -95,8 +96,108 @@ type atBottomCacheKey struct {
 
 // renderedItem holds the rendered content and height of an item.
 type renderedItem struct {
-	content string
-	height  int
+	rows   []string
+	height int
+}
+
+// ScrollAnchoredItem identifies content across item rebuilds. A grouped item
+// accepts every member's anchor so a tool can finish and join a group without
+// moving a reader to a different part of the conversation.
+type ScrollAnchoredItem interface {
+	ScrollAnchorID() string
+	ContainsScrollAnchor(id string) bool
+}
+
+// ScrollAnchorPositioner optionally resolves a line within a composite item
+// to a member and back. Line offsets are rendered rows at the supplied width.
+type ScrollAnchorPositioner interface {
+	ScrollAnchorAt(line, width int) (id string, memberLine int)
+	ScrollAnchorLine(id string, memberLine, width int) (line int, ok bool)
+}
+
+// ScrollAnchorLayoutItem avoids recomputing composite member layouts when a
+// frame rebuilds an unchanged item at the same width.
+type ScrollAnchorLayoutItem interface {
+	SameScrollAnchorLayout(Item) bool
+}
+
+type scrollAnchor struct {
+	id    string
+	line  int
+	item  Item
+	width int
+}
+
+func (l *List) currentScrollAnchor() scrollAnchor {
+	if l.offsetIdx < 0 || l.offsetIdx >= len(l.items) {
+		return scrollAnchor{}
+	}
+	item := l.items[l.offsetIdx]
+	if anchored, ok := item.(ScrollAnchoredItem); ok {
+		return scrollAnchor{id: anchored.ScrollAnchorID(), line: l.offsetLine, item: item, width: l.width}
+	}
+	return scrollAnchor{}
+}
+
+func (l *List) restoreScrollAnchor(anchor scrollAnchor) bool {
+	if anchor.id == "" {
+		return false
+	}
+	if anchor.width == l.width {
+		for index, item := range l.items {
+			anchored, ok := item.(ScrollAnchoredItem)
+			if !ok || !anchored.ContainsScrollAnchor(anchor.id) {
+				continue
+			}
+			if layout, ok := item.(ScrollAnchorLayoutItem); ok && layout.SameScrollAnchorLayout(anchor.item) {
+				l.offsetIdx, l.offsetLine = index, anchor.line
+				return true
+			}
+			break
+		}
+	}
+	gapLine := -1
+	oldHeight := len(renderItemRows(anchor.item, anchor.width))
+	if anchor.line >= oldHeight && l.gap > 0 {
+		gapLine, anchor.line = min(anchor.line-oldHeight, l.gap-1), oldHeight-1
+	}
+	if positioned, ok := anchor.item.(ScrollAnchorPositioner); ok {
+		anchor.id, anchor.line = positioned.ScrollAnchorAt(anchor.line, anchor.width)
+	}
+	for index, item := range l.items {
+		anchored, ok := item.(ScrollAnchoredItem)
+		if !ok || !anchored.ContainsScrollAnchor(anchor.id) {
+			continue
+		}
+		line := anchor.line
+		if positioned, ok := item.(ScrollAnchorPositioner); ok {
+			if memberLine, found := positioned.ScrollAnchorLine(anchor.id, line, l.width); found {
+				line = memberLine
+			}
+		}
+		l.offsetIdx = index
+		height := l.getItem(index).height
+		if gapLine >= 0 && l.gap > 0 {
+			line = height + min(gapLine, l.gap-1)
+		} else {
+			line = min(line, height-1)
+		}
+		l.offsetLine = max(0, line)
+		return true
+	}
+	return false
+}
+
+// A tool/group can shrink, or wider wrapping can remove its old final rows.
+// Keep the viewport inside the anchored item instead of skipping it entirely.
+func (l *List) normalizeScrollOffset() {
+	if len(l.items) == 0 {
+		l.offsetIdx, l.offsetLine = 0, 0
+		return
+	}
+	l.offsetIdx = max(0, min(l.offsetIdx, len(l.items)-1))
+	lastLine := max(0, l.itemSpan(l.offsetIdx)-1)
+	l.offsetLine = max(0, min(l.offsetLine, lastLine))
 }
 
 // NewList creates a new lazy-loaded list.
@@ -122,11 +223,22 @@ func (l *List) RegisterRenderCallback(cb RenderCallback) {
 
 // SetSize sets the size of the list viewport.
 func (l *List) SetSize(width, height int) {
+	widthChanged := l.width != width
+	var anchor scrollAnchor
+	if widthChanged {
+		anchor = l.currentScrollAnchor()
+		l.ClearSelection()
+	}
 	if l.width != width || l.height != height {
 		l.invalidateAtBottomCache()
 	}
 	l.width = width
 	l.height = height
+	if widthChanged {
+		if !l.restoreScrollAnchor(anchor) {
+			l.normalizeScrollOffset()
+		}
+	}
 }
 
 // SetGap sets the gap between items.
@@ -315,24 +427,21 @@ func (l *List) applyMaxMounted() {
 // ScrollPercent returns 0.0 when at top, 1.0 at bottom — used by the
 // scrollbar gutter renderer (render_overlay.go) to position its thumb.
 //
-// Approximation: maps offsetIdx into [0, 1] over the index range. This
-// is rough when items have wildly different heights but is good enough
-// for thumb positioning (the eye doesn't notice fractional offsets).
+// Progress uses the same rendered rows and between-item gaps as scrolling,
+// including movement within one long item or within a gap.
 func (l *List) ScrollPercent() float64 {
 	if len(l.items) == 0 {
 		return 1.0
 	}
-	if l.AtBottom() {
+	span := max(0, l.TotalLineCount()-max(0, l.height))
+	if span == 0 {
 		return 1.0
 	}
-	if l.offsetIdx == 0 && l.offsetLine == 0 {
-		return 0.0
+	offset := l.offsetLine
+	for idx := 0; idx < l.offsetIdx; idx++ {
+		offset += l.itemSpan(idx)
 	}
-	denom := len(l.items) - 1
-	if denom <= 0 {
-		return 0.0
-	}
-	return float64(l.offsetIdx) / float64(denom)
+	return float64(max(0, min(offset, span))) / float64(span)
 }
 
 // ItemAtY maps a viewport-relative y coordinate (0 = top of the list's
@@ -375,7 +484,7 @@ func (l *List) ItemContent(idx int) string {
 	if idx < 0 || idx >= len(l.items) {
 		return ""
 	}
-	return l.getItem(idx).content
+	return strings.Join(l.getItem(idx).rows, "\n")
 }
 
 // itemNoSelect reports whether the item at idx has opted out of text
@@ -391,13 +500,9 @@ func (l *List) itemNoSelect(idx int) bool {
 	return false
 }
 
-// TotalLineCount estimates total content height in lines. Used by the
-// scrollbar gutter to size the thumb proportionally.
-//
-// Honest cost note: this walks all items rendering each one. For 1200
-// items in metis's worst case this is ~5ms with the renderCache warm.
-// Callers should treat it as "occasional" — render_overlay.go calls it
-// once per View() for thumb sizing, which is fine.
+// TotalLineCount returns exact content height, including between-item gaps.
+// RowLayoutItem lets historical items reuse their cached rows without
+// rendering, splitting, or counting their complete contents again.
 func (l *List) TotalLineCount() int {
 	if len(l.items) == 0 {
 		return 0
@@ -411,6 +516,32 @@ func (l *List) TotalLineCount() int {
 		}
 	}
 	return total
+}
+
+// VisibleHeight measures min(TotalLineCount(), limit), stopping as soon as the
+// requested height is filled. It is useful for viewport sizing without walking
+// the history tail. It measures the content, independent of scroll position.
+func (l *List) VisibleHeight(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	var total int
+	for idx := range l.items {
+		total += l.itemSpan(idx)
+		if total >= limit {
+			return limit
+		}
+	}
+	return total
+}
+
+// itemSpan owns the gap following an item. There is no trailing content gap.
+func (l *List) itemSpan(idx int) int {
+	height := l.getItem(idx).height
+	if idx >= 0 && idx < len(l.items)-1 {
+		height += max(0, l.gap)
+	}
+	return height
 }
 
 // lastOffsetItem returns the index and line offsets of the last item that can
@@ -452,15 +583,24 @@ func (l *List) getItem(idx int) renderedItem {
 		}
 	}
 
-	rendered := item.Render(l.width)
-	rendered = strings.TrimRight(rendered, "\n")
-	height := strings.Count(rendered, "\n") + 1
-	ri := renderedItem{
-		content: rendered,
-		height:  height,
-	}
+	rows := renderItemRows(item, l.width)
+	return renderedItem{rows: rows, height: len(rows)}
+}
 
-	return ri
+func renderItemRows(item Item, width int) []string {
+	var rows []string
+	if layout, ok := item.(RowLayoutItem); ok {
+		rows = layout.RenderRows(width)
+	} else {
+		rows = strings.Split(strings.TrimRight(item.Render(width), "\n"), "\n")
+	}
+	for len(rows) > 0 && rows[len(rows)-1] == "" {
+		rows = rows[:len(rows)-1]
+	}
+	if len(rows) == 0 {
+		return []string{""}
+	}
+	return rows
 }
 
 // ScrollToIndex scrolls the list to the given item index.
@@ -493,12 +633,9 @@ func (l *List) ScrollBy(lines int) {
 
 		// Scroll down
 		l.offsetLine += lines
-		currentItem := l.getItem(l.offsetIdx)
-		for l.offsetLine >= currentItem.height {
-			l.offsetLine -= currentItem.height
-			if l.gap > 0 {
-				l.offsetLine = max(0, l.offsetLine-l.gap)
-			}
+		currentSpan := l.itemSpan(l.offsetIdx)
+		for l.offsetLine >= currentSpan {
+			l.offsetLine -= currentSpan
 
 			// Move to next item
 			l.offsetIdx++
@@ -507,7 +644,7 @@ func (l *List) ScrollBy(lines int) {
 				l.ScrollToBottom()
 				return
 			}
-			currentItem = l.getItem(l.offsetIdx)
+			currentSpan = l.itemSpan(l.offsetIdx)
 		}
 
 		lastOffsetIdx, lastOffsetLine, _ := l.lastOffsetItem()
@@ -527,12 +664,7 @@ func (l *List) ScrollBy(lines int) {
 				l.ScrollToTop()
 				break
 			}
-			prevItem := l.getItem(l.offsetIdx)
-			totalHeight := prevItem.height
-			if l.gap > 0 {
-				totalHeight += l.gap
-			}
-			l.offsetLine += totalHeight
+			l.offsetLine += l.itemSpan(l.offsetIdx)
 		}
 	}
 }
@@ -585,7 +717,7 @@ func (l *List) Render() string {
 
 	for linesNeeded > 0 && currentIdx < len(l.items) {
 		item := l.getItem(currentIdx)
-		itemLines := strings.Split(item.content, "\n")
+		itemLines := item.rows
 		itemHeight := len(itemLines)
 
 		if currentOffset >= 0 && currentOffset < itemHeight {
@@ -594,7 +726,7 @@ func (l *List) Render() string {
 			// range. lineY is the item-local line index, which is what
 			// applySelectionToLine expects — same coordinate system the
 			// HandleMouseDown call originally captured.
-			visible := itemLines[currentOffset:]
+			visible := itemLines[currentOffset:min(itemHeight, currentOffset+linesNeeded)]
 			if hasSel {
 				out := make([]string, len(visible))
 				for i, ln := range visible {
@@ -608,17 +740,20 @@ func (l *List) Render() string {
 
 			// Add gap if this is not the absolute last visual element (conceptually gaps are between items)
 			// But in the loop we can just add it and trim later
-			if l.gap > 0 {
-				for i := 0; i < l.gap; i++ {
+			if l.gap > 0 && currentIdx < len(l.items)-1 {
+				for range min(l.gap, l.height-len(lines)) {
 					lines = append(lines, "")
 				}
 			}
 		} else {
 			// offsetLine starts in the gap
 			gapOffset := currentOffset - itemHeight
-			gapRemaining := l.gap - gapOffset
+			gapRemaining := 0
+			if currentIdx < len(l.items)-1 {
+				gapRemaining = max(0, l.gap) - gapOffset
+			}
 			if gapRemaining > 0 {
-				for range gapRemaining {
+				for range min(gapRemaining, linesNeeded) {
 					lines = append(lines, "")
 				}
 			}
@@ -680,13 +815,11 @@ func (l *List) SetItems(items ...Item) {
 	l.setItems(true, items...)
 }
 
-// SetItemsKeepScroll replaces the items but preserves offsetIdx and
-// offsetLine. metis's chat surface calls this every frame: the items
+// SetItemsKeepScroll replaces the items but preserves the visible content
+// anchor and line offset. metis's chat surface calls this every frame: the items
 // slice is rebuilt from the chronological merge of m.messages +
 // m.toolEvents, but the user's scroll position should be stable across
-// rebuilds. Index clamping still happens (in case items shrunk via
-// undo / RemoveItem semantics), but offsetLine is left alone so a
-// half-scrolled message stays half-scrolled.
+// rebuilds. Items without ScrollAnchoredItem retain numeric-index behavior.
 func (l *List) SetItemsKeepScroll(items ...Item) {
 	l.setItems(false, items...)
 }
@@ -696,6 +829,19 @@ func (l *List) SetItemsKeepScroll(items ...Item) {
 // preserves the line offset so callers that re-Set the same logical
 // list every frame don't drop the user's scroll position.
 func (l *List) setItems(resetScroll bool, items ...Item) {
+	var anchor scrollAnchor
+	if !resetScroll {
+		anchor = l.currentScrollAnchor()
+	}
+	selectionItems := items
+	if l.maxMounted > 0 && len(selectionItems) > l.maxMounted {
+		selectionItems = selectionItems[len(selectionItems)-l.maxMounted:]
+	}
+	if resetScroll || l.selectionContentChanged(selectionItems) {
+		// Mouse ranges contain item indices and rendered row/column positions.
+		// A regroup or changed tool output gives those coordinates a new meaning.
+		l.ClearSelection()
+	}
 	l.items = items
 	l.selectedIdx = min(l.selectedIdx, len(l.items)-1)
 	if l.offsetIdx > len(l.items)-1 {
@@ -709,6 +855,47 @@ func (l *List) setItems(resetScroll bool, items ...Item) {
 	// Enforce max-mounted cap after every Set; oldest items get
 	// dropped from the front. Stays a no-op when maxMounted is 0.
 	l.applyMaxMounted()
+	if !resetScroll {
+		if !l.restoreScrollAnchor(anchor) {
+			l.normalizeScrollOffset()
+		}
+	}
+}
+
+func (l *List) selectionContentChanged(items []Item) bool {
+	if l.sel.Anchor.ItemIdx < 0 && !l.sel.hasStaged {
+		return false
+	}
+	first, last := len(l.items), -1
+	include := func(point SelectionPoint) {
+		if point.ItemIdx >= 0 {
+			first, last = min(first, point.ItemIdx), max(last, point.ItemIdx)
+		}
+	}
+	include(l.sel.Anchor)
+	include(l.sel.Focus)
+	if l.sel.hasStaged {
+		include(l.sel.stagedAnchor)
+	}
+	if l.sel.hasAnchorSpan {
+		include(l.sel.anchorSpan.Lo)
+		include(l.sel.anchorSpan.Hi)
+	}
+	for index := first; index <= last; index++ {
+		if index >= len(items) || index >= len(l.items) {
+			return true
+		}
+		oldItem, newItem := l.items[index], items[index]
+		oldAnchor, oldOK := oldItem.(ScrollAnchoredItem)
+		newAnchor, newOK := newItem.(ScrollAnchoredItem)
+		if oldOK != newOK || (oldOK && oldAnchor.ScrollAnchorID() != newAnchor.ScrollAnchorID()) {
+			return true
+		}
+		if !slices.Equal(renderItemRows(oldItem, l.width), renderItemRows(newItem, l.width)) {
+			return true
+		}
+	}
+	return false
 }
 
 // AppendItems appends items to the list.

@@ -47,10 +47,11 @@ func normalizeChatItemBoundary(rendered string) string {
 // the next View() rebuild creates a fresh messageItem reflecting the
 // updated Message anyway).
 type messageItem struct {
-	msg    Message
-	expand bool
-	plain  bool
-	cache  *renderCache
+	msg                 Message
+	expand              bool
+	plain               bool
+	cache               *renderCache
+	readingLiveRevision list.Item
 }
 
 // Render implements list.Item. Cache-aware: hit returns the stored
@@ -61,21 +62,37 @@ type messageItem struct {
 // keys into the cache via PutMessage/GetMessage — so toggling Ctrl+O
 // invalidates cached folded thinking blocks and forces a re-render.
 func (i *messageItem) Render(width int) string {
-	if i.plain {
-		return normalizeChatItemBoundary(renderMessagePlain(i.msg, width, i.expand))
+	if i.readingLiveRevision != nil {
+		return i.readingLiveRevision.Render(width)
 	}
-	if i.cache != nil {
-		if cached, ok := i.cache.GetMessage(i.msg, width, i.expand); ok {
-			return normalizeChatItemBoundary(cached)
+	return normalizeChatItemBoundary(i.layout(width).text)
+}
+
+func (i *messageItem) RenderRows(width int) []string {
+	if i.readingLiveRevision != nil {
+		if rows, ok := i.readingLiveRevision.(list.RowLayoutItem); ok {
+			return rows.RenderRows(width)
 		}
+		return layoutMessage(i.readingLiveRevision.Render(width)).rows
+	}
+	return i.layout(width).rows
+}
+
+func (i *messageItem) layout(width int) messageLayout {
+	if cached, ok := i.cache.getMessageLayout(i.msg, width, i.expand, i.plain); ok {
+		return cached
 	}
 	t0 := time.Now()
-	rendered := renderMessage(i.msg, width, i.expand)
+	render := renderMessage
+	if i.plain {
+		render = renderMessagePlain
+	}
+	layout := layoutMessage(render(i.msg, width, i.expand))
 	if i.cache != nil {
 		i.cache.RecordRender(i.msg.Role, len(i.msg.Content), time.Since(t0))
-		i.cache.PutMessage(i.msg, width, i.expand, rendered)
+		i.cache.putMessageLayout(i.msg, width, i.expand, i.plain, layout)
 	}
-	return normalizeChatItemBoundary(rendered)
+	return layout
 }
 
 // compactToolEventItem preserves the normal tool header + result summary but
@@ -584,6 +601,7 @@ func (s *staticItem) Render(width int) string {
 // mouse wheel, causing it to "stick" on screen as the user scrolled).
 // Not cached — content updates on every spinner tick.
 type inProgressThinkingItem struct {
+	id      string
 	text    string
 	expand  bool
 	width   int           // captured for thinkingHintFits gate; safe to ignore Render arg
@@ -670,45 +688,48 @@ func (it *inProgressThinkingItem) Render(width int) string {
 // inProgressThinkingItem — keeps the visible streaming text aligned
 // with transcript scroll. Suppressed when the turn has been
 // backgrounded (Ctrl+B): the bytes still accumulate, we just don't
-// paint them until finalizeTurn flushes.
+// paint them until finalizeTurn flushes. Its cache belongs to the Model so
+// height/scroll probes and later spinner frames reuse the same live layout.
 type inProgressStreamingItem struct {
+	id           string
+	styleKey     string
 	text         string
 	backgrounded bool
+	cache        *streamingRenderCache
 }
 
 func (it *inProgressStreamingItem) Render(width int) string {
 	if strings.TrimSpace(it.text) == "" || it.backgrounded {
 		return ""
 	}
-	// Streaming text arrives before the final assistant message goes through
-	// glamour, so a provider may give us one very long paragraph with no
-	// newlines. Wrap it here using the same width budget as historical
-	// assistant rows. Otherwise the list counts it as one row while the
-	// terminal paints/truncates it at the right edge, which desynchronizes
-	// frame geometry during long, frequently repainted conversations.
-	bodyW := assistantBodyWidth(width)
+	rows := it.RenderRows(width)
+	if !it.cache.joined {
+		it.cache.rendered = strings.Join(rows, "\n")
+		it.cache.joined = true
+	}
+	return it.cache.rendered
+}
+
+// RenderRows exposes immutable visual rows to the list without repeatedly
+// joining/counting/splitting a large live reply. Render preserves the old bytes.
+func (it *inProgressStreamingItem) RenderRows(width int) []string {
+	if strings.TrimSpace(it.text) == "" || it.backgrounded {
+		return []string{""}
+	}
+	if it.cache == nil {
+		it.cache = &streamingRenderCache{}
+	}
+	style := streamingRenderStyleKey()
+	if it.cache.valid && it.cache.rows != nil && it.cache.text == it.text && it.cache.width == width && it.cache.style == style {
+		return it.cache.rows.rows
+	}
+	bodyWidth := assistantBodyWidth(width)
 	prefix := assistantReplyPrefix(it.text, true)
 	if width > 0 && width < 6 {
-		// A normal four-cell gutter would leave no room for CJK/emoji.
-		// Narrow only the decoration; keep every body row in the same column.
 		prefix = xansi.Truncate(prefix, max(0, width-2), "")
-		bodyW = max(1, width-xansi.StringWidth(prefix))
+		bodyWidth = max(1, width-xansi.StringWidth(prefix))
 	}
-	indent := strings.Repeat(" ", xansi.StringWidth(prefix))
-	wrapped := xansi.Wrap(it.text, bodyW, "")
-
-	var sb strings.Builder
-	sb.WriteString(prefix)
-	lines := strings.Split(wrapped, "\n")
-	if len(lines) > 0 {
-		sb.WriteString(styleText.Render(clampLine(lines[0], bodyW)))
-		for _, ln := range lines[1:] {
-			sb.WriteString("\n" + indent)
-			sb.WriteString(styleText.Render(clampLine(ln, bodyW)))
-		}
-	}
-	sb.WriteString("\n")
-	return normalizeChatItemBoundary(sb.String())
+	return it.cache.replyRows(it.text, width, style, bodyWidth, prefix)
 }
 
 // buildChatItems composes a chronologically-ordered []list.Item from the
@@ -792,7 +813,19 @@ func (m *Model) buildChatItems() []list.Item {
 			// against a thinking row no longer expands it (only tool
 			// events participate in one-at-a-time expansion).
 			expand := forceExpandThinking && it.msg.Role == "thinking"
-			out = append(out, &messageItem{msg: *it.msg, expand: expand, plain: plainAssistant && it.msg.Role == "assistant", cache: m.renderCache})
+			item := &messageItem{msg: *it.msg, expand: expand, plain: plainAssistant && it.msg.Role == "assistant", cache: m.renderCache}
+			if m.readingLiveRevision != nil && it.msg.ID == m.readingLiveRevision.id {
+				compatible := it.msg.Content == m.readingLiveRevision.content && it.msg.Role == m.readingLiveRevision.role
+				if thinking, ok := m.readingLiveRevision.item.(*inProgressThinkingItem); ok && thinking.expand != expand {
+					compatible = false
+				}
+				if compatible {
+					item.readingLiveRevision = m.readingLiveRevision.item
+				} else {
+					m.readingLiveRevision = nil
+				}
+			}
+			out = append(out, item)
 		case it.te != nil:
 			if compactTools {
 				flushExploration()
@@ -851,6 +884,7 @@ func (m *Model) buildChatItems() []list.Item {
 			elapsed = time.Since(m.firstStreamAt)
 		}
 		out = append(out, &inProgressThinkingItem{
+			id:      m.liveMessageID(true),
 			text:    m.thinkingText,
 			expand:  forceExpandThinking,
 			width:   m.width,
@@ -859,9 +893,16 @@ func (m *Model) buildChatItems() []list.Item {
 	}
 	if m.streamingText != "" {
 		out = append(out, &inProgressStreamingItem{
+			id:           m.liveMessageID(false),
+			styleKey:     streamingRenderStyleKey(),
 			text:         m.streamingText,
 			backgrounded: m.turnBackgrounded,
+			cache:        &m.streamingRenderCache,
 		})
+	} else {
+		// Once the reply has become history, release its live layout and
+		// source text instead of retaining a second large transcript copy.
+		m.streamingRenderCache = streamingRenderCache{}
 	}
 	// Spinner status (`* scaffolding (5.5s · ↑ 95k tokens)`) used to
 	// live in the `upper` chrome block, but it visually matches the
