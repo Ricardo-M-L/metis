@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/Ricardo-M-L/metis/internal/turnprogress"
 )
 
 // TimingStep is one recorded tool/step duration.
@@ -35,17 +37,23 @@ type TimingStep struct {
 // turn so Desktop can restore "duration / first token / tok/s" after a session
 // switch or application restart.
 type MessageMetric struct {
-	Turn              int       `json:"turn"`
-	StartedAt         time.Time `json:"started_at"`
-	CompletedAt       time.Time `json:"completed_at"`
-	DurationMS        int64     `json:"duration_ms"`
-	TTFTMS            int64     `json:"ttft_ms,omitempty"`
-	InputTokens       int64     `json:"input_tokens,omitempty"`
-	OutputTokens      int64     `json:"output_tokens,omitempty"`
-	CacheCreateTokens int64     `json:"cache_create_tokens,omitempty"`
-	CacheReadTokens   int64     `json:"cache_read_tokens,omitempty"`
-	TokPerSec         float64   `json:"tok_per_sec,omitempty"`
+	Turn              int             `json:"turn"`
+	StartedAt         time.Time       `json:"started_at"`
+	CompletedAt       time.Time       `json:"completed_at"`
+	DurationMS        int64           `json:"duration_ms"`
+	TTFTMS            int64           `json:"ttft_ms,omitempty"`
+	InputTokens       int64           `json:"input_tokens,omitempty"`
+	OutputTokens      int64           `json:"output_tokens,omitempty"`
+	CacheCreateTokens int64           `json:"cache_create_tokens,omitempty"`
+	CacheReadTokens   int64           `json:"cache_read_tokens,omitempty"`
+	TokPerSec         float64         `json:"tok_per_sec,omitempty"`
+	StartupSummary    *StartupSummary `json:"startupSummary,omitempty"`
 }
+
+// StartupSummary is optional for older sessions. Its observed milestones and
+// queue durations use the server clock, separately from legacy UI TTFT and
+// worker-local request timing. A missing milestone remains unknown.
+type StartupSummary = turnprogress.StartupSummary
 
 func (s *Store) timingPath(id string) string {
 	return filepath.Join(s.Dir, filepath.Base(id)+".timing.jsonl")
@@ -328,6 +336,7 @@ func mergeMessageMetric(current, incoming MessageMetric) MessageMetric {
 	if incoming.TokPerSec > 0 {
 		current.TokPerSec = incoming.TokPerSec
 	}
+	current.StartupSummary = turnprogress.MergeStartupSummary(current.StartupSummary, incoming.StartupSummary)
 	// Throughput covers generation after the first token, not the complete
 	// request (which includes TTFT). A positive TTFT is also our evidence that
 	// this sidecar has generation timing; without it, retain any provider/handler

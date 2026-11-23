@@ -385,6 +385,7 @@ Usage:
   metis models <p> <m>  Deep-dive on a model + generate config.toml snippet
   metis sessions list   List recent saved sessions
   metis sessions timing <id>      Per-step timing breakdown of a past session
+  metis sessions metrics <id> [--json]  Persisted request and startup metrics
   metis sessions branch <id>      Create a branch from a saved session
   metis sessions export <id>      Print a session's JSONL to stdout
 	  metis sessions import [--id ID] Read JSONL from stdin and create a new session
@@ -4382,6 +4383,8 @@ func cmdSessions(args []string) error {
 			return errors.New("usage: metis sessions timing <id>")
 		}
 		return printSessionTiming(store, args[1])
+	case "metrics":
+		return printSessionMetrics(store, args[1:], os.Stdout)
 	}
 	return fmt.Errorf("sessions: unknown subcommand %q", sub)
 }
