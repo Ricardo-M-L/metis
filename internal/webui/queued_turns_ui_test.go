@@ -51,7 +51,7 @@ func TestQueuedTurnCardAssetsMatchInteractiveContract(t *testing.T) {
 		}
 	}
 
-	for _, name := range []string{"list-start", "list-end", "corner-down-left", "trash-2", "ellipsis", "pen-line", "message-circle-plus"} {
+	for _, name := range []string{"list-start", "list-end", "corner-down-left", "arrow-up", "trash-2", "ellipsis", "pen-line", "message-circle-plus"} {
 		asset, err := staticFS.ReadFile("static/icons/lucide/" + name + ".svg")
 		if err != nil {
 			t.Errorf("read %s icon: %v", name, err)
@@ -249,7 +249,7 @@ function notSent(f) {
   const minimal=fixture();delete minimal.c.drainingQueuedTurns;delete minimal.c.pendingAsk;delete minimal.c.pendingSessionId;
   delete minimal.c.isWorkspaceSelectionPending;await minimal.click();assert.equal(minimal.input.value,'帮我搜索清华');notSent(minimal);
 
-  // Immediate steering remains available, but only behind an explicit action in the menu.
+  // The explicit immediate-send action remains available in the menu.
   const immediate=fixture();immediate.button();immediate.c.toggleQueuedTurnMenu(immediate.c.event,0);
   const menu=(immediate.wrap.innerHTML.match(/<button\b[^>]*role="menuitem"[^>]*>[^]*?<\/button>/g)||[])
     .find(button=>button.includes('<span>立即发送给当前任务</span>'));

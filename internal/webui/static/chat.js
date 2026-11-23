@@ -2016,6 +2016,8 @@ function syncTurnControls() {
 }
 
 function setTurnRunning(running, sessionId) {
+  const previousRunning = turnRunning;
+  const previousSessionId = runningSessionId;
   turnRunning = running;
   if (running) {
     if (sessionId) runningSessionId = sessionId;
@@ -2027,6 +2029,10 @@ function setTurnRunning(running, sessionId) {
   syncTurnControls();
   renderSessions();
   renderTodoPlan();
+  if ((previousRunning !== turnRunning || previousSessionId !== runningSessionId) &&
+      typeof queuedTurns !== 'undefined' && queuedTurns.length && typeof renderQueuedTurns === 'function') {
+    renderQueuedTurns();
+  }
   if (!running && typeof refreshComposerPromptSuggestion === 'function') refreshComposerPromptSuggestion();
 }
 
@@ -4233,7 +4239,9 @@ function queuedTurnPreview(item) {
 }
 
 function queuedTurnCanSteer(item) {
-  return !!(turnRunning && runningSessionId && (!queuedSessionId || queuedSessionId === runningSessionId)
+  const owner = queuedSessionId || runningSessionId;
+  return !!(turnRunning && runningSessionId && owner === runningSessionId && owner === currentSessionId
+    && !queuedTurnPendingItem && !(typeof drainingQueuedTurns !== 'undefined' && drainingQueuedTurns)
     && item && (!Array.isArray(item.images) || item.images.length === 0));
 }
 
@@ -4283,7 +4291,7 @@ function renderQueuedTurns() {
     const preview = queuedTurnPreview(item);
     const menuOpen = queuedTurnMenuIndex === i;
     const pending = queuedTurnPendingItem === item;
-    const canSteer = queuedTurnCanSteer(item) && !pending;
+    const canSteer = queuedTurnCanSteer(item);
     const composerBlockReason = queuedTurnComposerBlockReason(i);
     const composerTitle = composerBlockReason || uiText('Move this message back to the composer to edit it', '将这条消息移回输入框编辑');
     const steerTitle = item.images && item.images.length
@@ -4299,10 +4307,11 @@ function renderQueuedTurns() {
     }
     return '<li class="queued-card' + (pending ? ' is-pending' : '') + '" data-queued-index="' + i + '">' +
       '<span class="queued-card-copy" title="' + escAttr(preview) + '">' + escHtml(preview) + '</span>' +
+      '<button type="button" class="queued-icon-button queued-send" onclick="steerQueuedTurn(event,' + i + ')" title="' + escAttr(steerTitle) + '" aria-label="' + escAttr(uiText('Send to the current turn now', '立即发送给当前任务')) + '"' + (canSteer ? '' : ' disabled') + '>' + queuedTurnIcon('arrow-up') + '</button>' +
       '<button type="button" class="queued-steer" onclick="editQueuedTurn(event,' + i + ')" title="' + escAttr(composerTitle) + '" aria-label="' + escAttr(uiText('Move this queued message back to the composer to edit it', '将这条排队消息移回输入框编辑')) + '"' + (composerBlockReason ? ' disabled' : '') + '>' +
         queuedTurnIcon('pen-line') + '<span class="visually-hidden">' + escHtml(uiText('Adjust direction', '调整方向')) + '</span></button>' +
-      '<button type="button" class="queued-icon-button queued-remove" onclick="removeQueuedTurn(' + i + ')" title="' + escAttr(uiText('Delete queued message', '删除排队消息')) + '" aria-label="' + escAttr(uiText('Delete queued message', '删除排队消息')) + '"' + (pending ? ' disabled' : '') + '>' + queuedTurnIcon('trash-2') + '</button>' +
-      '<button type="button" class="queued-icon-button queued-more' + (menuOpen ? ' is-open' : '') + '" onclick="toggleQueuedTurnMenu(event,' + i + ')" title="' + escAttr(uiText('More queued message actions', '更多排队消息操作')) + '" aria-label="' + escAttr(uiText('More queued message actions', '更多排队消息操作')) + '" aria-haspopup="menu" aria-expanded="' + (menuOpen ? 'true' : 'false') + '"' + (pending ? ' disabled' : '') + '>' + queuedTurnIcon('ellipsis') + '</button>' +
+      '<button type="button" class="queued-icon-button queued-remove" onclick="removeQueuedTurn(' + i + ')" title="' + escAttr(uiText('Delete queued message', '删除排队消息')) + '" aria-label="' + escAttr(uiText('Delete queued message', '删除排队消息')) + '"' + (queuedTurnPendingItem ? ' disabled' : '') + '>' + queuedTurnIcon('trash-2') + '</button>' +
+      '<button type="button" class="queued-icon-button queued-more' + (menuOpen ? ' is-open' : '') + '" onclick="toggleQueuedTurnMenu(event,' + i + ')" title="' + escAttr(uiText('More queued message actions', '更多排队消息操作')) + '" aria-label="' + escAttr(uiText('More queued message actions', '更多排队消息操作')) + '" aria-haspopup="menu" aria-expanded="' + (menuOpen ? 'true' : 'false') + '"' + (queuedTurnPendingItem ? ' disabled' : '') + '>' + queuedTurnIcon('ellipsis') + '</button>' +
     '</li>';
   }).join('') : '';
   wrap.innerHTML = '<section class="queued-dock">' +
@@ -4419,7 +4428,7 @@ async function steerQueuedTurn(event, index) {
     showToast(uiText('Sent to the current turn', '已发送给当前任务'));
     await loadSessions();
   } catch (error) {
-    showToast(uiText('Unable to steer; the message remains queued: ', '调整方向失败，消息仍在队列中：') + error.message);
+    showToast(uiText('Unable to send now; the message remains queued: ', '立即发送失败，消息仍在队列中：') + error.message);
   } finally {
     if (queueState) queueState.pending = null;
     if (queuedTurnPendingItem === item) queuedTurnPendingItem = null;
@@ -4486,7 +4495,7 @@ document.addEventListener('scroll', event => {
 }, true);
 
 async function drainQueuedTurns() {
-  if (isViewedTurnRunning() || drainingQueuedTurns || pendingAsk || !queuedTurns.length) return;
+  if (isViewedTurnRunning() || drainingQueuedTurns || (typeof queuedTurnPendingItem !== 'undefined' && queuedTurnPendingItem) || pendingAsk || !queuedTurns.length) return;
   if (isSessionQueuePaused()) return;
   if (queuedSessionId && currentSessionId !== queuedSessionId) return;
   const owner = currentSessionId;

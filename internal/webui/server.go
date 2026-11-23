@@ -4648,6 +4648,17 @@ func (s *Server) handleSteer(w http.ResponseWriter, r *http.Request) {
 			}
 			writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "sessionId": body.SessionID})
 		case <-worker.done:
+			// Worker cleanup may close done after buffering an accepted ACK,
+			// before this handler resumes. Preserve that acknowledgement so the
+			// browser cannot requeue input the worker already accepted.
+			select {
+			case accepted := <-request.Reply:
+				if accepted {
+					writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "sessionId": body.SessionID})
+					return
+				}
+			default:
+			}
 			writeError(w, http.StatusConflict, "turn no longer accepts steering")
 		case <-r.Context().Done():
 		}

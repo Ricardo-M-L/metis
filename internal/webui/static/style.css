@@ -6554,7 +6554,7 @@ a.tc-web-title:focus-visible,
   min-width: 0;
   height: 36px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 28px 28px 28px;
+  grid-template-columns: minmax(0, 1fr) repeat(4, 28px);
   align-items: center;
   gap: 10px;
   padding: 4px 5px 4px 12px;
