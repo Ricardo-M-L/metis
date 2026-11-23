@@ -84,6 +84,106 @@ func TestPromptSuggestionIsGhostUntilTabAndNeverAutoSends(t *testing.T) {
 	}
 }
 
+func TestPromptSuggestionAcceptedDraftCanBeErasedAndAcceptedAgain(t *testing.T) {
+	m, p := newPromptSuggestionModel(t)
+	m.input.Focus()
+	m.Update(preparePromptSuggestion(t, m)())
+	const suggestion = "给这个改动补测试"
+	before := len(m.loop.History())
+	for attempt := 0; attempt < 3; attempt++ {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+		if m.input.Value() != suggestion {
+			t.Fatalf("accept %d: draft=%q", attempt, m.input.Value())
+		}
+		// Exercise ordinary editor updates, including partial edits, rather
+		// than directly resetting the textarea or the suggestion state.
+		m.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
+		if attempt == 1 {
+			m.Update(tea.KeyPressMsg{Code: 'u', Mod: tea.ModCtrl})
+			if m.input.Value() != "" {
+				t.Fatal("Ctrl+U did not clear the accepted draft")
+			}
+		}
+		for m.input.Value() != "" {
+			previous := m.input.Value()
+			m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+			if m.input.Value() == previous {
+				t.Fatal("Backspace did not edit the accepted draft")
+			}
+		}
+		if m.input.Placeholder != suggestion || !strings.Contains(stripANSI(renderInputLine(m)), suggestion) {
+			t.Fatalf("erase %d: cached ghost did not reappear: %q", attempt, m.input.Placeholder)
+		}
+		if p.calls != 1 || m.turnActive || len(m.loop.History()) != before || m.startPromptSuggestion() != nil {
+			t.Fatal("restoring an accepted suggestion made a model request or sent a turn")
+		}
+	}
+}
+
+func TestPromptSuggestionAcceptedDraftSurvivesPasteThenErase(t *testing.T) {
+	m, p := newPromptSuggestionModel(t)
+	m.input.Focus()
+	m.Update(preparePromptSuggestion(t, m)())
+	m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m.Update(tea.PasteMsg{Content: "补上边界情况"})
+	if !strings.Contains(m.input.Value(), "补上边界情况") {
+		t.Fatal("paste did not reach the accepted draft")
+	}
+	for m.input.Value() != "" {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+	}
+	if m.input.Placeholder != "给这个改动补测试" || p.calls != 1 {
+		t.Fatal("pasting into an accepted draft discarded its cached suggestion")
+	}
+}
+
+func TestPromptSuggestionDirectSubmitExpiresAcceptedDraft(t *testing.T) {
+	m, p := newPromptSuggestionModel(t)
+	m.Update(preparePromptSuggestion(t, m)())
+	m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m.input.SetValue("/later verify")
+	m.turnActive = true
+	// Exercise the submission entry point without a preceding Enter key.
+	// Explicit queueing consumes the draft without running a model here.
+	m.handleSubmit()
+	if m.input.Value() != "" || len(m.queuedPrompts) != 1 {
+		t.Fatal("submission did not consume and queue the draft")
+	}
+	m.turnActive = false
+	m.queuedPrompts = nil
+	m.reconcilePromptSuggestion()
+	if m.input.Placeholder != defaultInputPlaceholder || m.acceptPromptSuggestion() || p.calls != 1 {
+		t.Fatal("submitted suggestion reappeared after the queue cleared")
+	}
+}
+
+func TestPromptSuggestionAcceptedDraftDoesNotRestoreAfterExpiry(t *testing.T) {
+	for name, expire := range map[string]func(*Model){
+		"escape":   func(m *Model) { m.Update(tea.KeyPressMsg{Code: tea.KeyEscape}) },
+		"session":  func(m *Model) { m.sessionID = "other-session"; m.reconcilePromptSuggestion() },
+		"model":    func(m *Model) { m.model = "other-model"; m.reconcilePromptSuggestion() },
+		"provider": func(m *Model) { m.providerName = "other-provider"; m.reconcilePromptSuggestion() },
+		"new turn": func(m *Model) { m.turnActive = true; m.reconcilePromptSuggestion(); m.turnActive = false },
+		"disabled": func(m *Model) {
+			m.cfg.UI.PromptSuggestions = false
+			m.reconcilePromptSuggestion()
+			m.cfg.UI.PromptSuggestions = true
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, p := newPromptSuggestionModel(t)
+			m.Update(preparePromptSuggestion(t, m)())
+			m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+			expire(m)
+			m.input.Reset()
+			m.reconcilePromptSuggestion()
+			if m.input.Placeholder != defaultInputPlaceholder || m.acceptPromptSuggestion() || p.calls != 1 {
+				t.Fatal("expired accepted suggestion reappeared or requested another suggestion")
+			}
+		})
+	}
+}
+
 func TestPromptSuggestionDoesNotOverwriteDraftsOrStealCompletion(t *testing.T) {
 	for _, value := range []string{"my draft", "  ", "/he", "@file"} {
 		t.Run(value, func(t *testing.T) {

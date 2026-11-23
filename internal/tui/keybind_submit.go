@@ -282,6 +282,7 @@ func (m *Model) handleSubmitWithUserInput(userInputBlocks []llm.ContentBlock, cr
 	if text == "" {
 		return m, nil
 	}
+	m.clearPromptSuggestion()
 	// Resolve the highlighted slash-palette entry before any mid-turn
 	// routing. Previously this happened only after the turnActive branch,
 	// so `/expo` + Enter while a turn was closing was treated as literal

@@ -93,8 +93,12 @@ func (m *Model) expandableToolEventIDs() []string {
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if msg.String() != "tab" {
+	switch msg.String() {
+	case "tab":
+	case "esc", "enter", "ctrl+c":
 		m.clearPromptSuggestion()
+	default:
+		m.editPromptSuggestion()
 	}
 	// Ctrl-C copies a composer selection before it acquires any cancellation
 	// meaning. Keep this check ahead of both OAuth and foreground-turn handling

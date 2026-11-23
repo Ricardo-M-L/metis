@@ -11,13 +11,14 @@ import (
 const defaultInputPlaceholder = "type a message · /commands · alt+enter newline"
 
 type promptSuggestionState struct {
-	generation uint64
-	pending    bool
-	text       string
-	sessionID  string
-	model      string
-	provider   string
-	cancel     context.CancelFunc
+	generation    uint64
+	pending       bool
+	text          string
+	acceptedDraft bool
+	sessionID     string
+	model         string
+	provider      string
+	cancel        context.CancelFunc
 }
 
 type promptSuggestionResultMsg struct {
@@ -27,11 +28,15 @@ type promptSuggestionResultMsg struct {
 }
 
 func (m *Model) promptSuggestionEligible() bool {
+	return m.promptSuggestionContextEligible() && m.input.Value() == ""
+}
+
+func (m *Model) promptSuggestionContextEligible() bool {
 	return m.cfg != nil && m.cfg.UI.PromptSuggestions && m.loop != nil && m.sessionID != "" &&
 		!m.turnActive && !m.spinnerActive && !m.shellMode && !m.copyMode && !m.queuePending && len(m.queuedPrompts) == 0 &&
 		!m.permActive && !m.askUserActive && !m.showPalette && m.activeScreen == nil && m.effortPicker == nil &&
 		(m.overlays == nil || m.overlays.Top() == nil) &&
-		m.input.Value() == "" && len(m.imagePaste) == 0 && (m.ctx == nil || m.ctx.Err() == nil)
+		len(m.imagePaste) == 0 && (m.ctx == nil || m.ctx.Err() == nil)
 }
 
 func (m *Model) queuePromptSuggestion() {
@@ -88,7 +93,11 @@ func (m *Model) applyPromptSuggestion(result promptSuggestionResultMsg) {
 }
 
 func (m *Model) promptSuggestionCurrent() bool {
-	return m.promptSuggestionEligible() && m.promptSuggestion.sessionID == m.sessionID &&
+	return m.input.Value() == "" && m.promptSuggestionContextCurrent()
+}
+
+func (m *Model) promptSuggestionContextCurrent() bool {
+	return m.promptSuggestionContextEligible() && m.promptSuggestion.sessionID == m.sessionID &&
 		m.promptSuggestion.model == m.model && m.promptSuggestion.provider == m.providerName
 }
 
@@ -102,10 +111,29 @@ func (m *Model) clearPromptSuggestion() {
 	}
 	s.generation++
 	s.cancel, s.pending, s.text = nil, false, ""
+	s.acceptedDraft = false
 	m.input.Placeholder = defaultInputPlaceholder
 }
 
+// Ordinary editing dismisses an unaccepted (possibly in-flight) suggestion.
+// Once Tab has accepted it, keep that completed result for the same idle turn
+// so erasing the draft can reveal it again without another model request.
+func (m *Model) editPromptSuggestion() {
+	if m.promptSuggestion.acceptedDraft {
+		m.input.Placeholder = defaultInputPlaceholder
+		return
+	}
+	m.clearPromptSuggestion()
+}
+
 func (m *Model) reconcilePromptSuggestion() {
+	if m.promptSuggestion.acceptedDraft && m.promptSuggestionContextCurrent() {
+		m.input.Placeholder = defaultInputPlaceholder
+		if m.input.Value() == "" {
+			m.input.Placeholder = m.promptSuggestion.text
+		}
+		return
+	}
 	if (m.promptSuggestion.pending || m.promptSuggestion.cancel != nil || m.promptSuggestion.text != "") && !m.promptSuggestionCurrent() {
 		m.clearPromptSuggestion()
 	}
@@ -116,7 +144,8 @@ func (m *Model) acceptPromptSuggestion() bool {
 		return false
 	}
 	text := m.promptSuggestion.text
-	m.clearPromptSuggestion()
+	m.promptSuggestion.acceptedDraft = true
+	m.input.Placeholder = defaultInputPlaceholder
 	m.input.SetValue(text)
 	m.input.CursorEnd()
 	return true

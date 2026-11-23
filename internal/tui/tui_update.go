@@ -366,7 +366,7 @@ func (m *Model) Update(msg tea.Msg) (updated tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case tea.PasteMsg:
-		m.clearPromptSuggestion()
+		m.editPromptSuggestion()
 		// Bracketed paste: terminal wraps cmd+V'd content with
 		// \x1b[200~ … \x1b[201~ and bubbletea v2 reports it as a
 		// single PasteMsg (instead of streaming each char as a
